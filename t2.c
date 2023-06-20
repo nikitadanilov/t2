@@ -19,6 +19,7 @@
 enum {
         MAX_TREE_HEIGHT =   10,
         MAX_TREE_TYPE   = 1024,
+        MAX_NODE_TYPE   = 1024,
         MAX_ERR_CODE    = 1024
 };
 
@@ -187,9 +188,12 @@ struct ht {
 
 struct t2 {
         const struct t2_tree_type *ttypes[MAX_TREE_TYPE];
+        const struct node_type    *ntypes[MAX_NODE_TYPE];
         struct t2_storage         *stor;
         struct ht                  ht;
 };
+
+SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
 
 /*
  * "Address" of a node on storage.
@@ -288,6 +292,31 @@ void t2_tree_type_degister(struct t2_tree_type *ttype)
         ttype->mod = NULL;
 }
 
+struct node_type {
+        int         id;
+        const char *name;
+        struct t2  *mod;
+        int         shift;
+};
+
+
+void t2_node_type_register(struct t2 *mod, struct node_type *ntype) {
+        ASSERT(IS_IN(ntype->id, mod->ntypes));
+        ASSERT(mod->ntypes[ntype->id] == NULL);
+        ASSERT(ntype->mod == NULL);
+        mod->ntypes[ntype->id] = ntype;
+        ntype->mod = mod;
+}
+
+
+void t2_node_type_degister(struct node_type *ntype)
+{
+        ASSERT(IS_IN(ntype->id, ntype->mod->ntypes));
+        ASSERT(ntype->mod->ntypes[ntype->id] == ntype);
+        ntype->mod->ttypes[ntype->id] = NULL;
+        ntype->mod = NULL;
+}
+
 #define SCALL(mod, method, ...)                         \
 ({                                                      \
         struct t2_storage *__stor = (mod)->stor;        \
@@ -353,18 +382,13 @@ static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         return -ESTALE;
 }
 
-struct node_type {
-        const char *name;
-        int         shift;
-};
-
 struct node {
         struct link             hash;
         uint64_t                seq;
         const struct node_type *ntype;
         taddr_t                 addr;
         void                   *data;
-        int                     level;
+        struct t2              *mod;
 };
 
 enum lock_mode {
@@ -435,28 +459,75 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
         return ht_lookup(&mod->ht, addr);
 }
 
+static struct node *ninit(struct t2 *mod, taddr_t addr) {
+        struct node *n = mem_alloc(sizeof *n);
+        ASSERT(SCALL(mod, is_valid, addr));
+        if (n != NULL) {
+                link_init(&n->hash);
+                n->addr = addr;
+                n->mod = mod;
+                return n;
+        } else {
+                return EPTR(-ENOMEM);
+        }
+}
+
 static struct node *get(struct t2 *mod, taddr_t addr) {
         struct node *n = ht_lookup(&mod->ht, addr);
         if (n == NULL) {
+                n = ninit(mod, addr);
+                if (EISOK(n)) {
+                        ht_insert(&mod->ht, n);
+                }
         }
-        return NULL;
+        return n;
 }
 
 static void put(struct node *n) {
 }
 
+struct header {
+        uint32_t magix;
+        uint32_t csum;
+        uint16_t ntype;
+        uint8_t  level;
+        uint8_t  pad;
+        uint64_t treeid[2];
+};
+
 static int load(struct node *n) {
-        return 0;
+        int result = 0;
+        if (n->data == NULL) {
+                n->data = mem_alloc(taddr_ssize(n->addr));
+                if (n->data != NULL) {
+                        struct header *h = n->data;
+                        result = SCALL(n->mod, read, n->addr);
+                        if (result == 0) {
+                                if (IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL) {
+                                        n->ntype = n->mod->ntypes[h->ntype];
+                                } else {
+                                        result = ERROR(-EIO);
+                                }
+                        }
+                } else {
+                        result = ERROR(-ENOMEM);
+                }
+        }
+        return result;
+}
+
+static struct header *nheader(const struct node *n) {
+        return n->data;
 }
 
 static bool is_leaf(const struct node *n) {
-        return n->level == 0;
+        return nheader(n)->level == 0;
 }
 
 struct slot {
-	struct node   *node;
-	int            idx;
-	struct t2_rec  rec;
+        struct node   *node;
+        int            idx;
+        struct t2_rec  rec;
 };
 
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int *pos);
@@ -503,7 +574,7 @@ static int lookup_complete(struct tree_op *top, struct node *n, struct t2_rec *r
         struct t2_buf key;
         struct t2_buf val;
         struct slot s = { .rec = { .key = &key, .val = &val } };
-        return leaf_search(n, r, &s) ?: val_copy(r, n, &s);
+        return leaf_search(n, r, &s) ? val_copy(r, n, &s) : -ENOENT;
 }
 
 static int insert_complete(struct tree_op *top, struct node *n, struct t2_rec *r, struct slot *s, int result) {
@@ -590,7 +661,6 @@ static int traverse(struct tree_op *top) {
                                 }
                         }
                 } else {
-                        int pos;
                         next = internal_search(n, top->rec, &r->pos);
                         if (EISERR(next)) {
                                 result = ERROR(ERRCODE(next));
@@ -605,7 +675,7 @@ static int traverse(struct tree_op *top) {
 static int lookup(struct t2_tree *t, struct t2_rec *r) {
         int result = cookie_try(t, r, LOOKUP);
         if (result != -ESTALE) {
-                return ERROR(result);
+                return result;
         } else {
                 struct tree_op top = {};
                 op_init(&top, t, r, LOOKUP);
@@ -689,8 +759,16 @@ static void ht_fini(struct ht *ht) {
         mem_free(ht->chains);
 }
 
-static unsigned ht_hash(taddr_t addr) {
-        return 0;
+static uint64_t ht_hash(taddr_t addr) {
+        uint64_t x = addr;             /* ChatGPT made me do it. */
+        x = (~x) + (x << 21);          /* x = (x << 21) - x - 1; */
+        x = x ^ (x >> 24);
+        x = (x + (x << 3)) + (x << 8); /* x * 265 */
+        x = x ^ (x >> 14);
+        x = (x + (x << 2)) + (x << 4); /* x * 21 */
+        x = x ^ (x >> 28);
+        x = x + (x << 31);
+        return x;
 }
 
 static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
@@ -723,15 +801,6 @@ static void ht_delete(struct node *n) {
 
 enum {
         NODE_MAGIX = 0x1f2e3d4c
-};
-
-struct header {
-        uint32_t magix;
-        uint32_t csum;
-        uint16_t ntype;
-        uint8_t  level;
-        uint8_t  pad;
-        uint64_t treeid[2];
 };
 
 struct dir_element {
@@ -870,6 +939,9 @@ static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := 
         struct t2_buf *key    = s->rec.key;
         struct t2_buf *val    = s->rec.val;
         int            result = 0;
+        if (s->idx < 0) {
+                return ERROR(-ERANGE);
+        }
         if (r->kcb != NULL) {
                 r->kcb(key, r->arg);
         } else {
@@ -1078,12 +1150,12 @@ static void usuite(const char *suite) {
         printf("        %s\n", suite);
 }
 
-static int ok;
-static int failed;
+static uint64_t ok;
+static uint64_t failed;
 static const char *test = NULL;
 
 static void utestdone(void) {
-        printf("                %c %-15s %6i %6i\n", failed == 0 ? '+' : '.', test, ok, failed);
+        printf("                %c %-15s %10llu %10llu\n", failed == 0 ? '+' : '.', test, ok, failed);
         test = NULL;
 }
 
@@ -1156,18 +1228,25 @@ static bool is_sorted(struct node *n, int maxkey) {
         return true;
 }
 
+static struct node_type ntype = {
+        .id    = 8,
+        .name  = "simple-ut",
+        .shift = 9
+};
+
+static struct t2_tree_type ttype = {
+        .id       = 7,
+        .name     = "tree-type-ut",
+        .root_min = 9,
+        .root_max = 9
+};
+
 static void simple_ut(void) {
-        int result;
-        struct node_type ntype = {
-                .name  = "simple-ut",
-                .shift = 9
-        };
         char body[1ul << ntype.shift];
         struct node n = {
                 .ntype = &ntype,
                 .addr  = taddr_make(0x100000, ntype.shift),
                 .data  = body,
-                .level = 0
         };
         struct sheader *sh = simple_header(&n);
         char key0[] = "KEY0";
@@ -1185,7 +1264,7 @@ static void simple_ut(void) {
         memset(body, 0, sizeof body);
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
-        usuite("simple node");
+        usuite("simple-node");
         utest("make");
         simple_make(&n);
         UASSERT(sh->nr == 0);
@@ -1207,22 +1286,178 @@ static void simple_ut(void) {
         }
         utest("search");
         key0[1] = 'a';
-        for (uint32_t i = 0; simple_free(&n) >
-                     buf_len(&key) + buf_len(&val) + sizeof(struct dir_element); ++i) {
+        while (simple_free(&n) > buf_len(&key) + buf_len(&val) + sizeof(struct dir_element)) {
                 UASSERT(!simple_search(&n, &s.rec, &s));
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
                 UASSERT(simple_insert(&s) == 0);
                 UASSERT(is_sorted(&n, sizeof key0));
-                key0[1] += 251; /* Co-prime with 512. */
+                key0[1] += 251; /* Co-prime with 256. */
                 val0[1]++;
         }
         utestdone();
 }
 
+static struct node *node_alloc_ut(uint64_t blk) {
+        struct node *n = mem_alloc(sizeof *n);
+        n->addr = taddr_make(blk & TADDR_ADDR_MASK, 9);
+        return n;
+}
+
+static void ht_ut() {
+        const uint64_t N = 10000;
+        struct ht ht;
+        usuite("ht");
+        utest("collision");
+        for (uint64_t i = 0; i < N; ++i) {
+                for (uint64_t j = 0; j < i; ++j) {
+                        UASSERT(ht_hash(i) != ht_hash(j));
+                        UASSERT(ht_hash(2 * N + i * i * i) != ht_hash(2 * N + j * j * j));
+                }
+        }
+        ht_init(&ht, 10);
+        utest("insert");
+        for (uint64_t i = 0; i < N; ++i) {
+                ht_insert(&ht, node_alloc_ut(ht_hash(i)));
+        }
+        utest("lookup");
+        for (uint64_t i = 0; i < N; ++i) {
+                taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
+                struct node *n = ht_lookup(&ht, blk);
+                UASSERT(n != NULL);
+                UASSERT(n->addr == blk);
+        }
+        utest("delete");
+        for (uint64_t i = 0; i < N; ++i) {
+                taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
+                struct node *n = ht_lookup(&ht, blk);
+                ht_delete(n);
+                put(n);
+        }
+        utest("fini");
+        ht_fini(&ht);
+        utestdone();
+}
+
+static int mso_init(struct t2_storage *storage) {
+        return 0;
+}
+
+static void mso_fini(struct t2_storage *storage) {
+}
+
+static uint64_t mso_alloc(struct t2_storage *storage,
+                          int shift_min, int shift_max, int *shift) {
+        return 0;
+}
+
+static void mso_free(struct t2_storage *storage, uint64_t addr, int size) {
+}
+
+static bool mso_is_valid(struct t2_storage *storage, uint64_t addr) {
+        return true;
+}
+
+static int mso_read(struct t2_storage *storage, uint64_t addr) {
+        return 0;
+}
+
+static struct t2_storage_op mock_storage_op = {
+        .name     = "mock-storage-op",
+        .init     = &mso_init,
+        .fini     = &mso_fini,
+        .alloc    = &mso_alloc,
+        .free     = &mso_free,
+        .is_valid = &mso_is_valid,
+        .read     = &mso_read
+};
+
+static struct t2_storage mock_storage = {
+        .op = &mock_storage_op
+};
+
+static void traverse_ut() {
+        taddr_t addr = taddr_make(0x100000, ntype.shift);
+        char body[1ul << ntype.shift];
+        struct node n = {
+                .ntype = &ntype,
+                .addr  = addr,
+                .data  = body,
+        };
+        struct sheader *sh = simple_header(&n);
+        struct t2 *mod = t2_init(&mock_storage, 10);
+        t2_node_type_register(mod, &ntype);
+        *sh = (struct sheader) {
+                .head = {
+                        .magix = NODE_MAGIX,
+                        .ntype = ntype.id,
+                        .level = 0,
+                }
+        };
+        char key0[] = "0";
+        char val0[] = "+";
+        struct t2_buf val;
+        struct t2_buf key;
+        struct slot s = {
+                .node = &n,
+                .idx = 0,
+                .rec = {
+                        .key = &key,
+                        .val = &val
+                }
+        };
+        struct t2_tree t = {
+                .ttype = &ttype,
+                .root  = addr
+        };
+        struct tree_op top = {
+                .tree = &t,
+                .opt  = LOOKUP,
+                .rec  = &s.rec
+        };
+        ttype.mod = mod;
+        memset(body, 0, sizeof body);
+        buf_init_str(&key, key0);
+        buf_init_str(&val, val0);
+        usuite("traverse");
+        utest("prepare");
+        simple_make(&n);
+        ht_insert(&mod->ht, &n);
+        for (int i = 0; i < 20; ++i, key0[0] += 2) {
+                UASSERT(!simple_search(&n, &s.rec, &s));
+                s.idx++;
+                buf_init_str(&key, key0);
+                buf_init_str(&val, val0);
+                UASSERT(simple_insert(&s) == 0);
+                UASSERT(is_sorted(&n, sizeof key0));
+        }
+        utest("existing");
+        key0[0] = '0';
+        UASSERT(traverse(&top) == 0);
+        key0[0] = '2';
+        top.path.used = 0;
+        UASSERT(traverse(&top) == 0);
+        key0[0] = '8';
+        top.path.used = 0;
+        UASSERT(traverse(&top) == 0);
+        utest("too-small");
+        key0[0] = ' ';
+        top.path.used = 0;
+        UASSERT(traverse(&top) == -ENOENT);
+        utest("non-existent");
+        key0[0] = '1';
+        top.path.used = 0;
+        UASSERT(traverse(&top) == -ENOENT);
+        ht_delete(&n);
+        t2_node_type_degister(&ntype);
+        utestdone();
+}
+
 int main(int argc, char **argv) {
         simple_ut();
+        ht_ut();
+        traverse_ut();
         return 0;
 }
 

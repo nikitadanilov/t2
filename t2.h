@@ -27,11 +27,13 @@ struct t2_storage {
 
 struct t2_storage_op {
         const char *name;
-        int      (*init) (struct t2_storage *storage);
-        void     (*fini) (struct t2_storage *storage);
-        uint64_t (*alloc)(struct t2_storage *storage,
-                          int shift_min, int shift_max, int *shift);
-        void     (*free) (struct t2_storage *storage, uint64_t addr, int size);
+        int      (*init)    (struct t2_storage *storage);
+        void     (*fini)    (struct t2_storage *storage);
+        uint64_t (*alloc)   (struct t2_storage *storage,
+                             int shift_min, int shift_max, int *shift);
+        void     (*free)    (struct t2_storage *storage, uint64_t addr, int size);
+        bool     (*is_valid)(struct t2_storage *storage, uint64_t addr);
+        int      (*read)    (struct t2_storage *storage, uint64_t addr);
 };
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift);
