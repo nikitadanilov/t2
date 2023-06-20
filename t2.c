@@ -23,17 +23,7 @@ enum {
         MAX_ERR_CODE    = 1024
 };
 
-struct msg_ctx {
-        const char *func;
-        const char *file;
-        int         lineno;
-        const char *fmt;
-};
-
-static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn));
-static void *mem_alloc(size_t size);
-static void  mem_free(void *ptr);
-static void llog(const struct msg_ctx *ctx, ...);
+/* @macro */
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -174,6 +164,15 @@ static void llog(const struct msg_ctx *ctx, ...);
 
 #define IS0(obj) FORALL(i, sizeof *(obj), ((char *)obj)[i] == 0)
 
+/* @types */
+
+struct msg_ctx {
+        const char *func;
+        const char *file;
+        int         lineno;
+        const char *fmt;
+};
+
 struct node;
 
 struct link {
@@ -195,55 +194,108 @@ struct t2 {
 
 SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
 
-/*
- * "Address" of a node on storage.
- *
- * Highest 8 bits (56--63) are reserved and must be 0.
- *
- * Lowest 4 bits (0--3) contains the node size, see below.
- *
- * Next 5 bits (4--8) are reserved and must be 0.
- *
- * Remaining 47 (9--55) bits contain the address on the storage.
- *
- * @verbatim
- *
- *  6      5 5                                            0 0   0 0  0
- *  3      6 5                                            9 8   4 3  0
- * +--------+----------------------------------------------+-----+----+
- * |   0    |                     ADDR                     |  0  | X  |
- * +--------+----------------------------------------------+-----+----+
- *
- * @endverbatim
- *
- * Node size is 2^(9+X) bytes (i.e., the smallest node is 512 bytes and the
- * largest node is 2^(9+15) == 16MB).
- *
- * Node address is ADDR << 9.
- *
- * This allows for 128T nodes (2^47) and total of 64PB (2^56) of meta-data per
- * segment.
- */
-typedef uint64_t taddr_t;
-
 struct t2_tree {
         struct t2_tree_type *ttype;
-        taddr_t root;
+        taddr_t              root;
+        uint64_t             id;
 };
 
-static void link_init(struct link *l) {
-        l->next = l->prev = l;
-}
+struct slot {
+        struct node   *node;
+        int            idx;
+        struct t2_rec  rec;
+};
 
-static void link_fini(struct link *l) {
-        ASSERT(l->next == l && l->prev == l);
-}
+enum optype {
+        LOOKUP,
+        DELETE,
+        INSERT,
+        NEXT
+};
 
+struct node {
+        struct link             hash;
+        uint64_t                seq;
+        const struct node_type *ntype;
+        taddr_t                 addr;
+        void                   *data;
+        struct t2              *mod;
+};
+
+enum lock_mode {
+        NONE,
+        READ,
+        WRITE
+};
+
+enum rung_flags {
+        PINNED = 1ull << 0
+};
+
+struct rung {
+        struct node   *node;
+        uint64_t       seq;
+        uint64_t       flags;
+        int            pos;
+};
+
+struct path {
+        int         used;
+        struct rung rung[MAX_TREE_HEIGHT];
+};
+
+struct tree_op {
+        struct t2_tree *tree;
+        enum optype     opt;
+        struct t2_rec  *rec;
+        struct path     path;
+};
+
+struct node_type {
+        int         id;
+        const char *name;
+        struct t2  *mod;
+        int         shift;
+};
+
+enum {
+        NODE_MAGIX = 0x1f2e3d4c
+};
+
+struct header {
+        uint32_t magix;
+        uint32_t csum;
+        uint16_t ntype;
+        uint8_t  level;
+        uint8_t  pad;
+        uint64_t treeid;
+};
+
+/* @static */
+static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
+static uint32_t buf_len(const struct t2_buf *b);
 static int  ht_init(struct ht *ht, int shift);
 static void ht_fini(struct ht *ht);
 static struct node *ht_lookup(struct ht *ht, taddr_t addr);
 static void ht_insert(struct ht *ht, struct node *n);
 static void ht_delete(struct node *n);
+static void link_init(struct link *l);
+static void link_fini(struct link *l);
+static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
+static taddr_t internal_search(struct node *n, struct t2_rec *r, int *pos);
+static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s);
+static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn));
+static void *mem_alloc(size_t size);
+static void  mem_free(void *ptr);
+static void llog(const struct msg_ctx *ctx, ...);
+static void put(struct node *n);
+static void lock(struct node *n, enum lock_mode mode);
+static void unlock(struct node *n, enum lock_mode mode);
+static struct header *nheader(const struct node *n);
+static int simple_insert(struct slot *s);
+static void simple_delete(struct slot *s);
+static void simple_get(struct slot *s);
+static void simple_make(struct node *n);
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
@@ -291,14 +343,6 @@ void t2_tree_type_degister(struct t2_tree_type *ttype)
         ttype->mod->ttypes[ttype->id] = NULL;
         ttype->mod = NULL;
 }
-
-struct node_type {
-        int         id;
-        const char *name;
-        struct t2  *mod;
-        int         shift;
-};
-
 
 void t2_node_type_register(struct t2 *mod, struct node_type *ntype) {
         ASSERT(IS_IN(ntype->id, mod->ntypes));
@@ -359,7 +403,7 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (t != NULL) {
                 int      shift;
-                uint64_t addr = SCALL(ttype->mod, alloc, ttype->root_min, ttype->root_max, &shift);
+                uint64_t addr = SCALL(ttype->mod, alloc, ttype->root_min, ttype->root_max);
                 if (EISOK(addr)) {
                         tree_init(t, ttype, taddr_make(addr, shift));
                         return t;
@@ -371,47 +415,9 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         }
 }
 
-enum optype {
-        LOOKUP,
-        DELETE,
-        INSERT,
-        NEXT
-};
-
 static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         return -ESTALE;
 }
-
-struct node {
-        struct link             hash;
-        uint64_t                seq;
-        const struct node_type *ntype;
-        taddr_t                 addr;
-        void                   *data;
-        struct t2              *mod;
-};
-
-enum lock_mode {
-        NONE,
-        READ,
-        WRITE
-};
-
-enum rung_flags {
-        PINNED = 1ull << 0
-};
-
-struct rung {
-        struct node   *node;
-        uint64_t       seq;
-        uint64_t       flags;
-        int            pos;
-};
-
-struct path {
-        int         used;
-        struct rung rung[MAX_TREE_HEIGHT];
-};
 
 static uint64_t node_seq(const struct node *n) {
         /* Barrier? */
@@ -433,14 +439,6 @@ static struct rung *path_add(struct path *p, struct node *n, uint64_t seq, uint6
         return &p->rung[p->used++];
 }
 
-static void put(struct node *n);
-
-static void lock(struct node *n, enum lock_mode mode) {
-};
-
-static void unlock(struct node *n, enum lock_mode mode) {
-};
-
 static void path_fini(struct path *p) {
         for (int i = 0; i < p->used; ++i) {
                 struct rung *r = &p->rung[i];
@@ -455,19 +453,30 @@ static void path_fini(struct path *p) {
         SET0(p);
 }
 
+/* @node */
+
+static void lock(struct node *n, enum lock_mode mode) {
+}
+
+static void unlock(struct node *n, enum lock_mode mode) {
+}
+
 static struct node *peek(struct t2 *mod, taddr_t addr) {
         return ht_lookup(&mod->ht, addr);
 }
 
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
-        struct node *n = mem_alloc(sizeof *n);
-        ASSERT(SCALL(mod, is_valid, addr));
-        if (n != NULL) {
+        struct node *n    = mem_alloc(sizeof *n);
+        void        *data = mem_alloc(taddr_ssize(addr));
+        if (n != NULL && data != NULL) {
                 link_init(&n->hash);
                 n->addr = addr;
                 n->mod = mod;
+                ht_insert(&mod->ht, n);
                 return n;
         } else {
+                mem_free(n);
+                mem_free(data);
                 return EPTR(-ENOMEM);
         }
 }
@@ -477,43 +486,43 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
         if (n == NULL) {
                 n = ninit(mod, addr);
                 if (EISOK(n)) {
-                        ht_insert(&mod->ht, n);
-                }
-        }
-        return n;
-}
-
-static void put(struct node *n) {
-}
-
-struct header {
-        uint32_t magix;
-        uint32_t csum;
-        uint16_t ntype;
-        uint8_t  level;
-        uint8_t  pad;
-        uint64_t treeid[2];
-};
-
-static int load(struct node *n) {
-        int result = 0;
-        if (n->data == NULL) {
-                n->data = mem_alloc(taddr_ssize(n->addr));
-                if (n->data != NULL) {
-                        struct header *h = n->data;
-                        result = SCALL(n->mod, read, n->addr);
+                        int result = SCALL(n->mod, read, n->addr, n->data);
                         if (result == 0) {
+                                struct header *h = n->data;
                                 if (IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL) {
                                         n->ntype = n->mod->ntypes[h->ntype];
                                 } else {
                                         result = ERROR(-EIO);
                                 }
+                        } else {
+                                n = EPTR(result);
                         }
-                } else {
-                        result = ERROR(-ENOMEM);
                 }
         }
-        return result;
+        return n;
+}
+
+static struct node *alloc(struct t2_tree *t, struct node_type *ntype, int level) {
+        struct t2 *mod = t->ttype->mod;
+        taddr_t addr = SCALL(mod, alloc, ntype->shift, ntype->shift);
+        struct node *n;
+        if (EISOK(addr)) {
+                n = ninit(mod, addr);
+                if (EISOK(n)) {
+                        *nheader(n) = (struct header) {
+                                .magix  = NODE_MAGIX,
+                                .ntype  = ntype->id,
+                                .level  = level,
+                                .treeid = t->id
+                        };
+                }
+        } else {
+                n = EPTR(addr);
+        }
+        return n;
+}
+
+static void put(struct node *n) {
 }
 
 static struct header *nheader(const struct node *n) {
@@ -523,22 +532,6 @@ static struct header *nheader(const struct node *n) {
 static bool is_leaf(const struct node *n) {
         return nheader(n)->level == 0;
 }
-
-struct slot {
-        struct node   *node;
-        int            idx;
-        struct t2_rec  rec;
-};
-
-static taddr_t internal_search(struct node *n, struct t2_rec *r, int *pos);
-static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s);
-
-struct tree_op {
-        struct t2_tree *tree;
-        enum optype     opt;
-        struct t2_rec  *rec;
-        struct path     path;
-};
 
 static void op_init(struct tree_op *top, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         ASSERT(IS0(top));
@@ -567,8 +560,7 @@ static void rcu_unlock(void) {
 static void op_lock(struct tree_op *top) {
 }
 
-static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
-
+/* @tree */
 
 static int lookup_complete(struct tree_op *top, struct node *n, struct t2_rec *r) {
         struct t2_buf key;
@@ -577,7 +569,23 @@ static int lookup_complete(struct tree_op *top, struct node *n, struct t2_rec *r
         return leaf_search(n, r, &s) ? val_copy(r, n, &s) : -ENOENT;
 }
 
+static int insert_balance(struct tree_op *top, struct node *n, struct t2_rec *r, struct slot *s) {
+        return 0;
+}
+
 static int insert_complete(struct tree_op *top, struct node *n, struct t2_rec *r, struct slot *s, int result) {
+        if (!result) {
+                result = simple_insert(&(struct slot) {
+                        .node = n,
+                        .idx  = s->idx + 1,
+                        .rec  = *r
+                });
+                if (result == -ENOSPC) {
+                        result = insert_balance(top, n, r, s);
+                }
+        } else {
+                result = -EEXIST;
+        }
         return 0;
 }
 
@@ -685,6 +693,19 @@ static int lookup(struct t2_tree *t, struct t2_rec *r) {
         }
 }
 
+static int insert(struct t2_tree *t, struct t2_rec *r) {
+        int result = cookie_try(t, r, INSERT);
+        if (result != -ESTALE) {
+                return result;
+        } else {
+                struct tree_op top = {};
+                op_init(&top, t, r, INSERT);
+                result = traverse(&top);
+                op_fini(&top);
+                return result;
+        }
+}
+
 int t2_lookup(struct t2_tree *t, struct t2_rec *r) {
         return lookup(t, r);
 }
@@ -694,8 +715,10 @@ int t2_delete(struct t2_tree *t, struct t2_rec *r) {
 }
 
 int t2_insert(struct t2_tree *t, struct t2_rec *r) {
-        return 0;
+        return insert(t, r);
 }
+
+/* @lib */
 
 __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...)
 {
@@ -738,6 +761,24 @@ static void llog(const struct msg_ctx *ctx, ...) {
         vfprintf(stderr, ctx->fmt, args);
         va_end(args);
         puts(".\n");
+}
+
+static uint32_t min_u32(uint32_t a, uint32_t b) {
+        return a < b ? a : b;
+}
+
+static uint32_t max_u32(uint32_t a, uint32_t b) {
+        return a > b ? a : b;
+}
+
+/* @ht */
+
+static void link_init(struct link *l) {
+        l->next = l->prev = l;
+}
+
+static void link_fini(struct link *l) {
+        ASSERT(l->next == l && l->prev == l);
 }
 
 static int ht_init(struct ht *ht, int shift) {
@@ -799,9 +840,71 @@ static void ht_delete(struct node *n) {
         n->hash.prev->next = n->hash.next;
 }
 
-enum {
-        NODE_MAGIX = 0x1f2e3d4c
-};
+/* @buf */
+
+static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := s */
+        struct t2_buf *key    = s->rec.key;
+        struct t2_buf *val    = s->rec.val;
+        int            result = 0;
+        if (s->idx < 0) {
+                return ERROR(-ERANGE);
+        }
+        if (r->kcb != NULL) {
+                r->kcb(key, r->arg);
+        } else {
+                ASSERT(r->key->nr > 0);
+                if (LIKELY(buf_len(r->key) >= buf_len(key))) {
+                        buf_copy(r->key, key);
+                } else {
+                        r->key->seg[0].len = buf_len(key);
+                        result = ERROR(-ENAMETOOLONG);
+                }
+        }
+        if (r->vcb != NULL) {
+                r->vcb(val, r->arg);
+        } else {
+                ASSERT(r->val->nr > 0);
+                if (LIKELY(buf_len(r->val) >= buf_len(val))) {
+                        buf_copy(r->val, val);
+                } else {
+                        r->val->seg[0].len = buf_len(val);
+                        result = ERROR(-ENAMETOOLONG);
+                }
+        }
+        return result;
+}
+
+static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
+        int      didx = 0;
+        uint32_t doff = 0;
+        int      sidx = 0;
+        uint32_t soff = 0;
+        ASSERT(buf_len(dst) >= buf_len(src));
+        while (sidx < src->nr && didx < dst->nr) {
+                uint32_t nob = min_u32(src->seg[sidx].len - soff, dst->seg[didx].len - doff);
+                memmove(dst->seg[didx].addr + doff, src->seg[sidx].addr + soff, nob);
+                doff += nob;
+                soff += nob;
+                if (doff == dst->seg[didx].len) {
+                        ++didx;
+                        doff = 0;
+                }
+                if (soff == src->seg[sidx].len) {
+                        ++sidx;
+                        soff = 0;
+                }
+        }
+}
+
+static uint32_t buf_len(const struct t2_buf *b) {
+        uint32_t len = 0;
+        for (int i = 0; i < b->nr; ++i) {
+                len += b->seg[i].len;
+        }
+        return len;
+}
+
+/* @simple */
 
 struct dir_element {
         uint32_t koff; /* Start of the key. */
@@ -932,41 +1035,6 @@ static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s) {
         return simple_search(n, r, s);
 }
 
-static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
-static uint32_t buf_len(const struct t2_buf *b);
-
-static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := s */
-        struct t2_buf *key    = s->rec.key;
-        struct t2_buf *val    = s->rec.val;
-        int            result = 0;
-        if (s->idx < 0) {
-                return ERROR(-ERANGE);
-        }
-        if (r->kcb != NULL) {
-                r->kcb(key, r->arg);
-        } else {
-                ASSERT(r->key->nr > 0);
-                if (LIKELY(buf_len(r->key) >= buf_len(key))) {
-                        buf_copy(r->key, key);
-                } else {
-                        r->key->seg[0].len = buf_len(key);
-                        result = ERROR(-ENAMETOOLONG);
-                }
-        }
-        if (r->vcb != NULL) {
-                r->vcb(val, r->arg);
-        } else {
-                ASSERT(r->val->nr > 0);
-                if (LIKELY(buf_len(r->val) >= buf_len(val))) {
-                        buf_copy(r->val, val);
-                } else {
-                        r->val->seg[0].len = buf_len(val);
-                        result = ERROR(-ENAMETOOLONG);
-                }
-        }
-        return result;
-}
-
 static uint32_t sfreekey(struct node *n) {
         struct sheader *sh  = simple_header(n);
         return sh->dir_off - sat(sh, sh->nr)->koff;
@@ -981,44 +1049,6 @@ static uint32_t simple_free(struct node *n) {
         struct sheader     *sh  = simple_header(n);
         struct dir_element *end = sat(sh, sh->nr);
         return end->voff - end->koff - sdirsize(sh);
-}
-
-static uint32_t min_u32(uint32_t a, uint32_t b) {
-        return a < b ? a : b;
-}
-
-static uint32_t max_u32(uint32_t a, uint32_t b) {
-        return a > b ? a : b;
-}
-
-static uint32_t buf_len(const struct t2_buf *b) {
-        uint32_t len = 0;
-        for (int i = 0; i < b->nr; ++i) {
-                len += b->seg[i].len;
-        }
-        return len;
-}
-
-static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
-        int      didx = 0;
-        uint32_t doff = 0;
-        int      sidx = 0;
-        uint32_t soff = 0;
-        ASSERT(buf_len(dst) >= buf_len(src));
-        while (sidx < src->nr && didx < dst->nr) {
-                uint32_t nob = min_u32(src->seg[sidx].len - soff, dst->seg[didx].len - doff);
-                memmove(dst->seg[didx].addr + doff, src->seg[sidx].addr + soff, nob);
-                doff += nob;
-                soff += nob;
-                if (doff == dst->seg[didx].len) {
-                        ++didx;
-                        doff = 0;
-                }
-                if (soff == src->seg[sidx].len) {
-                        ++sidx;
-                        soff = 0;
-                }
-        }
 }
 
 static void move(void *sh, uint32_t start, uint32_t end, int delta) {
@@ -1146,6 +1176,63 @@ static void simple_print(struct node *n) {
                 printf("\n");
         }
 }
+
+/* @mock */
+
+struct mock_storage {
+        struct t2_storage gen;
+};
+
+static int mso_init(struct t2_storage *storage) {
+        return 0;
+}
+
+static void mso_fini(struct t2_storage *storage) {
+}
+
+static taddr_t mso_alloc(struct t2_storage *storage, int shift_min, int shift_max) {
+        void *addr;
+        taddr_t result = posix_memalign(&addr, 1ul << TADDR_MIN_SHIFT,
+                                        1ul << shift_max);
+        if (result == 0) {
+                memset(addr, 0, 1ul << shift_max);
+                result = taddr_make((uint64_t)addr, shift_max);
+        } else {
+                result = ERROR(-result);
+        }
+        return result;
+}
+
+static void mso_free(struct t2_storage *storage, taddr_t addr) {
+        free((void *)taddr_saddr(addr));
+}
+
+static int mso_read(struct t2_storage *storage, taddr_t addr, void *dst) {
+        memcpy(dst, (void *)taddr_saddr(addr), taddr_ssize(addr));
+        return 0;
+}
+
+static int mso_write(struct t2_storage *storage, taddr_t addr, void *src) {
+        memcpy((void *)taddr_saddr(addr), src, taddr_ssize(addr));
+        return 0;
+}
+
+static struct t2_storage_op mock_storage_op = {
+        .name     = "mock-storage-op",
+        .init     = &mso_init,
+        .fini     = &mso_fini,
+        .alloc    = &mso_alloc,
+        .free     = &mso_free,
+        .read     = &mso_read,
+        .write    = &mso_write
+};
+
+static struct t2_storage mock_storage = {
+        .op = &mock_storage_op
+};
+
+/* @ut */
+
 static void usuite(const char *suite) {
         printf("        %s\n", suite);
 }
@@ -1339,43 +1426,6 @@ static void ht_ut() {
         ht_fini(&ht);
         utestdone();
 }
-
-static int mso_init(struct t2_storage *storage) {
-        return 0;
-}
-
-static void mso_fini(struct t2_storage *storage) {
-}
-
-static uint64_t mso_alloc(struct t2_storage *storage,
-                          int shift_min, int shift_max, int *shift) {
-        return 0;
-}
-
-static void mso_free(struct t2_storage *storage, uint64_t addr, int size) {
-}
-
-static bool mso_is_valid(struct t2_storage *storage, uint64_t addr) {
-        return true;
-}
-
-static int mso_read(struct t2_storage *storage, uint64_t addr) {
-        return 0;
-}
-
-static struct t2_storage_op mock_storage_op = {
-        .name     = "mock-storage-op",
-        .init     = &mso_init,
-        .fini     = &mso_fini,
-        .alloc    = &mso_alloc,
-        .free     = &mso_free,
-        .is_valid = &mso_is_valid,
-        .read     = &mso_read
-};
-
-static struct t2_storage mock_storage = {
-        .op = &mock_storage_op
-};
 
 static void traverse_ut() {
         taddr_t addr = taddr_make(0x100000, ntype.shift);
