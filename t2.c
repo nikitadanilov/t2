@@ -214,13 +214,6 @@ enum {
 
 /* @types */
 
-struct msg_ctx {
-        const char *func;
-        const char *file;
-        int         lineno;
-        const char *fmt;
-};
-
 struct node;
 
 struct link {
@@ -288,15 +281,11 @@ struct rung {
 };
 
 struct path {
-        int         used;
-        struct rung rung[MAX_TREE_HEIGHT];
-};
-
-struct tree_op {
         struct t2_tree *tree;
         enum optype     opt;
         struct t2_rec  *rec;
-        struct path     path;
+        int             used;
+        struct rung     rung[MAX_TREE_HEIGHT];
 };
 
 struct node_type {
@@ -317,6 +306,13 @@ struct header {
         uint8_t  level;
         uint8_t  pad;
         uint64_t treeid;
+};
+
+struct msg_ctx {
+        const char *func;
+        const char *file;
+        int         lineno;
+        const char *fmt;
 };
 
 /* @static */
@@ -475,35 +471,6 @@ static uint64_t node_seq(const struct node *n) {
         return n->seq;
 }
 
-static bool path_is_valid(const struct path *p) {
-        return FORALL(i, p->used, node_seq(p->rung[i].node) == p->rung[i].seq);
-}
-
-static struct rung *path_add(struct path *p, struct node *n, uint64_t seq, uint64_t flags) {
-        ASSERT(IS_IN(p->used, p->rung));
-        p->rung[p->used] = (struct rung) {
-                .node  = n,
-                .seq   = seq,
-                .flags = flags,
-                .pos   = 0
-        };
-        return &p->rung[p->used++];
-}
-
-static void path_fini(struct path *p) {
-        for (int i = 0; i < p->used; ++i) {
-                struct rung *r = &p->rung[i];
-                uint64_t flags = r->flags;
-                if ((flags >> 32) != 0) {
-                        unlock(r->node, flags >> 32);
-                }
-                if (r->flags & PINNED) {
-                        put(r->node);
-                }
-        }
-        SET0(p);
-}
-
 /* @node */
 
 static void lock(struct node *n, enum lock_mode mode) {
@@ -588,31 +555,55 @@ static uint32_t nr(struct node *n) {
         return simple_nr(n);
 }
 
-static void op_init(struct tree_op *top, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
-        ASSERT(IS0(top));
-        top->tree = t;
-        top->rec  = r;
-        top->opt  = opt;
+static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
+        ASSERT(IS0(p));
+        p->tree = t;
+        p->rec  = r;
+        p->opt  = opt;
 }
 
-static void op_fini(struct tree_op *top) {
-        path_fini(&top->path);
+static void path_fini(struct path *p) {
+        for (int i = 0; i < p->used; ++i) {
+                struct rung *r = &p->rung[i];
+                uint64_t flags = r->flags;
+                if ((flags >> 32) != 0) {
+                        unlock(r->node, flags >> 32);
+                }
+                if (r->flags & PINNED) {
+                        put(r->node);
+                }
+        }
+        SET0(p);
 }
 
-static bool op_is_valid(const struct tree_op *top) {
-        const struct path *p = &top->path;
+static bool rungs_are_valid(const struct path *p) {
+        return FORALL(i, p->used, node_seq(p->rung[i].node) == p->rung[i].seq);
+}
+
+static struct rung *path_add(struct path *p, struct node *n, uint64_t seq, uint64_t flags) {
+        ASSERT(IS_IN(p->used, p->rung));
+        p->rung[p->used] = (struct rung) {
+                .node  = n,
+                .seq   = seq,
+                .flags = flags,
+                .pos   = 0
+        };
+        return &p->rung[p->used++];
+}
+
+static bool path_is_valid(const struct path *p) {
         return p->used > 0 && is_leaf(p->rung[p->used - 1].node) &&
-                top->tree->root == p->rung[0].node->addr &&
-                path_is_valid(&top->path);
+                p->tree->root == p->rung[0].node->addr &&
+                rungs_are_valid(p);
 }
 
 static void rcu_lock(void) {
-};
+}
 
 static void rcu_unlock(void) {
-};
+}
 
-static void op_lock(struct tree_op *top) {
+static void path_lock(struct path *p) {
 }
 
 /* @tree */
@@ -643,18 +634,18 @@ static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, ui
         return result;
 }
 
-static int lookup_complete(struct tree_op *top, struct node *n, struct t2_rec *r) {
+static int lookup_complete(struct path *p, struct node *n, struct t2_rec *r) {
         struct t2_buf key;
         struct t2_buf val;
         struct slot s = { .rec = { .key = &key, .val = &val } };
         return leaf_search(n, r, &s) ? val_copy(r, n, &s) : -ENOENT;
 }
 
-static int insert_balance(struct tree_op *top, struct node *n, struct t2_rec *r, struct slot *s) {
+static int insert_balance(struct path *p, struct node *n, struct t2_rec *r, struct slot *s) {
         return 0;
 }
 
-static int insert_complete(struct tree_op *top, struct node *n, struct t2_rec *r, struct slot *s, int result) {
+static int insert_complete(struct path *p, struct node *n, struct t2_rec *r, struct slot *s, int result) {
         if (!result) {
                 result = simple_insert(&(struct slot) {
                         .node = n,
@@ -662,7 +653,7 @@ static int insert_complete(struct tree_op *top, struct node *n, struct t2_rec *r
                         .rec  = *r
                 });
                 if (result == -ENOSPC) {
-                        result = insert_balance(top, n, r, s);
+                        result = insert_balance(p, n, r, s);
                 }
         } else {
                 result = -EEXIST;
@@ -670,40 +661,39 @@ static int insert_complete(struct tree_op *top, struct node *n, struct t2_rec *r
         return 0;
 }
 
-static int delete_complete(struct tree_op *top, struct node *n, struct t2_rec *r, struct slot *s, int result) {
+static int delete_complete(struct path *p, struct node *n, struct t2_rec *r, struct slot *s, int result) {
         return 0;
 }
 
-static int next_complete(struct tree_op *top, struct node *n, struct t2_rec *r, struct slot *s, int result) {
+static int next_complete(struct path *p, struct node *n, struct t2_rec *r, struct slot *s, int result) {
         return 0;
 }
 
-static int op_complete(struct tree_op *top, struct node *n, struct t2_rec *r) {
+static int path_complete(struct path *p, struct node *n, struct t2_rec *r) {
         struct t2_buf key;
         struct t2_buf val;
         struct slot s = { .rec = { .key = &key, .val = &val } };
         int result = leaf_search(n, r, &s);
-        switch (top->opt) {
+        switch (p->opt) {
         case INSERT:
-                result = insert_complete(top, n, r, &s, result);
+                result = insert_complete(p, n, r, &s, result);
                 break;
         case DELETE:
-                result = delete_complete(top, n, r, &s, result);
+                result = delete_complete(p, n, r, &s, result);
                 break;
         case NEXT:
-                result = next_complete(top, n, r, &s, result);
+                result = next_complete(p, n, r, &s, result);
                 break;
         default:
-                IMMANENTISE("Wrong opt: %i", top->opt);
+                IMMANENTISE("Wrong opt: %i", p->opt);
         }
         return result;
 }
 
-static int traverse(struct tree_op *top) {
+static int traverse(struct path *p) {
         int      result;
         uint64_t next;
-        struct path *p = &top->path;
-        struct t2 *mod = top->tree->ttype->mod;
+        struct t2 *mod = p->tree->ttype->mod;
         ASSERT(p->used == 0);
         rcu_lock();
         while (true) {
@@ -711,7 +701,7 @@ static int traverse(struct tree_op *top) {
                 struct rung *r;
                 uint64_t     flags = 0;
                 if (p->used == 0) {
-                        next = top->tree->root;
+                        next = p->tree->root;
                 }
                 n = peek(mod, next);
                 if (EISERR(n)) {
@@ -721,7 +711,7 @@ static int traverse(struct tree_op *top) {
                         n = get(mod, next);
                         if (EISERR(n)) {
                                 if (ERRCODE(n) == -ESTALE) {
-                                        op_fini(top);
+                                        path_fini(p);
                                         continue;
                                 } else {
                                         result = ERROR(ERRCODE(n));
@@ -733,24 +723,24 @@ static int traverse(struct tree_op *top) {
                 }
                 r = path_add(p, n, node_seq(n), flags);
                 if (is_leaf(n)) {
-                        if (top->opt == LOOKUP) {
-                                result = lookup_complete(top, n, top->rec);
-                                if (!op_is_valid(top)) {
-                                        op_fini(top);
+                        if (p->opt == LOOKUP) {
+                                result = lookup_complete(p, n, p->rec);
+                                if (!path_is_valid(p)) {
+                                        path_fini(p);
                                 } else {
                                         break;
                                 }
                         } else {
-                                op_lock(top); /* Take locks as needed. */
-                                if (op_is_valid(top)) {
-                                        result = op_complete(top, n, top->rec);
+                                path_lock(p); /* Take locks as needed. */
+                                if (path_is_valid(p)) {
+                                        result = path_complete(p, n, p->rec);
                                         break;
                                 } else {
-                                        op_fini(top);
+                                        path_fini(p);
                                 }
                         }
                 } else {
-                        next = internal_search(n, top->rec, &r->pos);
+                        next = internal_search(n, p->rec, &r->pos);
                         if (EISERR(next)) {
                                 result = ERROR(ERRCODE(next));
                                 break;
@@ -766,10 +756,10 @@ static int lookup(struct t2_tree *t, struct t2_rec *r) {
         if (result != -ESTALE) {
                 return result;
         } else {
-                struct tree_op top = {};
-                op_init(&top, t, r, LOOKUP);
-                result = traverse(&top);
-                op_fini(&top);
+                struct path p = {};
+                path_init(&p, t, r, LOOKUP);
+                result = traverse(&p);
+                path_fini(&p);
                 return result;
         }
 }
@@ -779,10 +769,10 @@ static int insert(struct t2_tree *t, struct t2_rec *r) {
         if (result != -ESTALE) {
                 return result;
         } else {
-                struct tree_op top = {};
-                op_init(&top, t, r, INSERT);
-                result = traverse(&top);
-                op_fini(&top);
+                struct path p = {};
+                path_init(&p, t, r, INSERT);
+                result = traverse(&p);
+                path_fini(&p);
                 return result;
         }
 }
@@ -1564,7 +1554,7 @@ static void traverse_ut() {
                 .ttype = &ttype,
                 .root  = addr
         };
-        struct tree_op top = {
+        struct path p = {
                 .tree = &t,
                 .opt  = LOOKUP,
                 .rec  = &s.rec
@@ -1587,21 +1577,21 @@ static void traverse_ut() {
         }
         utest("existing");
         key0[0] = '0';
-        UASSERT(traverse(&top) == 0);
+        UASSERT(traverse(&p) == 0);
         key0[0] = '2';
-        top.path.used = 0;
-        UASSERT(traverse(&top) == 0);
+        p.used = 0;
+        UASSERT(traverse(&p) == 0);
         key0[0] = '8';
-        top.path.used = 0;
-        UASSERT(traverse(&top) == 0);
+        p.used = 0;
+        UASSERT(traverse(&p) == 0);
         utest("too-small");
         key0[0] = ' ';
-        top.path.used = 0;
-        UASSERT(traverse(&top) == -ENOENT);
+        p.used = 0;
+        UASSERT(traverse(&p) == -ENOENT);
         utest("non-existent");
         key0[0] = '1';
-        top.path.used = 0;
-        UASSERT(traverse(&top) == -ENOENT);
+        p.used = 0;
+        UASSERT(traverse(&p) == -ENOENT);
         ht_delete(&n);
         t2_node_type_degister(&ntype);
         utestdone();
