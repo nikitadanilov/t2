@@ -1,9 +1,57 @@
 /* -*- C -*- */
 
 /*
- * https://github.com/urcu/userspace-rcu/blob/master/include/urcu/rculist.h
+ * To do:
  *
- * Simple node functions should be robust in the face of concurrent modifications.
+ * - integrate rcu: https://github.com/urcu/userspace-rcu/blob/master/include/urcu/rculist.h
+ *
+ * - simple node functions should be robust in the face of concurrent modifications
+ *
+ * - path locking and re-checking (allocate new nodes outside of the lock)
+ *
+ * - abstract node and tree type operations (no direct simple_* calls)
+ *
+ * - error reporting: per-thread error propagation stack, (mostly) static error descriptors
+ *
+ * - binary search is inefficient (infinity keys)
+ *
+ * - multi-segment buffers
+ *
+ * - prefix compression for keys
+ *
+ * - variably-sized taddr_t encoding in internal nodes
+ *
+ * - checksums (re-use user-supplied ones)
+ *
+ * - other node formats: fixed-sized keys and values. Key prefixes in the directory
+ *
+ * - large keys and values stored outside of nodes
+ *
+ * - "streams" (sequential, random)
+ *
+ * - cookies to avoid tree traversal
+ *
+ * - decaying node temperature (see bits/avg.c)
+ *
+ * - cache replacement (arc, clock?)
+ *
+ * - transaction engine hooks
+ *
+ * - metrics
+ *
+ * - tools: dump, load, repair
+ *
+ * - iterator, cursor
+ *
+ * - in-place operations
+ *
+ * - single-move shift
+ *
+ * - invariants for key data-strctures
+ *
+ * - simple node: expand and shrink directory left or right, as cheaper
+ *
+ * - update value (and key?) in place
  */
 
 #include <stdbool.h>
