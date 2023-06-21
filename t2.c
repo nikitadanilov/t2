@@ -289,6 +289,7 @@ static void *mem_alloc(size_t size);
 static void  mem_free(void *ptr);
 static void llog(const struct msg_ctx *ctx, ...);
 static void put(struct node *n);
+static uint32_t nr(struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static struct header *nheader(const struct node *n);
@@ -296,6 +297,8 @@ static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n);
+static uint32_t simple_nr(struct node *n);
+static uint32_t simple_free(struct node *n);
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
@@ -533,6 +536,10 @@ static bool is_leaf(const struct node *n) {
         return nheader(n)->level == 0;
 }
 
+static uint32_t nr(struct node *n) {
+        return simple_nr(n);
+}
+
 static void op_init(struct tree_op *top, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         ASSERT(IS0(top));
         top->tree = t;
@@ -561,6 +568,32 @@ static void op_lock(struct tree_op *top) {
 }
 
 /* @tree */
+
+enum dir {
+        LEFT,
+        RIGHT
+};
+
+static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, uint32_t tnr) {
+        int result = 0;
+        struct t2_buf key = {};
+        struct t2_buf val = {};
+        struct slot   dst = { .node = d, .rec = { .key = &key, .val = &val } };
+        struct slot   src = { .node = s, .rec = { .key = &key, .val = &val } };
+        ASSERT(dir == LEFT || dir == RIGHT);
+        while (simple_free(s) < tnob && nr(s) > tnr) {
+                ASSERT(nr(s) > 0);
+                src.idx = dir == RIGHT ? nr(s) - 1 : 0;
+                simple_get(&src);
+                dst.idx = dir == LEFT ? nr(d) : 0;
+                result = simple_insert(&dst);
+                if (result != 0) {
+                        break;
+                }
+                simple_delete(&src);
+        }
+        return result;
+}
 
 static int lookup_complete(struct tree_op *top, struct node *n, struct t2_rec *r) {
         struct t2_buf key;
@@ -1140,6 +1173,10 @@ static void simple_make(struct node *n) {
         *sat(sh, 0) = (struct dir_element){ .koff = sizeof *sh, .voff = nsize };
 }
 
+static uint32_t simple_nr(struct node *n) {
+        return simple_header(n)->nr;
+}
+
 static void print_range(void *orig, uint32_t nsize, void *start, uint32_t nob, bool oct) {
         uint32_t off = start - orig;
         printf("[%u %u ", off, off + nob);
@@ -1335,6 +1372,12 @@ static void simple_ut(void) {
                 .addr  = taddr_make(0x100000, ntype.shift),
                 .data  = body,
         };
+        char body1[1ul << ntype.shift];
+        struct node n1 = {
+                .ntype = &ntype,
+                .addr  = taddr_make(0x200000, ntype.shift),
+                .data  = body1,
+        };
         struct sheader *sh = simple_header(&n);
         char key0[] = "KEY0";
         char val0[] = "VAL0--";
@@ -1383,6 +1426,18 @@ static void simple_ut(void) {
                 key0[1] += 251; /* Co-prime with 256. */
                 val0[1]++;
         }
+        utest("shift");
+        uint32_t nr0 = nr(&n);
+        memset(body1, 0, sizeof body1);
+        simple_make(&n1);
+        shift(&n1, &n, RIGHT, 1ul << ntype.shift, nr(&n) / 2);
+        UASSERT(nr0 == nr(&n) + nr(&n1));
+        shift(&n1, &n, RIGHT, 1ul << ntype.shift, 0);
+        UASSERT(nr0 == nr(&n) + nr(&n1));
+        UASSERT(nr(&n) == 0);
+        shift(&n, &n1, LEFT, 1ul << ntype.shift, 0);
+        UASSERT(nr0 == nr(&n) + nr(&n1));
+        UASSERT(nr(&n1) == 0);
         utestdone();
 }
 
