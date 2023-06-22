@@ -212,6 +212,25 @@ enum {
 
 #define IS0(obj) FORALL(i, sizeof *(obj), ((char *)obj)[i] == 0)
 
+#define MAX(a, b)                               \
+({                                              \
+        typeof(a) __a = (a);                    \
+        typeof(a) __b = (b);                    \
+        __a > __b ? __a : __b;                  \
+})
+
+#define MIN(a, b)                               \
+({                                              \
+        typeof(a) __a = (a);                    \
+        typeof(a) __b = (b);                    \
+        __a < __b ? __a : __b;                  \
+})
+
+#define SLOT_DEFINE(s, n)                                               \
+        struct t2_buf __key;                                            \
+        struct t2_buf __val;                                            \
+	struct slot s = { .node = n, .rec = { .key = &__key, .val = &__val } }
+
 /* @types */
 
 struct node;
@@ -277,7 +296,13 @@ struct rung {
         struct node   *node;
         uint64_t       seq;
         uint64_t       flags;
-        int            pos;
+        enum lock_mode lm;
+        uint32_t       pos;
+        struct node   *left;
+        struct node   *right;
+        enum lock_mode left_mode;
+        enum lock_mode right_mode;
+        struct node   *allocated;
 };
 
 struct path {
@@ -286,6 +311,7 @@ struct path {
         struct t2_rec  *rec;
         int             used;
         struct rung     rung[MAX_TREE_HEIGHT];
+        struct node    *newroot;
 };
 
 struct node_type {
@@ -315,7 +341,13 @@ struct msg_ctx {
         const char *fmt;
 };
 
+enum dir {
+        LEFT  = -1,
+        RIGHT = +1
+};
+
 /* @static */
+
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
 static uint32_t buf_len(const struct t2_buf *b);
 static int  ht_init(struct ht *ht, int shift);
@@ -326,14 +358,20 @@ static void ht_delete(struct node *n);
 static void link_init(struct link *l);
 static void link_fini(struct link *l);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
-static taddr_t internal_search(struct node *n, struct t2_rec *r, int *pos);
+static taddr_t internal_search(struct node *n, struct t2_rec *r, uint32_t *pos);
+static taddr_t internal_get(const struct node *n, uint32_t pos);
+static struct node *internal_child(const struct node *n, uint32_t pos, bool peek);
 static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s);
 static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn));
 static void *mem_alloc(size_t size);
 static void  mem_free(void *ptr);
 static void llog(const struct msg_ctx *ctx, ...);
 static void put(struct node *n);
-static uint32_t nr(struct node *n);
+static struct node *alloc(struct t2_tree *t, struct node_type *ntype, int level);
+static int dealloc(struct t2_tree *t, struct node *n);
+static uint8_t level(const struct node *n);
+static bool is_leaf(const struct node *n);
+static uint32_t nr(const struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static struct header *nheader(const struct node *n);
@@ -341,7 +379,7 @@ static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n);
-static uint32_t simple_nr(struct node *n);
+static uint32_t simple_nr(const struct node *n);
 static uint32_t simple_free(struct node *n);
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
@@ -473,10 +511,24 @@ static uint64_t node_seq(const struct node *n) {
 
 /* @node */
 
+static bool is_stable(const struct node *n) {
+        return (n->seq & 1) == 0;
+}
+
 static void lock(struct node *n, enum lock_mode mode) {
+        ASSERT(mode == NONE || mode == READ || mode == WRITE);
+        if (mode == WRITE) {
+                ASSERT(is_stable(n));
+                n->seq++;
+        }
 }
 
 static void unlock(struct node *n, enum lock_mode mode) {
+        ASSERT(mode == NONE || mode == READ || mode == WRITE);
+        if (mode == WRITE) {
+                ASSERT(!is_stable(n));
+                n->seq++;
+        }
 }
 
 static struct node *peek(struct t2 *mod, taddr_t addr) {
@@ -540,6 +592,10 @@ static struct node *alloc(struct t2_tree *t, struct node_type *ntype, int level)
         return n;
 }
 
+static int dealloc(struct t2_tree *t, struct node *n) {
+        return 0;
+}
+
 static void put(struct node *n) {
 }
 
@@ -547,37 +603,84 @@ static struct header *nheader(const struct node *n) {
         return n->data;
 }
 
-static bool is_leaf(const struct node *n) {
-        return nheader(n)->level == 0;
+static uint8_t level(const struct node *n) {
+        return nheader(n)->level;
 }
 
-static uint32_t nr(struct node *n) {
+static bool is_leaf(const struct node *n) {
+        return level(n) == 0;
+}
+
+static uint32_t nr(const struct node *n) {
         return simple_nr(n);
 }
 
+static void rcu_lock(void) {
+}
+
+static void rcu_unlock(void) {
+}
+
+/* @tree */
+
 static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         ASSERT(IS0(p));
+        SASSERT(NONE == 0);
         p->tree = t;
         p->rec  = r;
         p->opt  = opt;
 }
 
-static void path_fini(struct path *p) {
-        for (int i = 0; i < p->used; ++i) {
+static void path_lock(struct path *p) {
+        for (int i = p->used - 1; i >= 0; --i) {
                 struct rung *r = &p->rung[i];
-                uint64_t flags = r->flags;
-                if ((flags >> 32) != 0) {
-                        unlock(r->node, flags >> 32);
+                lock(r->node, r->lm);
+                if (r->left != NULL) {
+                        lock(r->left, r->left_mode);
+                }
+                if (r->right != NULL) {
+                        lock(r->right, r->right_mode);
+                }
+        }
+}
+
+static void path_fini(struct path *p) {
+        for (int i = p->used - 1; i >= 0; --i) {
+                struct rung *r = &p->rung[i];
+                unlock(r->node, r->lm);
+                if (r->left != NULL) {
+                        unlock(r->left, r->left_mode);
+                        put(r->left);
+                }
+                if (r->right != NULL) {
+                        unlock(r->right, r->right_mode);
+                        put(r->right);
                 }
                 if (r->flags & PINNED) {
                         put(r->node);
                 }
+                if (r->allocated != NULL) {
+                        dealloc(p->tree, r->allocated);
+                }
+        }
+        if (p->newroot != NULL) {
+                dealloc(p->tree, p->newroot);
         }
         SET0(p);
 }
 
-static bool rungs_are_valid(const struct path *p) {
-        return FORALL(i, p->used, node_seq(p->rung[i].node) == p->rung[i].seq);
+static bool rung_is_valid(const struct path *p, int i) {
+        const struct rung *r    = &p->rung[i];
+        const struct rung *prev = &p->rung[i - 1];
+        const struct node *n    = r->node;
+        return  n != NULL &&
+                n->data != NULL &&
+                node_seq(n) == r->seq &&
+                r->pos < nr(n) &&
+                (i == 0 ? p->tree->root == n->addr :
+                          n->addr == internal_get(prev->node, prev->pos) &&
+                          level(prev->node) == level(n) + 1) &&
+                (i == p->used - 1) == is_leaf(n);
 }
 
 static struct rung *path_add(struct path *p, struct node *n, uint64_t seq, uint64_t flags) {
@@ -592,68 +695,123 @@ static struct rung *path_add(struct path *p, struct node *n, uint64_t seq, uint6
 }
 
 static bool path_is_valid(const struct path *p) {
-        return p->used > 0 && is_leaf(p->rung[p->used - 1].node) &&
-                p->tree->root == p->rung[0].node->addr &&
-                rungs_are_valid(p);
+        return FORALL(i, p->used, rung_is_valid(p, i));
 }
 
-static void rcu_lock(void) {
+static bool can_insert(const struct node *n, const struct t2_rec *r) {
+        return true;
 }
 
-static void rcu_unlock(void) {
+static uint32_t utmost(const struct node *n, enum dir d) {
+        return d == LEFT ? 0 : nr(n) - 1;
 }
 
-static void path_lock(struct path *p) {
-}
-
-/* @tree */
-
-enum dir {
-        LEFT,
-        RIGHT
-};
-
-static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, uint32_t tnr) {
-        int result = 0;
-        struct t2_buf key = {};
-        struct t2_buf val = {};
-        struct slot   dst = { .node = d, .rec = { .key = &key, .val = &val } };
-        struct slot   src = { .node = s, .rec = { .key = &key, .val = &val } };
-        ASSERT(dir == LEFT || dir == RIGHT);
-        while (simple_free(s) < tnob && nr(s) > tnr) {
-                ASSERT(nr(s) > 0);
-                src.idx = dir == RIGHT ? nr(s) - 1 : 0;
-                simple_get(&src);
-                dst.idx = dir == LEFT ? nr(d) : 0;
-                result = simple_insert(&dst);
-                if (result != 0) {
-                        break;
-                }
-                simple_delete(&src);
+static struct node *neighbour(struct path *p, int idx, enum dir d, bool peek) {
+        int          i;
+        struct node *down;
+        for (i = idx - 1; i >= 0 && p->rung[i].pos == utmost(p->rung[i].node, d); --i) {
+                ;
         }
+        if (i < 0) {
+                return NULL;
+        }
+        SASSERT(NONE < READ && READ < WRITE);
+        p->rung[i].lm = MAX(p->rung[i].left_mode, READ);
+        down = internal_child(p->rung[i].node, p->rung[i].pos + d, peek);
+        while (down != NULL && EISOK(down) && ++i <= idx) {
+                p->rung[i].left = down;
+                p->rung[i].left_mode = MAX(p->rung[i].left_mode, READ);
+                SASSERT(LEFT == -RIGHT);
+                down = internal_child(down, utmost(down, -d), peek);
+        }
+        return down;
+}
+
+static struct node *right_peek(const struct path *p, int idx) {
+        return NULL;
+}
+
+static bool can_fit(struct node *left, struct node *middle, struct node *right, struct t2_rec *rec) {
+        return true;
+}
+
+static void internal_parent_rec(const struct node *n, struct t2_rec *rec) {
+}
+
+static int insert_prep(struct path *p) {
+        struct t2_buf  ikey;
+        struct t2_buf  ival;
+        struct t2_rec  irec = { .key = &ikey, .val = &ival };
+        int            idx = p->used - 1;
+        struct t2_rec *rec = p->rec;
+        int            result = 0;
+        do {
+                struct rung *r = &p->rung[idx];
+                r->lm = WRITE;
+                if (can_insert(r->node, rec)) {
+                        break;
+                } else {
+                        struct node *left  = neighbour(p, idx,  LEFT, false);
+                        struct node *right = neighbour(p, idx, RIGHT, false);
+                        if (EISOK(left) && EISOK(right)) {
+                                r->left_mode = r->right_mode = WRITE;
+                                if (can_fit(left, r->node, right, rec)) {
+                                        break;
+                                }
+                                r->allocated = alloc(p->tree, NULL, level(r->node));
+                                if (EISOK(r->allocated)) {
+                                        rec = &irec;
+                                        internal_parent_rec(r->node, rec);
+                                        if (idx == 0) { /* Hodie natus est radici frater. */
+                                                if (LIKELY(p->used < MAX_TREE_HEIGHT)) {
+                                                        p->newroot = alloc(p->tree, NULL, level(r->node) + 1);
+                                                        if (EISERR(r->allocated)) {
+                                                                result = ERROR(ERRCODE(p->newroot));
+                                                        }
+                                                } else {
+                                                        result = ERROR(-E2BIG);
+                                                }
+                                        }
+                                } else {
+                                        result = ERROR(ERRCODE(r->allocated));
+                                }
+                        } else if (EISERR(right)) {
+                                result = ERROR(ERRCODE(right));
+                        } else {
+                                result = ERROR(ERRCODE(left));
+                        }
+                }
+        } while (idx-- >= 0 && result == 0);
+        path_lock(p);
         return result;
 }
 
-static int lookup_complete(struct path *p, struct node *n, struct t2_rec *r) {
-        struct t2_buf key;
-        struct t2_buf val;
-        struct slot s = { .rec = { .key = &key, .val = &val } };
-        return leaf_search(n, r, &s) ? val_copy(r, n, &s) : -ENOENT;
+static void delete_prep(struct path *p) {
 }
 
-static int insert_balance(struct path *p, struct node *n, struct t2_rec *r, struct slot *s) {
+static void next_prep(struct path *p) {
+}
+
+static int lookup_complete(struct path *p, struct node *n) {
+        SLOT_DEFINE(s, NULL);
+        return leaf_search(n, p->rec, &s) ? val_copy(p->rec, n, &s) : -ENOENT;
+}
+
+static int insert_balance(struct path *p) {
         return 0;
 }
 
-static int insert_complete(struct path *p, struct node *n, struct t2_rec *r, struct slot *s, int result) {
+static int insert_complete(struct path *p, struct node *n) {
+        SLOT_DEFINE(s, n);
+        int result = leaf_search(n, p->rec, &s);
         if (!result) {
                 result = simple_insert(&(struct slot) {
                         .node = n,
-                        .idx  = s->idx + 1,
-                        .rec  = *r
+                        .idx  = s.idx + 1,
+                        .rec  = *p->rec
                 });
                 if (result == -ENOSPC) {
-                        result = insert_balance(p, n, r, s);
+                        result = insert_balance(p);
                 }
         } else {
                 result = -EEXIST;
@@ -661,33 +819,12 @@ static int insert_complete(struct path *p, struct node *n, struct t2_rec *r, str
         return 0;
 }
 
-static int delete_complete(struct path *p, struct node *n, struct t2_rec *r, struct slot *s, int result) {
+static int delete_complete(struct path *p, struct node *n) {
         return 0;
 }
 
-static int next_complete(struct path *p, struct node *n, struct t2_rec *r, struct slot *s, int result) {
+static int next_complete(struct path *p, struct node *n) {
         return 0;
-}
-
-static int path_complete(struct path *p, struct node *n, struct t2_rec *r) {
-        struct t2_buf key;
-        struct t2_buf val;
-        struct slot s = { .rec = { .key = &key, .val = &val } };
-        int result = leaf_search(n, r, &s);
-        switch (p->opt) {
-        case INSERT:
-                result = insert_complete(p, n, r, &s, result);
-                break;
-        case DELETE:
-                result = delete_complete(p, n, r, &s, result);
-                break;
-        case NEXT:
-                result = next_complete(p, n, r, &s, result);
-                break;
-        default:
-                IMMANENTISE("Wrong opt: %i", p->opt);
-        }
-        return result;
 }
 
 static int traverse(struct path *p) {
@@ -695,6 +832,7 @@ static int traverse(struct path *p) {
         uint64_t next;
         struct t2 *mod = p->tree->ttype->mod;
         ASSERT(p->used == 0);
+        ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
         rcu_lock();
         while (true) {
                 struct node *n;
@@ -720,20 +858,38 @@ static int traverse(struct path *p) {
                         } else {
                                 flags |= PINNED;
                         }
+                } else if (!is_stable(n)) { /* No chance this will complete */
+                        path_fini(p);       /* without a race. */
                 }
                 r = path_add(p, n, node_seq(n), flags);
                 if (is_leaf(n)) {
                         if (p->opt == LOOKUP) {
-                                result = lookup_complete(p, n, p->rec);
+                                result = lookup_complete(p, n);
                                 if (!path_is_valid(p)) {
                                         path_fini(p);
                                 } else {
                                         break;
                                 }
-                        } else {
-                                path_lock(p); /* Take locks as needed. */
+                        } else if (p->opt == INSERT) {
+                                insert_prep(p);
                                 if (path_is_valid(p)) {
-                                        result = path_complete(p, n, p->rec);
+                                        result = insert_complete(p, n);
+                                        break;
+                                } else {
+                                        path_fini(p);
+                                }
+                        } else if (p->opt == DELETE) {
+                                delete_prep(p);
+                                if (path_is_valid(p)) {
+                                        result = delete_complete(p, n);
+                                        break;
+                                } else {
+                                        path_fini(p);
+                                }
+                        } else {
+                                next_prep(p);
+                                if (path_is_valid(p)) {
+                                        result = next_complete(p, n);
                                         break;
                                 } else {
                                         path_fini(p);
@@ -1057,7 +1213,7 @@ static int skeycmp(struct sheader *sh, int pos, void *key, uint32_t klen) {
         }
 }
 
-static struct sheader *simple_header(struct node *n) {
+static struct sheader *simple_header(const struct node *n) {
         return n->data;
 }
 
@@ -1093,13 +1249,25 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         return found;
 }
 
-static taddr_t internal_search(struct node *n, struct t2_rec *r, int *pos) {
-        struct t2_buf key;
-        struct t2_buf val;
-        struct slot s = { .rec = { .key = &key, .val = &val } };
+static taddr_t internal_addr(const struct slot *s) {
+        ASSERT(s->rec.val->nr > 0 && s->rec.val->seg[0].len > sizeof(taddr_t));
+        return *(taddr_t *)s->rec.val->seg[0].addr;
+}
+
+static taddr_t internal_search(struct node *n, struct t2_rec *r, uint32_t *pos) {
+        SLOT_DEFINE(s, NULL); /* !sanitise */
         (void)simple_search(n, r, &s);
-        ASSERT(val.nr > 0 && val.seg[0].len > sizeof(taddr_t));
-        return *(taddr_t *)val.seg[0].addr;
+        return internal_addr(&s);
+}
+
+static taddr_t internal_get(const struct node *n, uint32_t pos) { /* !sanitise */
+        SLOT_DEFINE(s, (struct node *)n);
+        simple_get(&s);
+        return internal_addr(&s);
+}
+
+static struct node *internal_child(const struct node *n, uint32_t pos, bool peekp) {
+        return (peekp ? peek : get)(n->mod, internal_get(n, pos));
 }
 
 static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s) {
@@ -1211,7 +1379,7 @@ static void simple_make(struct node *n) {
         *sat(sh, 0) = (struct dir_element){ .koff = sizeof *sh, .voff = nsize };
 }
 
-static uint32_t simple_nr(struct node *n) {
+static uint32_t simple_nr(const struct node *n) {
         return simple_header(n)->nr;
 }
 
@@ -1250,6 +1418,27 @@ static void simple_print(struct node *n) {
                 }
                 printf("\n");
         }
+}
+
+static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, uint32_t tnr) {
+        int result = 0;
+        struct t2_buf key = {};
+        struct t2_buf val = {};
+        struct slot   dst = { .node = d, .rec = { .key = &key, .val = &val } };
+        struct slot   src = { .node = s, .rec = { .key = &key, .val = &val } };
+        ASSERT(dir == LEFT || dir == RIGHT);
+        while (simple_free(s) < tnob && nr(s) > tnr) {
+                ASSERT(nr(s) > 0);
+                src.idx = dir == RIGHT ? nr(s) - 1 : 0;
+                simple_get(&src);
+                dst.idx = dir == LEFT ? nr(d) : 0;
+                result = simple_insert(&dst);
+                if (result != 0) {
+                        break;
+                }
+                simple_delete(&src);
+        }
+        return result;
 }
 
 /* @mock */
