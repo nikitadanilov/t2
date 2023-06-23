@@ -52,6 +52,23 @@
  * - simple node: expand and shrink directory left or right, as cheaper
  *
  * - update value (and key?) in place
+ *
+ * - pre-allocated struct path (to reduce stack pressure)
+ *
+ * - node format that avoids memmove (always add at the end, compact as needed)
+ *
+ * - balancing policies (per-level?)
+ *
+ * - check validity of user input (2 records in a node, etc.)
+ *
+ * - handle IO failures
+ *
+ * References:
+ *
+ * - Knuth, Donald E. Art of Computer Programming, The: Volume 3: Sorting and
+ *   Searching; 6.2.4. Multiway Trees.
+ *
+ * - https://dl.acm.org/doi/pdf/10.1145/603867.603878
  */
 
 #include <stdbool.h>
@@ -62,6 +79,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <stdatomic.h>
 #include "t2.h"
 
 enum {
@@ -231,6 +249,9 @@ enum {
         struct t2_buf __val;                                            \
 	struct slot s = { .node = n, .rec = { .key = &__key, .val = &__val } }
 
+#define CINC(cnt) (++counters.cnt)
+#define CDEC(cnt) (--counters.cnt)
+
 /* @types */
 
 struct node;
@@ -273,11 +294,17 @@ enum optype {
         NEXT
 };
 
+enum node_flags {
+        HEARD_BANSHEE = 1ull << 0
+};
+
 struct node {
         struct link             hash;
+        atomic_int              ref;
         uint64_t                seq;
         const struct node_type *ntype;
         taddr_t                 addr;
+        uint64_t                flags;
         void                   *data;
         struct t2              *mod;
 };
@@ -289,7 +316,30 @@ enum lock_mode {
 };
 
 enum rung_flags {
-        PINNED = 1ull << 0
+        PINNED = 1ull << 0,
+        ALUSED = 1ull << 1
+};
+
+enum policy_id {
+        SPLIT_RIGHT, /* Knuth */
+        SPLIT_LR,
+        SHIFT,       /* Try to shift to the left and right neighbours. */
+
+        POLICY_NR
+};
+
+struct pstate {
+        enum policy_id id;
+        union {
+                struct split_right {
+                } sr;
+                struct shift {
+                        uint32_t shift_le;
+                        uint32_t shift_ln;
+                        uint32_t shift_rn;
+                        uint32_t shift_re;
+                } sh;
+        } u;
 };
 
 struct rung {
@@ -298,20 +348,28 @@ struct rung {
         uint64_t       flags;
         enum lock_mode lm;
         uint32_t       pos;
+        struct node   *allocated;
         struct node   *left;
         struct node   *right;
         enum lock_mode left_mode;
         enum lock_mode right_mode;
-        struct node   *allocated;
+        struct t2_buf  keyout;
+        struct t2_buf  valout;
+        struct pstate  pd;
 };
 
 struct path {
-        struct t2_tree *tree;
-        enum optype     opt;
         struct t2_rec  *rec;
+        enum optype     opt;
         int             used;
         struct rung     rung[MAX_TREE_HEIGHT];
+        struct t2_tree *tree;
         struct node    *newroot;
+};
+
+struct policy {
+        int (*plan)(struct path *p, int idx, const struct t2_rec *r);
+        int (*exec)(struct path *p, int idx);
 };
 
 struct node_type {
@@ -346,12 +404,21 @@ enum dir {
         RIGHT = +1
 };
 
+struct counters {
+        uint32_t node;
+        uint32_t rlock;
+        uint32_t wlock;
+};
+
+static __thread struct counters counters = {};
+
 /* @static */
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
 static uint32_t buf_len(const struct t2_buf *b);
 static int  ht_init(struct ht *ht, int shift);
 static void ht_fini(struct ht *ht);
+static void ht_clean(struct ht *ht);
 static struct node *ht_lookup(struct ht *ht, taddr_t addr);
 static void ht_insert(struct ht *ht, struct node *n);
 static void ht_delete(struct node *n);
@@ -367,11 +434,14 @@ static void *mem_alloc(size_t size);
 static void  mem_free(void *ptr);
 static void llog(const struct msg_ctx *ctx, ...);
 static void put(struct node *n);
-static struct node *alloc(struct t2_tree *t, struct node_type *ntype, int level);
+static struct node *alloc(struct t2_tree *t, int level);
+static struct node *neighbour(struct path *p, int idx, enum dir d, bool peek);
+static bool can_insert(const struct node *n, const struct t2_rec *r);
 static int dealloc(struct t2_tree *t, struct node *n);
 static uint8_t level(const struct node *n);
 static bool is_leaf(const struct node *n);
 static uint32_t nr(const struct node *n);
+static uint32_t freespace(const struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static struct header *nheader(const struct node *n);
@@ -380,7 +450,11 @@ static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n);
 static uint32_t simple_nr(const struct node *n);
-static uint32_t simple_free(struct node *n);
+static uint32_t simple_free(const struct node *n);
+static int simple_can_insert(const struct slot *s);
+static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, uint32_t tnr);
+struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
+static void counters_check(void);
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
@@ -395,7 +469,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
                         }
                 }
         } else {
-                result = -ENOMEM;
+                result = ERROR(-ENOMEM);
         }
         if (result != 0) {
                 mem_free(mod);
@@ -406,6 +480,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
 }
 
 void t2_fini(struct t2 *mod) {
+        ht_clean(&mod->ht);
         ht_fini(&mod->ht);
         mod->stor->op->fini(mod->stor);
         mem_free(mod);
@@ -487,10 +562,9 @@ static void tree_init(struct t2_tree *t, struct t2_tree_type *ttype, taddr_t roo
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (t != NULL) {
-                int      shift;
                 uint64_t addr = SCALL(ttype->mod, alloc, ttype->root_min, ttype->root_max);
                 if (EISOK(addr)) {
-                        tree_init(t, ttype, taddr_make(addr, shift));
+                        tree_init(t, ttype, addr);
                         return t;
                 } else {
                         return EPTR(addr);
@@ -520,14 +594,20 @@ static void lock(struct node *n, enum lock_mode mode) {
         if (mode == WRITE) {
                 ASSERT(is_stable(n));
                 n->seq++;
+                CINC(wlock);
+        } else if (mode == READ) {
+                CINC(rlock);
         }
 }
 
 static void unlock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         if (mode == WRITE) {
-                ASSERT(!is_stable(n));
                 n->seq++;
+                ASSERT(is_stable(n));
+                CDEC(wlock);
+        } else if (mode == READ) {
+                CDEC(rlock);
         }
 }
 
@@ -536,19 +616,30 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
 }
 
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
-        struct node *n    = mem_alloc(sizeof *n);
+        struct node *n    = mem_alloc(sizeof *n); /* Allocate them together? */
         void        *data = mem_alloc(taddr_ssize(addr));
         if (n != NULL && data != NULL) {
                 link_init(&n->hash);
                 n->addr = addr;
                 n->mod = mod;
+                n->data = data;
                 ht_insert(&mod->ht, n);
+                n->ref = 1;
+                CINC(node);
                 return n;
         } else {
                 mem_free(n);
                 mem_free(data);
                 return EPTR(-ENOMEM);
         }
+}
+
+static void nfini(struct node *n) {
+        ASSERT(n->ref == 0);
+        ht_delete(n);
+        mem_free(n->data);
+        SET0(n);
+        mem_free(n);
 }
 
 static struct node *get(struct t2 *mod, taddr_t addr) {
@@ -562,20 +653,26 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                 if (IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL) {
                                         n->ntype = n->mod->ntypes[h->ntype];
                                 } else {
+                                        put(n);
                                         result = ERROR(-EIO);
                                 }
                         } else {
+                                put(n);
                                 n = EPTR(result);
                         }
                 }
+        } else {
+                n->ref++;
+                CINC(node);
         }
         return n;
 }
 
-static struct node *alloc(struct t2_tree *t, struct node_type *ntype, int level) {
-        struct t2 *mod = t->ttype->mod;
-        taddr_t addr = SCALL(mod, alloc, ntype->shift, ntype->shift);
-        struct node *n;
+static struct node *alloc(struct t2_tree *t, int level) {
+        struct t2        *mod   = t->ttype->mod;
+        struct node_type *ntype = t->ttype->ntype(t, level);
+        taddr_t           addr  = SCALL(mod, alloc, ntype->shift, ntype->shift);
+        struct node      *n;
         if (EISOK(addr)) {
                 n = ninit(mod, addr);
                 if (EISOK(n)) {
@@ -585,6 +682,7 @@ static struct node *alloc(struct t2_tree *t, struct node_type *ntype, int level)
                                 .level  = level,
                                 .treeid = t->id
                         };
+                        n->ntype = ntype;
                 }
         } else {
                 n = EPTR(addr);
@@ -593,10 +691,17 @@ static struct node *alloc(struct t2_tree *t, struct node_type *ntype, int level)
 }
 
 static int dealloc(struct t2_tree *t, struct node *n) {
+        SCALL(t->ttype->mod, free, n->addr);
+        put(n);
         return 0;
 }
 
 static void put(struct node *n) {
+        ASSERT(n->ref > 0);
+        CDEC(node);
+        if (--n->ref == 0) {
+                /* TODO: lru. */
+        }
 }
 
 static struct header *nheader(const struct node *n) {
@@ -621,6 +726,139 @@ static void rcu_lock(void) {
 static void rcu_unlock(void) {
 }
 
+/* @policy */
+
+static void internal_parent_rec(struct rung *r) {
+        /* TODO: Should take newly inserted record into account. */
+        SLOT_DEFINE(s, r->node);
+        uint32_t maxlen = 0;
+        uint32_t keylen;
+        ASSERT(nr(r->node) > 0);
+        ASSERT(r->allocated != NULL);
+        for (uint32_t i = 0; i < nr(r->node); ++i) {
+                s.idx = i;
+                simple_get(&s);
+                keylen = buf_len(s.rec.key);
+                if (keylen > maxlen) {
+                        maxlen = keylen;
+                        r->keyout = *s.rec.key;
+                }
+        }
+        ptr_buf(r->allocated, &r->valout);
+}
+
+static int newnode(struct path *p, int idx) {
+       struct rung *r = &p->rung[idx];
+       if (r->allocated == NULL) {
+               r->allocated = alloc(p->tree, level(r->node));
+               if (EISERR(r->allocated)) {
+                       return ERROR(ERRCODE(r->allocated));
+               }
+       }
+       internal_parent_rec(r);
+       if (idx == 0) { /* Hodie natus est radici frater. */
+               if (LIKELY(p->used < MAX_TREE_HEIGHT)) {
+                       p->newroot = alloc(p->tree, level(r->node) + 1);
+                       if (EISERR(r->allocated)) {
+                               return ERROR(ERRCODE(p->newroot));
+                       }
+               } else {
+                       return ERROR(-E2BIG);
+               }
+       }
+       return 0;
+}
+
+static int split_right_plan(struct path *p, int idx, const struct t2_rec *rec) {
+       struct rung *r = &p->rung[idx];
+        int result = newnode(p, idx);
+        if (result == 0) {
+                internal_parent_rec(r);
+        }
+        return result;
+}
+
+static int split_right_exec(struct path *p, int idx) {
+        struct rung *r = &p->rung[idx];
+        SLOT_DEFINE(s, NULL);
+        ASSERT(r->allocated != NULL);
+        int result = shift(r->allocated, r->node, RIGHT, (1ul << r->node->ntype->shift) / 2, 0);
+        r->flags &= ~ALUSED;
+        if (result == 0) {
+                if (r->pos <= nr(r->node)) {
+                        s.node = r->node;
+                        s.idx  = r->pos;
+                } else {
+                        s.node = r->allocated;
+                        s.idx  = r->pos - nr(r->node);
+                        ASSERT(0 < s.idx && s.idx <= nr(r->allocated));
+                }
+                if (is_leaf(r->node)) {
+                        s.rec = *p->rec;
+                } else {
+                        ASSERT(idx + 1 < p->used);
+                        s.rec.key = &p->rung[idx + 1].keyout;
+                        s.rec.val = &p->rung[idx + 1].valout;
+                }
+                result = simple_insert(&s);
+                if (result == 0) {
+                        s.node = r->allocated;
+                        s.idx = 0;
+                        simple_get(&s);
+                        r->keyout = *s.rec.key;
+                        ptr_buf(r->allocated, &r->valout);
+                }
+        }
+        return result;
+}
+
+static bool can_fit(const struct node *left, const struct node *middle, const struct node *right, const struct t2_rec *rec) {
+        return true;
+}
+
+static int shift_plan(struct path *p, int idx, const struct t2_rec *rec) {
+       struct rung *r = &p->rung[idx];
+       int          result;
+       r->left  = neighbour(p, idx,  LEFT, false);
+       r->right = neighbour(p, idx, RIGHT, false);
+       if (UNLIKELY(EISOK(r->left) && EISOK(r->right))) {
+               r->left_mode = r->right_mode = WRITE;
+               if (can_fit(r->left, r->node, r->right, rec)) {
+                       return 0;
+               }
+               result = newnode(p, idx);
+       } else {
+               if (EISERR(r->right)) {
+                       result = ERROR(ERRCODE(r->right));
+                       r->right = NULL;
+               }
+               if (EISERR(r->left)) {
+                       result = ERROR(ERRCODE(r->left));
+                       r->left = NULL;
+               }
+       }
+       return result;
+}
+
+static int shift_exec(struct path *p, int idx) {
+        return 0;
+}
+
+static const struct policy dispatch[POLICY_NR] = {
+        [SPLIT_RIGHT] = {
+                .plan     = &split_right_plan,
+                .exec     = &split_right_exec
+        },
+        [SHIFT] = {
+                .plan     = &shift_plan,
+                .exec     = &shift_exec
+        }
+};
+
+static enum policy_id select(const struct path *p, int idx) {
+        return SPLIT_RIGHT;
+}
+
 /* @tree */
 
 static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
@@ -632,12 +870,13 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum 
 }
 
 static void path_lock(struct path *p) {
+        /* Top to bottom, left to right. */
         for (int i = p->used - 1; i >= 0; --i) {
                 struct rung *r = &p->rung[i];
-                lock(r->node, r->lm);
                 if (r->left != NULL) {
                         lock(r->left, r->left_mode);
                 }
+                lock(r->node, r->lm);
                 if (r->right != NULL) {
                         lock(r->right, r->right_mode);
                 }
@@ -645,28 +884,33 @@ static void path_lock(struct path *p) {
 }
 
 static void path_fini(struct path *p) {
-        for (int i = p->used - 1; i >= 0; --i) {
-                struct rung *r = &p->rung[i];
+        while (--p->used >= 0) {
+                struct rung *r = &p->rung[p->used];
+                if (r->right != NULL) {
+                        unlock(r->right, r->right_mode);
+                        put(r->right);
+                }
                 unlock(r->node, r->lm);
                 if (r->left != NULL) {
                         unlock(r->left, r->left_mode);
                         put(r->left);
                 }
-                if (r->right != NULL) {
-                        unlock(r->right, r->right_mode);
-                        put(r->right);
-                }
                 if (r->flags & PINNED) {
                         put(r->node);
                 }
                 if (r->allocated != NULL) {
-                        dealloc(p->tree, r->allocated);
+                        if (r->flags & ALUSED) {
+                                put(r->allocated);
+                        } else {
+                                dealloc(p->tree, r->allocated);
+                        }
                 }
+                SET0(r);
         }
+        p->used = 0;
         if (p->newroot != NULL) {
                 dealloc(p->tree, p->newroot);
         }
-        SET0(p);
 }
 
 static bool rung_is_valid(const struct path *p, int i) {
@@ -675,8 +919,9 @@ static bool rung_is_valid(const struct path *p, int i) {
         const struct node *n    = r->node;
         return  n != NULL &&
                 n->data != NULL &&
-                node_seq(n) == r->seq &&
-                r->pos < nr(n) &&
+                node_seq(n) == r->seq + (r->lm == WRITE) && /* Account for our own lock. */
+                is_stable(n) == (r->lm != WRITE) &&
+                !is_leaf(n) ? r->pos < nr(n) : true &&
                 (i == 0 ? p->tree->root == n->addr :
                           n->addr == internal_get(prev->node, prev->pos) &&
                           level(prev->node) == level(n) + 1) &&
@@ -699,7 +944,12 @@ static bool path_is_valid(const struct path *p) {
 }
 
 static bool can_insert(const struct node *n, const struct t2_rec *r) {
-        return true;
+        const struct slot s = {
+                .node = (struct node *)n,
+                .idx  = -1, /* Unknown position. */
+                .rec  = *r
+        };
+        return simple_can_insert(&s);
 }
 
 static uint32_t utmost(const struct node *n, enum dir d) {
@@ -727,69 +977,50 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, bool peek) {
         return down;
 }
 
-static struct node *right_peek(const struct path *p, int idx) {
-        return NULL;
-}
-
-static bool can_fit(struct node *left, struct node *middle, struct node *right, struct t2_rec *rec) {
-        return true;
-}
-
-static void internal_parent_rec(const struct node *n, struct t2_rec *rec) {
+static uint32_t freespace(const struct node *n) {
+        if (n != NULL) {
+                return simple_free(n);
+        } else {
+                return 0;
+        }
 }
 
 static int insert_prep(struct path *p) {
-        struct t2_buf  ikey;
-        struct t2_buf  ival;
-        struct t2_rec  irec = { .key = &ikey, .val = &ival };
+        struct t2_rec  irec = {};
         int            idx = p->used - 1;
         struct t2_rec *rec = p->rec;
         int            result = 0;
+        SLOT_DEFINE(s, p->rung[idx].node);
+        if (leaf_search(p->rung[idx].node, rec, &s)) {
+                return -EEXIST;
+        }
+        p->rung[p->used - 1].pos = s.idx + 1;
         do {
                 struct rung *r = &p->rung[idx];
                 r->lm = WRITE;
                 if (can_insert(r->node, rec)) {
                         break;
                 } else {
-                        struct node *left  = neighbour(p, idx,  LEFT, false);
-                        struct node *right = neighbour(p, idx, RIGHT, false);
-                        if (EISOK(left) && EISOK(right)) {
-                                r->left_mode = r->right_mode = WRITE;
-                                if (can_fit(left, r->node, right, rec)) {
-                                        break;
-                                }
-                                r->allocated = alloc(p->tree, NULL, level(r->node));
-                                if (EISOK(r->allocated)) {
-                                        rec = &irec;
-                                        internal_parent_rec(r->node, rec);
-                                        if (idx == 0) { /* Hodie natus est radici frater. */
-                                                if (LIKELY(p->used < MAX_TREE_HEIGHT)) {
-                                                        p->newroot = alloc(p->tree, NULL, level(r->node) + 1);
-                                                        if (EISERR(r->allocated)) {
-                                                                result = ERROR(ERRCODE(p->newroot));
-                                                        }
-                                                } else {
-                                                        result = ERROR(-E2BIG);
-                                                }
-                                        }
-                                } else {
-                                        result = ERROR(ERRCODE(r->allocated));
-                                }
-                        } else if (EISERR(right)) {
-                                result = ERROR(ERRCODE(right));
-                        } else {
-                                result = ERROR(ERRCODE(left));
+                        r->pd.id = select(p, idx);
+                        if (dispatch[r->pd.id].plan(p, idx, rec) > 0) {
+                                result = 0;
+                                break;
                         }
+                        rec = &irec;
+                        rec->key = &r->keyout;
+                        rec->val = &r->valout;
                 }
         } while (idx-- >= 0 && result == 0);
         path_lock(p);
         return result;
 }
 
-static void delete_prep(struct path *p) {
+static int delete_prep(struct path *p) {
+        return 0;
 }
 
-static void next_prep(struct path *p) {
+static int next_prep(struct path *p) {
+        return 0;
 }
 
 static int lookup_complete(struct path *p, struct node *n) {
@@ -797,8 +1028,51 @@ static int lookup_complete(struct path *p, struct node *n) {
         return leaf_search(n, p->rec, &s) ? val_copy(p->rec, n, &s) : -ENOENT;
 }
 
+struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b) {
+        *b = (struct t2_buf){ .nr = 1, .seg = { [0] = { .len = sizeof(n->addr), .addr = (void *)&n->addr } } };
+        return b;
+}
+
+static int root_add(struct path *p) {
+        struct node  *oldroot = p->rung[0].node;
+        struct t2_buf ptr;
+        int           result;
+        SLOT_DEFINE(s, oldroot);
+        s.idx = 0;
+        simple_get(&s);
+        s.node = p->newroot;
+        s.rec.val = ptr_buf(oldroot, &ptr);
+        result = simple_insert(&s);
+        if (result == 0) {
+                s.idx = 1;
+                ASSERT(p->rung[0].pd.id == SPLIT_RIGHT); /* For now. */
+                s.rec.key = &p->rung[0].keyout;
+                s.rec.val = &p->rung[0].valout;
+                result = simple_insert(&s);
+                if (result == 0) {
+                        /* Barrier? */
+                        p->tree->root = p->newroot->addr;
+                        p->newroot = NULL;
+                }
+        }
+        return result;
+}
+
 static int insert_balance(struct path *p) {
-        return 0;
+        int idx    = p->used - 1;
+        int result = 0;
+        do {
+                struct rung *r = &p->rung[idx];
+                if (r->lm != WRITE) {
+                        break;
+                }
+                result = dispatch[r->pd.id].exec(p, idx);
+        } while (idx-- >= 0 && result == 0);
+        if (UNLIKELY(idx < 0 && result == 0)) {
+                ASSERT(p->newroot != NULL);
+                result = root_add(p);
+        }
+        return result;
 }
 
 static int insert_complete(struct path *p, struct node *n) {
@@ -811,12 +1085,13 @@ static int insert_complete(struct path *p, struct node *n) {
                         .rec  = *p->rec
                 });
                 if (result == -ENOSPC) {
+                        p->rung[p->used - 1].pos = s.idx + 1;
                         result = insert_balance(p);
                 }
         } else {
                 result = -EEXIST;
         }
-        return 0;
+        return result;
 }
 
 static int delete_complete(struct path *p, struct node *n) {
@@ -858,8 +1133,9 @@ static int traverse(struct path *p) {
                         } else {
                                 flags |= PINNED;
                         }
-                } else if (!is_stable(n)) { /* No chance this will complete */
-                        path_fini(p);       /* without a race. */
+                } else if (!is_stable(n)) {
+                        lock(n, WRITE); /* Wait for stabilisation. */
+                        unlock(n, WRITE);
                 }
                 r = path_add(p, n, node_seq(n), flags);
                 if (is_leaf(n)) {
@@ -871,28 +1147,34 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else if (p->opt == INSERT) {
-                                insert_prep(p);
-                                if (path_is_valid(p)) {
+                                result = insert_prep(p);
+                                if (result != 0) {
+                                        break;
+                                } else if (!path_is_valid(p)) {
+                                        path_fini(p);
+                                } else {
                                         result = insert_complete(p, n);
                                         break;
-                                } else {
-                                        path_fini(p);
                                 }
                         } else if (p->opt == DELETE) {
-                                delete_prep(p);
-                                if (path_is_valid(p)) {
+                                result = delete_prep(p);
+                                if (result != 0) {
+                                        break;
+                                } else if (!path_is_valid(p)) {
+                                        path_fini(p);
+                                } else {
                                         result = delete_complete(p, n);
                                         break;
-                                } else {
-                                        path_fini(p);
                                 }
                         } else {
-                                next_prep(p);
-                                if (path_is_valid(p)) {
+                                result = next_prep(p);
+                                if (result != 0) {
+                                        break;
+                                } else if (!path_is_valid(p)) {
+                                        path_fini(p);
+                                } else {
                                         result = next_complete(p, n);
                                         break;
-                                } else {
-                                        path_fini(p);
                                 }
                         }
                 } else {
@@ -907,30 +1189,35 @@ static int traverse(struct path *p) {
         return result;
 }
 
+static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
+        int result;
+        struct path p = {};
+        path_init(&p, t, r, opt);
+        result = traverse(&p);
+        path_fini(&p);
+        return result;
+}
+
 static int lookup(struct t2_tree *t, struct t2_rec *r) {
-        int result = cookie_try(t, r, LOOKUP);
-        if (result != -ESTALE) {
-                return result;
-        } else {
-                struct path p = {};
-                path_init(&p, t, r, LOOKUP);
-                result = traverse(&p);
-                path_fini(&p);
-                return result;
+        int result;
+        counters_check();
+        result = cookie_try(t, r, LOOKUP);
+        if (result == -ESTALE) {
+                result = traverse_result(t, r, LOOKUP);
         }
+        counters_check();
+        return result;
 }
 
 static int insert(struct t2_tree *t, struct t2_rec *r) {
-        int result = cookie_try(t, r, INSERT);
-        if (result != -ESTALE) {
-                return result;
-        } else {
-                struct path p = {};
-                path_init(&p, t, r, INSERT);
-                result = traverse(&p);
-                path_fini(&p);
-                return result;
+        int result;
+        counters_check();
+        result = cookie_try(t, r, INSERT);
+        if (result == -ESTALE) {
+                result = traverse_result(t, r, INSERT);
         }
+        counters_check();
+        return result;
 }
 
 int t2_lookup(struct t2_tree *t, struct t2_rec *r) {
@@ -977,7 +1264,7 @@ static void *mem_alloc(size_t size) {
         }
 }
 
-static void  mem_free(void *ptr) {
+static void mem_free(void *ptr) {
         free(ptr);
 }
 
@@ -987,7 +1274,7 @@ static void llog(const struct msg_ctx *ctx, ...) {
         va_start(args, ctx);
         vfprintf(stderr, ctx->fmt, args);
         va_end(args);
-        puts(".\n");
+        puts(".");
 }
 
 static uint32_t min_u32(uint32_t a, uint32_t b) {
@@ -996,6 +1283,18 @@ static uint32_t min_u32(uint32_t a, uint32_t b) {
 
 static uint32_t max_u32(uint32_t a, uint32_t b) {
         return a > b ? a : b;
+}
+
+static void counters_check(void) {
+        if (counters.node != 0) {
+                LOG("Leaked node: %i", counters.node);
+        }
+        if (counters.rlock != 0) {
+                LOG("Leaked rlock: %i", counters.rlock);
+        }
+        if (counters.wlock != 0) {
+                LOG("Leaked wlock: %i", counters.wlock);
+        }
 }
 
 /* @ht */
@@ -1017,7 +1316,7 @@ static int ht_init(struct ht *ht, int shift) {
                 }
                 return 0;
         }
-        return -ENOMEM;
+        return ERROR(-ENOMEM);
 }
 
 static void ht_fini(struct ht *ht) {
@@ -1025,6 +1324,15 @@ static void ht_fini(struct ht *ht) {
                 link_fini(&ht->chains[i]);
         }
         mem_free(ht->chains);
+}
+
+static void ht_clean(struct ht *ht) {
+        for (int i = 0; i < (1 << ht->shift); i++) {
+                struct link *head = &ht->chains[i];
+                for (struct link *scan = head->next, *next = scan->next; scan != head; scan = next, next = scan->next) {
+                        nfini((struct node *)scan);
+                }
+        }
 }
 
 static uint64_t ht_hash(taddr_t addr) {
@@ -1257,6 +1565,7 @@ static taddr_t internal_addr(const struct slot *s) {
 static taddr_t internal_search(struct node *n, struct t2_rec *r, uint32_t *pos) {
         SLOT_DEFINE(s, NULL); /* !sanitise */
         (void)simple_search(n, r, &s);
+        *pos = s.idx;
         return internal_addr(&s);
 }
 
@@ -1284,7 +1593,7 @@ static uint32_t sfreeval(struct node *n) {
         return sat(sh, sh->nr)->voff - sdirend(sh);
 }
 
-static uint32_t simple_free(struct node *n) {
+static uint32_t simple_free(const struct node *n) {
         struct sheader     *sh  = simple_header(n);
         struct dir_element *end = sat(sh, sh->nr);
         return end->voff - end->koff - sdirsize(sh);
@@ -1303,6 +1612,10 @@ static void sdirmove(struct sheader *sh, uint32_t nsize,
         ASSERT(dir_off + nr * sizeof(struct dir_element) + vnob <= nsize);
         move(sh, sh->dir_off, sdirend(sh), dir_off - sh->dir_off);
         sh->dir_off = dir_off;
+}
+
+static int simple_can_insert(const struct slot *s) {
+        return simple_free(s->node) >= buf_len(s->rec.key) + buf_len(s->rec.val) + sizeof(struct dir_element);
 }
 
 static int simple_insert(struct slot *s) {
@@ -1374,7 +1687,6 @@ static void simple_get(struct slot *s) {
 static void simple_make(struct node *n) {
         uint32_t        nsize = 1ul << n->ntype->shift;
         struct sheader *sh    = simple_header(n);
-        ASSERT(IS0(sh));
         sh->dir_off = sizeof *sh + (nsize - sizeof *sh) / 2;
         *sat(sh, 0) = (struct dir_element){ .koff = sizeof *sh, .voff = nsize };
 }
@@ -1585,11 +1897,16 @@ static struct node_type ntype = {
         .shift = 9
 };
 
+static struct node_type *tree_ntype(struct t2_tree *t, int level) {
+        return &ntype;
+}
+
 static struct t2_tree_type ttype = {
         .id       = 7,
         .name     = "tree-type-ut",
         .root_min = 9,
-        .root_max = 9
+        .root_max = 9,
+        .ntype    = &tree_ntype
 };
 
 static void simple_ut(void) {
@@ -1702,7 +2019,6 @@ static void ht_ut() {
                 taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
                 struct node *n = ht_lookup(&ht, blk);
                 ht_delete(n);
-                put(n);
         }
         utest("fini");
         ht_fini(&ht);
@@ -1718,8 +2034,6 @@ static void traverse_ut() {
                 .data  = body,
         };
         struct sheader *sh = simple_header(&n);
-        struct t2 *mod = t2_init(&mock_storage, 10);
-        t2_node_type_register(mod, &ntype);
         *sh = (struct sheader) {
                 .head = {
                         .magix = NODE_MAGIX,
@@ -1748,11 +2062,14 @@ static void traverse_ut() {
                 .opt  = LOOKUP,
                 .rec  = &s.rec
         };
+        usuite("traverse");
+        utest("t2_init");
+        struct t2 *mod = t2_init(&mock_storage, 10);
+        t2_node_type_register(mod, &ntype);
         ttype.mod = mod;
         memset(body, 0, sizeof body);
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
-        usuite("traverse");
         utest("prepare");
         simple_make(&n);
         ht_insert(&mod->ht, &n);
@@ -1782,7 +2099,43 @@ static void traverse_ut() {
         p.used = 0;
         UASSERT(traverse(&p) == -ENOENT);
         ht_delete(&n);
+        utest("t2_fini");
         t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utestdone();
+}
+
+static void insert_ut() {
+        usuite("insert");
+        utest("init");
+        char key0[] = "0";
+        char val0[] = "+";
+        struct t2_buf val;
+        struct t2_buf key;
+        struct t2_tree t = {
+                .ttype = &ttype
+        };
+        struct t2 *mod = t2_init(&mock_storage, 10);
+        struct t2_rec r = {
+                .key = &key,
+                .val = &val
+        };
+        t2_node_type_register(mod, &ntype);
+        ttype.mod = mod;
+        buf_init_str(&key, key0);
+        buf_init_str(&val, val0);
+        struct node *n = alloc(&t, 0);
+        UASSERT(n != NULL && EISOK(n));
+        simple_make(n);
+        put(n);
+        t.root = n->addr;
+        utest("insert-1");
+        UASSERT(t2_insert(&t, &r) == 0);
+        utest("eexist");
+        UASSERT(t2_insert(&t, &r) == -EEXIST);
+        utest("fini");
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
         utestdone();
 }
 
@@ -1790,6 +2143,7 @@ int main(int argc, char **argv) {
         simple_ut();
         ht_ut();
         traverse_ut();
+        insert_ut();
         return 0;
 }
 

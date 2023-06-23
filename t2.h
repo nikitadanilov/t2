@@ -19,6 +19,7 @@ struct t2_tree_type {
         const char *name;
         int root_min;
         int root_max;
+        struct node_type *(*ntype)(struct t2_tree *t, int level);
 };
 
 struct t2_storage {
