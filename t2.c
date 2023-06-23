@@ -80,6 +80,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <stdatomic.h>
+#include <signal.h>
 #include "t2.h"
 
 enum {
@@ -457,6 +458,8 @@ static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, ui
 struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static void counters_check(void);
 static bool is_sorted(struct node *n, int maxkey);
+static int signal_init(void);
+static void signal_fini(void);
 
 static __thread struct counters counters = {};
 
@@ -464,12 +467,18 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
         struct t2 *mod = mem_alloc(sizeof *mod);
         if (mod != NULL) {
-                mod->stor = storage;
-                result = storage->op->init(storage);
+                result = signal_init();
                 if (result == 0) {
-                        result = ht_init(&mod->ht, hshift);
+                        mod->stor = storage;
+                        result = storage->op->init(storage);
+                        if (result == 0) {
+                                result = ht_init(&mod->ht, hshift);
+                                if (result != 0) {
+                                        storage->op->fini(storage);
+                                }
+                        }
                         if (result != 0) {
-                                storage->op->fini(storage);
+                                signal_fini();
                         }
                 }
         } else {
@@ -487,6 +496,7 @@ void t2_fini(struct t2 *mod) {
         ht_clean(&mod->ht);
         ht_fini(&mod->ht);
         mod->stor->op->fini(mod->stor);
+        signal_fini();
         mem_free(mod);
 }
 
@@ -1322,6 +1332,65 @@ static void counters_check(void) {
         }
 }
 
+static __thread int   insigsegv = 0;
+static struct sigaction osa = {};
+static int signal_set = 0;
+
+#include <execinfo.h>
+
+static void stacktrace(void) {
+    int    size;
+    char **syms;
+    void  *tracebuf[512];
+
+    size = backtrace(tracebuf, ARRAY_SIZE(tracebuf));
+    syms = backtrace_symbols(tracebuf, size);
+    for (int i = 0; i < size; i++) {
+            if (syms != NULL) {
+                    printf("%s\n", syms[i]);
+            } else {
+                    printf("%p\n", tracebuf[i]);
+            }
+    }
+    free(syms);
+}
+
+static void sigsegv(int signo, siginfo_t *si, void *uctx) {
+        if (insigsegv++ > 0) {
+                abort(); /* Don't try to print anything. */
+        }
+        printf("\nGot: %i errno: %i code: %i pid: %i uid: %i ucontext: %p\n",
+               signo, si->si_errno, si->si_code, si->si_pid, si->si_uid, uctx);
+        stacktrace();
+        if (osa.sa_handler != SIG_DFL && osa.sa_handler != SIG_IGN) {
+                if (osa.sa_flags & SA_SIGINFO) {
+                        (*osa.sa_sigaction)(signo, si, uctx);
+                }
+        }
+        --insigsegv;
+}
+
+static int signal_init(void) {
+        struct sigaction sa = {
+                .sa_sigaction = &sigsegv,
+                .sa_flags     = SA_SIGINFO | SA_NODEFER | SA_RESETHAND,
+        };
+        int result = 0;
+        if (signal_set == 0) {
+                result = sigaction(SIGSEGV, &sa, &osa);
+                if (result == 0) {
+                        signal_set = 1;
+                }
+        }
+        return result;
+}
+
+static void signal_fini(void) {
+        ASSERT(signal_set > 0);
+        if (--signal_set == 0) {
+                sigaction(SIGSEGV, &osa, NULL);
+        }
+}
 /* @ht */
 
 static void link_init(struct link *l) {
