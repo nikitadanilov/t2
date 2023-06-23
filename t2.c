@@ -1034,6 +1034,14 @@ struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b) {
 }
 
 static int root_add(struct path *p) {
+        /*
+         * TODO: It is desirable to never move the tree root.
+         *
+         * To achieve this, move half of the records from the old root to the
+         * new root and the other half to the allocated node. Then make the
+         * latter 2 nodes the only children of the old root. Then increase the
+         * old root's level.
+         */
         struct node  *oldroot = p->rung[0].node;
         struct t2_buf ptr;
         int           result;
