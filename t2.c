@@ -1634,7 +1634,9 @@ static void sdirmove(struct sheader *sh, uint32_t nsize,
                      uint32_t knob, uint32_t vnob, uint32_t nr) {
         uint32_t dir_off = (knob * (nsize - sizeof *sh)) / (knob + vnob) -
                 (nr + 1) * sizeof(struct dir_element) / 2 + sizeof *sh;
-        dir_off = max_u32(dir_off, knob + sizeof *sh);
+        dir_off = min_u32(max_u32(dir_off, knob + sizeof *sh),
+                          nsize - vnob - (nr + 1) * sizeof(struct dir_element));
+        ASSERT(knob + sizeof *sh <= dir_off);
         ASSERT(dir_off + (nr + 1) * sizeof(struct dir_element) + vnob <= nsize);
         move(sh, sh->dir_off, sdirend(sh), dir_off - sh->dir_off);
         sh->dir_off = dir_off;
@@ -2224,12 +2226,69 @@ static void tree_ut() {
         utestdone();
 }
 
+static void fill(char *x, int nr) {
+        for (int i = 0; i < nr; ++i) {
+                x[i] = rand() & 0xff;
+        }
+}
+
+static void stress_ut() {
+        struct t2      *mod;
+        struct t2_tree *t;
+        char key[512] = {};
+        char val[512] = {};
+        struct t2_buf keyb = {
+                .nr = 1,
+                .seg = { [0] = { .len = sizeof key, .addr = key } }
+        };
+        struct t2_buf valb = {
+                .nr = 1,
+                .seg = { [0] = { .len = sizeof val, .addr = val } }
+        };
+        struct t2_rec r = {
+                .key = &keyb,
+                .val = &valb
+        };
+        uint32_t maxsize = (1ul << (ntype.shift - 2)) - 40;
+        usuite("stress");
+        utest("init");
+        mod = t2_init(&mock_storage, 20);
+        UASSERT(EISOK(mod));
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        t = t2_tree_create(&ttype);
+        UASSERT(EISOK(t));
+        utest("5K");
+        for (int i = 0; true; ++i) {
+                uint32_t ksize = rand() % maxsize;
+                uint32_t vsize = rand() % maxsize;
+                int      result;
+                ASSERT(ksize < sizeof key);
+                ASSERT(vsize < sizeof val);
+                ASSERT(ksize + vsize < 1ul << (ntype.shift - 1));
+                fill(key, ksize);
+                fill(val, vsize);
+                keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
+                valb.seg[0] = (struct t2_seg){ .len = vsize, .addr = &val };
+                result = t2_insert(t, &r);
+                UASSERT(result == 0 || result == -EEXIST);
+                if ((i % 10000) == 0) {
+                        printf("%10i\n", i);
+                }
+        }
+        utest("fini");
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utestdone();
+}
+
 int main(int argc, char **argv) {
-        tree_ut();
+        stress_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
         insert_ut();
+        tree_ut();
         return 0;
 }
 
