@@ -17,8 +17,6 @@ struct t2_tree_type {
         struct t2  *mod;
         uint32_t    id;
         const char *name;
-        int root_min;
-        int root_max;
         struct node_type *(*ntype)(struct t2_tree *t, int level);
 };
 

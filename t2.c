@@ -106,6 +106,7 @@ enum {
 })
 #define IMMANENTISE(fmt, ...) immanentise(MSG_PREP(fmt), __VA_ARGS__)
 #define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr));
+#define EXPENSIVE_ASSERT(expr) (0)
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 #define IS_ARRAY(x) (!__builtin_types_compatible_p(typeof(&(x)[0]), typeof(x)))
 #define IS_IN(idx, array)                               \
@@ -410,8 +411,6 @@ struct counters {
         uint32_t wlock;
 };
 
-static __thread struct counters counters = {};
-
 /* @static */
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
@@ -452,9 +451,13 @@ static void simple_make(struct node *n);
 static uint32_t simple_nr(const struct node *n);
 static uint32_t simple_free(const struct node *n);
 static int simple_can_insert(const struct slot *s);
+static bool simple_invariant(const struct node *n);
 static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, uint32_t tnr);
 struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static void counters_check(void);
+static bool is_sorted(struct node *n, int maxkey);
+
+static __thread struct counters counters = {};
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
@@ -554,20 +557,17 @@ static taddr_t taddr_make(uint64_t addr, int shift) {
         return addr | shift;
 }
 
-static void tree_init(struct t2_tree *t, struct t2_tree_type *ttype, taddr_t root) {
-        t->ttype = ttype;
-        t->root = root;
-}
-
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (t != NULL) {
-                uint64_t addr = SCALL(ttype->mod, alloc, ttype->root_min, ttype->root_max);
-                if (EISOK(addr)) {
-                        tree_init(t, ttype, addr);
+                t->ttype = ttype;
+                struct node *root = alloc(t, 0);
+                if (EISOK(root)) {
+                        t->root = root->addr;
+                        put(root);
                         return t;
                 } else {
-                        return EPTR(addr);
+                        return EPTR(root);
                 }
         } else {
                 return EPTR(-ENOMEM);
@@ -683,6 +683,7 @@ static struct node *alloc(struct t2_tree *t, int level) {
                                 .treeid = t->id
                         };
                         n->ntype = ntype;
+                        simple_make(n);
                 }
         } else {
                 n = EPTR(addr);
@@ -698,6 +699,7 @@ static int dealloc(struct t2_tree *t, struct node *n) {
 
 static void put(struct node *n) {
         ASSERT(n->ref > 0);
+        EXPENSIVE_ASSERT(is_sorted(n, 256));
         CDEC(node);
         if (--n->ref == 0) {
                 /* TODO: lru. */
@@ -761,6 +763,8 @@ static int newnode(struct path *p, int idx) {
                        p->newroot = alloc(p->tree, level(r->node) + 1);
                        if (EISERR(r->allocated)) {
                                return ERROR(ERRCODE(p->newroot));
+                       } else {
+                               return +1; /* Done. */
                        }
                } else {
                        return ERROR(-E2BIG);
@@ -772,7 +776,7 @@ static int newnode(struct path *p, int idx) {
 static int split_right_plan(struct path *p, int idx, const struct t2_rec *rec) {
        struct rung *r = &p->rung[idx];
         int result = newnode(p, idx);
-        if (result == 0) {
+        if (result >= 0) {
                 internal_parent_rec(r);
         }
         return result;
@@ -781,18 +785,22 @@ static int split_right_plan(struct path *p, int idx, const struct t2_rec *rec) {
 static int split_right_exec(struct path *p, int idx) {
         struct rung *r = &p->rung[idx];
         SLOT_DEFINE(s, NULL);
-        ASSERT(r->allocated != NULL);
-        int result = shift(r->allocated, r->node, RIGHT, (1ul << r->node->ntype->shift) / 2, 0);
-        r->flags &= ~ALUSED;
+        int result = 0;
+        if (r->allocated != NULL) {
+                result = shift(r->allocated, r->node, RIGHT, (1ul << r->node->ntype->shift) / 2, 0);
+                r->flags |= ALUSED;
+        }
         if (result == 0) {
-                if (r->pos <= nr(r->node)) {
+                if (r->pos < nr(r->node)) {
                         s.node = r->node;
                         s.idx  = r->pos;
                 } else {
+                        ASSERT(r->allocated != NULL);
                         s.node = r->allocated;
                         s.idx  = r->pos - nr(r->node);
-                        ASSERT(0 < s.idx && s.idx <= nr(r->allocated));
                 }
+                s.idx++;
+                ASSERT(s.idx <= nr(s.node));
                 if (is_leaf(r->node)) {
                         s.rec = *p->rec;
                 } else {
@@ -801,7 +809,8 @@ static int split_right_exec(struct path *p, int idx) {
                         s.rec.val = &p->rung[idx + 1].valout;
                 }
                 result = simple_insert(&s);
-                if (result == 0) {
+                EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node, 256));
+                if (result == 0 && r->allocated != NULL) {
                         s.node = r->allocated;
                         s.idx = 0;
                         simple_get(&s);
@@ -994,7 +1003,7 @@ static int insert_prep(struct path *p) {
         if (leaf_search(p->rung[idx].node, rec, &s)) {
                 return -EEXIST;
         }
-        p->rung[p->used - 1].pos = s.idx + 1;
+        p->rung[idx].pos = s.idx;
         do {
                 struct rung *r = &p->rung[idx];
                 r->lm = WRITE;
@@ -1010,7 +1019,7 @@ static int insert_prep(struct path *p) {
                         rec->key = &r->keyout;
                         rec->val = &r->valout;
                 }
-        } while (idx-- >= 0 && result == 0);
+        } while (--idx >= 0 && result == 0);
         path_lock(p);
         return result;
 }
@@ -1058,8 +1067,10 @@ static int root_add(struct path *p) {
                 s.rec.val = &p->rung[0].valout;
                 result = simple_insert(&s);
                 if (result == 0) {
+                        p->rung[0].flags |= ALUSED;
                         /* Barrier? */
                         p->tree->root = p->newroot->addr;
+                        put(p->newroot);
                         p->newroot = NULL;
                 }
         }
@@ -1077,8 +1088,9 @@ static int insert_balance(struct path *p) {
                 result = dispatch[r->pd.id].exec(p, idx);
         } while (idx-- >= 0 && result == 0);
         if (UNLIKELY(idx < 0 && result == 0)) {
-                ASSERT(p->newroot != NULL);
-                result = root_add(p);
+                if (p->newroot != NULL) {
+                        result = root_add(p); /* Move this to policy? */
+                }
         }
         return result;
 }
@@ -1093,7 +1105,7 @@ static int insert_complete(struct path *p, struct node *n) {
                         .rec  = *p->rec
                 });
                 if (result == -ENOSPC) {
-                        p->rung[p->used - 1].pos = s.idx + 1;
+                        p->rung[p->used - 1].pos = s.idx;
                         result = insert_balance(p);
                 }
         } else {
@@ -1111,9 +1123,10 @@ static int next_complete(struct path *p, struct node *n) {
 }
 
 static int traverse(struct path *p) {
-        int      result;
-        uint64_t next;
-        struct t2 *mod = p->tree->ttype->mod;
+        struct t2 *mod   = p->tree->ttype->mod;
+        int        tries = 0;
+        int        result;
+        uint64_t   next;
         ASSERT(p->used == 0);
         ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
         rcu_lock();
@@ -1121,6 +1134,9 @@ static int traverse(struct path *p) {
                 struct node *n;
                 struct rung *r;
                 uint64_t     flags = 0;
+                if (UNLIKELY(tries++ > 10 && (tries & (tries - 1)) == 0)) {
+                        LOG("Looping: %i", tries);
+                }
                 if (p->used == 0) {
                         next = p->tree->root;
                 }
@@ -1475,7 +1491,7 @@ static bool is_in(uint32_t lo, uint32_t v, uint32_t hi) {
         return lo <= v && v <= hi;
 }
 
-static bool scheck(struct sheader *sh, struct node_type *nt) {
+static bool scheck(struct sheader *sh, const struct node_type *nt) {
         uint32_t size = 1ul << nt->shift;
         uint32_t dend = sh->dir_off + (sh->nr + 1) * sizeof(struct dir_element);
         return  is_in(sizeof *sh, sh->dir_off, size) &&
@@ -1542,6 +1558,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         struct t2_buf  *key   = out->rec.key;
         struct t2_buf  *val   = out->rec.val;
         int             cmp;
+        EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         while (l + 1 < r) {
                 int m = (l + r) >> 1;
                 cmp = skeycmp(sh, m, rec->key->seg[0].addr, rec->key->seg[0].len);
@@ -1566,7 +1583,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
 }
 
 static taddr_t internal_addr(const struct slot *s) {
-        ASSERT(s->rec.val->nr > 0 && s->rec.val->seg[0].len > sizeof(taddr_t));
+        ASSERT(s->rec.val->nr > 0 && s->rec.val->seg[0].len >= sizeof(taddr_t));
         return *(taddr_t *)s->rec.val->seg[0].addr;
 }
 
@@ -1579,6 +1596,7 @@ static taddr_t internal_search(struct node *n, struct t2_rec *r, uint32_t *pos) 
 
 static taddr_t internal_get(const struct node *n, uint32_t pos) { /* !sanitise */
         SLOT_DEFINE(s, (struct node *)n);
+        s.idx = pos;
         simple_get(&s);
         return internal_addr(&s);
 }
@@ -1615,9 +1633,9 @@ static void move(void *sh, uint32_t start, uint32_t end, int delta) {
 static void sdirmove(struct sheader *sh, uint32_t nsize,
                      uint32_t knob, uint32_t vnob, uint32_t nr) {
         uint32_t dir_off = (knob * (nsize - sizeof *sh)) / (knob + vnob) -
-                nr * sizeof(struct dir_element) / 2 + sizeof *sh;
+                (nr + 1) * sizeof(struct dir_element) / 2 + sizeof *sh;
         dir_off = max_u32(dir_off, knob + sizeof *sh);
-        ASSERT(dir_off + nr * sizeof(struct dir_element) + vnob <= nsize);
+        ASSERT(dir_off + (nr + 1) * sizeof(struct dir_element) + vnob <= nsize);
         move(sh, sh->dir_off, sdirend(sh), dir_off - sh->dir_off);
         sh->dir_off = dir_off;
 }
@@ -1630,10 +1648,11 @@ static int simple_insert(struct slot *s) {
         struct t2_buf       buf;
         struct sheader     *sh   = simple_header(s->node);
         struct dir_element *end  = sat(sh, sh->nr);
-        struct dir_element *piv  = sat(sh, s->idx);
+        struct dir_element *piv;
         uint32_t            klen = buf_len(s->rec.key);
         uint32_t            vlen = buf_len(s->rec.val);
         ASSERT(s->idx <= sh->nr);
+        EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         if (simple_free(s->node) < klen + vlen + sizeof(struct dir_element)) {
                 return -ENOSPC;
         }
@@ -1660,6 +1679,7 @@ static int simple_insert(struct slot *s) {
         buf.seg[0].addr = sval(sh, s->idx, &buf.seg[0].len);
         ASSERT(buf.seg[0].len == vlen);
         buf_copy(&buf, s->rec.val);
+        EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         return 0;
 }
 
@@ -1671,6 +1691,7 @@ static void simple_delete(struct slot *s) {
         uint32_t            klen = inn->koff - piv->koff;
         uint32_t            vlen = piv->voff - inn->voff;
         ASSERT(s->idx < sh->nr);
+        EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         move(sh, inn->koff, end->koff, -klen);
         move(sh, end->voff, inn->voff, +vlen);
         for (uint32_t i = s->idx; i < sh->nr; ++i) {
@@ -1681,6 +1702,7 @@ static void simple_delete(struct slot *s) {
                 };
         }
         --sh->nr;
+        EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
 }
 
 static void simple_get(struct slot *s) {
@@ -1690,6 +1712,7 @@ static void simple_get(struct slot *s) {
         s->rec.val->nr = 1;
         s->rec.key->seg[0].addr = skey(sh, s->idx, &s->rec.key->seg[0].len);
         s->rec.val->seg[0].addr = sval(sh, s->idx, &s->rec.val->seg[0].len);
+        EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
 }
 
 static void simple_make(struct node *n) {
@@ -1826,7 +1849,7 @@ static uint64_t failed;
 static const char *test = NULL;
 
 static void utestdone(void) {
-        printf("                %c %-15s %10llu %10llu\n", failed == 0 ? '+' : '.', test, ok, failed);
+        printf(" %c %10llu %10llu\n", failed == 0 ? '+' : '!', ok, failed);
         test = NULL;
 }
 
@@ -1834,6 +1857,7 @@ static void utest(const char *t) {
         if (test != NULL) {
                 utestdone();
         }
+        printf("                . %-15s ", t);
         ok = failed = 0;
         test = t;
 }
@@ -1873,15 +1897,15 @@ static bool is_sorted(struct node *n, int maxkey) {
                 .rec = { .key = &kk, .val = &vv }
         };
         char keyarea[maxkey];
+        uint32_t keysize;
         memset(keyarea, 0, sizeof keyarea);
         for (uint32_t i = 0; i < sh->nr; ++i) {
                 ss.idx = i;
                 simple_get(&ss);
                 UASSERT(ss.rec.key->seg[0].len <= sizeof keyarea);
                 if (i > 0) {
-                        int cmp = memcmp(keyarea, ss.rec.key->seg[0].addr,
-                                         ss.rec.key->seg[0].len);
-                        if (cmp >= 0) {
+                        int cmp = skeycmp(sh, i, keyarea, keysize);
+                        if (cmp <= 0) {
                                 printf("Misordered at %i: ", i);
                                 print_range(keyarea, sizeof keyarea,
                                             keyarea, sizeof keyarea, true);
@@ -1894,7 +1918,8 @@ static bool is_sorted(struct node *n, int maxkey) {
                                 return false;
                         }
                 }
-                memcpy(keyarea, ss.rec.key->seg[0].addr, ss.rec.key->seg[0].len);
+                keysize = ss.rec.key->seg[0].len;
+                memcpy(keyarea, ss.rec.key->seg[0].addr, keysize);
         }
         return true;
 }
@@ -1912,8 +1937,6 @@ static struct node_type *tree_ntype(struct t2_tree *t, int level) {
 static struct t2_tree_type ttype = {
         .id       = 7,
         .name     = "tree-type-ut",
-        .root_min = 9,
-        .root_max = 9,
         .ntype    = &tree_ntype
 };
 
@@ -2147,7 +2170,74 @@ static void insert_ut() {
         utestdone();
 }
 
+static void tree_ut() {
+        usuite("tree");
+        utest("init");
+        char key0[] = "0";
+        char val0[] = "+";
+        struct t2_buf val;
+        struct t2_buf key;
+        struct t2_tree *t;
+        struct t2 *mod;
+        struct t2_rec r = {
+                .key = &key,
+                .val = &val
+        };
+        uint64_t k64;
+        uint64_t v64;
+        mod = t2_init(&mock_storage, 10);
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        t = t2_tree_create(&ttype);
+        UASSERT(EISOK(t));
+        buf_init_str(&key, key0);
+        buf_init_str(&val, val0);
+        utest("insert-1");
+        UASSERT(t2_insert(t, &r) == 0);
+        utest("eexist");
+        UASSERT(t2_insert(t, &r) == -EEXIST);
+        utest("5K");
+        for (k64 = 0; k64 < 5000; ++k64) {
+                key.seg[0] = (struct t2_seg){ .len = sizeof k64, .addr = &k64 };
+                val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
+                UASSERT(t2_insert(t, &r) == 0);
+        }
+        utestdone();
+        struct node *root = get(mod, t->root);
+        printf("Height: %i\n", level(root) + 1);
+        put(root);
+        utest("50K");
+        for (int i = 0; i < 50000; ++i) {
+                k64 = ht_hash(i);
+                v64 = ht_hash(i + 1);
+                key.seg[0] = (struct t2_seg){ .len = sizeof k64, .addr = &k64 };
+                val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
+                UASSERT(t2_insert(t, &r) == 0);
+        }
+        utestdone();
+        root = get(mod, t->root);
+        printf("Height: %i\n", level(root) + 1);
+        put(root);
+        utest("500K");
+        for (int i = 0; i < 2000000; ++i) {
+                k64 = ht_hash(i);
+                v64 = ht_hash(i + 1);
+                key.seg[0] = (struct t2_seg){ .len = sizeof k64, .addr = &k64 };
+                val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
+                UASSERT(t2_insert(t, &r) == (i < 50000 ? -EEXIST : 0));
+        }
+        utestdone();
+        root = get(mod, t->root);
+        printf("Height: %i\n", level(root) + 1);
+        put(root);
+        utest("fini");
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utestdone();
+}
+
 int main(int argc, char **argv) {
+        tree_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
