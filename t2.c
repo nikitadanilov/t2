@@ -864,7 +864,7 @@ static const struct policy dispatch[POLICY_NR] = {
         }
 };
 
-static enum policy_id select(const struct path *p, int idx) {
+static enum policy_id policy_select(const struct path *p, int idx) {
         return SPLIT_RIGHT;
 }
 
@@ -1010,7 +1010,7 @@ static int insert_prep(struct path *p) {
                 if (can_insert(r->node, rec)) {
                         break;
                 } else {
-                        r->pd.id = select(p, idx);
+                        r->pd.id = policy_select(p, idx);
                         if (dispatch[r->pd.id].plan(p, idx, rec) > 0) {
                                 result = 0;
                                 break;
@@ -2185,7 +2185,7 @@ static void tree_ut() {
         };
         uint64_t k64;
         uint64_t v64;
-        mod = t2_init(&mock_storage, 10);
+        mod = t2_init(&mock_storage, 20);
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype);
@@ -2202,10 +2202,6 @@ static void tree_ut() {
                 val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
                 UASSERT(t2_insert(t, &r) == 0);
         }
-        utestdone();
-        struct node *root = get(mod, t->root);
-        printf("Height: %i\n", level(root) + 1);
-        put(root);
         utest("50K");
         for (int i = 0; i < 50000; ++i) {
                 k64 = ht_hash(i);
@@ -2214,22 +2210,14 @@ static void tree_ut() {
                 val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
                 UASSERT(t2_insert(t, &r) == 0);
         }
-        utestdone();
-        root = get(mod, t->root);
-        printf("Height: %i\n", level(root) + 1);
-        put(root);
-        utest("500K");
-        for (int i = 0; i < 2000000; ++i) {
+        utest("5M");
+        for (int i = 0; i < 5000000; ++i) {
                 k64 = ht_hash(i);
                 v64 = ht_hash(i + 1);
                 key.seg[0] = (struct t2_seg){ .len = sizeof k64, .addr = &k64 };
                 val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
                 UASSERT(t2_insert(t, &r) == (i < 50000 ? -EEXIST : 0));
         }
-        utestdone();
-        root = get(mod, t->root);
-        printf("Height: %i\n", level(root) + 1);
-        put(root);
         utest("fini");
         t2_node_type_degister(&ntype);
         t2_fini(mod);
