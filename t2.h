@@ -76,12 +76,12 @@ void t2_tree_type_register(struct t2 *mod, struct t2_tree_type *ttype);
 void t2_tree_type_degister(struct t2_tree_type *ttype);
 
 struct t2_seg {
-        uint32_t  len;
-        void     *addr;
+        int32_t  len;
+        void    *addr;
 };
 
 struct t2_buf {
-        uint32_t      nr;
+        int32_t       nr;
         struct t2_seg seg[1];
 };
 

@@ -107,7 +107,7 @@ enum {
 })
 #define IMMANENTISE(fmt, ...) immanentise(MSG_PREP(fmt), __VA_ARGS__)
 #define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr));
-#define EXPENSIVE_ASSERT(expr) ((void)0)
+#define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 #define IS_ARRAY(x) (!__builtin_types_compatible_p(typeof(&(x)[0]), typeof(x)))
 #define IS_IN(idx, array)                               \
@@ -336,10 +336,10 @@ struct pstate {
                 struct split_right {
                 } sr;
                 struct shift {
-                        uint32_t shift_le;
-                        uint32_t shift_ln;
-                        uint32_t shift_rn;
-                        uint32_t shift_re;
+                        int32_t shift_le;
+                        int32_t shift_ln;
+                        int32_t shift_rn;
+                        int32_t shift_re;
                 } sh;
         } u;
 };
@@ -370,7 +370,7 @@ struct path {
 };
 
 struct policy {
-        int (*plan)(struct path *p, int idx, const struct t2_rec *r);
+        int (*plan)(struct path *p, int idx);
         int (*exec)(struct path *p, int idx);
 };
 
@@ -389,7 +389,7 @@ struct header {
         uint32_t magix;
         uint32_t csum;
         uint16_t ntype;
-        uint8_t  level;
+        int8_t   level;
         uint8_t  pad;
         uint64_t treeid;
 };
@@ -407,15 +407,16 @@ enum dir {
 };
 
 struct counters {
-        uint32_t node;
-        uint32_t rlock;
-        uint32_t wlock;
+        int32_t node;
+        int32_t rlock;
+        int32_t wlock;
 };
 
 /* @static */
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
-static uint32_t buf_len(const struct t2_buf *b);
+static int32_t buf_len(const struct t2_buf *b);
+static int32_t rec_len(const struct t2_rec *r);
 static int  ht_init(struct ht *ht, int shift);
 static void ht_fini(struct ht *ht);
 static void ht_clean(struct ht *ht);
@@ -426,8 +427,8 @@ static void link_init(struct link *l);
 static void link_fini(struct link *l);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos);
-static taddr_t internal_get(const struct node *n, uint32_t pos);
-static struct node *internal_child(const struct node *n, uint32_t pos, bool peek);
+static taddr_t internal_get(const struct node *n, int32_t pos);
+static struct node *internal_child(const struct node *n, int32_t pos, bool peek);
 static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s);
 static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn));
 static void *mem_alloc(size_t size);
@@ -440,8 +441,7 @@ static bool can_insert(const struct node *n, const struct t2_rec *r);
 static int dealloc(struct t2_tree *t, struct node *n);
 static uint8_t level(const struct node *n);
 static bool is_leaf(const struct node *n);
-static uint32_t nr(const struct node *n);
-static uint32_t freespace(const struct node *n);
+static int32_t nr(const struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static struct header *nheader(const struct node *n);
@@ -449,17 +449,19 @@ static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n);
-static uint32_t simple_nr(const struct node *n);
-static uint32_t simple_free(const struct node *n);
+static int32_t simple_nr(const struct node *n);
+static int32_t simple_free(const struct node *n);
 static int simple_can_insert(const struct slot *s);
 static void simple_print(struct node *n);
 static bool simple_invariant(const struct node *n);
-static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, uint32_t tnr);
+static int shift(struct node *d, struct node *s, const struct slot *insert, enum dir dir);
 struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static void counters_check(void);
 static bool is_sorted(struct node *n, int maxkey);
 static int signal_init(void);
 static void signal_fini(void);
+static void stacktrace(void);
+int t2_insert(struct t2_tree *t, struct t2_rec *r);
 
 static __thread struct counters counters = {};
 
@@ -568,14 +570,25 @@ static taddr_t taddr_make(uint64_t addr, int shift) {
         return addr | shift;
 }
 
+static struct t2_buf zero = {};
+
+static int zerokey_insert(struct t2_tree *t) {
+	return t2_insert(t, &(struct t2_rec) { .key = &zero, .val = &zero });
+}
+
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (t != NULL) {
                 t->ttype = ttype;
                 struct node *root = alloc(t, 0);
                 if (EISOK(root)) {
+                        int result;
                         t->root = root->addr;
-                        put(root);
+                        put(root); /* Release earlier to keep counters happy. */
+                        result = zerokey_insert(t);
+                        if (result != 0) {
+                                t = EPTR(result);
+                        }
                         return t;
                 } else {
                         return EPTR(root);
@@ -704,13 +717,14 @@ static struct node *alloc(struct t2_tree *t, int level) {
 
 static int dealloc(struct t2_tree *t, struct node *n) {
         SCALL(t->ttype->mod, free, n->addr);
+        n->data = NULL;
         put(n);
         return 0;
 }
 
 static void put(struct node *n) {
         ASSERT(n->ref > 0);
-        EXPENSIVE_ASSERT(is_sorted(n, 256));
+        EXPENSIVE_ASSERT(n->data != NULL ? is_sorted(n, 256) : true);
         CDEC(node);
         if (--n->ref == 0) {
                 /* TODO: lru. */
@@ -729,7 +743,7 @@ static bool is_leaf(const struct node *n) {
         return level(n) == 0;
 }
 
-static uint32_t nr(const struct node *n) {
+static int32_t nr(const struct node *n) {
         return simple_nr(n);
 }
 
@@ -744,11 +758,11 @@ static void rcu_unlock(void) {
 static void internal_parent_rec(struct rung *r) {
         /* TODO: Should take newly inserted record into account. */
         SLOT_DEFINE(s, r->node);
-        uint32_t maxlen = 0;
-        uint32_t keylen;
+        int32_t maxlen = 0;
+        int32_t keylen;
         ASSERT(nr(r->node) > 0);
         ASSERT(r->allocated != NULL);
-        for (uint32_t i = 0; i < nr(r->node); ++i) {
+        for (int32_t i = 0; i < nr(r->node); ++i) {
                 s.idx = i;
                 simple_get(&s);
                 keylen = buf_len(s.rec.key);
@@ -784,8 +798,8 @@ static int newnode(struct path *p, int idx) {
        return 0;
 }
 
-static int split_right_plan(struct path *p, int idx, const struct t2_rec *rec) {
-       struct rung *r = &p->rung[idx];
+static int split_right_plan(struct path *p, int idx) {
+        struct rung *r = &p->rung[idx];
         int result = newnode(p, idx);
         if (result >= 0) {
                 internal_parent_rec(r);
@@ -797,12 +811,26 @@ static int split_right_exec(struct path *p, int idx) {
         struct rung *r = &p->rung[idx];
         SLOT_DEFINE(s, NULL);
         int result = 0;
-        if (r->allocated != NULL) {
-                result = shift(r->allocated, r->node, RIGHT, (1ul << r->node->ntype->shift) / 2, 0);
+        if (is_leaf(r->node)) {
+                s.rec = *p->rec;
+        } else {
+                ASSERT(idx + 1 < p->used);
+                s.rec.key = &p->rung[idx + 1].keyout;
+                s.rec.val = &p->rung[idx + 1].valout;
+        }
+        r->keyout.nr = r->valout.nr = 0;
+        if (rec_len(&s.rec) == 0) {
+                return 0; /* Nothing to do. */
+        } /* Maybe ->plan() overestimated keysize and shift is not needed. */
+        if (r->allocated != NULL && !can_insert(r->node, &s.rec)) {
+                s.idx = r->pos + 1;
+                result = shift(r->allocated, r->node, &s, RIGHT);
+                ASSERT(nr(r->node) > 0);
+                ASSERT(nr(r->allocated) > 0);
                 r->flags |= ALUSED;
         }
         if (result == 0) {
-                if (r->pos < (int32_t)nr(r->node)) {
+                if (r->pos < nr(r->node)) {
                         s.node = r->node;
                         s.idx  = r->pos;
                 } else {
@@ -812,16 +840,9 @@ static int split_right_exec(struct path *p, int idx) {
                 }
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
-                if (is_leaf(r->node)) {
-                        s.rec = *p->rec;
-                } else {
-                        ASSERT(idx + 1 < p->used);
-                        s.rec.key = &p->rung[idx + 1].keyout;
-                        s.rec.val = &p->rung[idx + 1].valout;
-                }
                 result = simple_insert(&s);
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node, 256));
-                if (result == 0 && r->allocated != NULL) {
+                if (result == 0 && (r->flags & ALUSED)) {
                         s.node = r->allocated;
                         s.idx = 0;
                         simple_get(&s);
@@ -836,14 +857,14 @@ static bool can_fit(const struct node *left, const struct node *middle, const st
         return true;
 }
 
-static int shift_plan(struct path *p, int idx, const struct t2_rec *rec) {
+static int shift_plan(struct path *p, int idx) {
        struct rung *r = &p->rung[idx];
        int          result;
        r->left  = neighbour(p, idx,  LEFT, false);
        r->right = neighbour(p, idx, RIGHT, false);
        if (UNLIKELY(EISOK(r->left) && EISOK(r->right))) {
                r->left_mode = r->right_mode = WRITE;
-               if (can_fit(r->left, r->node, r->right, rec)) {
+               if (can_fit(r->left, r->node, r->right, NULL)) {
                        return 0;
                }
                result = newnode(p, idx);
@@ -972,7 +993,7 @@ static bool can_insert(const struct node *n, const struct t2_rec *r) {
         return simple_can_insert(&s);
 }
 
-static uint32_t utmost(const struct node *n, enum dir d) {
+static int32_t utmost(const struct node *n, enum dir d) {
         return d == LEFT ? 0 : nr(n) - 1;
 }
 
@@ -997,14 +1018,6 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, bool peek) {
         return down;
 }
 
-static uint32_t freespace(const struct node *n) {
-        if (n != NULL) {
-                return simple_free(n);
-        } else {
-                return 0;
-        }
-}
-
 static int insert_prep(struct path *p) {
         struct t2_rec  irec = {};
         int            idx = p->used - 1;
@@ -1022,7 +1035,7 @@ static int insert_prep(struct path *p) {
                         break;
                 } else {
                         r->pd.id = policy_select(p, idx);
-                        if (dispatch[r->pd.id].plan(p, idx, rec) > 0) {
+                        if (dispatch[r->pd.id].plan(p, idx) > 0) {
                                 result = 0;
                                 break;
                         }
@@ -1066,6 +1079,9 @@ static int root_add(struct path *p) {
         struct t2_buf ptr;
         int           result;
         SLOT_DEFINE(s, oldroot);
+        if (buf_len(&p->rung[0].keyout) == 0 && buf_len(&p->rung[0].valout) == 0) {
+                return 0; /* Nothing to do. */
+        }
         s.idx = 0;
         simple_get(&s);
         s.node = p->newroot;
@@ -1277,6 +1293,7 @@ __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...
         vfprintf(stderr, ctx->fmt, args);
         va_end(args);
         puts(".\n");
+        stacktrace();
         abort();
 }
 
@@ -1312,11 +1329,11 @@ static void llog(const struct msg_ctx *ctx, ...) {
         puts(".");
 }
 
-static uint32_t min_u32(uint32_t a, uint32_t b) {
+static int32_t min_u32(int32_t a, int32_t b) {
         return a < b ? a : b;
 }
 
-static uint32_t max_u32(uint32_t a, uint32_t b) {
+static int32_t max_u32(int32_t a, int32_t b) {
         return a > b ? a : b;
 }
 
@@ -1504,13 +1521,13 @@ static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := 
 }
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
-        int      didx = 0;
-        uint32_t doff = 0;
-        int      sidx = 0;
-        uint32_t soff = 0;
+        int     didx = 0;
+        int32_t doff = 0;
+        int     sidx = 0;
+        int32_t soff = 0;
         ASSERT(buf_len(dst) >= buf_len(src));
         while (sidx < src->nr && didx < dst->nr) {
-                uint32_t nob = min_u32(src->seg[sidx].len - soff, dst->seg[didx].len - doff);
+                int32_t nob = min_u32(src->seg[sidx].len - soff, dst->seg[didx].len - doff);
                 memmove(dst->seg[didx].addr + doff, src->seg[sidx].addr + soff, nob);
                 doff += nob;
                 soff += nob;
@@ -1525,26 +1542,30 @@ static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
         }
 }
 
-static uint32_t buf_len(const struct t2_buf *b) {
-        uint32_t len = 0;
+static int32_t buf_len(const struct t2_buf *b) {
+        int32_t len = 0;
         for (int i = 0; i < b->nr; ++i) {
                 len += b->seg[i].len;
         }
         return len;
 }
 
+static int32_t rec_len(const struct t2_rec *r) {
+        return buf_len(r->key) + buf_len(r->val);
+}
+
 /* @simple */
 
 struct dir_element {
-        uint32_t koff; /* Start of the key. */
-        uint32_t voff; /* End of the value. */
+        int32_t koff; /* Start of the key. */
+        int32_t voff; /* End of the value. */
 };
 
 struct sheader { /* Simple node format. */
         struct header head;
-        uint32_t      dir_off;
-        uint16_t      nr;
-        uint16_t      pad;
+        int32_t       dir_off;
+        int16_t       nr;
+        int16_t       pad;
 };
 
 static struct dir_element *sdir(struct sheader *sh) {
@@ -1555,13 +1576,13 @@ static struct dir_element *sat(struct sheader *sh, int pos) {
         return sdir(sh) + pos;
 }
 
-static bool is_in(uint32_t lo, uint32_t v, uint32_t hi) {
+static bool is_in(int32_t lo, int32_t v, int32_t hi) {
         return lo <= v && v <= hi;
 }
 
 static bool scheck(struct sheader *sh, const struct node_type *nt) {
-        uint32_t size = 1ul << nt->shift;
-        uint32_t dend = sh->dir_off + (sh->nr + 1) * sizeof(struct dir_element);
+        int32_t size = 1ul << nt->shift;
+        int32_t dend = sh->dir_off + (sh->nr + 1) * sizeof(struct dir_element);
         return  is_in(sizeof *sh, sh->dir_off, size) &&
                 is_in(sizeof *sh, dend, size) &&
                 FORALL(i, sh->nr + 1,
@@ -1572,22 +1593,22 @@ static bool scheck(struct sheader *sh, const struct node_type *nt) {
                        sat(sh, i)->voff >= sat(sh, i + 1)->voff);
 }
 
-static uint32_t sdirsize(struct sheader *sh) {
+static int32_t sdirsize(struct sheader *sh) {
         return (sh->nr + 1) * sizeof(struct dir_element);
 }
 
-static uint32_t sdirend(struct sheader *sh) {
+static int32_t sdirend(struct sheader *sh) {
         return sh->dir_off + sdirsize(sh);
 }
 
-static void *skey(struct sheader *sh, int pos, uint32_t *size) {
+static void *skey(struct sheader *sh, int pos, int32_t *size) {
         ASSERT(0 <= pos && pos < sh->nr);
         struct dir_element *del = sat(sh, pos);
         *size = sat(sh, pos + 1)->koff - del->koff;
         return (void *)sh + del->koff;
 }
 
-static void *sval(struct sheader *sh, int pos, uint32_t *size) {
+static void *sval(struct sheader *sh, int pos, int32_t *size) {
         ASSERT(0 <= pos && pos < sh->nr);
         struct dir_element *del = sat(sh, pos + 1);
         *size = sat(sh, pos)->voff  - del->voff;
@@ -1598,10 +1619,10 @@ static char cmpch(int cmp) {
         return cmp < 0 ? '<' : cmp == 0 ? '=' : '>';
 }
 
-static void print_range(void *orig, uint32_t nsize, void *start, uint32_t nob);
+static void print_range(void *orig, int32_t nsize, void *start, int32_t nob);
 
-static int skeycmp(struct sheader *sh, int pos, void *key, uint32_t klen) {
-        uint32_t ksize;
+static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen) {
+        int32_t ksize;
         void *kstart = skey(sh, pos, &ksize);
         if (pos == -1) {
                 return -1;
@@ -1618,7 +1639,7 @@ static struct sheader *simple_header(const struct node *n) {
 }
 
 static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) {
-        ASSERT(rec->key->nr == 1);
+        ASSERT(rec->key->nr <= 1);
         bool            found = false;
         struct sheader *sh    = simple_header(n);
         int             l     = -1;
@@ -1658,18 +1679,20 @@ static taddr_t internal_addr(const struct slot *s) {
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
         SLOT_DEFINE(s, NULL); /* !sanitise */
         (void)simple_search(n, r, &s);
+        ASSERT(0 <= s.idx && s.idx < nr(n));
         *pos = s.idx;
         return internal_addr(&s);
 }
 
-static taddr_t internal_get(const struct node *n, uint32_t pos) { /* !sanitise */
+static taddr_t internal_get(const struct node *n, int32_t pos) { /* !sanitise */
+        ASSERT(0 <= pos && pos < nr(n));
         SLOT_DEFINE(s, (struct node *)n);
         s.idx = pos;
         simple_get(&s);
         return internal_addr(&s);
 }
 
-static struct node *internal_child(const struct node *n, uint32_t pos, bool peekp) {
+static struct node *internal_child(const struct node *n, int32_t pos, bool peekp) {
         return (peekp ? peek : get)(n->mod, internal_get(n, pos));
 }
 
@@ -1677,30 +1700,30 @@ static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s) {
         return simple_search(n, r, s);
 }
 
-static uint32_t sfreekey(struct node *n) {
+static int32_t sfreekey(struct node *n) {
         struct sheader *sh  = simple_header(n);
         return sh->dir_off - sat(sh, sh->nr)->koff;
 }
 
-static uint32_t sfreeval(struct node *n) {
+static int32_t sfreeval(struct node *n) {
         struct sheader *sh  = simple_header(n);
         return sat(sh, sh->nr)->voff - sdirend(sh);
 }
 
-static uint32_t simple_free(const struct node *n) {
+static int32_t simple_free(const struct node *n) {
         struct sheader     *sh  = simple_header(n);
         struct dir_element *end = sat(sh, sh->nr);
         return end->voff - end->koff - sdirsize(sh);
 }
 
-static void move(void *sh, uint32_t start, uint32_t end, int delta) {
+static void move(void *sh, int32_t start, int32_t end, int delta) {
         ASSERT(start <= end);
         memmove(sh + start + delta, sh + start, end - start);
 }
 
-static void sdirmove(struct sheader *sh, uint32_t nsize,
-                     uint32_t knob, uint32_t vnob, uint32_t nr) {
-        uint32_t dir_off = (knob * (nsize - sizeof *sh)) / (knob + vnob) -
+static void sdirmove(struct sheader *sh, int32_t nsize,
+                     int32_t knob, int32_t vnob, int32_t nr) {
+        int32_t dir_off = (knob * (nsize - sizeof *sh)) / (knob + vnob) -
                 (nr + 1) * sizeof(struct dir_element) / 2 + sizeof *sh;
         dir_off = min_u32(max_u32(dir_off, knob + sizeof *sh),
                           nsize - vnob - (nr + 1) * sizeof(struct dir_element));
@@ -1711,7 +1734,7 @@ static void sdirmove(struct sheader *sh, uint32_t nsize,
 }
 
 static int simple_can_insert(const struct slot *s) {
-        return simple_free(s->node) >= buf_len(s->rec.key) + buf_len(s->rec.val) + sizeof(struct dir_element);
+        return simple_free(s->node) >= rec_len(&s->rec) + sizeof(struct dir_element);
 }
 
 static int simple_insert(struct slot *s) {
@@ -1719,8 +1742,8 @@ static int simple_insert(struct slot *s) {
         struct sheader     *sh   = simple_header(s->node);
         struct dir_element *end  = sat(sh, sh->nr);
         struct dir_element *piv;
-        uint32_t            klen = buf_len(s->rec.key);
-        uint32_t            vlen = buf_len(s->rec.val);
+        int32_t             klen = buf_len(s->rec.key);
+        int32_t             vlen = buf_len(s->rec.val);
         ASSERT(s->idx <= sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         if (simple_free(s->node) < klen + vlen + sizeof(struct dir_element)) {
@@ -1735,7 +1758,7 @@ static int simple_insert(struct slot *s) {
         piv = sat(sh, s->idx);
         move(sh, piv->koff, end->koff, +klen);
         move(sh, end->voff, piv->voff, -vlen);
-        for (uint32_t i = ++sh->nr; i > s->idx; --i) {
+        for (int32_t i = ++sh->nr; i > s->idx; --i) {
                 struct dir_element *prev = sat(sh, i - 1);
                 *sat(sh, i) = (struct dir_element){
                         .koff = prev->koff + klen,
@@ -1758,13 +1781,13 @@ static void simple_delete(struct slot *s) {
         struct dir_element *end  = sat(sh, sh->nr);
         struct dir_element *piv  = sat(sh, s->idx);
         struct dir_element *inn  = sat(sh, s->idx + 1);
-        uint32_t            klen = inn->koff - piv->koff;
-        uint32_t            vlen = piv->voff - inn->voff;
+        int32_t             klen = inn->koff - piv->koff;
+        int32_t             vlen = piv->voff - inn->voff;
         ASSERT(s->idx < sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         move(sh, inn->koff, end->koff, -klen);
         move(sh, end->voff, inn->voff, +vlen);
-        for (uint32_t i = s->idx; i < sh->nr; ++i) {
+        for (int32_t i = s->idx; i < sh->nr; ++i) {
                 struct dir_element *next = sat(sh, i + 1);
                 *sat(sh, i) = (struct dir_element){
                         .koff = next->koff - klen,
@@ -1786,25 +1809,25 @@ static void simple_get(struct slot *s) {
 }
 
 static void simple_make(struct node *n) {
-        uint32_t        nsize = 1ul << n->ntype->shift;
+        int32_t         nsize = 1ul << n->ntype->shift;
         struct sheader *sh    = simple_header(n);
         sh->dir_off = sizeof *sh + (nsize - sizeof *sh) / 2;
         *sat(sh, 0) = (struct dir_element){ .koff = sizeof *sh, .voff = nsize };
 }
 
-static uint32_t simple_nr(const struct node *n) {
+static int32_t simple_nr(const struct node *n) {
         return simple_header(n)->nr;
 }
 
-static void print_range(void *orig, uint32_t nsize, void *start, uint32_t nob) {
+static void print_range(void *orig, int32_t nsize, void *start, int32_t nob) {
         static const char hexdigit[] = "0123456789abcdef";
-        uint32_t off = start - orig;
+        int32_t off = start - orig;
         printf("[%4u .. %4u : ", off, off + nob);
         if (is_in(0, off, nsize) &&
             is_in(0, off + nob, nsize)) {
-                for (uint32_t i = 0; i < nob; ++i) {
+                for (int32_t i = 0; i < nob; ++i) {
                         int ch = ((char *)orig)[off + i];
-                        printf("%c%c ", hexdigit[ch & 0xf], hexdigit[(ch >> 4) & 0xf]);
+                        printf("%c%c ", hexdigit[(ch >> 4) & 0xf], hexdigit[ch & 0xf]);
                 }
         } else {
                 printf("out of range");
@@ -1813,7 +1836,7 @@ static void print_range(void *orig, uint32_t nsize, void *start, uint32_t nob) {
 }
 
 static void simple_print(struct node *n) {
-        uint32_t        nsize = 1ul << n->ntype->shift;
+        int32_t         nsize = 1ul << n->ntype->shift;
         struct sheader *sh    = simple_header(n);
         if (n == NULL) {
                 printf("nil node");
@@ -1821,9 +1844,9 @@ static void simple_print(struct node *n) {
         printf("tree: %"PRIx64" level: %u ntype: %u nr: %u size: %u dir_off: %u dir_end: %u\n",
                sh->head.treeid, sh->head.level, sh->head.ntype,
                sh->nr, nsize, sh->dir_off, sdirend(sh));
-        for (uint32_t i = 0; i <= sh->nr; ++i) {
+        for (int32_t i = 0; i <= sh->nr; ++i) {
                 struct dir_element *del = sat(sh, i);
-                uint32_t            size;
+                int32_t             size;
                 printf("        %4u %4u %4u: ", i, del->koff, del->voff);
                 if (i < sh->nr) {
                         print_range(sh, nsize, skey(sh, i, &size), size);
@@ -1834,23 +1857,25 @@ static void simple_print(struct node *n) {
         }
 }
 
-static int shift(struct node *d, struct node *s, enum dir dir, uint32_t tnob, uint32_t tnr) {
-        int result = 0;
+static int shift_one(struct node *d, struct node *s, enum dir dir) {
         struct t2_buf key = {};
         struct t2_buf val = {};
         struct slot   dst = { .node = d, .rec = { .key = &key, .val = &val } };
         struct slot   src = { .node = s, .rec = { .key = &key, .val = &val } };
+        ASSERT(nr(s) > 0);
+        src.idx = dir == RIGHT ? nr(s) - 1 : 0;
+        simple_get(&src);
+        dst.idx = dir == LEFT ? nr(d) : 0;
+        return simple_insert(&dst) ?: (simple_delete(&src), 0);
+}
+
+static int shift(struct node *d, struct node *s, const struct slot *point, enum dir dir) {
+        int result = 0;
         ASSERT(dir == LEFT || dir == RIGHT);
-        while (simple_free(s) < tnob && nr(s) > tnr) {
-                ASSERT(nr(s) > 0);
-                src.idx = dir == RIGHT ? nr(s) - 1 : 0;
-                simple_get(&src);
-                dst.idx = dir == LEFT ? nr(d) : 0;
-                result = simple_insert(&dst);
-                if (result != 0) {
-                        break;
-                }
-                simple_delete(&src);
+        ASSERT(point->idx >= 0 && point->idx <= nr(s));
+        ASSERT(simple_free(d) > simple_free(s));
+        while (result == 0 && !can_insert(point->idx <= nr(s) ? s : d, &point->rec)) {
+                result = shift_one(d, s, dir);
         }
         return result;
 }
@@ -1943,7 +1968,7 @@ static void ufail(const char *cond) {
 
 static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         struct sheader *sh = simple_header(s->node);
-        for (uint32_t i = 0; simple_free(s->node) >
+        for (int32_t i = 0; simple_free(s->node) >
                      buf_len(key) + buf_len(val) + sizeof(struct dir_element); ++i) {
                 UASSERT(simple_insert(s) == 0);
                 UASSERT(sh->nr == i + 1);
@@ -1968,9 +1993,9 @@ static bool is_sorted(struct node *n, int maxkey) {
                 .rec = { .key = &kk, .val = &vv }
         };
         char keyarea[maxkey];
-        uint32_t keysize;
+        int32_t keysize;
         memset(keyarea, 0, sizeof keyarea);
-        for (uint32_t i = 0; i < sh->nr; ++i) {
+        for (int32_t i = 0; i < sh->nr; ++i) {
                 ss.idx = i;
                 simple_get(&ss);
                 UASSERT(ss.rec.key->seg[0].len <= sizeof keyarea);
@@ -2048,7 +2073,7 @@ static void simple_ut(void) {
         populate(&s, &key, &val);
         UASSERT(simple_insert(&s) == -ENOSPC);
         utest("get");
-        for (uint32_t i = 0; i < sh->nr; ++i) {
+        for (int32_t i = 0; i < sh->nr; ++i) {
                 s.idx = i;
                 simple_get(&s);
                 UASSERT(buf_len(s.rec.key) == strlen(key0) + 1);
@@ -2072,18 +2097,6 @@ static void simple_ut(void) {
                 key0[1] += 251; /* Co-prime with 256. */
                 val0[1]++;
         }
-        utest("shift");
-        uint32_t nr0 = nr(&n);
-        memset(body1, 0, sizeof body1);
-        simple_make(&n1);
-        shift(&n1, &n, RIGHT, 1ul << ntype.shift, nr(&n) / 2);
-        UASSERT(nr0 == nr(&n) + nr(&n1));
-        shift(&n1, &n, RIGHT, 1ul << ntype.shift, 0);
-        UASSERT(nr0 == nr(&n) + nr(&n1));
-        UASSERT(nr(&n) == 0);
-        shift(&n, &n1, LEFT, 1ul << ntype.shift, 0);
-        UASSERT(nr0 == nr(&n) + nr(&n1));
-        UASSERT(nr(&n1) == 0);
         utestdone();
 }
 
@@ -2229,8 +2242,8 @@ static void insert_ut() {
         struct node *n = alloc(&t, 0);
         UASSERT(n != NULL && EISOK(n));
         simple_make(n);
-        put(n);
         t.root = n->addr;
+        put(n);
         utest("insert-1");
         UASSERT(t2_insert(&t, &r) == 0);
         utest("eexist");
@@ -2305,8 +2318,8 @@ static void fill(char *x, int nr) {
 static void stress_ut() {
         struct t2      *mod;
         struct t2_tree *t;
-        char key[512] = {};
-        char val[512] = {};
+        char key[1ul << ntype.shift];
+        char val[1ul << ntype.shift];
         struct t2_buf keyb = {
                 .nr = 1,
                 .seg = { [0] = { .len = sizeof key, .addr = key } }
@@ -2319,7 +2332,8 @@ static void stress_ut() {
                 .key = &keyb,
                 .val = &valb
         };
-        uint32_t maxsize = (1ul << (ntype.shift - 2)) - 40;
+        int32_t maxsize = (1ul << (ntype.shift - 3)) - 10;
+        int exist = 0;
         usuite("stress");
         utest("init");
         mod = t2_init(&mock_storage, 20);
@@ -2329,22 +2343,29 @@ static void stress_ut() {
         t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype);
         UASSERT(EISOK(t));
-        utest("5K");
-        for (int i = 0; true; ++i) {
-                uint32_t ksize = rand() % maxsize;
-                uint32_t vsize = rand() % maxsize;
-                int      result;
+        utest("1M");
+        for (int i = 0; i < 1000000; ++i) {
+                int32_t ksize = rand() % maxsize;
+                int32_t vsize = rand() % maxsize;
+                int     result;
                 ASSERT(ksize < sizeof key);
                 ASSERT(vsize < sizeof val);
-                ASSERT(ksize + vsize < 1ul << (ntype.shift - 1));
+                ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
                 fill(key, ksize);
                 fill(val, vsize);
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = vsize, .addr = &val };
                 result = t2_insert(t, &r);
                 UASSERT(result == 0 || result == -EEXIST);
-                if ((i % 10000) == 0) {
-                        printf("\n        %10i", i);
+                if (result == -EEXIST) {
+                        exist++;
+                }
+                if ((i % 100000) == 0 && i > 0) {
+                        struct node *r = get(mod, t->root);
+                        printf("\n        %10i: %5i / %4.2f%%", i, level(r),
+                               100.0 * exist / 10000);
+                        put(r);
+                        exist = 0;
                 }
         }
         utest("fini");
@@ -2354,12 +2375,12 @@ static void stress_ut() {
 }
 
 int main(int argc, char **argv) {
-        stress_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
         insert_ut();
         tree_ut();
+        stress_ut();
         return 0;
 }
 
