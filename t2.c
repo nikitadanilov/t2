@@ -817,10 +817,6 @@ static int split_right_exec(struct path *p, int idx) {
                 ASSERT(idx + 1 < p->used);
                 s.rec.key = &p->rung[idx + 1].keyout;
                 s.rec.val = &p->rung[idx + 1].valout;
-        }
-        r->keyout.nr = r->valout.nr = 0;
-        if (rec_len(&s.rec) == 0) {
-                return 0; /* Nothing to do. */
         } /* Maybe ->plan() overestimated keysize and shift is not needed. */
         if (r->allocated != NULL && !can_insert(r->node, &s.rec)) {
                 s.idx = r->pos + 1;
@@ -848,6 +844,7 @@ static int split_right_exec(struct path *p, int idx) {
                         simple_get(&s);
                         r->keyout = *s.rec.key;
                         ptr_buf(r->allocated, &r->valout);
+                        return +1;
                 }
         }
         return result;
@@ -1105,15 +1102,17 @@ static int root_add(struct path *p) {
 }
 
 static int insert_balance(struct path *p) {
-        int idx    = p->used - 1;
+        int idx;
         int result = 0;
-        do {
+        for (idx = p->used - 1; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
-                if (r->lm != WRITE) {
+                ASSERT(r->lm == WRITE);
+                result = dispatch[r->pd.id].exec(p, idx);
+                if (result <= 0) {
                         break;
                 }
-                result = dispatch[r->pd.id].exec(p, idx);
-        } while (idx-- >= 0 && result == 0);
+                result = 0;
+        }
         if (UNLIKELY(idx < 0 && result == 0)) {
                 if (p->newroot != NULL) {
                         result = root_add(p); /* Move this to policy? */
