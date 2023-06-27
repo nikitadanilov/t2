@@ -373,8 +373,8 @@ struct path {
 };
 
 struct policy {
-        int (*plan)(struct path *p, int idx);
-        int (*exec)(struct path *p, int idx);
+        int (*plan_insert)(struct path *p, int idx);
+        int (*exec_insert)(struct path *p, int idx);
 };
 
 struct node_type {
@@ -936,12 +936,12 @@ static int shift_exec(struct path *p, int idx) {
 
 static const struct policy dispatch[POLICY_NR] = {
         [SPLIT_RIGHT] = {
-                .plan     = &split_right_plan,
-                .exec     = &split_right_exec
+                .plan_insert = &split_right_plan,
+                .exec_insert = &split_right_exec
         },
         [SHIFT] = {
-                .plan     = &shift_plan,
-                .exec     = &shift_exec
+                .plan_insert = &shift_plan,
+                .exec_insert = &shift_exec
         }
 };
 
@@ -1085,7 +1085,7 @@ static int insert_prep(struct path *p) {
                         break;
                 } else {
                         r->pd.id = policy_select(p, idx);
-                        result = dispatch[r->pd.id].plan(p, idx);
+                        result = dispatch[r->pd.id].plan_insert(p, idx);
                         if (result > 0) {
                                 result = 0;
                                 break;
@@ -1165,7 +1165,7 @@ static int insert_balance(struct path *p) {
         for (idx = p->used - 1; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->lm == WRITE);
-                result = dispatch[r->pd.id].exec(p, idx);
+                result = dispatch[r->pd.id].exec_insert(p, idx);
                 if (result <= 0) {
                         break;
                 }
