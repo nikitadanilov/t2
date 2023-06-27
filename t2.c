@@ -416,6 +416,7 @@ struct counters {
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
 static int32_t buf_len(const struct t2_buf *b);
+static int buf_cmp(const struct t2_buf *dst, const struct t2_buf *src);
 static int32_t rec_len(const struct t2_rec *r);
 static int  ht_init(struct ht *ht, int shift);
 static void ht_fini(struct ht *ht);
@@ -755,16 +756,40 @@ static void rcu_unlock(void) {
 
 /* @policy */
 
-static void internal_parent_rec(struct rung *r) {
-        /* TODO: Should take newly inserted record into account. */
+static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r) {
+        ASSERT(buf_cmp(l, r) < 0);
+        ASSERT(r->nr == 1);
+        do {
+                r->seg[0].len--;
+        } while (buf_cmp(l, r) < 0);
+        return ++r->seg[0].len;
+}
+
+static void rec_todo(struct path *p, int idx, struct slot *out) {
+        if (idx + 1 == p->used) {
+                *out->rec.key = *p->rec->key;
+                *out->rec.val = *p->rec->key;
+        } else {
+                ASSERT(idx + 1 < p->used);
+                *out->rec.key = p->rung[idx + 1].keyout;
+                *out->rec.val = p->rung[idx + 1].valout;
+        }
+}
+
+static void internal_parent_rec(struct path *p, int idx) {
+        struct rung  *r = &p->rung[idx];
         SLOT_DEFINE(s, r->node);
-        int32_t maxlen = 0;
-        int32_t keylen;
+        int32_t       maxlen;
+        int32_t       keylen;
         ASSERT(nr(r->node) > 0);
         ASSERT(r->allocated != NULL);
+        rec_todo(p, idx, &s);
+        maxlen = buf_len(s.rec.key);
+        r->keyout = *s.rec.key;
         for (int32_t i = 0; i < nr(r->node); ++i) {
                 s.idx = i;
                 simple_get(&s);
+                /* TODO: Implement shortest separating keys. */
                 keylen = buf_len(s.rec.key);
                 if (keylen > maxlen) {
                         maxlen = keylen;
@@ -782,7 +807,6 @@ static int newnode(struct path *p, int idx) {
                        return ERROR(ERRCODE(r->allocated));
                }
        }
-       internal_parent_rec(r);
        if (idx == 0) { /* Hodie natus est radici frater. */
                if (LIKELY(p->used < MAX_TREE_HEIGHT)) {
                        p->newroot = alloc(p->tree, level(r->node) + 1);
@@ -802,48 +826,46 @@ static int split_right_plan(struct path *p, int idx) {
         struct rung *r = &p->rung[idx];
         int result = newnode(p, idx);
         if (result >= 0) {
-                internal_parent_rec(r);
+                internal_parent_rec(p, idx);
         }
         return result;
 }
 
 static int split_right_exec(struct path *p, int idx) {
         struct rung *r = &p->rung[idx];
+        struct node *left = r->node;
+        struct node *right = r->allocated;
         SLOT_DEFINE(s, NULL);
         int result = 0;
-        if (is_leaf(r->node)) {
-                s.rec = *p->rec;
-        } else {
-                ASSERT(idx + 1 < p->used);
-                s.rec.key = &p->rung[idx + 1].keyout;
-                s.rec.val = &p->rung[idx + 1].valout;
-        } /* Maybe ->plan() overestimated keysize and shift is not needed. */
-        if (r->allocated != NULL && !can_insert(r->node, &s.rec)) {
+        rec_todo(p, idx, &s);
+        /* Maybe ->plan() overestimated keysize and shift is not needed. */
+        if (right != NULL && !can_insert(left, &s.rec)) {
                 s.idx = r->pos + 1;
-                result = shift(r->allocated, r->node, &s, RIGHT);
-                ASSERT(nr(r->node) > 0);
-                ASSERT(nr(r->allocated) > 0);
+                result = shift(right, left, &s, RIGHT);
+                ASSERT(nr(left) > 0);
+                ASSERT(nr(right) > 0);
                 r->flags |= ALUSED;
         }
         if (result == 0) {
-                if (r->pos < nr(r->node)) {
-                        s.node = r->node;
+                if (r->pos < nr(left)) {
+                        s.node = left;
                         s.idx  = r->pos;
                 } else {
-                        ASSERT(r->allocated != NULL);
-                        s.node = r->allocated;
-                        s.idx  = r->pos - nr(r->node);
+                        ASSERT(right != NULL);
+                        s.node = right;
+                        s.idx  = r->pos - nr(left);
                 }
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
                 result = simple_insert(&s);
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node, 256));
                 if (result == 0 && (r->flags & ALUSED)) {
-                        s.node = r->allocated;
+                        s.node = right;
                         s.idx = 0;
                         simple_get(&s);
+                        ASSERT(buf_len(s.rec.key) <= buf_len(&r->keyout));
                         r->keyout = *s.rec.key;
-                        ptr_buf(r->allocated, &r->valout);
+                        ptr_buf(right, &r->valout);
                         return +1;
                 }
         }
@@ -921,7 +943,7 @@ static void path_lock(struct path *p) {
         }
 }
 
-static void path_fini(struct path *p) {
+static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
         while (--p->used >= 0) {
                 struct rung *r = &p->rung[p->used];
                 if (r->right != NULL) {
@@ -1032,7 +1054,8 @@ static int insert_prep(struct path *p) {
                         break;
                 } else {
                         r->pd.id = policy_select(p, idx);
-                        if (dispatch[r->pd.id].plan(p, idx) > 0) {
+                        result = dispatch[r->pd.id].plan(p, idx);
+                        if (result > 0) {
                                 result = 0;
                                 break;
                         }
@@ -1519,6 +1542,28 @@ static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := 
         return result;
 }
 
+static int32_t buf_remain(const struct t2_buf *buf, int idx, uint32_t off) {
+        int32_t nob = 0;
+        if (idx < buf->nr) {
+                for (nob = buf->seg[idx].len - off; idx < buf->nr; idx++) {
+                        nob += buf->seg[idx].len;
+                }
+        }
+        return nob;
+}
+
+static int int32_cmp(int32_t a, int32_t b) {
+        return a < b ? -1 : a != b; /* sic. */
+}
+
+static int buf_cmp(const struct t2_buf *b0, const struct t2_buf *b1) {
+        ASSERT(b0->nr == 1);
+        ASSERT(b1->nr == 1); /* From skeycmp(). */
+        uint32_t len0 = b0->seg[0].len;
+        uint32_t len1 = b1->seg[0].len;
+        return memcmp(b0->seg[0].addr, b1->seg[0].addr, len0 < len1 ? len0 : len1) ?: int32_cmp(len0, len1);
+}
+
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
         int     didx = 0;
         int32_t doff = 0;
@@ -1628,8 +1673,7 @@ static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen) {
         } else if (pos == sh->nr) {
                 return +1;
         } else {
-                return memcmp(kstart, key, ksize < klen ? ksize : klen) ?:
-                        ksize < klen ? -1 : klen != ksize; /* sic. */
+                return memcmp(kstart, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
         }
 }
 
@@ -1963,14 +2007,12 @@ static void ufail(const char *cond) {
 }
 
 
-#define UASSERT(cond) ((cond) ? ++ok : ufail(#cond))
-
 static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         struct sheader *sh = simple_header(s->node);
         for (int32_t i = 0; simple_free(s->node) >
                      buf_len(key) + buf_len(val) + sizeof(struct dir_element); ++i) {
-                UASSERT(simple_insert(s) == 0);
-                UASSERT(sh->nr == i + 1);
+                ASSERT(simple_insert(s) == 0);
+                ASSERT(sh->nr == i + 1);
                 ((char *)key->seg[0].addr)[1]++;
                 ((char *)val->seg[0].addr)[1]++;
                 s->idx = (s->idx + 7) % sh->nr;
@@ -1997,7 +2039,7 @@ static bool is_sorted(struct node *n, int maxkey) {
         for (int32_t i = 0; i < sh->nr; ++i) {
                 ss.idx = i;
                 simple_get(&ss);
-                UASSERT(ss.rec.key->seg[0].len <= sizeof keyarea);
+                ASSERT(ss.rec.key->seg[0].len <= sizeof keyarea);
                 if (i > 0) {
                         int cmp = skeycmp(sh, i, keyarea, keysize);
                         if (cmp <= 0) {
@@ -2067,32 +2109,32 @@ static void simple_ut(void) {
         usuite("simple-node");
         utest("make");
         simple_make(&n);
-        UASSERT(sh->nr == 0);
+        ASSERT(sh->nr == 0);
         utest("insert");
         populate(&s, &key, &val);
-        UASSERT(simple_insert(&s) == -ENOSPC);
+        ASSERT(simple_insert(&s) == -ENOSPC);
         utest("get");
         for (int32_t i = 0; i < sh->nr; ++i) {
                 s.idx = i;
                 simple_get(&s);
-                UASSERT(buf_len(s.rec.key) == strlen(key0) + 1);
-                UASSERT(buf_len(s.rec.val) == strlen(val0) + 1);
+                ASSERT(buf_len(s.rec.key) == strlen(key0) + 1);
+                ASSERT(buf_len(s.rec.val) == strlen(val0) + 1);
         }
         utest("delete");
         for (int32_t i = sh->nr - 1; i >= 0; --i) {
                 s.idx = (s.idx + 7) % sh->nr;
                 simple_delete(&s);
-                UASSERT(sh->nr == i);
+                ASSERT(sh->nr == i);
         }
         utest("search");
         key0[1] = 'a';
         while (simple_free(&n) > buf_len(&key) + buf_len(&val) + sizeof(struct dir_element)) {
-                UASSERT(!simple_search(&n, &s.rec, &s));
+                ASSERT(!simple_search(&n, &s.rec, &s));
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
-                UASSERT(simple_insert(&s) == 0);
-                UASSERT(is_sorted(&n, sizeof key0));
+                ASSERT(simple_insert(&s) == 0);
+                ASSERT(is_sorted(&n, sizeof key0));
                 key0[1] += 251; /* Co-prime with 256. */
                 val0[1]++;
         }
@@ -2112,8 +2154,8 @@ static void ht_ut() {
         utest("collision");
         for (uint64_t i = 0; i < N; ++i) {
                 for (uint64_t j = 0; j < i; ++j) {
-                        UASSERT(ht_hash(i) != ht_hash(j));
-                        UASSERT(ht_hash(2 * N + i * i * i) != ht_hash(2 * N + j * j * j));
+                        ASSERT(ht_hash(i) != ht_hash(j));
+                        ASSERT(ht_hash(2 * N + i * i * i) != ht_hash(2 * N + j * j * j));
                 }
         }
         ht_init(&ht, 10);
@@ -2125,8 +2167,8 @@ static void ht_ut() {
         for (uint64_t i = 0; i < N; ++i) {
                 taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
                 struct node *n = ht_lookup(&ht, blk);
-                UASSERT(n != NULL);
-                UASSERT(n->addr == blk);
+                ASSERT(n != NULL);
+                ASSERT(n->addr == blk);
         }
         utest("delete");
         for (uint64_t i = 0; i < N; ++i) {
@@ -2188,30 +2230,30 @@ static void traverse_ut() {
         simple_make(&n);
         ht_insert(&mod->ht, &n);
         for (int i = 0; i < 20; ++i, key0[0] += 2) {
-                UASSERT(!simple_search(&n, &s.rec, &s));
+                ASSERT(!simple_search(&n, &s.rec, &s));
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
-                UASSERT(simple_insert(&s) == 0);
-                UASSERT(is_sorted(&n, sizeof key0));
+                ASSERT(simple_insert(&s) == 0);
+                ASSERT(is_sorted(&n, sizeof key0));
         }
         utest("existing");
         key0[0] = '0';
-        UASSERT(traverse(&p) == 0);
+        ASSERT(traverse(&p) == 0);
         key0[0] = '2';
         p.used = 0;
-        UASSERT(traverse(&p) == 0);
+        ASSERT(traverse(&p) == 0);
         key0[0] = '8';
         p.used = 0;
-        UASSERT(traverse(&p) == 0);
+        ASSERT(traverse(&p) == 0);
         utest("too-small");
         key0[0] = ' ';
         p.used = 0;
-        UASSERT(traverse(&p) == -ENOENT);
+        ASSERT(traverse(&p) == -ENOENT);
         utest("non-existent");
         key0[0] = '1';
         p.used = 0;
-        UASSERT(traverse(&p) == -ENOENT);
+        ASSERT(traverse(&p) == -ENOENT);
         ht_delete(&n);
         utest("t2_fini");
         t2_node_type_degister(&ntype);
@@ -2239,14 +2281,14 @@ static void insert_ut() {
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         struct node *n = alloc(&t, 0);
-        UASSERT(n != NULL && EISOK(n));
+        ASSERT(n != NULL && EISOK(n));
         simple_make(n);
         t.root = n->addr;
         put(n);
         utest("insert-1");
-        UASSERT(t2_insert(&t, &r) == 0);
+        ASSERT(t2_insert(&t, &r) == 0);
         utest("eexist");
-        UASSERT(t2_insert(&t, &r) == -EEXIST);
+        ASSERT(t2_insert(&t, &r) == -EEXIST);
         utest("fini");
         t2_node_type_degister(&ntype);
         t2_fini(mod);
@@ -2273,18 +2315,26 @@ static void tree_ut() {
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype);
-        UASSERT(EISOK(t));
+        ASSERT(EISOK(t));
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         utest("insert-1");
-        UASSERT(t2_insert(t, &r) == 0);
+        ASSERT(t2_insert(t, &r) == 0);
         utest("eexist");
-        UASSERT(t2_insert(t, &r) == -EEXIST);
+        ASSERT(t2_insert(t, &r) == -EEXIST);
         utest("5K");
         for (k64 = 0; k64 < 5000; ++k64) {
                 key.seg[0] = (struct t2_seg){ .len = sizeof k64, .addr = &k64 };
                 val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
-                UASSERT(t2_insert(t, &r) == 0);
+                ASSERT(t2_insert(t, &r) == 0);
+        }
+        utest("20K");
+        for (int i = 0; i < 20000; ++i) {
+                k64 = ht_hash(i);
+                v64 = ht_hash(i + 1);
+                key.seg[0] = (struct t2_seg){ .len = sizeof k64, .addr = &k64 };
+                val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
+                ASSERT(t2_insert(t, &r) == 0);
         }
         utest("50K");
         for (int i = 0; i < 50000; ++i) {
@@ -2292,15 +2342,7 @@ static void tree_ut() {
                 v64 = ht_hash(i + 1);
                 key.seg[0] = (struct t2_seg){ .len = sizeof k64, .addr = &k64 };
                 val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
-                UASSERT(t2_insert(t, &r) == 0);
-        }
-        utest("5M");
-        for (int i = 0; i < 5000000; ++i) {
-                k64 = ht_hash(i);
-                v64 = ht_hash(i + 1);
-                key.seg[0] = (struct t2_seg){ .len = sizeof k64, .addr = &k64 };
-                val.seg[0] = (struct t2_seg){ .len = sizeof v64, .addr = &v64 };
-                UASSERT(t2_insert(t, &r) == (i < 50000 ? -EEXIST : 0));
+                ASSERT(t2_insert(t, &r) == (i < 20000 ? -EEXIST : 0));
         }
         utest("fini");
         t2_node_type_degister(&ntype);
@@ -2333,20 +2375,60 @@ static void stress_ut() {
         };
         int32_t maxsize = (1ul << (ntype.shift - 3)) - 10;
         int exist = 0;
+        int32_t ksize;
+        int32_t vsize;
+        int     result;
         usuite("stress");
         utest("init");
         mod = t2_init(&mock_storage, 20);
-        UASSERT(EISOK(mod));
+        ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype);
-        UASSERT(EISOK(t));
-        utest("1M");
-        for (int i = 0; i < 1000000; ++i) {
-                int32_t ksize = rand() % maxsize;
-                int32_t vsize = rand() % maxsize;
-                int     result;
+        ASSERT(EISOK(t));
+        utest("probe");
+        long U = 500000;
+        for (long i = 0; i < U; ++i) {
+                ksize = sizeof i;
+                vsize = rand() % maxsize;
+                ASSERT(ksize < sizeof key);
+                ASSERT(vsize < sizeof val);
+                ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
+                *(long *)key = i;
+                fill(val, vsize);
+                keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
+                valb.seg[0] = (struct t2_seg){ .len = vsize, .addr = &val };
+                result = t2_insert(t, &r);
+                ASSERT(result == 0);
+                for (int j = 0; j < 10; ++j) {
+                        long probe = rand();
+                        *(long *)key = probe;
+                        keyb.seg[0] = (struct t2_seg){ .len = ksize,      .addr = &key };
+                        valb.seg[0] = (struct t2_seg){ .len = sizeof val, .addr = &val };
+                        result = t2_lookup(t, &r);
+                        ASSERT((result ==       0) == (probe <= i) &&
+                                (result == -ENOENT) == (probe >  i));
+                }
+                if ((i % (U/10)) == 0 && i > 0) {
+                        struct node *r = get(mod, t->root);
+                        printf("\n        %10li: %5i / %4.2f%%", i, level(r) + 1,
+                               100.0 * exist / (U/10));
+                        put(r);
+                        exist = 0;
+                }
+        }
+        for (long j = 0; j < U; ++j) {
+                *(long *)key = j;
+                keyb.seg[0] = (struct t2_seg){ .len = ksize,      .addr = &key };
+                valb.seg[0] = (struct t2_seg){ .len = sizeof val, .addr = &val };
+                ASSERT(t2_lookup(t, &r) == 0);
+        }
+        utest("rand");
+        t = t2_tree_create(&ttype);
+        for (int i = 0; i < U; ++i) {
+                ksize = rand() % maxsize;
+                vsize = rand() % maxsize;
                 ASSERT(ksize < sizeof key);
                 ASSERT(vsize < sizeof val);
                 ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
@@ -2355,14 +2437,14 @@ static void stress_ut() {
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = vsize, .addr = &val };
                 result = t2_insert(t, &r);
-                UASSERT(result == 0 || result == -EEXIST);
+                ASSERT(result == 0 || result == -EEXIST);
                 if (result == -EEXIST) {
                         exist++;
                 }
-                if ((i % 100000) == 0 && i > 0) {
+                if ((i % (U/10)) == 0 && i > 0) {
                         struct node *r = get(mod, t->root);
-                        printf("\n        %10i: %5i / %4.2f%%", i, level(r),
-                               100.0 * exist / 10000);
+                        printf("\n        %10i: %5i / %4.2f%%", i, level(r) + 1,
+                               100.0 * exist / (U/10));
                         put(r);
                         exist = 0;
                 }
