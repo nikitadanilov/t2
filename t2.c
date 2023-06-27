@@ -63,6 +63,8 @@
  *
  * - handle IO failures
  *
+ * - avoid dynamic allocations in *_balance(), pre-allocate in *_prepare().
+ *
  * References:
  *
  * - Knuth, Donald E. Art of Computer Programming, The: Volume 3: Sorting and
@@ -358,6 +360,7 @@ struct rung {
         struct t2_buf  keyout;
         struct t2_buf  valout;
         struct pstate  pd;
+        struct t2_buf  scratch;
 };
 
 struct path {
@@ -417,6 +420,8 @@ struct counters {
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
 static int32_t buf_len(const struct t2_buf *b);
 static int buf_cmp(const struct t2_buf *dst, const struct t2_buf *src);
+static int buf_alloc(struct t2_buf *dst, struct t2_buf *src);
+static void buf_free(struct t2_buf *b);
 static int32_t rec_len(const struct t2_rec *r);
 static int  ht_init(struct ht *ht, int shift);
 static void ht_fini(struct ht *ht);
@@ -456,7 +461,8 @@ static int simple_can_insert(const struct slot *s);
 static void simple_print(struct node *n);
 static bool simple_invariant(const struct node *n);
 static int shift(struct node *d, struct node *s, const struct slot *insert, enum dir dir);
-struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
+static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
+static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
 static void counters_check(void);
 static bool is_sorted(struct node *n, int maxkey);
 static int signal_init(void);
@@ -789,7 +795,6 @@ static void internal_parent_rec(struct path *p, int idx) {
         for (int32_t i = 0; i < nr(r->node); ++i) {
                 s.idx = i;
                 simple_get(&s);
-                /* TODO: Implement shortest separating keys. */
                 keylen = buf_len(s.rec.key);
                 if (keylen > maxlen) {
                         maxlen = keylen;
@@ -860,12 +865,37 @@ static int split_right_exec(struct path *p, int idx) {
                 result = simple_insert(&s);
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node, 256));
                 if (result == 0 && (r->flags & ALUSED)) {
+                        struct t2_buf lkey;
+                        struct t2_buf rkey;
+                        taddr_t       child;
+                        if (is_leaf(right)) {
+                                s.node = left;
+                                s.idx = nr(left) - 1;
+                                simple_get(&s);
+                                lkey = *s.rec.key;
+                        }
                         s.node = right;
                         s.idx = 0;
                         simple_get(&s);
-                        ASSERT(buf_len(s.rec.key) <= buf_len(&r->keyout));
-                        r->keyout = *s.rec.key;
+                        rkey = *s.rec.key;
+                        child = *(taddr_t *)s.rec.val->seg[0].addr;
+                        if (is_leaf(right)) {
+                                prefix_separator(&lkey, &rkey);
+                        }
+                        result = buf_alloc(&r->scratch, &rkey);
+                        ASSERT(result == 0);
+                        r->keyout = r->scratch;
                         ptr_buf(right, &r->valout);
+                        if (!is_leaf(right)) {
+                                struct t2_buf cptr;
+                                s.node = right;
+                                s.idx = 0;
+                                simple_delete(&s);
+                                s.rec.key = &zero;
+                                s.rec.val = addr_buf(&child, &cptr);
+                                result = simple_insert(&s);
+                                ASSERT(result == 0);
+                        }
                         return +1;
                 }
         }
@@ -965,6 +995,7 @@ static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
                                 dealloc(p->tree, r->allocated);
                         }
                 }
+                buf_free(&r->scratch);
                 SET0(r);
         }
         p->used = 0;
@@ -1081,8 +1112,12 @@ static int lookup_complete(struct path *p, struct node *n) {
         return leaf_search(n, p->rec, &s) ? val_copy(p->rec, n, &s) : -ENOENT;
 }
 
-struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b) {
-        *b = (struct t2_buf){ .nr = 1, .seg = { [0] = { .len = sizeof(n->addr), .addr = (void *)&n->addr } } };
+static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b) {
+        return addr_buf(&n->addr, b);
+}
+
+static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b) {
+        *b = (struct t2_buf){ .nr = 1, .seg = { [0] = { .len = sizeof(*addr), .addr = (void *)addr } } };
         return b;
 }
 
@@ -1596,6 +1631,28 @@ static int32_t buf_len(const struct t2_buf *b) {
 
 static int32_t rec_len(const struct t2_rec *r) {
         return buf_len(r->key) + buf_len(r->val);
+}
+
+static int buf_alloc(struct t2_buf *dst, struct t2_buf *src) {
+        int32_t len = buf_len(src);
+        ASSERT(dst->seg[0].addr == NULL);
+        dst->nr = 1;
+        dst->seg[0].len = len;
+        dst->seg[0].addr = mem_alloc(len);
+        if (dst->seg[0].addr != NULL) {
+                buf_copy(dst, src);
+                return 0;
+        } else {
+                SET0(dst);
+                return ERROR(-ENOMEM);
+        }
+}
+
+static void buf_free(struct t2_buf *b) {
+        for (int32_t i = 0; i < b->nr; ++i) {
+                mem_free(b->seg[i].addr);
+                SET0(&b->seg[i]);
+        }
 }
 
 /* @simple */
