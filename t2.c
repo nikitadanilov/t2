@@ -1351,11 +1351,11 @@ static void llog(const struct msg_ctx *ctx, ...) {
         puts(".");
 }
 
-static int32_t min_u32(int32_t a, int32_t b) {
+static int32_t min_32(int32_t a, int32_t b) {
         return a < b ? a : b;
 }
 
-static int32_t max_u32(int32_t a, int32_t b) {
+static int32_t max_32(int32_t a, int32_t b) {
         return a > b ? a : b;
 }
 
@@ -1571,7 +1571,7 @@ static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
         int32_t soff = 0;
         ASSERT(buf_len(dst) >= buf_len(src));
         while (sidx < src->nr && didx < dst->nr) {
-                int32_t nob = min_u32(src->seg[sidx].len - soff, dst->seg[didx].len - doff);
+                int32_t nob = min_32(src->seg[sidx].len - soff, dst->seg[didx].len - doff);
                 memmove(dst->seg[didx].addr + doff, src->seg[sidx].addr + soff, nob);
                 doff += nob;
                 soff += nob;
@@ -1768,8 +1768,8 @@ static void sdirmove(struct sheader *sh, int32_t nsize,
                      int32_t knob, int32_t vnob, int32_t nr) {
         int32_t dir_off = (knob * (nsize - sizeof *sh)) / (knob + vnob) -
                 (nr + 1) * sizeof(struct dir_element) / 2 + sizeof *sh;
-        dir_off = min_u32(max_u32(dir_off, knob + sizeof *sh),
-                          nsize - vnob - (nr + 1) * sizeof(struct dir_element));
+        dir_off = min_32(max_32(dir_off, knob + sizeof *sh),
+                         nsize - vnob - (nr + 1) * sizeof(struct dir_element));
         ASSERT(knob + sizeof *sh <= dir_off);
         ASSERT(dir_off + (nr + 1) * sizeof(struct dir_element) + vnob <= nsize);
         move(sh, sh->dir_off, sdirend(sh), dir_off - sh->dir_off);
@@ -1917,9 +1917,18 @@ static int shift(struct node *d, struct node *s, const struct slot *point, enum 
         ASSERT(dir == LEFT || dir == RIGHT);
         ASSERT(point->idx >= 0 && point->idx <= nr(s));
         ASSERT(simple_free(d) > simple_free(s));
-        while (result == 0 && !can_insert(point->idx <= nr(s) ? s : d, &point->rec)) {
-                result = shift_one(d, s, dir);
+        ASSERT(4 * rec_len(&point->rec) < (1ul << min_32(d->ntype->shift, s->ntype->shift)));
+        while (result == 0) {
+                SLOT_DEFINE(slot, s);
+                slot.idx = dir == RIGHT ? nr(s) - 1 : 0;
+                simple_get(&slot);
+                if (simple_free(d) - simple_free(s) > rec_len(&slot.rec)) {
+                        result = shift_one(d, s, dir);
+                } else {
+                        break;
+                }
         }
+        ASSERT(can_insert(point->idx <= nr(s) ? s : d, &point->rec));
         return result;
 }
 
@@ -1984,11 +1993,10 @@ static void usuite(const char *suite) {
 }
 
 static uint64_t ok;
-static uint64_t failed;
 static const char *test = NULL;
 
 static void utestdone(void) {
-        printf(" %c %10llu %10llu\n", failed == 0 ? '+' : '!', ok, failed);
+        printf("   %10llu\n", ok);
         test = NULL;
 }
 
@@ -1997,15 +2005,9 @@ static void utest(const char *t) {
                 utestdone();
         }
         printf("                . %-15s ", t);
-        ok = failed = 0;
+        ok = 0;
         test = t;
 }
-
-static void ufail(const char *cond) {
-        ++failed;
-        printf("                        Failed: %s\n", cond);
-}
-
 
 static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         struct sheader *sh = simple_header(s->node);
@@ -2425,7 +2427,7 @@ static void stress_ut() {
                 ASSERT(t2_lookup(t, &r) == 0);
         }
         utest("rand");
-        t = t2_tree_create(&ttype);
+        U *= 100;
         for (int i = 0; i < U; ++i) {
                 ksize = rand() % maxsize;
                 vsize = rand() % maxsize;
