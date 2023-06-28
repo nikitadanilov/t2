@@ -12,6 +12,8 @@ struct t2_cookie;
 struct t2_storage;
 struct t2_storage_op;
 struct t2_tree_type;
+struct t2_cursor;
+struct t2_cursor_op;
 
 struct t2_tree_type {
         struct t2  *mod;
@@ -98,6 +100,27 @@ struct t2_rec {
         void            *arg;
         struct t2_cookie cookie;
 };
+
+enum t2_dir {
+        T2_LESS = -1,
+        T2_MORE = +1
+};
+
+struct t2_cursor_op {
+        int (*next)(struct t2_cursor *c, const struct t2_rec *rec);
+};
+
+struct t2_cursor {
+        enum t2_dir          dir;
+        struct t2_buf        curkey;
+        struct t2_tree      *tree;
+        struct t2_cursor_op *op;
+        int32_t              maxlen;
+};
+
+int  t2_cursor_init(struct t2_cursor *c, struct t2_buf *key);
+void t2_cursor_fini(struct t2_cursor *c);
+int  t2_cursor_next(struct t2_cursor *c);
 
 /*
  *  Local variables:
