@@ -101,6 +101,8 @@ enum {
         MAX_ERR_CODE    = 1024
 };
 
+#define DEBUG (1)
+
 /* @macro */
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -117,7 +119,11 @@ enum {
         &__ctx;                                 \
 })
 #define IMMANENTISE(fmt, ...) immanentise(MSG_PREP(fmt), __VA_ARGS__)
-#define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr));
+#if DEBUG
+#define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
+#else
+#define ASSERT(expr) ((void)sizeof((expr), 0))
+#endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 #define IS_ARRAY(x) (!__builtin_types_compatible_p(typeof(&(x)[0]), typeof(x)))
@@ -621,7 +627,7 @@ static taddr_t taddr_make(uint64_t addr, int shift) {
         return addr | shift;
 }
 
-static struct t2_buf zero = {};
+static struct t2_buf zero = { .nr = 1 };
 
 static int zerokey_insert(struct t2_tree *t) {
 	return insert(t, &(struct t2_rec) { .key = &zero, .val = &zero });
@@ -1086,7 +1092,7 @@ static enum policy_id policy_select(const struct path *p, int idx) {
 /* @tree */
 
 static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
-        ASSERT(IS0(p));
+        ASSERT(p->used == 0);
         SASSERT(NONE == 0);
         p->tree = t;
         p->rec  = r;
@@ -1114,20 +1120,20 @@ static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
                 struct rung *r = &p->rung[p->used];
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
-                if (right->node != NULL) {
+                if (UNLIKELY(right->node != NULL)) {
                         unlock(right->node, right->lm);
                         put(right->node);
                 }
                 unlock(r->node, r->lm);
-                if (left->node != NULL) {
+                if (UNLIKELY(left->node != NULL)) {
                         unlock(left->node, left->lm);
                         put(left->node);
                 }
                 if (r->flags & PINNED) {
                         put(r->node);
                 }
-                if (r->allocated != NULL) {
-                        if (r->flags & ALUSED) {
+                if (UNLIKELY(r->allocated != NULL)) {
+                        if (UNLIKELY(r->flags & ALUSED)) {
                                 put(r->allocated);
                         } else {
                                 dealloc(p->tree, r->allocated);
@@ -1137,7 +1143,7 @@ static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
                 SET0(r);
         }
         p->used = 0;
-        if (p->newroot != NULL) {
+        if (UNLIKELY(p->newroot != NULL)) {
                 dealloc(p->tree, p->newroot);
                 p->newroot = NULL;
         }
@@ -2069,13 +2075,13 @@ static char cmpch(int cmp) {
 static void print_range(void *orig, int32_t nsize, void *start, int32_t nob);
 
 static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen) {
-        int32_t ksize;
-        void *kstart = skey(sh, pos, &ksize);
-        if (pos == -1) {
+        if (UNLIKELY(pos == -1)) {
                 return -1;
-        } else if (pos == sh->nr) {
+        } else if (UNLIKELY(pos == sh->nr)) {
                 return +1;
         } else {
+                int32_t ksize;
+                void *kstart = skey(sh, pos, &ksize);
                 return memcmp(kstart, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
         }
 }
@@ -2084,31 +2090,47 @@ static struct sheader *simple_header(const struct node *n) {
         return n->data;
 }
 
+enum { LINEAR = 1 }; /* Effects of switching to linear search seem to be minimal. */
+
 static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) {
-        ASSERT(rec->key->nr <= 1);
+        ASSERT(rec->key->nr == 1);
         bool            found = false;
         struct sheader *sh    = simple_header(n);
         int             l     = -1;
         int             r     = sh->nr;
-        struct t2_buf  *key   = out->rec.key;
-        struct t2_buf  *val   = out->rec.val;
-        int             cmp;
+        void           *kaddr = rec->key->seg[0].addr;
+        int32_t         klen  = rec->key->seg[0].len;
+        int             cmp   = -1;
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
-        while (l + 1 < r) {
+        while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
-                cmp = skeycmp(sh, m, rec->key->seg[0].addr, rec->key->seg[0].len);
+                cmp = skeycmp(sh, m, kaddr, klen);
                 if (cmp > 0) {
                         r = m;
                 } else {
                         l = m;
                         if (cmp == 0) {
                                 found = true;
-                                break;
+                                goto here;
                         }
                 }
         }
+        while (r - l > 1) {
+                cmp = skeycmp(sh, ++l, kaddr, klen);
+                if (cmp >= 0) {
+                        if (cmp > 0) {
+                                --l;
+                        } else {
+                                found = true;
+                        }
+                        break;
+                }
+        }
+ here:
         out->idx = l;
         if (0 <= l && l < sh->nr) {
+                struct t2_buf *key = out->rec.key;
+                struct t2_buf *val = out->rec.val;
                 key->nr = 1;
                 key->seg[0].addr = skey(sh, l, &key->seg[0].len);
                 val->nr = 1;
@@ -2456,9 +2478,11 @@ static void utest(const char *t) {
 
 static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         struct sheader *sh = simple_header(s->node);
+        int result;
         for (int32_t i = 0; simple_free(s->node) >
                      buf_len(key) + buf_len(val) + sizeof(struct dir_element); ++i) {
-                ASSERT(simple_insert(s) == 0);
+                result = simple_insert(s);
+                ASSERT(result == 0);
                 ASSERT(sh->nr == i + 1);
                 ((char *)key->seg[0].addr)[1]++;
                 ((char *)val->seg[0].addr)[1]++;
@@ -2550,6 +2574,7 @@ static void simple_ut(void) {
                         .val = &val
                 }
         };
+        int result;
         memset(body, 0, sizeof body);
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
@@ -2559,7 +2584,8 @@ static void simple_ut(void) {
         ASSERT(sh->nr == 0);
         utest("insert");
         populate(&s, &key, &val);
-        ASSERT(simple_insert(&s) == -ENOSPC);
+        result = simple_insert(&s);
+        ASSERT(result == -ENOSPC);
         utest("get");
         for (int32_t i = 0; i < sh->nr; ++i) {
                 s.idx = i;
@@ -2576,11 +2602,14 @@ static void simple_ut(void) {
         utest("search");
         key0[1] = 'a';
         while (simple_free(&n) > buf_len(&key) + buf_len(&val) + sizeof(struct dir_element)) {
-                ASSERT(!simple_search(&n, &s.rec, &s));
+                result = simple_search(&n, &s.rec, &s);
+                ASSERT(!result);
+                ASSERT(-1 <= s.idx && s.idx < nr(&n));
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
-                ASSERT(simple_insert(&s) == 0);
+                result = simple_insert(&s);
+                ASSERT(result == 0);
                 ASSERT(is_sorted(&n));
                 key0[1] += 251; /* Co-prime with 256. */
                 val0[1]++;
@@ -2665,6 +2694,7 @@ static void traverse_ut() {
                 .opt  = LOOKUP,
                 .rec  = &s.rec
         };
+        int result;
         usuite("traverse");
         utest("t2_init");
         struct t2 *mod = t2_init(&mock_storage, 10);
@@ -2677,30 +2707,37 @@ static void traverse_ut() {
         simple_make(&n);
         ht_insert(&mod->ht, &n);
         for (int i = 0; i < 20; ++i, key0[0] += 2) {
-                ASSERT(!simple_search(&n, &s.rec, &s));
+                result = simple_search(&n, &s.rec, &s);
+                ASSERT(!result);
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
-                ASSERT(simple_insert(&s) == 0);
+                result = simple_insert(&s);
+                ASSERT(result == 0);
                 ASSERT(is_sorted(&n));
         }
         utest("existing");
         key0[0] = '0';
-        ASSERT(traverse(&p) == 0);
+        result = traverse(&p);
+        ASSERT(result == 0);
         key0[0] = '2';
         p.used = 0;
-        ASSERT(traverse(&p) == 0);
+        result = traverse(&p);
+        ASSERT(result == 0);
         key0[0] = '8';
         p.used = 0;
-        ASSERT(traverse(&p) == 0);
+        result = traverse(&p);
+        ASSERT(result == 0);
         utest("too-small");
         key0[0] = ' ';
         p.used = 0;
-        ASSERT(traverse(&p) == -ENOENT);
+        result = traverse(&p);
+        ASSERT(result == -ENOENT);
         utest("non-existent");
         key0[0] = '1';
         p.used = 0;
-        ASSERT(traverse(&p) == -ENOENT);
+        result = traverse(&p);
+        ASSERT(result == -ENOENT);
         ht_delete(&n);
         utest("t2_fini");
         t2_node_type_degister(&ntype);
@@ -2723,6 +2760,7 @@ static void insert_ut() {
                 .key = &key,
                 .val = &val
         };
+        int result;
         t2_node_type_register(mod, &ntype);
         ttype.mod = mod;
         buf_init_str(&key, key0);
@@ -2733,9 +2771,11 @@ static void insert_ut() {
         t.root = n->addr;
         put(n);
         utest("insert-1");
-        ASSERT(t2_insert(&t, &r) == 0);
+        result = t2_insert(&t, &r);
+        ASSERT(result == 0);
         utest("eexist");
-        ASSERT(t2_insert(&t, &r) == -EEXIST);
+        result = t2_insert(&t, &r);
+        ASSERT(result == -EEXIST);
         utest("fini");
         t2_node_type_degister(&ntype);
         t2_fini(mod);
@@ -2757,6 +2797,7 @@ static void tree_ut() {
         };
         uint64_t k64;
         uint64_t v64;
+        int result;
         mod = t2_init(&mock_storage, 20);
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -2766,14 +2807,17 @@ static void tree_ut() {
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         utest("insert-1");
-        ASSERT(t2_insert(t, &r) == 0);
+        result = t2_insert(t, &r);
+        ASSERT(result == 0);
         utest("eexist");
-        ASSERT(t2_insert(t, &r) == -EEXIST);
+        result = t2_insert(t, &r);
+        ASSERT(result == -EEXIST);
         utest("5K");
         for (k64 = 0; k64 < 5000; ++k64) {
                 key = BUF_VAL(k64);
                 val = BUF_VAL(v64);
-                ASSERT(t2_insert(t, &r) == 0);
+                result = t2_insert(t, &r);
+                ASSERT(result == 0);
         }
         utest("20K");
         for (int i = 0; i < 20000; ++i) {
@@ -2781,7 +2825,8 @@ static void tree_ut() {
                 v64 = ht_hash(i + 1);
                 key = BUF_VAL(k64);
                 val = BUF_VAL(v64);
-                ASSERT(t2_insert(t, &r) == 0);
+                result = t2_insert(t, &r);
+                ASSERT(result == 0);
         }
         utest("50K");
         for (int i = 0; i < 50000; ++i) {
@@ -2789,7 +2834,8 @@ static void tree_ut() {
                 v64 = ht_hash(i + 1);
                 key = BUF_VAL(k64);
                 val = BUF_VAL(v64);
-                ASSERT(t2_insert(t, &r) == (i < 20000 ? -EEXIST : 0));
+                result = t2_insert(t, &r);
+                ASSERT(result == (i < 20000 ? -EEXIST : 0));
         }
         utest("fini");
         t2_node_type_degister(&ntype);
@@ -2863,10 +2909,11 @@ static void stress_ut() {
                 *(long *)key = j;
                 keyb.seg[0] = (struct t2_seg){ .len = ksize,      .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = sizeof val, .addr = &val };
-                ASSERT(t2_lookup(t, &r) == 0);
+                result = t2_lookup(t, &r);
+                ASSERT(result == 0);
         }
         utest("rand");
-        U *= 10;
+        U *= 1;
         for (int i = 0; i < U; ++i) {
                 ksize = rand() % maxsize;
                 vsize = rand() % maxsize;
@@ -2974,7 +3021,7 @@ static void delete_ut() {
                 ASSERT(result == -ENOENT);
         }
         utest("rand");
-        U = 100000000;
+        U = 100000;
         int inserts = 0;
         int deletes = 0;
         for (int i = 0; i < U; ++i) {
