@@ -88,6 +88,7 @@
 #include <ctype.h>
 #include <stdatomic.h>
 #include <signal.h>
+#include <pthread.h>
 #include "t2.h"
 
 enum {
@@ -262,6 +263,7 @@ enum {
 
 #define CINC(cnt) (++__t_counters.cnt)
 #define CDEC(cnt) (--__t_counters.cnt)
+#define CVAL(cnt) (__t_counters.cnt)
 
 /* @types */
 
@@ -311,6 +313,7 @@ enum node_flags {
 
 struct node {
         struct link             hash;
+        pthread_rwlock_t        lock;
         atomic_int              ref;
         uint64_t                seq;
         const struct node_type *ntype;
@@ -425,6 +428,7 @@ struct counters {
         int32_t node;
         int32_t rlock;
         int32_t wlock;
+        int32_t rcu;
 };
 
 /* @static */
@@ -453,6 +457,7 @@ static void *mem_alloc(size_t size);
 static void  mem_free(void *ptr);
 static void llog(const struct msg_ctx *ctx, ...);
 static void put(struct node *n);
+static void ref(struct node *n);
 static struct node *alloc(struct t2_tree *t, int level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
 static bool can_insert(const struct node *n, const struct t2_rec *r);
@@ -639,23 +644,33 @@ static bool is_stable(const struct node *n) {
 }
 
 static void lock(struct node *n, enum lock_mode mode) {
+        int result;
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
+        ASSERT(CVAL(rcu) == 0);
         if (mode == WRITE) {
+                result = pthread_rwlock_wrlock(&n->lock);
+                ASSERT(result == 0);
                 ASSERT(is_stable(n));
                 n->seq++;
                 CINC(wlock);
         } else if (mode == READ) {
+                result = pthread_rwlock_rdlock(&n->lock);
                 CINC(rlock);
         }
 }
 
 static void unlock(struct node *n, enum lock_mode mode) {
+        int result;
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         if (mode == WRITE) {
                 n->seq++;
                 ASSERT(is_stable(n));
+                result = pthread_rwlock_unlock(&n->lock);
+                ASSERT(result == 0);
                 CDEC(wlock);
         } else if (mode == READ) {
+                result = pthread_rwlock_unlock(&n->lock);
+                ASSERT(result == 0);
                 CDEC(rlock);
         }
 }
@@ -667,32 +682,45 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
         struct node *n    = mem_alloc(sizeof *n); /* Allocate them together? */
         void        *data = mem_alloc(taddr_ssize(addr));
-        if (n != NULL && data != NULL) {
-                link_init(&n->hash);
-                n->addr = addr;
-                n->mod = mod;
-                n->data = data;
-                ht_insert(&mod->ht, n);
-                n->ref = 1;
-                CINC(node);
-                return n;
+        int          result;
+        if (LIKELY(n != NULL && data != NULL)) {
+                int result = pthread_rwlock_init(&n->lock, NULL);
+                if (LIKELY(result == 0)) {
+                        link_init(&n->hash);
+                        n->addr = addr;
+                        n->mod = mod;
+                        n->data = data;
+                        ht_insert(&mod->ht, n);
+                        n->ref = 1;
+                        CINC(node);
+                        return n;
+                }
         } else {
-                mem_free(n);
-                mem_free(data);
-                return EPTR(-ENOMEM);
+                result = ERROR(-ENOMEM);
         }
+        mem_free(n);
+        mem_free(data);
+        return EPTR(result);
 }
 
 static void nfini(struct node *n) {
         ASSERT(n->ref == 0);
+        pthread_rwlock_destroy(&n->lock);
         ht_delete(n);
         mem_free(n->data);
         SET0(n);
         mem_free(n);
 }
 
+static void ref(struct node *n) {
+        ASSERT(CVAL(rcu) > 0 || n->ref > 0);
+        n->ref++;
+        CINC(node);
+}
+
 static struct node *get(struct t2 *mod, taddr_t addr) {
         struct node *n = ht_lookup(&mod->ht, addr);
+        ASSERT(CVAL(rcu) == 0);
         if (n == NULL) {
                 n = ninit(mod, addr);
                 if (EISOK(n)) {
@@ -722,6 +750,7 @@ static struct node *alloc(struct t2_tree *t, int level) {
         struct node_type *ntype = t->ttype->ntype(t, level);
         taddr_t           addr  = SCALL(mod, alloc, ntype->shift, ntype->shift);
         struct node      *n;
+        ASSERT(CVAL(rcu) == 0);
         if (EISOK(addr)) {
                 n = ninit(mod, addr);
                 if (EISOK(n)) {
@@ -777,9 +806,12 @@ static int32_t nsize(const struct node *n) {
 }
 
 static void rcu_lock(void) {
+        ASSERT(CVAL(rcu) == 0);
+        CINC(rcu);
 }
 
 static void rcu_unlock(void) {
+        CDEC(rcu);
 }
 
 /* @policy */
@@ -1079,6 +1111,16 @@ static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
         if (p->newroot != NULL) {
                 dealloc(p->tree, p->newroot);
                 p->newroot = NULL;
+        }
+}
+
+static void path_pin(struct path *p) {
+        for (int i = p->used - 1; i >= 0; --i) {
+                struct rung *r = &p->rung[i];
+                if (!(r->flags & PINNED)) {
+                        ref(r->node);
+                        r->flags |= PINNED;
+                }
         }
 }
 
@@ -1390,6 +1432,19 @@ static int next_complete(struct path *p, struct node *n) {
         return result;
 }
 
+static void rcu_leave(struct path *p) {
+        path_pin(p);
+        rcu_unlock();
+}
+
+static bool rcu_try(struct path *p) {
+        bool result = false;
+        if (result) {
+                path_fini(p);
+        }
+        return result;
+}
+
 static int traverse(struct path *p) {
         struct t2 *mod   = p->tree->ttype->mod;
         int        tries = 0;
@@ -1402,6 +1457,7 @@ static int traverse(struct path *p) {
                 struct node *n;
                 struct rung *r;
                 uint64_t     flags = 0;
+                ASSERT(CVAL(rcu) == 1);
                 if (UNLIKELY(tries++ > 10 && (tries & (tries - 1)) == 0)) {
                         LOG("Looping: %i", tries);
                 }
@@ -1411,23 +1467,33 @@ static int traverse(struct path *p) {
                 n = peek(mod, next);
                 if (EISERR(n)) {
                         result = ERROR(ERRCODE(n));
+                        rcu_unlock();
                         break;
                 } else if (n == NULL) {
+                        rcu_leave(p);
                         n = get(mod, next);
+                        if (rcu_try(p)) {
+                                continue;
+                        }
                         if (EISERR(n)) {
                                 if (ERRCODE(n) == -ESTALE) {
                                         path_fini(p);
                                         continue;
                                 } else {
                                         result = ERROR(ERRCODE(n));
+                                        rcu_unlock();
                                         break;
                                 }
                         } else {
                                 flags |= PINNED;
                         }
                 } else if (!is_stable(n)) {
+                        rcu_leave(p);
                         lock(n, WRITE); /* Wait for stabilisation. */
                         unlock(n, WRITE);
+                        if (rcu_try(p)) {
+                                continue;
+                        }
                 }
                 r = path_add(p, n, node_seq(n), flags);
                 if (is_leaf(n)) {
@@ -1436,34 +1502,41 @@ static int traverse(struct path *p) {
                                 if (!path_is_valid(p)) {
                                         path_fini(p);
                                 } else {
+                                        rcu_unlock();
                                         break;
                                 }
                         } else if (p->opt == INSERT) {
+                                rcu_leave(p);
                                 result = insert_prep(p);
                                 if (result != 0) {
                                         break;
                                 } else if (!path_is_valid(p)) {
                                         path_fini(p);
+                                        rcu_lock();
                                 } else {
                                         result = insert_complete(p, n);
                                         break;
                                 }
                         } else if (p->opt == DELETE) {
+                                rcu_leave(p);
                                 result = delete_prep(p);
                                 if (result != 0) {
                                         break;
                                 } else if (!path_is_valid(p)) {
                                         path_fini(p);
+                                        rcu_lock();
                                 } else {
                                         result = delete_complete(p, n);
                                         break;
                                 }
                         } else {
+                                rcu_leave(p);
                                 result = next_prep(p);
                                 if (result != 0) {
                                         break;
                                 } else if (!path_is_valid(p)) {
                                         path_fini(p);
+                                        rcu_lock();
                                 } else {
                                         result = next_complete(p, n);
                                         break;
@@ -1473,11 +1546,12 @@ static int traverse(struct path *p) {
                         next = internal_search(n, p->rec, &r->pos);
                         if (EISERR(next)) {
                                 result = ERROR(ERRCODE(next));
+                                rcu_unlock();
                                 break;
                         }
                 }
         }
-        rcu_unlock();
+        ASSERT(CVAL(rcu) == 0);
         return result;
 }
 
@@ -1633,6 +1707,9 @@ static void counters_check(void) {
         }
         if (__t_counters.wlock != 0) {
                 LOG("Leaked wlock: %i", __t_counters.wlock);
+        }
+        if (__t_counters.rcu != 0) {
+                LOG("Leaked rcu: %i", __t_counters.rcu);
         }
 }
 
