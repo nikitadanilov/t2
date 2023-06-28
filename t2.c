@@ -125,11 +125,15 @@ enum {
 #define ASSERT(expr) ((void)sizeof((expr), 0))
 #endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
+#define ARRAY_SIZE(a)                           \
+({                                              \
+        SASSERT(IS_ARRAY(a));                   \
+        (sizeof(a) / sizeof(a[0]));             \
+})
 #define IS_ARRAY(x) (!__builtin_types_compatible_p(typeof(&(x)[0]), typeof(x)))
 #define IS_IN(idx, array)                               \
 ({                                                      \
-        ASSERT(IS_ARRAY(array));                        \
+        SASSERT(IS_ARRAY(array));                       \
         ((unsigned long)(idx)) < ARRAY_SIZE(array);     \
 })
 #define COF(ptr, type, member) ((type *)((char *)(ptr) - (char *)(&((type *)0)->member)))
