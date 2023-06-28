@@ -77,6 +77,9 @@ void *t2_errptr (int errcode);
 void t2_tree_type_register(struct t2 *mod, struct t2_tree_type *ttype);
 void t2_tree_type_degister(struct t2_tree_type *ttype);
 
+void t2_thread_register(void);
+void t2_thread_degister(void);
+
 struct t2_seg {
         int32_t  len;
         void    *addr;

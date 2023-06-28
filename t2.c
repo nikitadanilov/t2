@@ -89,6 +89,9 @@
 #include <stdatomic.h>
 #include <signal.h>
 #include <pthread.h>
+#define _LGPL_SOURCE
+#define URCU_INLINE_SMALL_FUNCTIONS
+#include <urcu/urcu-memb.h>
 #include "t2.h"
 
 enum {
@@ -313,14 +316,15 @@ enum node_flags {
 
 struct node {
         struct link             hash;
-        pthread_rwlock_t        lock;
-        atomic_int              ref;
-        uint64_t                seq;
-        const struct node_type *ntype;
         taddr_t                 addr;
+        uint64_t                seq;
+        atomic_int              ref;
+        const struct node_type *ntype;
         uint64_t                flags;
         void                   *data;
         struct t2              *mod;
+        pthread_rwlock_t        lock;
+        struct rcu_head         rcu;
 };
 
 enum lock_mode {
@@ -498,6 +502,7 @@ static __thread struct counters __t_counters = {};
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
         struct t2 *mod = mem_alloc(sizeof *mod);
+        t2_thread_register();
         if (mod != NULL) {
                 result = signal_init();
                 if (result == 0) {
@@ -518,6 +523,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         }
         if (result != 0) {
                 mem_free(mod);
+                t2_thread_degister();
                 return EPTR(result);
         } else {
                 return mod;
@@ -530,6 +536,7 @@ void t2_fini(struct t2 *mod) {
         mod->stor->op->fini(mod->stor);
         signal_fini();
         mem_free(mod);
+        t2_thread_degister();
 }
 
 
@@ -565,6 +572,20 @@ void t2_node_type_degister(struct node_type *ntype)
         ASSERT(ntype->mod->ntypes[ntype->id] == ntype);
         ntype->mod->ttypes[ntype->id] = NULL;
         ntype->mod = NULL;
+}
+
+static __thread bool thread_registered = false;
+
+void t2_thread_register(void) {
+        ASSERT(!thread_registered);
+        urcu_memb_register_thread();
+        thread_registered = true;
+}
+
+void t2_thread_degister(void) {
+        ASSERT(thread_registered);
+        urcu_memb_unregister_thread();
+        thread_registered = false;
 }
 
 #define SCALL(mod, method, ...)                         \
@@ -607,6 +628,7 @@ static int zerokey_insert(struct t2_tree *t) {
 }
 
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
+        ASSERT(thread_registered);
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (t != NULL) {
                 t->ttype = ttype;
@@ -806,13 +828,20 @@ static int32_t nsize(const struct node *n) {
 }
 
 static void rcu_lock(void) {
+        urcu_memb_read_lock();
         ASSERT(CVAL(rcu) == 0);
         CINC(rcu);
 }
 
 static void rcu_unlock(void) {
         CDEC(rcu);
+        urcu_memb_read_unlock();
 }
+
+static void rcu_quiescent(void) {
+        urcu_memb_quiescent_state();
+}
+
 
 /* @policy */
 
@@ -1615,18 +1644,22 @@ static int next(struct t2_cursor *c) {
 }
 
 int t2_lookup(struct t2_tree *t, struct t2_rec *r) {
+        ASSERT(thread_registered);
         return lookup(t, r);
 }
 
 int t2_delete(struct t2_tree *t, struct t2_rec *r) {
+        ASSERT(thread_registered);
         return delete(t, r);
 }
 
 int t2_insert(struct t2_tree *t, struct t2_rec *r) {
+        ASSERT(thread_registered);
         return insert(t, r);
 }
 
 int t2_cursor_init(struct t2_cursor *c, struct t2_buf *key) {
+        ASSERT(thread_registered);
         ASSERT(buf_len(key) <= buf_len(&c->curkey));
         ASSERT(c->curkey.nr == 1);
         ASSERT(c->dir == T2_LESS || c->dir == T2_MORE);
@@ -1637,10 +1670,12 @@ int t2_cursor_init(struct t2_cursor *c, struct t2_buf *key) {
 }
 
 void t2_cursor_fini(struct t2_cursor *c) {
+        ASSERT(thread_registered);
         c->curkey.seg[0].len = c->maxlen;
 }
 
 int t2_cursor_next(struct t2_cursor *c) {
+        ASSERT(thread_registered);
         return next(c);
 }
 
