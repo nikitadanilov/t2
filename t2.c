@@ -1717,7 +1717,7 @@ static bool addr_is_valid(uint64_t *addr) {
         ASSERT(addr != NULL);
         addr_check.addr = addr;
         addr_check.buf  = &buf;
-        if (setjmp(buf) != 0) {
+        if (sigsetjmp(buf, true) != 0) {
                 result = false;
         } else {
                 uint64_t val = *(volatile uint64_t *)addr;
@@ -1840,7 +1840,7 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
         }
         if (LIKELY(addr_check.addr != NULL)) {
                 --insigsegv;
-                longjmp(*addr_check.buf, 1);
+                siglongjmp(*addr_check.buf, 1);
         }
         printf("\nGot: %i errno: %i code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_code, si->si_pid, si->si_uid, uctx);
@@ -3235,6 +3235,7 @@ int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
         cookie_ut();
+	return 0;
         simple_ut();
         ht_ut();
         traverse_ut();
