@@ -1707,15 +1707,17 @@ static void cookie_init(void) {
 
 static __thread struct {
         uint64_t *addr;
-        jmp_buf   buf;
+        jmp_buf  *buf;
 } addr_check = {};
 
 static bool addr_is_valid(uint64_t *addr) {
-        bool result;
+        volatile bool result;
+        jmp_buf       buf;
         ASSERT(addr_check.addr == NULL);
         ASSERT(addr != NULL);
         addr_check.addr = addr;
-        if (setjmp(addr_check.buf) != 0) {
+        addr_check.buf  = &buf;
+        if (setjmp(buf) != 0) {
                 result = false;
         } else {
                 uint64_t val = *(volatile uint64_t *)addr;
@@ -1837,7 +1839,8 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
                 abort(); /* Don't try to print anything. */
         }
         if (LIKELY(addr_check.addr != NULL)) {
-                longjmp(addr_check.buf, 1);
+                --insigsegv;
+                longjmp(*addr_check.buf, 1);
         }
         printf("\nGot: %i errno: %i code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_code, si->si_pid, si->si_uid, uctx);
@@ -1853,7 +1856,7 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
 static int signal_init(void) {
         struct sigaction sa = {
                 .sa_sigaction = &sigsegv,
-                .sa_flags     = SA_SIGINFO | SA_NODEFER | SA_RESETHAND,
+                .sa_flags     = SA_SIGINFO,
         };
         int result = 0;
         if (signal_set == 0) {
@@ -3222,7 +3225,7 @@ static void cookie_ut() {
         result = cookie_is_valid(&k, sizeof v);
         ASSERT(result);
         for (uint64_t b = 0; b <= 0xff; ++b) {
-                uint64_t *addr = (void *)((b << (64 - 8)) | 0x1000);
+                uint64_t *addr = (void *)((b << 20) ^ (uint64_t)&v[0]);
                 printf("%20p %s\n", addr, addr_is_valid(addr) ? "+" : "-");
         }
         signal_fini();
