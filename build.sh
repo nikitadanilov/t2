@@ -15,7 +15,8 @@ function tryconfig() {
 }
 
 function build() {
-    cc -g2 -O0 t2.c -L/usr/local/lib/ -lurcu
+    CFLAGS="-g3 -Wall -Wextra -Wconversion -Wdouble-promotion -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion -fsanitize=undefined -fsanitize-trap"
+    ${CC:-cc} ${CFLAGS} -O0 t2.c -L/usr/local/lib/ -lurcu
     if [ $? -eq 0 ]
     then
 	echo "Done."

@@ -133,6 +133,7 @@ enum {
 #define ASSERT(expr) ((void)sizeof((expr), 0))
 #endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
+#define SOF(x) ((int32_t)sizeof(x))
 #define ARRAY_SIZE(a)                           \
 ({                                              \
         SASSERT(IS_ARRAY(a));                   \
@@ -148,11 +149,11 @@ enum {
 #define LOG(fmt, ...) llog(MSG_PREP(fmt) , ## __VA_ARGS__)
 #define ERROR(errcode)                          \
 ({                                              \
-        typeof(errcode) __errc = (errcode);     \
+        int __errc = (int)(errcode);            \
         __errc;                                 \
 })
 #define EPTR(errcode) ((void *)(uint64_t)(errcode))
-#define ERRCODE(val) ((uint64_t)(val))
+#define ERRCODE(val) ((int)(intptr_t)(val))
 #define EISERR(val) UNLIKELY((uint64_t)(val) >= (uint64_t)-MAX_ERR_CODE)
 #define EISOK(val) (!EISERR(val))
 
@@ -280,7 +281,7 @@ enum {
         struct t2_buf __val;                                            \
 	struct slot s = { .node = n, .rec = { .key = &__key, .val = &__val } }
 
-#define BUF_VAL(v) (struct t2_buf){ .nr = 1, .seg = { [0] = { .len = sizeof(v), .addr = &(v) } } }
+#define BUF_VAL(v) (struct t2_buf){ .nr = 1, .seg = { [0] = { .len = SOF(v), .addr = &(v) } } }
 
 #define CINC(cnt) (++__t_counters.cnt)
 #define CDEC(cnt) (--__t_counters.cnt)
@@ -415,7 +416,7 @@ struct policy {
 };
 
 struct node_type {
-        int         id;
+        int16_t     id;
         const char *name;
         struct t2  *mod;
         int         shift;
@@ -480,7 +481,7 @@ static void  mem_free(void *ptr);
 static void llog(const struct msg_ctx *ctx, ...);
 static void put(struct node *n);
 static void ref(struct node *n);
-static struct node *alloc(struct t2_tree *t, int level);
+static struct node *alloc(struct t2_tree *t, int8_t level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
 static bool can_insert(const struct node *n, const struct t2_rec *r);
 static int dealloc(struct t2_tree *t, struct node *n);
@@ -729,7 +730,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
         void        *data = mem_alloc(taddr_ssize(addr));
         int          result;
         if (LIKELY(n != NULL && data != NULL)) {
-                int result = pthread_rwlock_init(&n->lock, NULL);
+                result = pthread_rwlock_init(&n->lock, NULL);
                 if (LIKELY(result == 0)) {
                         link_init(&n->hash);
                         n->addr = addr;
@@ -790,7 +791,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
         return n;
 }
 
-static struct node *alloc(struct t2_tree *t, int level) {
+static struct node *alloc(struct t2_tree *t, int8_t level) {
         struct t2        *mod   = t->ttype->mod;
         struct node_type *ntype = t->ttype->ntype(t, level);
         taddr_t           addr  = SCALL(mod, alloc, ntype->shift, ntype->shift);
@@ -847,7 +848,7 @@ static int32_t nr(const struct node *n) {
 }
 
 static int32_t nsize(const struct node *n) {
-        return 1ul << n->ntype->shift;
+        return (int32_t)1 << n->ntype->shift;
 }
 
 static void rcu_lock(void) {
@@ -934,7 +935,6 @@ static int newnode(struct path *p, int idx) {
 }
 
 static int split_right_plan_insert(struct path *p, int idx) {
-        struct rung *r = &p->rung[idx];
         int result = newnode(p, idx);
         if (result >= 0) {
                 internal_parent_rec(p, idx);
@@ -1760,7 +1760,7 @@ static bool addr_is_valid(uint64_t *addr) {
 
 static bool cookie_is_valid(const struct t2_cookie *k, int32_t size) {
         uint64_t *addr = (void *)k->hi;
-        return addr_is_valid(addr) && addr_is_valid(addr + size - sizeof *addr) && *addr == k->lo;
+        return addr_is_valid(addr) && addr_is_valid(addr + size - SOF(*addr)) && *addr == k->lo;
 }
 
 static void cookie_invalidate(uint64_t *addr) {
@@ -2121,16 +2121,16 @@ static bool is_in(int32_t lo, int32_t v, int32_t hi) {
 }
 
 static int32_t dirsize(int32_t n) {
-        return n * sizeof(struct dir_element);
+        return n * SOF(struct dir_element);
 }
 
 static bool scheck(struct sheader *sh, const struct node_type *nt) {
-        int32_t size = 1ul << nt->shift;
+        int32_t size = (int32_t)1 << nt->shift;
         int32_t dend = sh->dir_off + dirsize(sh->nr + 1);
-        return  is_in(sizeof *sh, sh->dir_off, size) &&
-                is_in(sizeof *sh, dend, size) &&
+        return  is_in(SOF(*sh), sh->dir_off, size) &&
+                is_in(SOF(*sh), dend, size) &&
                 FORALL(i, sh->nr + 1,
-                       is_in(sizeof *sh, sat(sh, i)->koff, sh->dir_off) &&
+                       is_in(SOF(*sh), sat(sh, i)->koff, sh->dir_off) &&
                        is_in(dend, sat(sh, i)->voff, size));
                 FORALL(i, sh->nr,
                        sat(sh, i)->koff  < sat(sh, i + 1)->koff &&
@@ -2232,7 +2232,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
 
 static taddr_t internal_addr(const struct slot *s) {
         taddr_t addr;
-        ASSERT(s->rec.val->nr > 0 && s->rec.val->seg[0].len >= sizeof(taddr_t));
+        ASSERT(s->rec.val->nr > 0 && s->rec.val->seg[0].len >= SOF(taddr_t));
         addr = *(taddr_t *)s->rec.val->seg[0].addr;
         ASSERT(taddr_is_valid(addr));
         return addr;
@@ -2291,18 +2291,18 @@ static void move(void *sh, int32_t start, int32_t end, int delta) {
 
 static void sdirmove(struct sheader *sh, int32_t nsize,
                      int32_t knob, int32_t vnob, int32_t nr) {
-        int32_t dir_off = (knob * (nsize - sizeof *sh)) / (knob + vnob) -
-                dirsize(nr + 1) / 2 + sizeof *sh;
-        dir_off = min_32(max_32(dir_off, knob + sizeof *sh),
+        int32_t dir_off = (knob * (nsize - SOF(*sh))) / (knob + vnob) -
+                dirsize(nr + 1) / 2 + SOF(*sh);
+        dir_off = min_32(max_32(dir_off, knob + SOF(*sh)),
                          nsize - vnob - dirsize(nr + 1));
-        ASSERT(knob + sizeof *sh <= dir_off);
+        ASSERT(knob + SOF(*sh) <= dir_off);
         ASSERT(dir_off + dirsize(nr + 1) + vnob <= nsize);
         move(sh, sh->dir_off, sdirend(sh), dir_off - sh->dir_off);
         sh->dir_off = dir_off;
 }
 
 static int simple_can_insert(const struct slot *s) {
-        return simple_free(s->node) >= rec_len(&s->rec) + sizeof(struct dir_element);
+        return simple_free(s->node) >= rec_len(&s->rec) + SOF(struct dir_element);
 }
 
 static int32_t simple_used(const struct node *n) {
@@ -2325,10 +2325,10 @@ static int simple_insert(struct slot *s) {
         int32_t             vlen = buf_len(s->rec.val);
         ASSERT(s->idx <= sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
-        if (simple_free(s->node) < klen + vlen + sizeof(struct dir_element)) {
+        if (simple_free(s->node) < klen + vlen + SOF(struct dir_element)) {
                 return -ENOSPC;
         }
-        if (sfreekey(s->node) < klen || sfreeval(s->node) < vlen + sizeof *end) {
+        if (sfreekey(s->node) < klen || sfreeval(s->node) < vlen + SOF(*end)) {
                 struct dir_element *beg = sat(sh, 0);
                 sdirmove(sh, beg->voff, end->koff - beg->koff + klen,
                          beg->voff - end->voff + vlen, sh->nr + 1);
@@ -2390,8 +2390,8 @@ static void simple_get(struct slot *s) {
 static void simple_make(struct node *n) {
         int32_t         size = nsize(n);
         struct sheader *sh   = simple_header(n);
-        sh->dir_off = sizeof *sh + (size - sizeof *sh) / 2;
-        *sat(sh, 0) = (struct dir_element){ .koff = sizeof *sh, .voff = size };
+        sh->dir_off = SOF(*sh) + (size - SOF(*sh)) / 2;
+        *sat(sh, 0) = (struct dir_element){ .koff = SOF(*sh), .voff = size };
 }
 
 static int32_t simple_nr(const struct node *n) {
@@ -2400,7 +2400,7 @@ static int32_t simple_nr(const struct node *n) {
 
 static void print_range(void *orig, int32_t nsize, void *start, int32_t nob) {
         static const char hexdigit[] = "0123456789abcdef";
-        int32_t off = start - orig;
+        int32_t off = (int32_t)(start - orig);
         printf("[%4u .. %4u : ", off, off + nob);
         if (is_in(0, off, nsize) &&
             is_in(0, off + nob, nsize)) {
@@ -2573,7 +2573,7 @@ static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         struct sheader *sh = simple_header(s->node);
         int result;
         for (int32_t i = 0; simple_free(s->node) >
-                     buf_len(key) + buf_len(val) + sizeof(struct dir_element); ++i) {
+                     buf_len(key) + buf_len(val) + SOF(struct dir_element); ++i) {
                 result = simple_insert(s);
                 ASSERT(result == 0);
                 ASSERT(sh->nr == i + 1);
@@ -2585,7 +2585,7 @@ static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
 
 static void buf_init_str(struct t2_buf *b, const char *s) {
         b->nr = 1;
-        b->seg[0].len  = strlen(s) + 1;
+        b->seg[0].len  = (int32_t)strlen(s) + 1;
         b->seg[0].addr = (void *)s;
 }
 
@@ -2670,8 +2670,8 @@ static void simple_ut(void) {
         for (int32_t i = 0; i < sh->nr; ++i) {
                 s.idx = i;
                 simple_get(&s);
-                ASSERT(buf_len(s.rec.key) == strlen(key0) + 1);
-                ASSERT(buf_len(s.rec.val) == strlen(val0) + 1);
+                ASSERT(buf_len(s.rec.key) == (int32_t)strlen(key0) + 1);
+                ASSERT(buf_len(s.rec.val) == (int32_t)strlen(val0) + 1);
         }
         utest("delete");
         for (int32_t i = sh->nr - 1; i >= 0; --i) {
@@ -2685,7 +2685,7 @@ static void simple_ut(void) {
         }
         utest("search");
         key0[1] = 'a';
-        while (simple_free(&n) > buf_len(&key) + buf_len(&val) + sizeof(struct dir_element)) {
+        while (simple_free(&n) > buf_len(&key) + buf_len(&val) + SOF(struct dir_element)) {
                 result = simple_search(&n, &s.rec, &s);
                 ASSERT(!result);
                 ASSERT(-1 <= s.idx && s.idx < nr(&n));
@@ -2947,7 +2947,7 @@ static void stress_ut() {
                 .key = &keyb,
                 .val = &valb
         };
-        int32_t maxsize = (1ul << (ntype.shift - 3)) - 10;
+        int32_t maxsize = ((int32_t)1 << (ntype.shift - 3)) - 10;
         int exist = 0;
         int32_t ksize;
         int32_t vsize;
@@ -2966,9 +2966,9 @@ static void stress_ut() {
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
                 vsize = rand() % maxsize;
-                ASSERT(ksize < sizeof key);
-                ASSERT(vsize < sizeof val);
-                ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
+                ASSERT(ksize < SOF(key));
+                ASSERT(vsize < SOF(val));
+                ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                 *(long *)key = i;
                 fill(val, vsize);
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
@@ -2994,8 +2994,8 @@ static void stress_ut() {
         }
         for (long j = 0; j < U; ++j) {
                 *(long *)key = j;
-                keyb.seg[0] = (struct t2_seg){ .len = ksize,      .addr = &key };
-                valb.seg[0] = (struct t2_seg){ .len = sizeof val, .addr = &val };
+                keyb.seg[0] = (struct t2_seg){ .len = ksize,    .addr = &key };
+                valb.seg[0] = (struct t2_seg){ .len = SOF(val), .addr = &val };
                 result = t2_lookup(t, &r);
                 ASSERT(result == 0);
         }
@@ -3004,9 +3004,9 @@ static void stress_ut() {
         for (int i = 0; i < U; ++i) {
                 ksize = rand() % maxsize;
                 vsize = rand() % maxsize;
-                ASSERT(ksize < sizeof key);
-                ASSERT(vsize < sizeof val);
-                ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
+                ASSERT(ksize < SOF(key));
+                ASSERT(vsize < SOF(val));
+                ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                 fill(key, ksize);
                 fill(val, vsize);
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
@@ -3041,7 +3041,7 @@ static void delete_ut() {
                 .key = &keyb,
                 .val = &valb
         };
-        int32_t maxsize = (1ul << (ntype.shift - 3)) - 10;
+        int32_t maxsize = ((int32_t)1 << (ntype.shift - 3)) - 10;
         int exist = 0;
         int noent = 0;
         int32_t ksize;
@@ -3061,9 +3061,9 @@ static void delete_ut() {
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
                 vsize = rand() % maxsize;
-                ASSERT(ksize < sizeof key);
-                ASSERT(vsize < sizeof val);
-                ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
+                ASSERT(ksize < SOF(key));
+                ASSERT(vsize < SOF(val));
+                ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                 *(long *)key = i;
                 fill(val, vsize);
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
@@ -3075,20 +3075,20 @@ static void delete_ut() {
                 for (long j = 0; j < U; ++j) {
                         ksize = sizeof i;
                         vsize = rand() % maxsize;
-                        ASSERT(ksize < sizeof key);
-                        ASSERT(vsize < sizeof val);
-                        ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
+                        ASSERT(ksize < SOF(key));
+                        ASSERT(vsize < SOF(val));
+                        ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                         *(long *)key = j;
-                        keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
-                        valb.seg[0] = (struct t2_seg){ .len = sizeof val, .addr = &val };
+                        keyb.seg[0] = (struct t2_seg){ .len = ksize,    .addr = &key };
+                        valb.seg[0] = (struct t2_seg){ .len = SOF(val), .addr = &val };
                         result = t2_lookup(t, &r);
                         ASSERT((result == 0) == (j <= i) && (result == -ENOENT) == (j > i));
                 }
                 ksize = sizeof i;
                 vsize = rand() % maxsize;
-                ASSERT(ksize < sizeof key);
-                ASSERT(vsize < sizeof val);
-                ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
+                ASSERT(ksize < SOF(key));
+                ASSERT(vsize < SOF(val));
+                ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                 *(long *)key = i;
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = vsize, .addr = &val };
@@ -3098,12 +3098,12 @@ static void delete_ut() {
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
                 vsize = rand() % maxsize;
-                ASSERT(ksize < sizeof key);
-                ASSERT(vsize < sizeof val);
-                ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
+                ASSERT(ksize < SOF(key));
+                ASSERT(vsize < SOF(val));
+                ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                 *(long *)key = i;
-                keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
-                valb.seg[0] = (struct t2_seg){ .len = sizeof val, .addr = &val };
+                keyb.seg[0] = (struct t2_seg){ .len = ksize,    .addr = &key };
+                valb.seg[0] = (struct t2_seg){ .len = SOF(val), .addr = &val };
                 result = t2_lookup(t, &r);
                 ASSERT(result == -ENOENT);
         }
@@ -3114,9 +3114,9 @@ static void delete_ut() {
         for (int i = 0; i < U; ++i) {
                 ksize = rand() % maxsize + (ht_hash(i) & 1); /* Beat prng cycles. */
                 vsize = rand() % maxsize + (ht_hash(i) & 3);
-                ASSERT(ksize < sizeof key);
-                ASSERT(vsize < sizeof val);
-                ASSERT(4 * (ksize + vsize) < (1ul << ntype.shift));
+                ASSERT(ksize < SOF(key));
+                ASSERT(vsize < SOF(val));
+                ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                 fill(key, ksize);
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
                 if (rand() & 1) {
@@ -3201,7 +3201,7 @@ static void next_ut() {
                 .curkey = keyb,
                 .tree   = t,
                 .op     = &cop,
-                .maxlen = sizeof key
+                .maxlen = SOF(key)
         };
         utest("populate");
         long U = 10000;
