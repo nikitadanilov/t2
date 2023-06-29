@@ -1707,17 +1707,21 @@ static void cookie_init(void) {
 
 static __thread struct {
         uint64_t *addr;
-        jmp_buf  *buf;
+        jmp_buf   buf;
 } addr_check = {};
 
+static void sigsegv(int signo, siginfo_t *si, void *uctx);
 static bool addr_is_valid(uint64_t *addr) {
-        volatile bool result;
-        jmp_buf       buf;
+        bool result;
         ASSERT(addr_check.addr == NULL);
         ASSERT(addr != NULL);
         addr_check.addr = addr;
-        addr_check.buf  = &buf;
-        if (sigsetjmp(buf, true) != 0) {
+        {
+                struct sigaction sa = {};
+                sigaction(SIGSEGV, NULL, &sa);
+                ASSERT(sa.sa_sigaction == &sigsegv);
+        }
+        if (sigsetjmp(addr_check.buf, true) != 0) {
                 result = false;
         } else {
                 uint64_t val = *(volatile uint64_t *)addr;
@@ -1835,15 +1839,18 @@ static void stacktrace(void) {
 }
 
 static void sigsegv(int signo, siginfo_t *si, void *uctx) {
+        char buf[256];
+        sprintf(buf, "sigsegv: %p %p\n", addr_check.addr, si->si_addr);
+        write(1, buf, strlen(buf));
         if (UNLIKELY(insigsegv++ > 0)) {
                 abort(); /* Don't try to print anything. */
         }
         if (LIKELY(addr_check.addr != NULL)) {
                 --insigsegv;
-                siglongjmp(*addr_check.buf, 1);
+                siglongjmp(addr_check.buf, 1);
         }
-        printf("\nGot: %i errno: %i code: %i pid: %i uid: %i ucontext: %p\n",
-               signo, si->si_errno, si->si_code, si->si_pid, si->si_uid, uctx);
+        printf("\nGot: %i errno: %i addr: %p code: %i pid: %i uid: %i ucontext: %p\n",
+               signo, si->si_errno, si->si_addr, si->si_code, si->si_pid, si->si_uid, uctx);
         stacktrace();
         if (osa.sa_handler != SIG_DFL && osa.sa_handler != SIG_IGN) {
                 if (osa.sa_flags & SA_SIGINFO) {
