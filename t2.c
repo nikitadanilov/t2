@@ -63,9 +63,11 @@
  *
  * - handle IO failures
  *
- * - avoid dynamic allocations in *_balance(), pre-allocate in *_prepare().
+ * - avoid dynamic allocations in *_balance(), pre-allocate in *_prepare()
  *
- * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels.
+ * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
+ *
+ * - simple node: store key offsets separately from value offsets
  *
  * References:
  *
@@ -2341,9 +2343,11 @@ static void simple_print(struct node *n) {
                 printf("        %4u %4u %4u: ", i, del->koff, del->voff);
                 if (i < sh->nr) {
                         int32_t kvsize;
-                        print_range(sh, size, skey(sh, i, &kvsize), kvsize);
+                        void   *addr = skey(sh, i, &kvsize);
+                        print_range(sh, size, addr, kvsize);
                         printf(" ");
-                        print_range(sh, size, sval(sh, i, &kvsize), kvsize);
+                        addr = sval(sh, i, &kvsize);
+                        print_range(sh, size, addr, kvsize);
                         if (!is_leaf(n)) {
                                 printf("    (%p)", peek(n->mod, internal_get(n, i)));
                         }
@@ -2502,27 +2506,20 @@ static void buf_init_str(struct t2_buf *b, const char *s) {
 
 static bool is_sorted(struct node *n) {
         struct sheader *sh = simple_header(n);
-        struct t2_buf kk;
-        struct t2_buf vv;
-        struct slot ss = {
-                .node = n,
-                .rec = { .key = &kk, .val = &vv }
-        };
-        char keyarea[nsize(n)];
+        SLOT_DEFINE(ss, n);
+        char   *keyarea;
         int32_t keysize;
-        memset(keyarea, 0, nsize(n));
         for (int32_t i = 0; i < sh->nr; ++i) {
                 ss.idx = i;
                 simple_get(&ss);
-                ASSERT(ss.rec.key->seg[0].len <= sizeof keyarea);
                 if (i > 0) {
                         int cmp = skeycmp(sh, i, keyarea, keysize);
                         if (cmp <= 0) {
                                 printf("Misordered at %i: ", i);
-                                print_range(keyarea, sizeof keyarea,
-                                            keyarea, sizeof keyarea);
+                                print_range(keyarea, keysize,
+                                            keyarea, keysize);
                                 printf(" %c ", cmpch(cmp));
-                                print_range(n->data, 1ul << nsize(n),
+                                print_range(n->data, nsize(n),
                                             ss.rec.key->seg[0].addr,
                                             ss.rec.key->seg[0].len);
                                 printf("\n");
@@ -2530,8 +2527,8 @@ static bool is_sorted(struct node *n) {
                                 return false;
                         }
                 }
+                keyarea = ss.rec.key->seg[0].addr;
                 keysize = ss.rec.key->seg[0].len;
-                memcpy(keyarea, ss.rec.key->seg[0].addr, keysize);
         }
         return true;
 }
@@ -2603,6 +2600,10 @@ static void simple_ut(void) {
                 simple_delete(&s);
                 ASSERT(sh->nr == i);
         }
+        s.idx = 0;
+        while (nr(&n) > 0) {
+                simple_delete(&s);
+        }
         utest("search");
         key0[1] = 'a';
         while (simple_free(&n) > buf_len(&key) + buf_len(&val) + sizeof(struct dir_element)) {
@@ -2610,12 +2611,15 @@ static void simple_ut(void) {
                 ASSERT(!result);
                 ASSERT(-1 <= s.idx && s.idx < nr(&n));
                 s.idx++;
-                buf_init_str(&key, key0);
-                buf_init_str(&val, val0);
+                key = BUF_VAL(key0);
+                val = BUF_VAL(val0);
                 result = simple_insert(&s);
                 ASSERT(result == 0);
                 ASSERT(is_sorted(&n));
                 key0[1] += 251; /* Co-prime with 256. */
+                if (key0[1] == 'a') {
+                        key0[2]++;
+                }
                 val0[1]++;
         }
         utestdone();
@@ -3162,7 +3166,6 @@ static void next_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        rand_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
@@ -3171,6 +3174,7 @@ int main(int argc, char **argv) {
         stress_ut();
         delete_ut();
         next_ut();
+        rand_ut();
         return 0;
 }
 
