@@ -91,6 +91,7 @@
 #include <stdatomic.h>
 #include <signal.h>
 #include <pthread.h>
+#include <setjmp.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -508,6 +509,10 @@ static void stacktrace(void);
 static int lookup(struct t2_tree *t, struct t2_rec *r);
 static int insert(struct t2_tree *t, struct t2_rec *r);
 static int delete(struct t2_tree *t, struct t2_rec *r);
+static void cookie_init(void);
+static bool cookie_is_valid(const struct t2_cookie *k, int32_t size);
+static void cookie_invalidate(uint64_t *addr);
+static void cookie_make(uint64_t *addr, struct t2_cookie *k);
 
 static __thread struct counters __t_counters = {};
 
@@ -515,6 +520,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
         struct t2 *mod = mem_alloc(sizeof *mod);
         t2_thread_register();
+        cookie_init();
         if (mod != NULL) {
                 result = signal_init();
                 if (result == 0) {
@@ -1691,6 +1697,49 @@ int t2_cursor_next(struct t2_cursor *c) {
         return next(c);
 }
 
+/* @cookie */
+
+static uint64_t cgen;
+
+static void cookie_init(void) {
+	cgen = time(NULL);
+}
+
+static __thread struct {
+        uint64_t *addr;
+        jmp_buf   buf;
+} addr_check = {};
+
+static bool addr_is_valid(uint64_t *addr) {
+        bool result;
+        ASSERT(addr_check.addr == NULL);
+        ASSERT(addr != NULL);
+        addr_check.addr = addr;
+        if (setjmp(addr_check.buf) != 0) {
+                result = false;
+        } else {
+                uint64_t val = *(volatile uint64_t *)addr;
+                (void)val;
+                result = true;
+        }
+        addr_check.addr = NULL;
+        return result;
+}
+
+static bool cookie_is_valid(const struct t2_cookie *k, int32_t size) {
+        uint64_t *addr = (void *)k->hi;
+        return addr_is_valid(addr) && addr_is_valid(addr + size - sizeof *addr) && *addr == k->lo;
+}
+
+static void cookie_invalidate(uint64_t *addr) {
+        *addr = 0;
+}
+
+static void cookie_make(uint64_t *addr, struct t2_cookie *k) {
+        k->lo = *addr = ++cgen;
+        k->hi = (uint64_t)addr;
+}
+
 /* @lib */
 
 __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...)
@@ -1784,8 +1833,11 @@ static void stacktrace(void) {
 }
 
 static void sigsegv(int signo, siginfo_t *si, void *uctx) {
-        if (insigsegv++ > 0) {
+        if (UNLIKELY(insigsegv++ > 0)) {
                 abort(); /* Don't try to print anything. */
+        }
+        if (LIKELY(addr_check.addr != NULL)) {
+                longjmp(addr_check.buf, 1);
         }
         printf("\nGot: %i errno: %i code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_code, si->si_pid, si->si_uid, uctx);
@@ -2556,12 +2608,6 @@ static void simple_ut(void) {
                 .addr  = taddr_make(0x100000, ntype.shift),
                 .data  = body,
         };
-        char body1[1ul << ntype.shift];
-        struct node n1 = {
-                .ntype = &ntype,
-                .addr  = taddr_make(0x200000, ntype.shift),
-                .data  = body1,
-        };
         struct sheader *sh = simple_header(&n);
         char key0[] = "KEY0";
         char val0[] = "VAL0--";
@@ -3163,9 +3209,29 @@ static void next_ut() {
         utestdone();
 }
 
+static void cookie_ut() {
+        uint64_t v[10];
+        struct t2_cookie k;
+        int result;
+        cookie_init();
+        result = signal_init();
+        ASSERT(result == 0);
+        cookie_make(&v[0], &k);
+        result = cookie_is_valid(&k, sizeof v[0]);
+        ASSERT(result);
+        result = cookie_is_valid(&k, sizeof v);
+        ASSERT(result);
+        for (uint64_t b = 0; b <= 0xff; ++b) {
+                uint64_t *addr = (void *)((b << (64 - 8)) | 0x1000);
+                printf("%20p %s\n", addr, addr_is_valid(addr) ? "+" : "-");
+        }
+        signal_fini();
+}
+
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        cookie_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
