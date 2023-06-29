@@ -2493,6 +2493,8 @@ static int merge(struct node *d, struct node *s, enum dir dir) {
         return result;
 }
 
+#if defined(UT)
+
 /* @mock */
 
 struct mock_storage {
@@ -3288,6 +3290,8 @@ int main(int argc, char **argv) {
         cookie_ut();
         return 0;
 }
+
+#endif /* UT */
 
 /*
  *  Local variables:
