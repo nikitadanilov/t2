@@ -77,7 +77,7 @@
  * - D. Lomet, The evolution of effective B-tree: page organization and
  *   techniques: a personal account (https://dl.acm.org/doi/pdf/10.1145/603867.603878)
  *
- * - R. Bayer, K. Unterauer, Prefix B-Trees
+ * - R. Bayer, K. Unterauer, Prefix B-Trees (https://dl.acm.org/doi/abs/10.1145/320521.320530)
  */
 
 #include <stdbool.h>
