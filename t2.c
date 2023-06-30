@@ -2080,11 +2080,9 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
         if (UNLIKELY(insigsegv++ > 0)) {
                 abort(); /* Don't try to print anything. */
         }
-        if (ON_LINUX) {
-                if (LIKELY(addr_check.addr != NULL)) {
-                        --insigsegv;
-                        siglongjmp(addr_check.buf, 1);
-                }
+        if (ON_LINUX && LIKELY(addr_check.addr != NULL)) {
+                --insigsegv;
+                siglongjmp(addr_check.buf, 1);
         }
         printf("\nGot: %i errno: %i addr: %p code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_addr, si->si_code, si->si_pid, si->si_uid, uctx);
