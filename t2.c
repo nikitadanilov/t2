@@ -1035,7 +1035,7 @@ static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r) {
 static void rec_todo(struct path *p, int idx, struct slot *out) {
         if (idx + 1 == p->used) {
                 *out->rec.key = *p->rec->key;
-                *out->rec.val = *p->rec->key;
+                *out->rec.val = *p->rec->val;
         } else {
                 ASSERT(idx + 1 < p->used);
                 *out->rec.key = p->rung[idx + 1].keyout;
@@ -3523,22 +3523,20 @@ static void inc(char *key, int len) {
         for (i = len - 1; i >= 0 && key[i] == '9'; --i) {
                 ;
         }
-        ASSERT(i >= 0);
-        key[i]++;
+        if (i >= 0) {
+                key[i]++;
+        }
         while (++i < len) {
                 key[i] = '0';
         }
 }
 
 void seq_ut(void) {
-        char key[] = "0000000000";
+        char key[] = "999999999";
         char val[] = "*VALUE*";
         struct t2_buf keyb;
         struct t2_buf valb;
-        struct t2_rec r = {
-                .key = &keyb,
-                .val = &valb
-        };
+        struct t2_rec r = {};
         struct t2      *mod;
         struct t2_tree *t;
         int     result;
@@ -3557,11 +3555,11 @@ void seq_ut(void) {
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(key);
                 valb = BUF_VAL(val);
-                inc(key, (sizeof key) - 1);
-                keyb = BUF_VAL(i);
-                valb = BUF_VAL(i);
+                r.key = &keyb;
+                r.val = &valb;
                 result = t2_insert(t, &r);
                 ASSERT(result == 0);
+                inc(key, (sizeof key) - 1);
         }
         counters_print();
         utest("fini");
