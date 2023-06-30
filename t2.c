@@ -313,7 +313,7 @@ SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
 struct t2_tree {
         struct t2_tree_type *ttype;
         taddr_t              root;
-        uint64_t             id;
+        uint32_t             id;
 };
 
 struct slot {
@@ -427,12 +427,14 @@ enum {
 };
 
 struct header {
+        uint64_t cookie;
         uint32_t magix;
         uint32_t csum;
         uint16_t ntype;
         int8_t   level;
-        uint8_t  pad;
-        uint64_t treeid;
+        uint8_t  pad8;
+        uint32_t treeid;
+        uint64_t addr;
 };
 
 struct msg_ctx {
@@ -481,6 +483,7 @@ static void  mem_free(void *ptr);
 static void llog(const struct msg_ctx *ctx, ...);
 static void put(struct node *n);
 static void ref(struct node *n);
+static struct node *peek(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
 static bool can_insert(const struct node *n, const struct t2_rec *r);
@@ -492,6 +495,8 @@ static int32_t nsize(const struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static struct header *nheader(const struct node *n);
+static void rcu_lock(void);
+static void rcu_unlock(void);
 static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
@@ -516,9 +521,11 @@ static int lookup(struct t2_tree *t, struct t2_rec *r);
 static int insert(struct t2_tree *t, struct t2_rec *r);
 static int delete(struct t2_tree *t, struct t2_rec *r);
 static void cookie_init(void);
-static bool cookie_is_valid(const struct t2_cookie *k, int32_t size);
+static bool cookie_is_valid(const struct t2_cookie *k);
 static void cookie_invalidate(uint64_t *addr);
-static void cookie_make(uint64_t *addr, struct t2_cookie *k);
+static void cookie_make(uint64_t *addr);
+static void cookie_complete(struct path *p, struct node *n);
+static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 
 static __thread struct counters __t_counters = {};
 
@@ -674,7 +681,80 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         }
 }
 
+static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node *n, enum optype opt) {
+        ASSERT(r->key->nr == 1);
+        int result;
+        bool found;
+        SLOT_DEFINE(s, n);
+        s.idx = 0;
+        simple_get(&s);
+        if (buf_cmp(s.rec.key, r->key) > 0) {
+                return -ESTALE;
+        }
+        s.idx = nr(n) - 1;
+        simple_get(&s);
+        if (buf_cmp(s.rec.key, r->key) < 0) {
+                return -ESTALE;
+        }
+        found = leaf_search(n, r, &s);
+        switch (opt) {
+        case LOOKUP:
+                result = found ? val_copy(r, n, &s) : -ENOENT;
+                break;
+        case INSERT:
+                if (!found) {
+                        result = simple_insert(&(struct slot) {
+                                        .node = n,
+                                        .idx  = s.idx + 1,
+                                        .rec  = *r
+                                });
+                        if (result == -ENOSPC) {
+                                result = -ESTALE;
+                        }
+                } else {
+                        result = -EEXIST;
+                }
+        case DELETE:
+                if (found) {
+                        simple_delete(&(struct slot) {
+                                        .node = n,
+                                        .idx  = s.idx,
+                                        .rec  = *r
+                                });
+                        result = 0;
+                } else {
+                        result = -EEXIST;
+                }
+        case NEXT:
+                result = -ESTALE;
+                break; /* TODO: implement. */
+        default:
+                IMMANENTISE("Wrong opt: %i", opt);
+        }
+        return result;
+}
+
 static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
+        enum lock_mode mode = opt == LOOKUP || opt == NEXT ? READ : WRITE;
+        rcu_lock();
+        if (cookie_is_valid(&r->cookie)) {
+                struct header *h = (void *)r->cookie.hi;
+                if (h->magix == NODE_MAGIX && h->level == 0) { /* TODO: More checks? */
+                        struct node *n = peek(t->ttype->mod, h->addr);
+                        if (n != NULL && nheader(n) == h && nr(n) > 0) {
+                                int result;
+                                ref(n);
+                                rcu_unlock();
+                                lock(n, mode);
+                                /* TODO: re-check node. */
+                                result = cookie_node_complete(t, r, n, opt);
+                                unlock(n, mode);
+                                put(n);
+                                return result;
+                        }
+                }
+        }
+        rcu_unlock();
         return -ESTALE;
 }
 
@@ -773,7 +853,8 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                         int result = SCALL(n->mod, read, n->addr, n->data);
                         if (result == 0) {
                                 struct header *h = n->data;
-                                if (IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL) {
+                                /* TODO: check node. */
+                                if (LIKELY(IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL)) {
                                         n->ntype = n->mod->ntypes[h->ntype];
                                 } else {
                                         put(n);
@@ -804,8 +885,10 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
                                 .magix  = NODE_MAGIX,
                                 .ntype  = ntype->id,
                                 .level  = level,
-                                .treeid = t->id
+                                .treeid = t->id,
+                                .addr   = addr
                         };
+                        cookie_make(&nheader(n)->cookie);
                         n->ntype = ntype;
                         simple_make(n);
                 }
@@ -1418,6 +1501,7 @@ static int insert_complete(struct path *p, struct node *n) {
         if (result == -ENOSPC) {
                 result = insert_balance(p);
         }
+        cookie_complete(p, n);
         return result;
 }
 
@@ -1446,6 +1530,7 @@ static int delete_complete(struct path *p, struct node *n) {
         if (!keep(n)) {
                 result = delete_balance(p);
         }
+        cookie_complete(p, n);
         return result;
 }
 
@@ -1481,6 +1566,7 @@ static int next_complete(struct path *p, struct node *n) {
                         result = ERROR(-ENAMETOOLONG);
                 }
         }
+        cookie_complete(p, s.node);
         return result;
 }
 
@@ -1704,20 +1790,14 @@ int t2_cursor_next(struct t2_cursor *c) {
 
 /* @cookie */
 
-static uint64_t cgen;
-
-static void cookie_init(void) {
-	cgen = time(NULL);
-}
-
 #if ON_LINUX
 
 static __thread struct {
-        uint64_t *addr;
-        jmp_buf   buf;
+        void    *addr;
+        jmp_buf  buf;
 } addr_check = {};
 
-static bool addr_is_valid(uint64_t *addr) {
+static bool addr_is_valid(void *addr) {
         bool result;
         ASSERT(addr_check.addr == NULL);
         ASSERT(addr != NULL);
@@ -1741,7 +1821,7 @@ static struct {
 } addr_check = {};
 
 /* https://stackoverflow.com/questions/56177752/safely-checking-a-pointer-for-validity-in-macos */
-static bool addr_is_valid(uint64_t *addr) {
+static bool addr_is_valid(void *addr) {
         vm_map_t                       task    = mach_task_self();
         mach_vm_address_t              address = (mach_vm_address_t)addr;
         mach_msg_type_number_t         count   = VM_REGION_BASIC_INFO_COUNT_64;
@@ -1752,24 +1832,38 @@ static bool addr_is_valid(uint64_t *addr) {
         ret = mach_vm_region(task, &address, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object_name);
         return ret == KERN_SUCCESS &&
                 address <= ((mach_vm_address_t)addr) &&
-                ((mach_vm_address_t)(addr + 1)) <= address + size &&
+                ((mach_vm_address_t)(addr + sizeof(uint64_t))) <= address + size &&
                 (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
 }
 
 #endif
 
-static bool cookie_is_valid(const struct t2_cookie *k, int32_t size) {
-        uint64_t *addr = (void *)k->hi;
-        return addr_is_valid(addr) && addr_is_valid(addr + size - SOF(*addr)) && *addr == k->lo;
+static uint64_t cgen;
+
+static void cookie_init(void) {
+	cgen = time(NULL) * (int64_t)1000000000;
+}
+
+static void cookie_complete(struct path *p, struct node *n) {
+        cookie_load(&nheader(n)->cookie, &p->rec->cookie);
+}
+
+static void cookie_load(uint64_t *addr, struct t2_cookie *k) {
+        k->lo = *addr;
+        k->hi = (uint64_t)addr;
+}
+
+static bool cookie_is_valid(const struct t2_cookie *k) {
+        void *addr = (void *)k->hi;
+        return addr_is_valid(addr) && *(uint64_t *)addr == k->lo;
 }
 
 static void cookie_invalidate(uint64_t *addr) {
         *addr = 0;
 }
 
-static void cookie_make(uint64_t *addr, struct t2_cookie *k) {
-        k->lo = *addr = ++cgen;
-        k->hi = (uint64_t)addr;
+static void cookie_make(uint64_t *addr) {
+        *addr = ++cgen;
 }
 
 /* @lib */
@@ -2420,7 +2514,7 @@ static void simple_print(struct node *n) {
         if (n == NULL) {
                 printf("nil node");
         }
-        printf("addr: %"PRIx64" tree: %"PRIx64" level: %u ntype: %u nr: %u size: %u dir_off: %u dir_end: %u (%p)\n",
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u dir_off: %u dir_end: %u (%p)\n",
                n->addr, sh->head.treeid, sh->head.level, sh->head.ntype,
                sh->nr, size, sh->dir_off, sdirend(sh), n);
         for (int32_t i = 0; i <= sh->nr; ++i) {
@@ -3251,13 +3345,12 @@ static void cookie_ut() {
         cookie_init();
         result = signal_init();
         ASSERT(result == 0);
-        cookie_make(&v[0], &k);
-        result = cookie_is_valid(&k, sizeof v[0]);
-        ASSERT(result);
-        result = cookie_is_valid(&k, sizeof v);
+        cookie_make(&v[0]);
+        cookie_load(&v[0], &k);
+        result = cookie_is_valid(&k);
         ASSERT(result);
         for (uint64_t b = 0; b <= 0xff; ++b) {
-                uint64_t *addr = (void *)((b << 20) ^ (uint64_t)&v[0]);
+                void *addr = (void *)((b << 20) ^ (uint64_t)&v[0]);
                 addr_is_valid(addr);
         }
         if (!ON_DARWIN) { /* Code segment is not writable. */
