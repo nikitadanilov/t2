@@ -747,18 +747,29 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         }
 }
 
+static int rec_insert(struct node *n, int32_t idx, struct t2_rec *r) {
+        return simple_insert(&(struct slot) { .node = n, .idx = idx, .rec  = *r });
+}
+
+static void rec_delete(struct node *n, int32_t idx) {
+        simple_delete(&(struct slot) { .node = n, .idx = idx });
+}
+
+static void rec_get(struct slot *s, int32_t idx) {
+        s->idx = idx;
+        simple_get(s);
+}
+
 static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node *n, enum optype opt) {
         ASSERT(r->key->nr == 1);
         int result;
         bool found;
         SLOT_DEFINE(s, n);
-        s.idx = 0;
-        simple_get(&s);
+        rec_get(&s, 0);
         if (buf_cmp(s.rec.key, r->key) > 0) {
                 return -ESTALE;
         }
-        s.idx = nr(n) - 1;
-        simple_get(&s);
+        rec_get(&s, nr(n) - 1);
         if (buf_cmp(s.rec.key, r->key) < 0) {
                 return -ESTALE;
         }
@@ -769,11 +780,7 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
                 break;
         case INSERT:
                 if (!found) {
-                        result = simple_insert(&(struct slot) {
-                                        .node = n,
-                                        .idx  = s.idx + 1,
-                                        .rec  = *r
-                                });
+                        result = rec_insert(n, s.idx + 1, r);
                         if (result == -ENOSPC) {
                                 result = -ESTALE;
                         }
@@ -785,11 +792,7 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
                 if (!keep(n)) {
                         result = -ESTALE;
                 } else if (found) {
-                        simple_delete(&(struct slot) {
-                                        .node = n,
-                                        .idx  = s.idx,
-                                        .rec  = *r
-                                });
+                        rec_delete(n, s.idx);
                         result = 0;
                 } else {
                         result = -ENOENT;
@@ -1054,8 +1057,7 @@ static void internal_parent_rec(struct path *p, int idx) {
         maxlen = buf_len(s.rec.key);
         r->keyout = *s.rec.key;
         for (int32_t i = 0; i < nr(r->node); ++i) {
-                s.idx = i;
-                simple_get(&s);
+                rec_get(&s, i);
                 keylen = buf_len(s.rec.key);
                 if (keylen > maxlen) {
                         maxlen = keylen;
@@ -1129,13 +1131,11 @@ static int split_right_exec_insert(struct path *p, int idx) {
                         struct t2_buf rkey;
                         if (is_leaf(right)) {
                                 s.node = left;
-                                s.idx = nr(left) - 1;
-                                simple_get(&s);
+                                rec_get(&s, nr(left) - 1);
                                 lkey = *s.rec.key;
                         }
                         s.node = right;
-                        s.idx = 0;
-                        simple_get(&s);
+                        rec_get(&s, 0);
                         rkey = *s.rec.key;
                         if (is_leaf(right)) {
                                 prefix_separator(&lkey, &rkey);
@@ -1177,8 +1177,7 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
                 struct t2_buf cptr;
                 SLOT_DEFINE(sub, child);
                 ASSERT(child != NULL && !is_leaf(child));
-                sub.idx = 0;
-                simple_get(&sub);
+                rec_get(&sub, 0);
                 *s->rec.key = *sub.rec.key;
                 *s->rec.val = *ptr_buf(child, &cptr);
                 result = simple_insert(s);
@@ -1521,8 +1520,7 @@ static int root_add(struct path *p) {
         if (buf_len(&p->rung[0].keyout) == 0 && buf_len(&p->rung[0].valout) == 0) {
                 return 0; /* Nothing to do. */
         }
-        s.idx = 0;
-        simple_get(&s);
+        rec_get(&s, 0);
         s.node = p->newroot;
         s.rec.val = ptr_buf(oldroot, &ptr);
         result = simple_insert(&s);
@@ -1565,11 +1563,7 @@ static int insert_balance(struct path *p) {
 }
 
 static int insert_complete(struct path *p, struct node *n) {
-        int result = simple_insert(&(struct slot) {
-                        .node = n,
-                        .idx  = p->rung[p->used - 1].pos + 1,
-                        .rec  = *p->rec
-                });
+        int result = rec_insert(n, p->rung[p->used - 1].pos + 1, p->rec);
         if (result == -ENOSPC) {
                 result = insert_balance(p);
         }
@@ -1596,10 +1590,7 @@ static int delete_balance(struct path *p) {
 
 static int delete_complete(struct path *p, struct node *n) {
         int result = 0;
-        simple_delete(&(struct slot) {
-                        .node = n,
-                        .idx  = p->rung[p->used - 1].pos
-                });
+        rec_delete(n, p->rung[p->used - 1].pos);
         if (!keep(n)) {
                 result = delete_balance(p);
         }
@@ -1623,8 +1614,7 @@ static int next_complete(struct path *p, struct node *n) {
                 struct node *sibling = brother(r, (enum dir)c->dir)->node;
                 if (LIKELY(sibling != NULL && nr(sibling) > 0)) { /* Rightmost leaf can be empty. */
                         s.node = sibling;
-                        s.idx = utmost(sibling, -c->dir); /* Cute. */
-                        simple_get(&s);
+                        rec_get(&s, utmost(sibling, -c->dir)); /* Cute. */
                 } else {
                         return 0;
                 }
@@ -2464,8 +2454,7 @@ static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
         (void)simple_search(n, r, &s);
         if (s.idx < 0) {
                 s.node = n;
-                s.idx = 0;
-                simple_get(&s);
+                rec_get(&s, 0);
         }
         ASSERT(0 <= s.idx && s.idx < nr(n));
         *pos = s.idx;
@@ -2476,8 +2465,7 @@ static taddr_t internal_get(const struct node *n, int32_t pos) { /* !sanitise */
         ASSERT(0 <= pos && pos < nr(n));
         ASSERT(!is_leaf(n));
         SLOT_DEFINE(s, (struct node *)n);
-        s.idx = pos;
-        simple_get(&s);
+        rec_get(&s, pos);
         return internal_addr(&s);
 }
 
@@ -2680,8 +2668,7 @@ static int shift_one(struct node *d, struct node *s, enum dir dir) {
         struct slot   dst = { .node = d, .rec = { .key = &key, .val = &val } };
         struct slot   src = { .node = s, .rec = { .key = &key, .val = &val } };
         ASSERT(nr(s) > 0);
-        src.idx = dir == RIGHT ? nr(s) - 1 : 0;
-        simple_get(&src);
+        rec_get(&src, utmost(s, dir));
         dst.idx = dir == LEFT ? nr(d) : 0;
         return simple_insert(&dst) ?: (simple_delete(&src), 0);
 }
@@ -2694,8 +2681,7 @@ static int shift(struct node *d, struct node *s, const struct slot *point, enum 
         ASSERT(4 * rec_len(&point->rec) < min_32(nsize(d), nsize(s)));
         while (result == 0) {
                 SLOT_DEFINE(slot, s);
-                slot.idx = dir == RIGHT ? nr(s) - 1 : 0;
-                simple_get(&slot);
+                rec_get(&slot, utmost(s, dir));
                 if (simple_free(d) - simple_free(s) > rec_len(&slot.rec)) {
                         result = shift_one(d, s, dir);
                 } else {
@@ -2818,8 +2804,7 @@ static bool is_sorted(struct node *n) {
         char   *keyarea;
         int32_t keysize;
         for (int32_t i = 0; i < sh->nr; ++i) {
-                ss.idx = i;
-                simple_get(&ss);
+                rec_get(&ss, i);
                 if (i > 0) {
                         int cmp = skeycmp(sh, i, keyarea, keysize);
                         if (cmp <= 0) {
@@ -2891,8 +2876,7 @@ static void simple_ut(void) {
         ASSERT(result == -ENOSPC);
         utest("get");
         for (int32_t i = 0; i < sh->nr; ++i) {
-                s.idx = i;
-                simple_get(&s);
+                rec_get(&s, i);
                 ASSERT(buf_len(s.rec.key) == (int32_t)strlen(key0) + 1);
                 ASSERT(buf_len(s.rec.val) == (int32_t)strlen(val0) + 1);
         }
@@ -3123,18 +3107,18 @@ static void tree_ut() {
         result = t2_insert(t, &r);
         ASSERT(result == -EEXIST);
         utest("5K");
+        key = BUF_VAL(k64);
+        val = BUF_VAL(v64);
         for (k64 = 0; k64 < 5000; ++k64) {
-                key = BUF_VAL(k64);
-                val = BUF_VAL(v64);
                 result = t2_insert(t, &r);
                 ASSERT(result == 0);
         }
         utest("20K");
+        key = BUF_VAL(k64);
+        val = BUF_VAL(v64);
         for (int i = 0; i < 20000; ++i) {
                 k64 = ht_hash(i);
                 v64 = ht_hash(i + 1);
-                key = BUF_VAL(k64);
-                val = BUF_VAL(v64);
                 result = t2_insert(t, &r);
                 ASSERT(result == 0);
         }
@@ -3142,8 +3126,6 @@ static void tree_ut() {
         for (int i = 0; i < 50000; ++i) {
                 k64 = ht_hash(i);
                 v64 = ht_hash(i + 1);
-                key = BUF_VAL(k64);
-                val = BUF_VAL(v64);
                 result = t2_insert(t, &r);
                 ASSERT(result == (i < 20000 ? -EEXIST : 0));
         }
@@ -3205,7 +3187,7 @@ static void stress_ut() {
                         valb = BUF_VAL(val);
                         result = t2_lookup(t, &r);
                         ASSERT((result ==       0) == (probe <= i) &&
-                                (result == -ENOENT) == (probe >  i));
+                               (result == -ENOENT) == (probe >  i));
                 }
                 if ((i % (U/10)) == 0 && i > 0) {
                         struct node *r = get(mod, t->root);
@@ -3297,10 +3279,6 @@ static void delete_ut() {
         for (long i = U - 1; i >= 0; --i) {
                 for (long j = 0; j < U; ++j) {
                         ksize = sizeof i;
-                        vsize = rand() % maxsize;
-                        ASSERT(ksize < SOF(key));
-                        ASSERT(vsize < SOF(val));
-                        ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                         *(long *)key = j;
                         keyb.seg[0] = (struct t2_seg){ .len = ksize,    .addr = &key };
                         valb.seg[0] = (struct t2_seg){ .len = SOF(val), .addr = &val };
@@ -3321,9 +3299,6 @@ static void delete_ut() {
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
                 vsize = rand() % maxsize;
-                ASSERT(ksize < SOF(key));
-                ASSERT(vsize < SOF(val));
-                ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                 *(long *)key = i;
                 keyb.seg[0] = (struct t2_seg){ .len = ksize,    .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = SOF(val), .addr = &val };
@@ -3551,7 +3526,6 @@ void seq_ut(void) {
         ASSERT(EISOK(t));
         utest("populate");
         long U = 1000000;
-        counters_clear();
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(key);
                 valb = BUF_VAL(val);
@@ -3561,7 +3535,6 @@ void seq_ut(void) {
                 ASSERT(result == 0);
                 inc(key, (sizeof key) - 1);
         }
-        counters_print();
         utest("fini");
         t2_node_type_degister(&ntype);
         t2_fini(mod);
@@ -3571,7 +3544,6 @@ void seq_ut(void) {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        seq_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
@@ -3583,6 +3555,7 @@ int main(int argc, char **argv) {
         rand_ut();
         cookie_ut();
         error_ut();
+        seq_ut();
         counters_print();
         counters_clear();
         return 0;
