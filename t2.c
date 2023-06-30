@@ -582,10 +582,10 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         cookie_init();
         if (mod != NULL) {
                 result = signal_init();
-                if (result == 0) {
+                if (LIKELY(result == 0)) {
                         mod->stor = storage;
                         result = storage->op->init(storage);
-                        if (result == 0) {
+                        if (LIKELY(result == 0)) {
                                 result = ht_init(&mod->ht, hshift);
                                 if (result != 0) {
                                         storage->op->fini(storage);
@@ -925,7 +925,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                 n = ninit(mod, addr);
                 if (EISOK(n)) {
                         int result = SCALL(n->mod, read, n->addr, n->data);
-                        if (result == 0) {
+                        if (LIKELY(result == 0)) {
                                 struct header *h = n->data;
                                 /* TODO: check node. */
                                 if (LIKELY(IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL)) {
@@ -1113,7 +1113,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 ASSERT(nr(right) > 0);
                 r->flags |= ALUSED;
         }
-        if (result == 0) {
+        if (LIKELY(result == 0)) {
                 if (r->pos < nr(left)) {
                         s.node = left;
                         s.idx  = r->pos;
@@ -1126,7 +1126,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 ASSERT(s.idx <= nr(s.node));
                 result = simple_insert(&s);
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node));
-                if (result == 0 && (r->flags & ALUSED)) {
+                if (LIKELY(result == 0) && (r->flags & ALUSED)) {
                         struct t2_buf lkey;
                         struct t2_buf rkey;
                         if (is_leaf(right)) {
@@ -1433,7 +1433,7 @@ static int insert_prep(struct path *p) {
                         rec->key = &r->keyout;
                         rec->val = &r->valout;
                 }
-        } while (--idx >= 0 && result == 0);
+        } while (--idx >= 0 && LIKELY(result == 0));
         path_lock(p);
         return result;
 }
@@ -1464,7 +1464,7 @@ static int delete_prep(struct path *p) {
                                 break;
                         }
                 }
-        } while (--idx >= 0 && result == 0);
+        } while (--idx >= 0 && LIKELY(result == 0));
         path_lock(p);
         return result;
 }
@@ -1517,20 +1517,20 @@ static int root_add(struct path *p) {
         struct t2_buf ptr;
         int           result;
         SLOT_DEFINE(s, oldroot);
-        if (buf_len(&p->rung[0].keyout) == 0 && buf_len(&p->rung[0].valout) == 0) {
+        if (UNLIKELY(buf_len(&p->rung[0].keyout) == 0 && buf_len(&p->rung[0].valout) == 0)) {
                 return 0; /* Nothing to do. */
         }
         rec_get(&s, 0);
         s.node = p->newroot;
         s.rec.val = ptr_buf(oldroot, &ptr);
         result = simple_insert(&s);
-        if (result == 0) {
+        if (LIKELY(result == 0)) {
                 s.idx = 1;
                 ASSERT(p->rung[0].pd.id == SPLIT_RIGHT); /* For now. */
                 s.rec.key = &p->rung[0].keyout;
                 s.rec.val = &p->rung[0].valout;
                 result = simple_insert(&s);
-                if (result == 0) {
+                if (LIKELY(result == 0)) {
                         p->rung[0].flags |= ALUSED;
                         /* Barrier? */
                         p->tree->root = p->newroot->addr;
@@ -1554,7 +1554,7 @@ static int insert_balance(struct path *p) {
                 }
                 result = 0;
         }
-        if (UNLIKELY(idx < 0 && result == 0)) {
+        if (UNLIKELY(idx < 0 && LIKELY(result == 0))) {
                 if (p->newroot != NULL) {
                         result = root_add(p); /* Move this to policy? */
                 }
@@ -2101,7 +2101,7 @@ static int signal_init(void) {
         int result = 0;
         if (signal_set == 0) {
                 result = sigaction(SIGSEGV, &sa, &osa);
-                if (result == 0) {
+                if (LIKELY(result == 0)) {
                         signal_set = 1;
                 }
         }
@@ -2679,7 +2679,7 @@ static int shift(struct node *d, struct node *s, const struct slot *point, enum 
         ASSERT(point->idx >= 0 && point->idx <= nr(s));
         ASSERT(simple_free(d) > simple_free(s));
         ASSERT(4 * rec_len(&point->rec) < min_32(nsize(d), nsize(s)));
-        while (result == 0) {
+        while (LIKELY(result == 0)) {
                 SLOT_DEFINE(slot, s);
                 rec_get(&slot, utmost(s, dir));
                 if (simple_free(d) - simple_free(s) > rec_len(&slot.rec)) {
@@ -2694,7 +2694,7 @@ static int shift(struct node *d, struct node *s, const struct slot *point, enum 
 
 static int merge(struct node *d, struct node *s, enum dir dir) {
         int result = 0;
-        while (result == 0 && nr(s) > 0) {
+        while (LIKELY(result == 0) && nr(s) > 0) {
                 result = shift_one(d, s, dir);
         }
         return result;
@@ -2719,7 +2719,7 @@ static taddr_t mso_alloc(struct t2_storage *storage, int shift_min, int shift_ma
         void *addr;
         taddr_t result = posix_memalign(&addr, 1ul << TADDR_MIN_SHIFT,
                                         1ul << shift_max);
-        if (result == 0) {
+        if (LIKELY(result == 0)) {
                 ASSERT(((uint64_t)addr & TADDR_ADDR_MASK) == (uint64_t)addr);
                 memset(addr, 0, 1ul << shift_max);
                 result = taddr_make((uint64_t)addr, shift_max);
