@@ -1,6 +1,6 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
-verbose=1
+verbose=3
 
 function log() {
 	local level=$1
@@ -29,6 +29,7 @@ function run() {
 	local label=$1
 	shift
 	echo -n "$label: "
+	log 2 $*
 	$* > /tmp/build.log 2>&1
 	if [ $? -eq 0 ]
 	then
@@ -42,7 +43,7 @@ function run() {
 }
 
 function build() {
-    CFLAGS="-O0 -I/usr/local/include -g3 -Wall -Wextra -Wconversion -Wdouble-promotion -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
+    CFLAGS="-O0 -I/usr/local/include -g3 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
     LDFLAGS="-L/usr/local/lib/ -lurcu -lpthread -rdynamic"
     run ut ${CC:-cc} $CFLAGS -DUT t2.c $LDFLAGS -o ut
     run object ${CC:-cc} $CFLAGS -c t2.c

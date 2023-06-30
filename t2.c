@@ -11,8 +11,6 @@
  *
  * - abstract node and tree type operations (no direct simple_* calls)
  *
- * - error reporting: per-thread error propagation stack, (mostly) static error descriptors
- *
  * - binary search is inefficient (infinity keys)
  *
  * - multi-segment buffers
@@ -69,6 +67,10 @@
  *
  * - simple node: store key offsets separately from value offsets
  *
+ * Done:
+ *
+ * + error reporting: per-thread error propagation stack, (mostly) static error descriptors
+ *
  * References:
  *
  * - D. Knuth, The Art of Computer Programming, Volume 3: Sorting and
@@ -108,7 +110,8 @@ enum {
         MAX_TREE_HEIGHT =   10,
         MAX_TREE_TYPE   = 1024,
         MAX_NODE_TYPE   = 1024,
-        MAX_ERR_CODE    = 1024
+        MAX_ERR_CODE    = 1024,
+        MAX_ERR_DEPTH   =   16
 };
 
 /* @macro */
@@ -147,15 +150,18 @@ enum {
 })
 #define COF(ptr, type, member) ((type *)((char *)(ptr) - (char *)(&((type *)0)->member)))
 #define LOG(fmt, ...) llog(MSG_PREP(fmt) , ## __VA_ARGS__)
-#define ERROR(errcode)                          \
+#define ERROR_INFO(errcode, fmt, a0, a1)        \
 ({                                              \
         int __errc = (int)(errcode);            \
+        EDESCR(__errc, fmt, a0, a1);            \
         __errc;                                 \
 })
+#define ERROR(errcode)  ERROR_INFO(errcode, "", 0, 0)
 #define EPTR(errcode) ((void *)(uint64_t)(errcode))
 #define ERRCODE(val) ((int)(intptr_t)(val))
 #define EISERR(val) UNLIKELY((uint64_t)(val) >= (uint64_t)-MAX_ERR_CODE)
 #define EISOK(val) (!EISERR(val))
+#define EDESCR(err, fmt, a0, a1) edescr(MSG_PREP(fmt), err, (uint64_t)a0, (uint64_t)a1)
 
 /* Returns the number of array elements that satisfy given criteria. */
 #define COUNT(var, nr, ...)                             \
@@ -456,6 +462,13 @@ struct counters {
         int32_t rcu;
 };
 
+struct error_descr {
+        int                   err;
+        const struct msg_ctx *ctx;
+        uint64_t              v0;
+        uint64_t              v1;
+};
+
 /* @static */
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
@@ -481,6 +494,9 @@ static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn)
 static void *mem_alloc(size_t size);
 static void  mem_free(void *ptr);
 static void llog(const struct msg_ctx *ctx, ...);
+static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1);
+static void eclear(void);
+static void eprint(void);
 static void put(struct node *n);
 static void ref(struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
@@ -529,11 +545,14 @@ static void cookie_complete(struct path *p, struct node *n);
 static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 
 static __thread struct counters __t_counters = {};
+static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
+static __thread int edepth = 0;
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
         struct t2 *mod = mem_alloc(sizeof *mod);
         t2_thread_register();
+        eclear();
         cookie_init();
         if (mod != NULL) {
                 result = signal_init();
@@ -563,6 +582,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
 }
 
 void t2_fini(struct t2 *mod) {
+        eclear();
         ht_clean(&mod->ht);
         ht_fini(&mod->ht);
         mod->stor->op->fini(mod->stor);
@@ -578,6 +598,7 @@ void t2_tree_type_register(struct t2 *mod, struct t2_tree_type *ttype) {
         ASSERT(ttype->mod == NULL);
         mod->ttypes[ttype->id] = ttype;
         ttype->mod = mod;
+        eclear();
 }
 
 
@@ -587,6 +608,7 @@ void t2_tree_type_degister(struct t2_tree_type *ttype)
         ASSERT(ttype->mod->ttypes[ttype->id] == ttype);
         ttype->mod->ttypes[ttype->id] = NULL;
         ttype->mod = NULL;
+        eclear();
 }
 
 void t2_node_type_register(struct t2 *mod, struct node_type *ntype) {
@@ -595,6 +617,7 @@ void t2_node_type_register(struct t2 *mod, struct node_type *ntype) {
         ASSERT(ntype->mod == NULL);
         mod->ntypes[ntype->id] = ntype;
         ntype->mod = mod;
+        eclear();
 }
 
 
@@ -604,6 +627,21 @@ void t2_node_type_degister(struct node_type *ntype)
         ASSERT(ntype->mod->ntypes[ntype->id] == ntype);
         ntype->mod->ttypes[ntype->id] = NULL;
         ntype->mod = NULL;
+        eclear();
+}
+
+int t2_error(int idx, char *buf, int nob, int *err) {
+        if (0 <= idx && idx < edepth) {
+                struct error_descr *ed = &estack[idx];
+                *err = ed->err;
+                return snprintf(buf, nob, ed->ctx->fmt, ed->v0, ed->v1);
+        } else {
+                return -EINVAL;
+        }
+}
+
+void t2_error_print(void) {
+        eprint();
 }
 
 static __thread bool thread_registered = false;
@@ -661,6 +699,7 @@ static int zerokey_insert(struct t2_tree *t) {
 
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         ASSERT(thread_registered);
+        eclear();
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (t != NULL) {
                 t->ttype = ttype;
@@ -1404,7 +1443,7 @@ static int delete_prep(struct path *p) {
         return result;
 }
 
-SASSERT(T2_LESS == LEFT && T2_MORE == RIGHT);
+SASSERT((enum dir)T2_LESS == LEFT && (enum dir)T2_MORE == RIGHT);
 
 static int next_prep(struct path *p) {
         struct node      *sibling;
@@ -1412,7 +1451,7 @@ static int next_prep(struct path *p) {
         struct t2_cursor *c      = (void *)p->rec->vcb;
         int               result = 0;
         SLOT_DEFINE(s, r->node);
-        if (!leaf_search(r->node, p->rec, &s) && c->dir == RIGHT) {
+        if (!leaf_search(r->node, p->rec, &s) && (enum dir)c->dir == RIGHT) {
                 s.idx++;
         }
         r->pos = s.idx;
@@ -1759,16 +1798,19 @@ static int next(struct t2_cursor *c) {
 
 int t2_lookup(struct t2_tree *t, struct t2_rec *r) {
         ASSERT(thread_registered);
+        eclear();
         return lookup(t, r);
 }
 
 int t2_delete(struct t2_tree *t, struct t2_rec *r) {
         ASSERT(thread_registered);
+        eclear();
         return delete(t, r);
 }
 
 int t2_insert(struct t2_tree *t, struct t2_rec *r) {
         ASSERT(thread_registered);
+        eclear();
         return insert(t, r);
 }
 
@@ -1777,6 +1819,7 @@ int t2_cursor_init(struct t2_cursor *c, struct t2_buf *key) {
         ASSERT(buf_len(key) <= buf_len(&c->curkey));
         ASSERT(c->curkey.nr == 1);
         ASSERT(c->dir == T2_LESS || c->dir == T2_MORE);
+        eclear();
         buf_copy(&c->curkey, key);
         c->maxlen = buf_len(&c->curkey);
         c->curkey.seg[0].len = buf_len(key);
@@ -1785,11 +1828,13 @@ int t2_cursor_init(struct t2_cursor *c, struct t2_buf *key) {
 
 void t2_cursor_fini(struct t2_cursor *c) {
         ASSERT(thread_registered);
+        eclear();
         c->curkey.seg[0].len = c->maxlen;
 }
 
 int t2_cursor_next(struct t2_cursor *c) {
         ASSERT(thread_registered);
+        eclear();
         return next(c);
 }
 
@@ -1923,6 +1968,29 @@ static int32_t min_32(int32_t a, int32_t b) {
 
 static int32_t max_32(int32_t a, int32_t b) {
         return a > b ? a : b;
+}
+
+static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1) {
+        if (edepth < (int)ARRAY_SIZE(estack)) {
+                estack[edepth++] = (struct error_descr) {
+                        .err = err,
+                        .ctx = ctx,
+                        .v0  = a0,
+                        .v1  = a1
+                };
+        }
+}
+
+static void eclear(void) {
+        edepth = 0;
+}
+
+static void eprint(void) {
+        for (int i = 0; i < edepth; ++i) {
+                struct error_descr *ed = &estack[i];
+                printf("[%s] (%i): ", strerror(-ed->err), ed->err);
+                llog(ed->ctx, ed->v0, ed->v1);
+        }
 }
 
 static void counters_check(void) {
@@ -3364,9 +3432,32 @@ static void cookie_ut() {
         stacktrace(); /* Test it here. */
 }
 
+static void error_ut(void) {
+        int e0 = ERROR(-ENOMEM);
+        int e1 = ERROR_INFO(e0, "error: %i", 6, 0);
+        int e2 = ERROR_INFO(-EINVAL, "bump!", 0, 0);
+        int e3 = ERROR_INFO(e2, "at: %s (%p)", "fowl", &error_ut);
+        char buf[256];
+        (void)e1;
+        eprint();
+        for (int i = -1; i < 5; ++i) {
+                int err;
+                int result = t2_error(i, buf, sizeof buf, &err);
+                printf("%i: %i %i %s\n", i, result, err, buf);
+        }
+        t2_error_print();
+        eclear();
+        eprint();
+        for (int i = 0; i < 100; ++i) {
+                e3 = ERROR_INFO(e3, "More! %i", i, 0);
+        }
+        eprint();
+}
+
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        error_ut();
         simple_ut();
         ht_ut();
         traverse_ut();

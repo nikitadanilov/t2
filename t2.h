@@ -125,6 +125,9 @@ int  t2_cursor_init(struct t2_cursor *c, struct t2_buf *key);
 void t2_cursor_fini(struct t2_cursor *c);
 int  t2_cursor_next(struct t2_cursor *c);
 
+int  t2_error(int idx, char *buf, int nob, int *err);
+void t2_error_print(void);
+
 /*
  *  Local variables:
  *  c-indentation-style: "K&R"
