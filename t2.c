@@ -1946,19 +1946,10 @@ static int signal_set = 0;
 
 static void stacktrace(void) {
     int    size;
-    char **syms;
     void  *tracebuf[512];
 
     size = backtrace(tracebuf, ARRAY_SIZE(tracebuf));
-    syms = backtrace_symbols(tracebuf, size);
-    for (int i = 0; i < size; i++) {
-            if (syms != NULL) {
-                    printf("%s\n", syms[i]);
-            } else {
-                    printf("%p\n", tracebuf[i]);
-            }
-    }
-    free(syms);
+    backtrace_symbols_fd(tracebuf, size, 1);
 }
 
 static void sigsegv(int signo, siginfo_t *si, void *uctx) {
