@@ -12,7 +12,7 @@ function log() {
 }
 
 function tryconfig() {
-    local cfg=$(echo $1 | tr ' ' '-')
+    local cfg=$(echo $1 | tr ' /' '--')
     file="config-$cfg.h"
     if [ -f "$file" ]
     then

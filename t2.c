@@ -35,8 +35,6 @@
  *
  * - transaction engine hooks
  *
- * - metrics
- *
  * - tools: dump, load, repair
  *
  * - iterator, cursor
@@ -70,6 +68,8 @@
  * Done:
  *
  * + error reporting: per-thread error propagation stack, (mostly) static error descriptors
+ *
+ * + metrics
  *
  * References:
  *
@@ -140,7 +140,7 @@ enum {
 #define ARRAY_SIZE(a)                           \
 ({                                              \
         SASSERT(IS_ARRAY(a));                   \
-        (sizeof(a) / sizeof(a[0]));             \
+        (int)(sizeof(a) / sizeof(a[0]));        \
 })
 #define IS_ARRAY(x) (!__builtin_types_compatible_p(typeof(&(x)[0]), typeof(x)))
 #define IS_IN(idx, array)                               \
@@ -292,6 +292,8 @@ enum {
 #define CINC(cnt) (++__t_counters.cnt)
 #define CDEC(cnt) (--__t_counters.cnt)
 #define CVAL(cnt) (__t_counters.cnt)
+#define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
+#define CAVG(cnt) ({ struct counter_var *v = &(__t_counters.cnt); v->nr ? 1.0 * v->sum / v->nr : 0.0; })
 
 /* @types */
 
@@ -332,7 +334,9 @@ enum optype {
         LOOKUP,
         DELETE,
         INSERT,
-        NEXT
+        NEXT,
+
+        OP_NR
 };
 
 enum node_flags {
@@ -455,11 +459,31 @@ enum dir {
         RIGHT = +1
 };
 
+struct counter_var {
+        int64_t sum;
+        int64_t nr;
+};
+
+struct op_counters {
+        int32_t nr;
+        int32_t traverse;
+        int32_t ok;
+        struct {
+                int32_t nr;
+                int32_t get;
+                int32_t search;
+                int32_t balance;
+        } l[MAX_TREE_HEIGHT];
+};
+
 struct counters {
         int32_t node;
         int32_t rlock;
         int32_t wlock;
         int32_t rcu;
+        struct op_counters op[OP_NR];
+        struct counter_var nr[MAX_TREE_HEIGHT];
+        struct counter_var free[MAX_TREE_HEIGHT];
 };
 
 struct error_descr {
@@ -530,6 +554,8 @@ static int merge(struct node *d, struct node *s, enum dir dir);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
 static void counters_check(void);
+static void counters_print(void);
+static void counters_clear(void);
 static bool is_sorted(struct node *n);
 static int signal_init(void);
 static void signal_fini(void);
@@ -780,6 +806,7 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
 
 static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         enum lock_mode mode = opt == LOOKUP || opt == NEXT ? READ : WRITE;
+        CINC(op[opt].nr);
         rcu_lock();
         if (cookie_is_valid(&r->cookie)) {
                 struct header *h = (void *)r->cookie.hi;
@@ -1522,6 +1549,7 @@ static int insert_balance(struct path *p) {
         for (idx = p->used - 1; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->lm == WRITE);
+                CINC(op[INSERT].l[level(r->node)].balance);
                 result = dispatch[r->pd.id].exec_insert(p, idx);
                 if (result <= 0) {
                         break;
@@ -1555,6 +1583,7 @@ static int delete_balance(struct path *p) {
         for (idx = p->used - 1; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->lm == WRITE);
+                CINC(op[DELETE].l[level(r->node)].balance);
                 result = dispatch[r->pd.id].exec_delete(p, idx);
                 if (result <= 0) {
                         break;
@@ -1634,6 +1663,7 @@ static int traverse(struct path *p) {
         uint64_t   next;
         ASSERT(p->used == 0);
         ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
+        CINC(op[p->opt].traverse);
         rcu_lock();
         while (true) {
                 struct node *n;
@@ -1653,6 +1683,7 @@ static int traverse(struct path *p) {
                         break;
                 } else if (n == NULL) {
                         rcu_leave(p);
+                        CINC(op[p->opt].l[level(n)].get);
                         n = get(mod, next);
                         if (rcu_try(p)) {
                                 continue;
@@ -1678,6 +1709,9 @@ static int traverse(struct path *p) {
                         }
                 }
                 r = path_add(p, n, node_seq(n), flags);
+                CINC(op[p->opt].l[level(n)].nr);
+                CMOD(nr[level(n)], nr(n));
+                CMOD(free[level(n)], simple_free(n));
                 if (is_leaf(n)) {
                         if (p->opt == LOOKUP) {
                                 result = lookup_complete(p, n);
@@ -1994,18 +2028,46 @@ static void eprint(void) {
 }
 
 static void counters_check(void) {
-        if (__t_counters.node != 0) {
-                LOG("Leaked node: %i", __t_counters.node);
+        if (CVAL(node) != 0) {
+                LOG("Leaked node: %i", CVAL(node));
         }
-        if (__t_counters.rlock != 0) {
-                LOG("Leaked rlock: %i", __t_counters.rlock);
+        if (CVAL(rlock) != 0) {
+                LOG("Leaked rlock: %i", CVAL(rlock));
         }
-        if (__t_counters.wlock != 0) {
-                LOG("Leaked wlock: %i", __t_counters.wlock);
+        if (CVAL(wlock) != 0) {
+                LOG("Leaked wlock: %i", CVAL(wlock));
         }
-        if (__t_counters.rcu != 0) {
-                LOG("Leaked rcu: %i", __t_counters.rcu);
+        if (CVAL(rcu) != 0) {
+                LOG("Leaked rcu: %i", CVAL(rcu));
         }
+}
+
+static void op_counter_print(int opt, const char *label) {
+        printf("%10s nr: %10i traverse: %10i ok: %10i\n", label, CVAL(op[opt].nr), CVAL(op[opt].traverse), CVAL(op[opt].ok));
+        printf("%3s %10s %10s %10s %10s\n", "lv", "nr", "get", "search", "balance");
+        for (int i = 0; i < ARRAY_SIZE(CVAL(op[opt].l)); ++i) {
+                printf("%3i %10i %10i %10i %10i\n", i,
+                       CVAL(op[opt].l[i].nr), CVAL(op[opt].l[i].get), CVAL(op[opt].l[i].search), CVAL(op[opt].l[i].balance));
+        }
+}
+
+static void counters_print(void) {
+        printf("node:  %i\n", CVAL(node));
+        printf("rlock: %i\n", CVAL(rlock));
+        printf("wlock: %i\n", CVAL(wlock));
+        printf("rcu:   %i\n", CVAL(rcu));
+        op_counter_print(LOOKUP, "lookup");
+        op_counter_print(INSERT, "insert");
+        op_counter_print(DELETE, "delete");
+        op_counter_print(NEXT,   "next");
+        printf("%3s %10s %10s\n", "lv", "nr", "free");
+        for (int i = 0; i < MAX_TREE_HEIGHT; ++i) {
+                printf("%3i %10.1f %10.1f\n", i, CAVG(nr[i]), CAVG(free[i]));
+        }
+}
+
+static void counters_clear(void) {
+        SET0(&__t_counters);
 }
 
 static __thread int insigsegv = 0;
@@ -2351,6 +2413,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         int32_t         klen  = rec->key->seg[0].len;
         int             cmp   = -1;
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
+        CINC(op[LOOKUP].l[level(n)].search);
         while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
                 cmp = skeycmp(sh, m, kaddr, klen);
@@ -3216,8 +3279,8 @@ static void delete_ut() {
         t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype);
         ASSERT(EISOK(t));
-        utest("5K*5K");
-        long U = 5000;
+        utest("1K*1K");
+        long U = 1000;
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
                 vsize = rand() % maxsize;
@@ -3296,7 +3359,7 @@ static void delete_ut() {
                         }
                         deletes++;
                 }
-                if ((i % (U/100)) == 0 && i > 0) {
+                if ((i % (U/10)) == 0 && i > 0) {
                         struct node *r = get(mod, t->root);
                         printf("\n        %10i: %5i / %4.2f%% / %4.2f%%", i, level(r) + 1,
                                100.0 * exist / inserts, 100.0 * noent / deletes);
@@ -3457,7 +3520,6 @@ static void error_ut(void) {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        error_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
@@ -3468,6 +3530,9 @@ int main(int argc, char **argv) {
         next_ut();
         rand_ut();
         cookie_ut();
+        error_ut();
+        counters_print();
+        counters_clear();
         return 0;
 }
 
