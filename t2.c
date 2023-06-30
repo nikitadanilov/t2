@@ -487,6 +487,7 @@ static struct node *peek(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
 static bool can_insert(const struct node *n, const struct t2_rec *r);
+static bool keep(const struct node *n);
 static int dealloc(struct t2_tree *t, struct node *n);
 static uint8_t level(const struct node *n);
 static bool is_leaf(const struct node *n);
@@ -714,8 +715,11 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
                 } else {
                         result = -EEXIST;
                 }
+                break;
         case DELETE:
-                if (found) {
+		if (!keep(n)) {
+                        result = -ESTALE;
+		} else if (found) {
                         simple_delete(&(struct slot) {
                                         .node = n,
                                         .idx  = s.idx,
@@ -723,8 +727,9 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
                                 });
                         result = 0;
                 } else {
-                        result = -EEXIST;
+                        result = -ENOENT;
                 }
+                break;
         case NEXT:
                 result = -ESTALE;
                 break; /* TODO: implement. */
@@ -1855,7 +1860,7 @@ static void cookie_load(uint64_t *addr, struct t2_cookie *k) {
 
 static bool cookie_is_valid(const struct t2_cookie *k) {
         void *addr = (void *)k->hi;
-        return addr_is_valid(addr) && *(uint64_t *)addr == k->lo;
+        return addr != NULL && addr_is_valid(addr) && *(uint64_t *)addr == k->lo;
 }
 
 static void cookie_invalidate(uint64_t *addr) {
@@ -2049,7 +2054,7 @@ static uint64_t ht_hash(taddr_t addr) {
 }
 
 static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
-        unsigned     hash = ht_hash(addr) & ((1 << ht->shift) - 1);
+        uint64_t     hash = ht_hash(addr) & ((1 << ht->shift) - 1);
         struct link *scan;
         struct link *head = &ht->chains[hash];
         for (scan = head->next; scan != head; scan = scan->next) {
@@ -2061,7 +2066,7 @@ static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
 }
 
 static void ht_insert(struct ht *ht, struct node *n) {
-        unsigned     hash = ht_hash(n->addr) & ((1 << ht->shift) - 1);
+        uint64_t     hash = ht_hash(n->addr) & ((1 << ht->shift) - 1);
         struct link *head = &ht->chains[hash];
         head->next->prev = &n->hash;
         n->hash.next     = head->next;
