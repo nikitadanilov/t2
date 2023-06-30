@@ -17,8 +17,6 @@
  *
  * - prefix compression for keys
  *
- * - variably-sized taddr_t encoding in internal nodes
- *
  * - checksums (re-use user-supplied ones)
  *
  * - other node formats: fixed-sized keys and values. Key prefixes in the directory
@@ -70,6 +68,8 @@
  * + error reporting: per-thread error propagation stack, (mostly) static error descriptors
  *
  * + metrics
+ *
+ * + variably-sized taddr_t encoding in internal nodes
  *
  * References:
  *
@@ -1500,7 +1500,11 @@ static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b) {
 }
 
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b) {
+        ASSERT(*addr != 0);
         *b = BUF_VAL(*addr);
+        while (((int8_t *)b->seg[0].addr)[b->seg[0].len - 1] == 0) {
+                b->seg[0].len--;
+        }
         return b;
 }
 
@@ -2443,8 +2447,8 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
 
 static taddr_t internal_addr(const struct slot *s) {
         taddr_t addr;
-        ASSERT(s->rec.val->nr > 0 && s->rec.val->seg[0].len >= SOF(taddr_t));
-        addr = *(taddr_t *)s->rec.val->seg[0].addr;
+        ASSERT(s->rec.val->nr > 0 && s->rec.val->seg[0].len >= 0);
+        memcpy(&addr, s->rec.val->seg[0].addr, s->rec.val->seg[0].len);
         ASSERT(taddr_is_valid(addr));
         return addr;
 }
