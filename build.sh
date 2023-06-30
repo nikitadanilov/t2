@@ -1,32 +1,51 @@
 #!/bin/sh
 
+verbose=1
+
+function log() {
+	local level=$1
+	shift
+	if [ $level -le $verbose ]
+	then
+		echo $*
+	fi
+}
+
 function tryconfig() {
     local cfg=$(echo $1 | tr ' ' '-')
     file="config-$cfg.h"
     if [ -f "$file" ]
     then
-	echo "Using $file."
+	log 1 "Using $file."
 	cp "$file" config.h
 	return 0
     else
-	echo "No config for $1 (looked for $file)."
+	log 2 "No config for $1 (looked for $file)."
 	return 1
     fi
 }
 
+function run() {
+	local label=$1
+	shift
+	echo -n "$label: "
+	$* > /tmp/build.log 2>&1
+	if [ $? -eq 0 ]
+	then
+		echo "ok."
+	else
+		log 0 "failed: $* ($?)"
+		echo "Log:"
+		cat /tmp/build.log
+		exit $?
+	fi
+}
+
 function build() {
     CFLAGS="-O0 -I/usr/local/include -g3 -Wall -Wextra -Wconversion -Wdouble-promotion -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
-    LDFLAGS="-L/usr/local/lib/ -lurcu"
-    ${CC:-cc} $CFLAGS -DUT t2.c $LDFLAGS -o ut
-    ${CC:-cc} $CFLAGS -c t2.c
-    if [ $? -eq 0 ]
-    then
-	echo "Done."
-	exit 0
-    else
-	echo "Build failed."
-	exit 1
-    fi
+    LDFLAGS="-L/usr/local/lib/ -lurcu -lpthread"
+    run ut ${CC:-cc} $CFLAGS -DUT t2.c $LDFLAGS -o ut
+    run object ${CC:-cc} $CFLAGS -c t2.c
 }
 
 for cfg in "$(uname -a)" "$(uname -srm)" "$(uname -sm)" "$(uname -s)" "$(uname -m)" "default"
@@ -38,5 +57,5 @@ do
 	exit
     fi
 done
-echo "No config found."
+log 0 "No config found."
 exit 1
