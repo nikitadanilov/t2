@@ -3517,9 +3517,63 @@ static void error_ut(void) {
         eprint();
 }
 
+static void inc(char *key, int len) {
+        int i;
+        ASSERT(FORALL(j, len, '0' <= key[j] && key[j] <= '9'));
+        for (i = len - 1; i >= 0 && key[i] == '9'; --i) {
+                ;
+        }
+        ASSERT(i >= 0);
+        key[i]++;
+        while (++i < len) {
+                key[i] = '0';
+        }
+}
+
+void seq_ut(void) {
+        char key[] = "0000000000";
+        char val[] = "*VALUE*";
+        struct t2_buf keyb;
+        struct t2_buf valb;
+        struct t2_rec r = {
+                .key = &keyb,
+                .val = &valb
+        };
+        struct t2      *mod;
+        struct t2_tree *t;
+        int     result;
+        usuite("seq");
+        utest("init");
+        mod = t2_init(&mock_storage, 20);
+        ASSERT(EISOK(mod));
+        ttype.mod = NULL;
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        t = t2_tree_create(&ttype);
+        ASSERT(EISOK(t));
+        utest("populate");
+        long U = 1000000;
+        counters_clear();
+        for (long i = 0; i < U; ++i) {
+                keyb = BUF_VAL(key);
+                valb = BUF_VAL(val);
+                inc(key, (sizeof key) - 1);
+                keyb = BUF_VAL(i);
+                valb = BUF_VAL(i);
+                result = t2_insert(t, &r);
+                ASSERT(result == 0);
+        }
+        counters_print();
+        utest("fini");
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utestdone();
+}
+
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        seq_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
