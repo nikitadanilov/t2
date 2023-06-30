@@ -279,7 +279,7 @@ enum {
 #define SLOT_DEFINE(s, n)                                               \
         struct t2_buf __key;                                            \
         struct t2_buf __val;                                            \
-	struct slot s = { .node = n, .rec = { .key = &__key, .val = &__val } }
+        struct slot s = { .node = n, .rec = { .key = &__key, .val = &__val } }
 
 #define BUF_VAL(v) (struct t2_buf){ .nr = 1, .seg = { [0] = { .len = SOF(v), .addr = &(v) } } }
 
@@ -656,7 +656,7 @@ static taddr_t taddr_make(uint64_t addr, int shift) {
 static struct t2_buf zero = { .nr = 1 };
 
 static int zerokey_insert(struct t2_tree *t) {
-	return insert(t, &(struct t2_rec) { .key = &zero, .val = &zero });
+        return insert(t, &(struct t2_rec) { .key = &zero, .val = &zero });
 }
 
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
@@ -717,9 +717,9 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
                 }
                 break;
         case DELETE:
-		if (!keep(n)) {
+                if (!keep(n)) {
                         result = -ESTALE;
-		} else if (found) {
+                } else if (found) {
                         simple_delete(&(struct slot) {
                                         .node = n,
                                         .idx  = s.idx,
@@ -1846,7 +1846,7 @@ static bool addr_is_valid(void *addr) {
 static uint64_t cgen;
 
 static void cookie_init(void) {
-	cgen = time(NULL) * (int64_t)1000000000;
+        cgen = time(NULL) * (int64_t)1000000000;
 }
 
 static void cookie_complete(struct path *p, struct node *n) {

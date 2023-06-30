@@ -42,7 +42,7 @@ function run() {
 }
 
 function build() {
-    CFLAGS="-O0 -I/usr/local/include -g3 -Wall -Wextra -Wconversion -Wdouble-promotion -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
+    CFLAGS="-O3 -I/usr/local/include -g3 -Wall -Wextra -Wconversion -Wdouble-promotion -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
     LDFLAGS="-L/usr/local/lib/ -lurcu -lpthread"
     run ut ${CC:-cc} $CFLAGS -DUT t2.c $LDFLAGS -o ut
     run object ${CC:-cc} $CFLAGS -c t2.c
