@@ -71,6 +71,8 @@
  *
  * + variably-sized taddr_t encoding in internal nodes
  *
+ * + binary search is inefficient (infinity keys)
+ *
  * References:
  *
  * - D. Knuth, The Art of Computer Programming, Volume 3: Sorting and
@@ -1698,6 +1700,10 @@ static int traverse(struct path *p) {
                                 continue;
                         }
                 }
+                if (UNLIKELY(p->used == ARRAY_SIZE(p->rung))) {
+                        path_fini(p);
+                        continue;
+                }
                 r = path_add(p, n, node_seq(n), flags);
                 CINC(op[p->opt].l[level(n)].nr);
                 CMOD(nr[level(n)], nr(n));
@@ -2224,16 +2230,6 @@ static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := 
         return result;
 }
 
-static int32_t buf_remain(const struct t2_buf *buf, int idx, uint32_t off) {
-        int32_t nob = 0;
-        if (idx < buf->nr) {
-                for (nob = buf->seg[idx].len - off; idx < buf->nr; idx++) {
-                        nob += buf->seg[idx].len;
-                }
-        }
-        return nob;
-}
-
 static int int32_cmp(int32_t a, int32_t b) {
         return a < b ? -1 : a != b; /* sic. */
 }
@@ -2374,15 +2370,10 @@ static char cmpch(int cmp) {
 static void print_range(void *orig, int32_t nsize, void *start, int32_t nob);
 
 static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen) {
-        if (UNLIKELY(pos == -1)) {
-                return -1;
-        } else if (UNLIKELY(pos == sh->nr)) {
-                return +1;
-        } else {
-                int32_t ksize;
-                void *kstart = skey(sh, pos, &ksize);
-                return memcmp(kstart, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
-        }
+        ASSERT(0 <= pos && pos < sh->nr);
+        int32_t ksize;
+        void *kstart = skey(sh, pos, &ksize);
+        return memcmp(kstart, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
 }
 
 static struct sheader *simple_header(const struct node *n) {
