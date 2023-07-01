@@ -5,8 +5,6 @@
  *
  * - integrate rcu: https://github.com/urcu/userspace-rcu/blob/master/include/urcu/rculist.h
  *
- * - simple node functions should be robust in the face of concurrent modifications
- *
  * - path locking and re-checking (allocate new nodes outside of the lock)
  *
  * - abstract node and tree type operations (no direct simple_* calls)
@@ -24,8 +22,6 @@
  * - large keys and values stored outside of nodes
  *
  * - "streams" (sequential, random)
- *
- * - cookies to avoid tree traversal
  *
  * - decaying node temperature (see bits/avg.c)
  *
@@ -72,6 +68,10 @@
  * + variably-sized taddr_t encoding in internal nodes
  *
  * + binary search is inefficient (infinity keys)
+ *
+ * + cookies to avoid tree traversal
+ *
+ * + simple node functions should be robust in the face of concurrent modifications
  *
  * References:
  *
@@ -511,12 +511,14 @@ static void ht_delete(struct node *n);
 static void link_init(struct link *l);
 static void link_fini(struct link *l);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
+static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos);
 static taddr_t internal_get(const struct node *n, int32_t pos);
 static struct node *internal_child(const struct node *n, int32_t pos, bool peek);
 static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s);
 static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn));
 static void *mem_alloc(size_t size);
+static void *mem_alloc_align(size_t size);
 static void  mem_free(void *ptr);
 static void llog(const struct msg_ctx *ctx, ...);
 static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1);
@@ -574,6 +576,10 @@ static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 static __thread struct counters __t_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
 static __thread int edepth = 0;
+static __thread struct {
+        volatile jmp_buf  *buf;
+} addr_check = {};
+
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
@@ -818,7 +824,7 @@ static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
                         int result;
                         ref(n);
                         rcu_unlock();
-                        lock(n, mode);
+                        lock(n, mode); /* TODO: Lock-less lookup. */
                         /* TODO: re-check node. */
                         result = cookie_node_complete(t, r, n, opt);
                         unlock(n, mode);
@@ -878,8 +884,8 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
 }
 
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
-        struct node *n    = mem_alloc(sizeof *n); /* Allocate them together? */
-        void        *data = mem_alloc(taddr_ssize(addr));
+        struct node *n    = mem_alloc(sizeof *n);
+        void        *data = mem_alloc_align(taddr_ssize(addr));
         int          result;
         if (LIKELY(n != NULL && data != NULL)) {
                 result = pthread_rwlock_init(&n->lock, NULL);
@@ -1062,6 +1068,7 @@ static void internal_parent_rec(struct path *p, int idx) {
                         r->keyout = *s.rec.key;
                 }
         }
+        buf_clip(&r->keyout, nsize(r->node) - 1, r->node->data);
         ptr_buf(r->allocated, &r->valout);
 }
 
@@ -1769,61 +1776,38 @@ static int traverse(struct path *p) {
 
 static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         int result;
-        struct path p = {};
-        path_init(&p, t, r, opt);
-        result = traverse(&p);
-        path_fini(&p);
+        counters_check();
+        result = cookie_try(t, r, opt);
+        if (result == -ESTALE) {
+                struct path p = {};
+                path_init(&p, t, r, opt);
+                result = traverse(&p);
+                path_fini(&p);
+        }
+        counters_check();
         return result;
 }
 
 static int lookup(struct t2_tree *t, struct t2_rec *r) {
-        int result;
-        counters_check();
-        result = cookie_try(t, r, LOOKUP);
-        if (result == -ESTALE) {
-                result = traverse_result(t, r, LOOKUP);
-        }
-        counters_check();
-        return result;
+        return traverse_result(t, r, LOOKUP);
 }
 
 static int insert(struct t2_tree *t, struct t2_rec *r) {
-        int result;
-        counters_check();
-        result = cookie_try(t, r, INSERT);
-        if (result == -ESTALE) {
-                result = traverse_result(t, r, INSERT);
-        }
-        counters_check();
-        return result;
+        return traverse_result(t, r, INSERT);
 }
 
 static int delete(struct t2_tree *t, struct t2_rec *r) {
-        int result;
-        counters_check();
-        result = cookie_try(t, r, DELETE);
-        if (result == -ESTALE) {
-                result = traverse_result(t, r, DELETE);
-        }
-        counters_check();
-        return result;
+        return traverse_result(t, r, DELETE);
 }
 
 static int next(struct t2_cursor *c) {
-        int result;
         struct t2_buf val = {};
         struct t2_rec r = {
                 .key = &c->curkey,
                 .val = &val,
                 .vcb = (void *)c /* Erm... */
         };
-        counters_check();
-        result = cookie_try(c->tree, &r, NEXT);
-        if (result == -ESTALE) {
-                result = traverse_result(c->tree, &r, NEXT);
-        }
-        counters_check();
-        return result;
+        return traverse_result(c->tree, &r, NEXT);
 }
 
 int t2_lookup(struct t2_tree *t, struct t2_rec *r) {
@@ -1872,33 +1856,24 @@ int t2_cursor_next(struct t2_cursor *c) {
 
 #if ON_LINUX
 
-static __thread struct {
-        void    *addr;
-        jmp_buf  buf;
-} addr_check = {};
-
 static bool addr_is_valid(void *addr) {
         bool result;
-        ASSERT(addr_check.addr == NULL);
+        jmp_buf buf;
+        ASSERT(addr_check.buf == NULL);
         ASSERT(addr != NULL);
-        addr_check.addr = addr;
-        if (sigsetjmp(addr_check.buf, true) != 0) {
+        if (sigsetjmp(buf, true) != 0) {
                 result = false;
         } else {
+                addr_check.buf = &buf;
                 uint64_t val = *(volatile uint64_t *)addr;
+                addr_check.buf = NULL;
                 (void)val;
                 result = true;
         }
-        addr_check.addr = NULL;
         return result;
 }
 
 #elif ON_DARWIN
-
-static struct {
-        uint64_t *addr;
-        jmp_buf   buf;
-} addr_check = {};
 
 /* https://stackoverflow.com/questions/56177752/safely-checking-a-pointer-for-validity-in-macos */
 static bool addr_is_valid(void *addr) {
@@ -1967,6 +1942,15 @@ bool t2_is_eptr(void *ptr) {
 void *t2_errptr(int errcode) {
         ASSERT(0 <= errcode && errcode <= MAX_ERR_CODE);
         return (void *)(uint64_t)-errcode;
+}
+
+static void *mem_alloc_align(size_t size) {
+        void *out = NULL;
+        int   result = posix_memalign(&out, size, size);
+        if (result == 0) {
+                memset(out, 0, size);
+        }
+        return out;
 }
 
 static void *mem_alloc(size_t size) {
@@ -2082,9 +2066,9 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
         if (UNLIKELY(insigsegv++ > 0)) {
                 abort(); /* Don't try to print anything. */
         }
-        if (ON_LINUX && LIKELY(addr_check.addr != NULL)) {
+        if (ON_LINUX && LIKELY(addr_check.buf != NULL)) {
                 --insigsegv;
-                siglongjmp(addr_check.buf, 1);
+                siglongjmp(*(jmp_buf *)addr_check.buf, 1);
         }
         printf("\nGot: %i errno: %i addr: %p code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_addr, si->si_code, si->si_pid, si->si_uid, uctx);
@@ -2236,7 +2220,7 @@ static int int32_cmp(int32_t a, int32_t b) {
 
 static int buf_cmp(const struct t2_buf *b0, const struct t2_buf *b1) {
         ASSERT(b0->nr == 1);
-        ASSERT(b1->nr == 1); /* From skeycmp(). */
+        ASSERT(b1->nr == 1);
         uint32_t len0 = b0->seg[0].len;
         uint32_t len1 = b1->seg[0].len;
         return memcmp(b0->seg[0].addr, b1->seg[0].addr, len0 < len1 ? len0 : len1) ?: int32_cmp(len0, len1);
@@ -2349,11 +2333,15 @@ static int32_t sdirend(struct sheader *sh) {
         return sh->dir_off + sdirsize(sh);
 }
 
-static void *skey(struct sheader *sh, int pos, int32_t *size) {
+static int32_t skeyoff(struct sheader *sh, int pos, int32_t *size) {
         ASSERT(0 <= pos && pos < sh->nr);
         struct dir_element *del = sat(sh, pos);
         *size = sat(sh, pos + 1)->koff - del->koff;
-        return (void *)sh + del->koff;
+        return del->koff;
+}
+
+static void *skey(struct sheader *sh, int pos, int32_t *size) {
+        return (void *)sh + skeyoff(sh, pos, size);
 }
 
 static void *sval(struct sheader *sh, int pos, int32_t *size) {
@@ -2369,15 +2357,23 @@ static char cmpch(int cmp) {
 
 static void print_range(void *orig, int32_t nsize, void *start, int32_t nob);
 
-static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen) {
+static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen, uint32_t mask) {
         ASSERT(0 <= pos && pos < sh->nr);
         int32_t ksize;
-        void *kstart = skey(sh, pos, &ksize);
-        return memcmp(kstart, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
+        int32_t koff = skeyoff(sh, pos, &ksize) & mask;
+        ksize = min_32(ksize & mask, mask + 1 - koff);
+        return memcmp((void *)sh + koff, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
 }
 
 static struct sheader *simple_header(const struct node *n) {
         return n->data;
+}
+
+static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin) {
+        ASSERT(b->nr == 1);
+        int32_t off = (b->seg[0].addr - origin) & mask;
+        b->seg[0].addr = origin + off;
+        b->seg[0].len  = min_32(b->seg[0].len & mask, mask + 1 - off);
 }
 
 enum { LINEAR = 1 }; /* Effects of switching to linear search seem to be minimal. */
@@ -2391,11 +2387,14 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         void           *kaddr = rec->key->seg[0].addr;
         int32_t         klen  = rec->key->seg[0].len;
         int             cmp   = -1;
+        uint32_t        mask  = nsize(n) - 1;
+        ASSERT((nsize(n) & mask) == 0);
+        ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         CINC(op[LOOKUP].l[level(n)].search);
         while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
-                cmp = skeycmp(sh, m, kaddr, klen);
+                cmp = skeycmp(sh, m, kaddr, klen, mask);
                 if (cmp > 0) {
                         r = m;
                 } else {
@@ -2407,7 +2406,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                 }
         }
         while (r - l > 1) {
-                cmp = skeycmp(sh, ++l, kaddr, klen);
+                cmp = skeycmp(sh, ++l, kaddr, klen, mask);
                 if (cmp >= 0) {
                         if (cmp > 0) {
                                 --l;
@@ -2424,8 +2423,10 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                 struct t2_buf *val = out->rec.val;
                 key->nr = 1;
                 key->seg[0].addr = skey(sh, l, &key->seg[0].len);
+                buf_clip(key, mask, sh);
                 val->nr = 1;
                 val->seg[0].addr = sval(sh, l, &val->seg[0].len);
+                buf_clip(val, mask, sh);
         }
         return found;
 }
@@ -2439,7 +2440,7 @@ static taddr_t internal_addr(const struct slot *s) {
 }
 
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
-        SLOT_DEFINE(s, NULL); /* !sanitise */
+        SLOT_DEFINE(s, NULL);
         (void)simple_search(n, r, &s);
         if (s.idx < 0) {
                 s.node = n;
@@ -2450,11 +2451,13 @@ static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
         return internal_addr(&s);
 }
 
-static taddr_t internal_get(const struct node *n, int32_t pos) { /* !sanitise */
+static taddr_t internal_get(const struct node *n, int32_t pos) {
         ASSERT(0 <= pos && pos < nr(n));
         ASSERT(!is_leaf(n));
         SLOT_DEFINE(s, (struct node *)n);
         rec_get(&s, pos);
+        buf_clip(s.rec.key, nsize(n) - 1, n->data);
+        buf_clip(s.rec.val, nsize(n) - 1, n->data);
         return internal_addr(&s);
 }
 
@@ -2795,7 +2798,7 @@ static bool is_sorted(struct node *n) {
         for (int32_t i = 0; i < sh->nr; ++i) {
                 rec_get(&ss, i);
                 if (i > 0) {
-                        int cmp = skeycmp(sh, i, keyarea, keysize);
+                        int cmp = skeycmp(sh, i, keyarea, keysize, nsize(n) - 1);
                         if (cmp <= 0) {
                                 printf("Misordered at %i: ", i);
                                 print_range(keyarea, keysize,
@@ -2832,12 +2835,12 @@ static struct t2_tree_type ttype = {
 };
 
 static void simple_ut(void) {
-        char body[1ul << ntype.shift];
         struct node n = {
                 .ntype = &ntype,
                 .addr  = taddr_make(0x100000, ntype.shift),
-                .data  = body,
+                .data  = mem_alloc_align(1ul << ntype.shift)
         };
+        ASSERT(n.data != NULL);
         struct sheader *sh = simple_header(&n);
         char key0[] = "KEY0";
         char val0[] = "VAL0--";
@@ -2852,7 +2855,6 @@ static void simple_ut(void) {
                 }
         };
         int result;
-        memset(body, 0, sizeof body);
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         usuite("simple-node");
@@ -2942,12 +2944,12 @@ static void ht_ut() {
 
 static void traverse_ut() {
         taddr_t addr = taddr_make(0x100000, ntype.shift);
-        char body[1ul << ntype.shift];
         struct node n = {
                 .ntype = &ntype,
                 .addr  = addr,
-                .data  = body,
+                .data  = mem_alloc_align(1ul << ntype.shift)
         };
+        ASSERT(n.data != NULL);
         struct sheader *sh = simple_header(&n);
         *sh = (struct sheader) {
                 .head = {
@@ -2983,7 +2985,6 @@ static void traverse_ut() {
         struct t2 *mod = t2_init(&mock_storage, 10);
         t2_node_type_register(mod, &ntype);
         ttype.mod = mod;
-        memset(body, 0, sizeof body);
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         utest("prepare");
