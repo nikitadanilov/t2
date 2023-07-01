@@ -352,6 +352,7 @@ struct node {
         uint64_t                flags;
         void                   *data;
         struct t2              *mod;
+        uint64_t                cookie;
         pthread_rwlock_t        lock;
         struct rcu_head         rcu;
 };
@@ -437,14 +438,12 @@ enum {
 };
 
 struct header {
-        uint64_t cookie;
-        uint32_t magix;
-        uint32_t csum;
-        uint16_t ntype;
         int8_t   level;
         uint8_t  pad8;
+        uint16_t ntype;
+        uint32_t magix;
+        uint32_t csum;
         uint32_t treeid;
-        uint64_t addr;
 };
 
 struct msg_ctx {
@@ -812,20 +811,17 @@ static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         CINC(op[opt].nr);
         rcu_lock();
         if (cookie_is_valid(&r->cookie)) {
-                struct header *h = (void *)r->cookie.hi;
-                if (h->magix == NODE_MAGIX && h->level == 0) { /* TODO: More checks? */
-                        struct node *n = peek(t->ttype->mod, h->addr);
-                        if (n != NULL && nheader(n) == h && nr(n) > 0) {
-                                int result;
-                                ref(n);
-                                rcu_unlock();
-                                lock(n, mode);
-                                /* TODO: re-check node. */
-                                result = cookie_node_complete(t, r, n, opt);
-                                unlock(n, mode);
-                                put(n);
-                                return result;
-                        }
+                struct node *n = COF(r->cookie.hi, struct node, cookie);
+                if (is_leaf(n) && nr(n) > 0) { /* TODO: More checks? */
+                        int result;
+                        ref(n);
+                        rcu_unlock();
+                        lock(n, mode);
+                        /* TODO: re-check node. */
+                        result = cookie_node_complete(t, r, n, opt);
+                        unlock(n, mode);
+                        put(n);
+                        return result;
                 }
         }
         rcu_unlock();
@@ -892,6 +888,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                         n->data = data;
                         ht_insert(&mod->ht, n);
                         n->ref = 1;
+                        cookie_make(&n->cookie);
                         CINC(node);
                         return n;
                 }
@@ -905,6 +902,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
 
 static void nfini(struct node *n) {
         ASSERT(n->ref == 0);
+        cookie_invalidate(&n->cookie);
         pthread_rwlock_destroy(&n->lock);
         ht_delete(n);
         mem_free(n->data);
@@ -959,10 +957,8 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
                                 .magix  = NODE_MAGIX,
                                 .ntype  = ntype->id,
                                 .level  = level,
-                                .treeid = t->id,
-                                .addr   = addr
+                                .treeid = t->id
                         };
-                        cookie_make(&nheader(n)->cookie);
                         n->ntype = ntype;
                         simple_make(n);
                 }
@@ -1923,7 +1919,7 @@ static void cookie_init(void) {
 }
 
 static void cookie_complete(struct path *p, struct node *n) {
-        cookie_load(&nheader(n)->cookie, &p->rec->cookie);
+        cookie_load(&n->cookie, &p->rec->cookie);
 }
 
 static void cookie_load(uint64_t *addr, struct t2_cookie *k) {
