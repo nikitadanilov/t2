@@ -2779,7 +2779,7 @@ static void utest(const char *t) {
 static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         struct sheader *sh = simple_header(s->node);
         int result;
-        for (int32_t i = 0; simple_free(s->node) >
+        for (int32_t i = 0; simple_free(s->node) >=
                      buf_len(key) + buf_len(val) + SOF(struct dir_element); ++i) {
                 result = simple_insert(s);
                 ASSERT(result == 0);
@@ -3126,6 +3126,13 @@ static void tree_ut() {
                 v64 = ht_hash(i + 1);
                 result = t2_insert(t, &r);
                 ASSERT(result == (i < 20000 ? -EEXIST : 0));
+        }
+        utest("check");
+        for (int i = 0; i < 50000; ++i) {
+                k64 = ht_hash(i);
+                result = t2_lookup(t, &r);
+                ASSERT(result == 0);
+                ASSERT(v64 == ht_hash(i + 1));
         }
         utest("fini");
         t2_node_type_degister(&ntype);
