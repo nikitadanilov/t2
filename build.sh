@@ -45,8 +45,8 @@ function run() {
 function build() {
     CFLAGS="-O0 -I/usr/local/include -g3 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
     LDFLAGS="-L/usr/local/lib/ -lurcu -lpthread -rdynamic"
-    run ut ${CC:-cc} $CFLAGS -DUT t2.c $LDFLAGS -o ut
-    run object ${CC:-cc} $CFLAGS -c t2.c
+    run ut ${CC:-cc} $CFLAGS -DUT=1 t2.c $LDFLAGS -o ut
+    run object ${CC:-cc} $CFLAGS -DUT=0 -c t2.c
 }
 
 for cfg in "$(uname -a)" "$(uname -srm)" "$(uname -sm)" "$(uname -s)" "$(uname -m)" "default"

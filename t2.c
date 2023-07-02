@@ -2377,6 +2377,8 @@ static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin) {
         b->seg[0].len  = min_32(b->seg[0].len & mask, mask + 1 - off);
 }
 
+static void (*ut_search_hook)(struct node *n, struct t2_rec *rec, struct slot *out) = NULL;
+
 enum { LINEAR = 1 }; /* Effects of switching to linear search seem to be minimal. */
 
 static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) {
@@ -2393,6 +2395,9 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         CINC(op[LOOKUP].l[level(n)].search);
+        if (UT && ut_search_hook != NULL) {
+                (ut_search_hook)(n, rec, out);
+        }
         while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
                 cmp = skeycmp(sh, m, kaddr, klen, mask);
@@ -2693,7 +2698,7 @@ static int merge(struct node *d, struct node *s, enum dir dir) {
         return result;
 }
 
-#if defined(UT)
+#if UT
 
 /* @mock */
 
@@ -3541,7 +3546,7 @@ void seq_ut(void) {
 
 void lib_ut() {
         usuite("lib");
-        utest("init");
+        utest("minmax");
 #define MINMAX(l, g) (min_32(l, g) == l && min_32(g, l) == l && max_32(l, g) == g && max_32(g, l) == g)
         ASSERT(MINMAX(0, 1));
         ASSERT(MINMAX(0, 1000));
@@ -3557,9 +3562,67 @@ void lib_ut() {
         utestdone();
 }
 
+enum { CORRUPT_RATE = 100 };
+
+static void corrupt_hook(struct node *n, struct t2_rec *rec, struct slot *out) {
+        if (rand() % CORRUPT_RATE == 0) {
+                int off = rand() % nsize(n);
+                int bit = rand() % 8;
+                ((char *)n->data)[off] ^= 1 << bit;
+        }
+}
+
+void corrupt_ut() {
+        uint64_t key;
+        uint64_t val;
+        struct t2_buf keyb;
+        struct t2_buf valb;
+        struct t2_rec r = {};
+        struct t2      *mod;
+        struct t2_tree *t;
+        int     result;
+        usuite("corrupt");
+        utest("init");
+        mod = t2_init(&mock_storage, 20);
+        ASSERT(EISOK(mod));
+        ttype.mod = NULL;
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        t = t2_tree_create(&ttype);
+        ASSERT(EISOK(t));
+        utest("populate");
+        long U = 1000000;
+        for (long i = 0; i < U; ++i) {
+                keyb = BUF_VAL(key);
+                valb = BUF_VAL(val);
+                r.key = &keyb;
+                r.val = &valb;
+                key = ht_hash(i);
+                val = ht_hash(i + 1);
+                result = t2_insert(t, &r);
+                ASSERT(result == 0);
+        }
+        ut_search_hook = &corrupt_hook;
+        for (long i = 0; i < U; ++i) {
+                keyb = BUF_VAL(key);
+                valb = BUF_VAL(val);
+                r.key = &keyb;
+                r.val = &valb;
+                key = ht_hash(rand());
+                result = t2_lookup(t, &r);
+                ASSERT(result == 0 || result == -ENOENT);
+        }
+        ut_search_hook = NULL;
+        utest("fini");
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utestdone();
+}
+
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        corrupt_ut();
         lib_ut();
         simple_ut();
         ht_ut();
