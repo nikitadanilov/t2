@@ -96,6 +96,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <limits.h>
 #include <execinfo.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
@@ -3538,9 +3539,28 @@ void seq_ut(void) {
         utestdone();
 }
 
+void lib_ut() {
+        usuite("lib");
+        utest("init");
+#define MINMAX(l, g) (min_32(l, g) == l && min_32(g, l) == l && max_32(l, g) == g && max_32(g, l) == g)
+        ASSERT(MINMAX(0, 1));
+        ASSERT(MINMAX(0, 1000));
+        ASSERT(MINMAX(0, INT_MAX));
+        ASSERT(MINMAX(-1, 0));
+        ASSERT(MINMAX(-1000, 0));
+        ASSERT(MINMAX(INT_MIN / 2, 0));
+        ASSERT(MINMAX(1, 1));
+        ASSERT(MINMAX(-1000, 1));
+        ASSERT(MINMAX(INT_MIN / 2, 1000));
+        ASSERT(MINMAX(INT_MIN / 2, INT_MAX / 2));
+#undef MINMAX
+        utestdone();
+}
+
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        lib_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
