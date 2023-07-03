@@ -3654,7 +3654,6 @@ void corrupt_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        corrupt_ut();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -3670,6 +3669,7 @@ int main(int argc, char **argv) {
         seq_ut();
         counters_print();
         counters_clear();
+        corrupt_ut();
         return 0;
 }
 
