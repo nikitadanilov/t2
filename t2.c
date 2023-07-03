@@ -578,8 +578,8 @@ static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 static __thread struct counters __t_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
 static __thread int edepth = 0;
-static __thread struct {
-        volatile jmp_buf  *buf;
+static __thread volatile struct {
+        volatile jmp_buf *buf;
 } addr_check = {};
 
 
