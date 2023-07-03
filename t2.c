@@ -1869,7 +1869,6 @@ static bool addr_is_valid(void *addr) {
         bool result;
         jmp_buf buf;
         ASSERT(addr_check.buf == NULL);
-        ASSERT(addr != NULL);
         if (sigsetjmp(buf, true) != 0) {
                 result = false;
         } else {
@@ -2072,12 +2071,14 @@ static void stacktrace(void) {
 }
 
 static void sigsegv(int signo, siginfo_t *si, void *uctx) {
+        jmp_buf *buf = addr_check.buf;
         if (UNLIKELY(insigsegv++ > 0)) {
                 abort(); /* Don't try to print anything. */
         }
-        if (ON_LINUX && LIKELY(addr_check.buf != NULL)) {
+        if (ON_LINUX && LIKELY(buf != NULL)) {
+		addr_check.buf = NULL;
                 --insigsegv;
-                siglongjmp(*(jmp_buf *)addr_check.buf, 1);
+                siglongjmp(*buf, 1);
         }
         printf("\nGot: %i errno: %i addr: %p code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_addr, si->si_code, si->si_pid, si->si_uid, uctx);
