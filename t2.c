@@ -1136,7 +1136,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 result = simple_insert(&s);
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node));
                 if (LIKELY(result == 0) && (r->flags & ALUSED)) {
-                        struct t2_buf lkey;
+                        struct t2_buf lkey = {};
                         struct t2_buf rkey;
                         if (is_leaf(right)) {
                                 s.node = left;
@@ -1664,7 +1664,7 @@ static int traverse(struct path *p) {
         struct t2 *mod   = p->tree->ttype->mod;
         int        tries = 0;
         int        result;
-        uint64_t   next;
+        uint64_t   next = 0;
         ASSERT(p->used == 0);
         ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
         CINC(op[p->opt].traverse);
@@ -2071,14 +2071,14 @@ static void stacktrace(void) {
 }
 
 static void sigsegv(int signo, siginfo_t *si, void *uctx) {
-        jmp_buf *buf = addr_check.buf;
+        volatile jmp_buf *buf = addr_check.buf;
         if (UNLIKELY(insigsegv++ > 0)) {
                 abort(); /* Don't try to print anything. */
         }
         if (ON_LINUX && LIKELY(buf != NULL)) {
 		addr_check.buf = NULL;
                 --insigsegv;
-                siglongjmp(*buf, 1);
+                siglongjmp((void *)*buf, 1);
         }
         printf("\nGot: %i errno: %i addr: %p code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_addr, si->si_code, si->si_pid, si->si_uid, uctx);
@@ -2814,8 +2814,8 @@ static void buf_init_str(struct t2_buf *b, const char *s) {
 static bool is_sorted(struct node *n) {
         struct sheader *sh = simple_header(n);
         SLOT_DEFINE(ss, n);
-        char   *keyarea;
-        int32_t keysize;
+        char   *keyarea = NULL;
+        int32_t keysize = 0;
         for (int32_t i = 0; i < sh->nr; ++i) {
                 rec_get(&ss, i);
                 if (i > 0) {
@@ -3497,7 +3497,7 @@ static void error_ut(void) {
         (void)e1;
         eprint();
         for (int i = -1; i < 5; ++i) {
-                int err;
+                int err = 0;
                 int result = t2_error(i, buf, sizeof buf, &err);
                 printf("%i: %i %i %s\n", i, result, err, buf);
         }
@@ -3596,7 +3596,7 @@ static void corrupt_hook(struct node *n, struct t2_rec *rec, struct slot *out) {
                 sh->nr = min_32(max_32(sh->nr, 0), (nsize(n) - sh->dir_off) / sizeof(struct dir_element));
         } else if (rand() % CORRUPT_DIR_RATE == 0) {
                 sh->dir_off += 2*(rand() % 2) - 1;
-                sh->dir_off = min_32(max_32(sh->nr, sizeof *sh), nsize(n) - sdirsize(n));
+                sh->dir_off = min_32(max_32(sh->nr, sizeof *sh), nsize(n) - sdirsize(sh));
         } else if (rand() % CORRUPT_LEVEL_RATE == 0) {
                 sh->head.level += 2*(rand() % 2) - 1;
                 sh->head.level = min_32(max_32(sh->nr, 0), MAX_TREE_HEIGHT - 1);
