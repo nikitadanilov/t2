@@ -513,6 +513,7 @@ static void link_init(struct link *l);
 static void link_fini(struct link *l);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
+static void buf_clip_node(struct t2_buf *b, const struct node *n);
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos);
 static taddr_t internal_get(const struct node *n, int32_t pos);
 static struct node *internal_child(const struct node *n, int32_t pos, bool peek);
@@ -939,10 +940,12 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                         n->ntype = n->mod->ntypes[h->ntype];
                                 } else {
                                         put(n);
-                                        result = ERROR(-EIO);
+                                        nfini(n);
+                                        n = EPTR(-EIO);
                                 }
                         } else {
                                 put(n);
+                                nfini(n);
                                 n = EPTR(result);
                         }
                 }
@@ -1069,7 +1072,7 @@ static void internal_parent_rec(struct path *p, int idx) {
                         r->keyout = *s.rec.key;
                 }
         }
-        buf_clip(&r->keyout, nsize(r->node) - 1, r->node->data);
+        buf_clip_node(&r->keyout, r->node);
         ptr_buf(r->allocated, &r->valout);
 }
 
@@ -1653,6 +1656,7 @@ static bool rcu_try(struct path *p) {
         if (result) {
                 path_fini(p);
         }
+        rcu_lock();
         return result;
 }
 
@@ -1672,6 +1676,10 @@ static int traverse(struct path *p) {
                 ASSERT(CVAL(rcu) == 1);
                 if (UNLIKELY(tries++ > 10 && (tries & (tries - 1)) == 0)) {
                         LOG("Looping: %i", tries);
+                        if (tries > 100) {
+                                rcu_unlock();
+                                return -EIO;
+                        }
                 }
                 if (p->used == 0) {
                         next = p->tree->root;
@@ -1683,7 +1691,6 @@ static int traverse(struct path *p) {
                         break;
                 } else if (n == NULL) {
                         rcu_leave(p);
-                        CINC(op[p->opt].l[level(n)].get);
                         n = get(mod, next);
                         if (rcu_try(p)) {
                                 continue;
@@ -1698,6 +1705,7 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else {
+                                CINC(op[p->opt].l[level(n)].get);
                                 flags |= PINNED;
                         }
                 } else if (!is_stable(n)) {
@@ -2136,7 +2144,7 @@ static void ht_clean(struct ht *ht) {
         for (int i = 0; i < (1 << ht->shift); i++) {
                 struct link *head = &ht->chains[i];
                 for (struct link *scan = head->next, *next = scan->next; scan != head; scan = next, next = scan->next) {
-                        nfini((struct node *)scan);
+                        nfini(COF(scan, struct node, hash));
                 }
         }
 }
@@ -2298,11 +2306,11 @@ struct sheader { /* Simple node format. */
 };
 
 static struct dir_element *sdir(struct sheader *sh) {
-        return (void *)sh + sh->dir_off;
+        return (void *)sh + sh->dir_off; /* Always within node. */
 }
 
 static struct dir_element *sat(struct sheader *sh, int pos) {
-        return sdir(sh) + pos;
+        return sdir(sh) + pos; /* Always within node. */
 }
 
 static bool is_in(int32_t lo, int32_t v, int32_t hi) {
@@ -2335,7 +2343,6 @@ static int32_t sdirend(struct sheader *sh) {
 }
 
 static int32_t skeyoff(struct sheader *sh, int pos, int32_t *size) {
-        ASSERT(0 <= pos && pos < sh->nr);
         struct dir_element *del = sat(sh, pos);
         *size = sat(sh, pos + 1)->koff - del->koff;
         return del->koff;
@@ -2346,7 +2353,6 @@ static void *skey(struct sheader *sh, int pos, int32_t *size) {
 }
 
 static void *sval(struct sheader *sh, int pos, int32_t *size) {
-        ASSERT(0 <= pos && pos < sh->nr);
         struct dir_element *del = sat(sh, pos + 1);
         *size = sat(sh, pos)->voff  - del->voff;
         return (void *)sh + del->voff;
@@ -2359,7 +2365,6 @@ static char cmpch(int cmp) {
 static void print_range(void *orig, int32_t nsize, void *start, int32_t nob);
 
 static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen, uint32_t mask) {
-        ASSERT(0 <= pos && pos < sh->nr);
         int32_t ksize;
         int32_t koff = skeyoff(sh, pos, &ksize) & mask;
         ksize = min_32(ksize & mask, mask + 1 - koff);
@@ -2375,6 +2380,10 @@ static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin) {
         int32_t off = (b->seg[0].addr - origin) & mask;
         b->seg[0].addr = origin + off;
         b->seg[0].len  = min_32(b->seg[0].len & mask, mask + 1 - off);
+}
+
+static void buf_clip_node(struct t2_buf *b, const struct node *n) {
+        buf_clip(b, nsize(n) - 1, n->data);
 }
 
 static void (*ut_search_hook)(struct node *n, struct t2_rec *rec, struct slot *out) = NULL;
@@ -2438,21 +2447,25 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
 }
 
 static taddr_t internal_addr(const struct slot *s) {
-        taddr_t addr;
+        taddr_t addr = 0;
+        buf_clip_node(s->rec.key, s->node);
+        buf_clip_node(s->rec.val, s->node);
+        s->rec.val->seg[0].len = min_32(s->rec.val->seg[0].len, sizeof addr);
         ASSERT(s->rec.val->nr > 0 && s->rec.val->seg[0].len >= 0);
         memcpy(&addr, s->rec.val->seg[0].addr, s->rec.val->seg[0].len);
-        ASSERT(taddr_is_valid(addr));
-        return addr;
+        return taddr_is_valid(addr) ? addr : 0;
 }
 
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
-        SLOT_DEFINE(s, NULL);
+        SLOT_DEFINE(s, n);
+        SET0(s.rec.key);
+        SET0(s.rec.val);
+        s.rec.key->nr = 1;
+        s.rec.val->nr = 1;
         (void)simple_search(n, r, &s);
         if (s.idx < 0) {
-                s.node = n;
                 rec_get(&s, 0);
         }
-        ASSERT(0 <= s.idx && s.idx < nr(n));
         *pos = s.idx;
         return internal_addr(&s);
 }
@@ -2462,8 +2475,6 @@ static taddr_t internal_get(const struct node *n, int32_t pos) {
         ASSERT(!is_leaf(n));
         SLOT_DEFINE(s, (struct node *)n);
         rec_get(&s, pos);
-        buf_clip(s.rec.key, nsize(n) - 1, n->data);
-        buf_clip(s.rec.val, nsize(n) - 1, n->data);
         return internal_addr(&s);
 }
 
@@ -2586,7 +2597,6 @@ static void simple_delete(struct slot *s) {
 
 static void simple_get(struct slot *s) {
         struct sheader *sh = simple_header(s->node);
-        ASSERT(0 <= s->idx && s->idx < sh->nr);
         s->rec.key->nr = 1;
         s->rec.val->nr = 1;
         s->rec.key->seg[0].addr = skey(sh, s->idx, &s->rec.key->seg[0].len);
@@ -2732,8 +2742,12 @@ static void mso_free(struct t2_storage *storage, taddr_t addr) {
 }
 
 static int mso_read(struct t2_storage *storage, taddr_t addr, void *dst) {
-        memcpy(dst, (void *)taddr_saddr(addr), taddr_ssize(addr));
-        return 0;
+        if (FORALL(i, taddr_ssize(addr), addr_is_valid((void *)taddr_saddr(addr) + i))) {
+                memcpy(dst, (void *)taddr_saddr(addr), taddr_ssize(addr));
+                return 0;
+        } else {
+                return -EIO;
+        }
 }
 
 static int mso_write(struct t2_storage *storage, taddr_t addr, void *src) {
@@ -3562,13 +3576,29 @@ void lib_ut() {
         utestdone();
 }
 
-enum { CORRUPT_RATE = 100 };
+enum {
+        CORRUPT_RATE       = 10,
+        CORRUPT_DIR_RATE   = 10,
+        CORRUPT_NR_RATE    = 10,
+        CORRUPT_LEVEL_RATE = 10
+};
 
 static void corrupt_hook(struct node *n, struct t2_rec *rec, struct slot *out) {
+        struct sheader *sh = simple_header(n);
         if (rand() % CORRUPT_RATE == 0) {
-                int off = rand() % nsize(n);
+                int off = rand() % (nsize(n) - sizeof *sh);
                 int bit = rand() % 8;
-                ((char *)n->data)[off] ^= 1 << bit;
+                ((char *)n->data)[off + sizeof *sh] ^= 1 << bit;
+        } else if (rand() % CORRUPT_NR_RATE == 0) {
+                struct sheader *sh = simple_header(n);
+                sh->nr += 2*(rand() % 2) - 1;
+                sh->nr = min_32(max_32(sh->nr, 0), (nsize(n) - sh->dir_off) / sizeof(struct dir_element));
+        } else if (rand() % CORRUPT_DIR_RATE == 0) {
+                sh->dir_off += 2*(rand() % 2) - 1;
+                sh->dir_off = min_32(max_32(sh->nr, sizeof *sh), nsize(n) - sdirsize(n));
+        } else if (rand() % CORRUPT_LEVEL_RATE == 0) {
+                sh->head.level += 2*(rand() % 2) - 1;
+                sh->head.level = min_32(max_32(sh->nr, 0), MAX_TREE_HEIGHT - 1);
         }
 }
 
@@ -3602,6 +3632,7 @@ void corrupt_ut() {
                 result = t2_insert(t, &r);
                 ASSERT(result == 0);
         }
+        utest("corrupt");
         ut_search_hook = &corrupt_hook;
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(key);
@@ -3610,7 +3641,7 @@ void corrupt_ut() {
                 r.val = &valb;
                 key = ht_hash(rand());
                 result = t2_lookup(t, &r);
-                ASSERT(result == 0 || result == -ENOENT);
+                ASSERT(result == 0 || result == -ENOENT || result == -EIO);
         }
         ut_search_hook = NULL;
         utest("fini");
