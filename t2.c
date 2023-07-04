@@ -353,7 +353,8 @@ enum optype {
 };
 
 enum node_flags {
-        HEARD_BANSHEE = 1ull << 0
+        HEARD_BANSHEE = 1ull << 0,
+        NOCACHE       = 1ull << 1
 };
 
 struct node {
@@ -516,6 +517,7 @@ static int32_t rec_len(const struct t2_rec *r);
 static int  ht_init(struct ht *ht, int shift);
 static void ht_fini(struct ht *ht);
 static void ht_clean(struct ht *ht);
+static struct bucket *ht_bucket(struct ht *ht, taddr_t addr);
 static struct node *ht_lookup(struct ht *ht, taddr_t addr);
 static void ht_insert(struct ht *ht, struct node *n);
 static void ht_delete(struct node *n);
@@ -536,13 +538,14 @@ static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1)
 static void eclear(void);
 static void eprint(void);
 static void put(struct node *n);
+static void put_locked(struct node *n);
 static void ref(struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
 static bool can_insert(const struct node *n, const struct t2_rec *r);
 static bool keep(const struct node *n);
-static int dealloc(struct t2_tree *t, struct node *n);
+static int dealloc(struct node *n);
 static uint8_t level(const struct node *n);
 static bool is_leaf(const struct node *n);
 static int32_t nr(const struct node *n);
@@ -583,6 +586,8 @@ static void cookie_invalidate(uint64_t *addr);
 static void cookie_make(uint64_t *addr);
 static void cookie_complete(struct path *p, struct node *n);
 static void cookie_load(uint64_t *addr, struct t2_cookie *k);
+static void mutex_lock(pthread_mutex_t *lock);
+static void mutex_unlock(pthread_mutex_t *lock);
 
 static __thread struct counters __t_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
@@ -905,7 +910,7 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
         return ht_lookup(&mod->ht, addr);
 }
 
-static struct node *ninit(struct t2 *mod, taddr_t addr) {
+static struct node *nalloc(struct t2 *mod, taddr_t addr) {
         struct node *n    = mem_alloc(sizeof *n);
         void        *data = mem_alloc_align(taddr_ssize(addr));
         int          result;
@@ -915,7 +920,6 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                         n->addr = addr;
                         n->mod = mod;
                         n->data = data;
-                        ht_insert(&mod->ht, n);
                         n->ref = 1;
                         cookie_make(&n->cookie);
                         CINC(node);
@@ -933,44 +937,68 @@ static void nfini(struct node *n) {
         ASSERT(n->ref == 0);
         cookie_invalidate(&n->cookie);
         pthread_rwlock_destroy(&n->lock);
-        ht_delete(n);
         mem_free(n->data);
         SET0(n);
         mem_free(n);
 }
 
+static struct node *ninit(struct t2 *mod, taddr_t addr) {
+        struct node *n = nalloc(mod, addr);
+        if (EISOK(n)) {
+                struct node     *other;
+                pthread_mutex_t *bucket = &ht_bucket(&mod->ht, addr)->lock;
+                mutex_lock(bucket);
+                other = ht_lookup(&mod->ht, addr);
+                if (LIKELY(other == NULL)) {
+                        ht_insert(&mod->ht, n);
+                } else {
+                        n->ref = 0;
+                        CDEC(node);
+                        nfini(n);
+                        n = other;
+                        ref(n);
+                }
+                mutex_unlock(bucket);
+        }
+        return n;
+}
+
 static void ref(struct node *n) {
-        ASSERT(CVAL(rcu) > 0 || n->ref > 0);
         n->ref++;
         CINC(node);
 }
 
+static void ndelete(struct node *n) {
+        pthread_mutex_t *bucket = &ht_bucket(&n->mod->ht, n->addr)->lock;
+        mutex_lock(bucket);
+        n->flags |= NOCACHE | HEARD_BANSHEE;
+        put_locked(n);
+        mutex_unlock(bucket);
+}
+
 static struct node *get(struct t2 *mod, taddr_t addr) {
-        struct node *n = ht_lookup(&mod->ht, addr);
+        struct node *n = ninit(mod, addr);
         ASSERT(CVAL(rcu) == 0);
-        if (n == NULL) {
-                n = ninit(mod, addr);
-                if (EISOK(n)) {
+        if (EISOK(n)) {
+                lock(n, WRITE);
+                if (LIKELY(n->ntype == NULL)) {
                         int result = SCALL(n->mod, read, n->addr, n->data);
                         if (LIKELY(result == 0)) {
                                 struct header *h = n->data;
                                 /* TODO: check node. */
                                 if (LIKELY(IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL)) {
-                                        n->ntype = n->mod->ntypes[h->ntype];
+                                        rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                 } else {
-                                        put(n);
-                                        nfini(n);
-                                        n = EPTR(-EIO);
+                                        result = ERROR(-EIO);
                                 }
-                        } else {
-                                put(n);
-                                nfini(n);
-                                n = EPTR(result);
+                        }
+                        if (UNLIKELY(result != 0)) {
+                                unlock(n, WRITE);
+                                ndelete(n);
+                                return EPTR(result);
                         }
                 }
-        } else {
-                n->ref++;
-                CINC(node);
+                unlock(n, WRITE);
         }
         return n;
 }
@@ -999,21 +1027,42 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
         return n;
 }
 
-static int dealloc(struct t2_tree *t, struct node *n) {
-        SCALL(t->ttype->mod, free, n->addr);
-        n->data = NULL;
-        put(n);
-        return 0;
+static void free_callback(struct rcu_head *head) {
+        struct node *n = COF(head, struct node, rcu);
+        nfini(n);
+}
+
+static void put_final(struct node *n) {
+        n->flags |= HEARD_BANSHEE;
+        ht_delete(n);
+        call_rcu_memb(&n->rcu, &free_callback);
+}
+
+static void put_locked(struct node *n) {
+        ASSERT(n->ref > 0);
+        EXPENSIVE_ASSERT(n->data != NULL ? is_sorted(n) : true);
+        if (--n->ref == 0) {
+                /* TODO: lru. */
+                if (n->flags & NOCACHE) {
+                        put_final(n);
+                }
+        }
+        CDEC(node);
 }
 
 static void put(struct node *n) {
-        ASSERT(n->ref > 0);
-        EXPENSIVE_ASSERT(n->data != NULL ? is_sorted(n) : true);
-        CDEC(node);
-        if (--n->ref == 0) {
-                /* TODO: lru. */
-        }
+        pthread_mutex_t *bucket = &ht_bucket(&n->mod->ht, n->addr)->lock;
+        mutex_lock(bucket);
+        put_locked(n);
+        mutex_unlock(bucket);
 }
+
+static int dealloc(struct node *n) {
+        ndelete(n);
+        SCALL(n->mod, free, n->addr);
+        return 0;
+}
+
 
 static struct header *nheader(const struct node *n) {
         return n->data;
@@ -1334,7 +1383,7 @@ static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
                         if (UNLIKELY(r->flags & ALUSED)) {
                                 put(r->allocated);
                         } else {
-                                dealloc(p->tree, r->allocated);
+                                dealloc(r->allocated);
                         }
                 }
                 buf_free(&r->scratch);
@@ -1342,7 +1391,7 @@ static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
         }
         p->used = 0;
         if (UNLIKELY(p->newroot != NULL)) {
-                dealloc(p->tree, p->newroot);
+                dealloc(p->newroot);
                 p->newroot = NULL;
         }
 }
@@ -1708,7 +1757,7 @@ static int traverse(struct path *p) {
                         result = ERROR(ERRCODE(n));
                         rcu_unlock();
                         break;
-                } else if (n == NULL) {
+                } else if (n == NULL || rcu_dereference(n->ntype) == NULL) {
                         rcu_leave(p);
                         n = get(mod, next);
                         if (rcu_try(p)) {
@@ -2147,6 +2196,17 @@ static void signal_fini(void) {
                 sigaction(SIGSEGV, &osa, NULL);
         }
 }
+
+static void mutex_lock(pthread_mutex_t *lock) {
+        int result = pthread_mutex_lock(lock);
+        ASSERT(result == 0);
+}
+
+static void mutex_unlock(pthread_mutex_t *lock) {
+        int result = pthread_mutex_unlock(lock);
+        ASSERT(result == 0);
+}
+
 /* @ht */
 
 static int ht_init(struct ht *ht, int shift) {
@@ -2176,9 +2236,12 @@ static void ht_clean(struct ht *ht) {
                 struct cds_hlist_head *head = &ht->buckets[i].chain;
                 struct node           *scan;
                 struct node           *next;
+                mutex_lock(&ht->buckets[i].lock);
                 cds_hlist_for_each_entry_safe_2(scan, next, head, hash) {
+                        ht_delete(scan);
                         nfini(scan);
                 }
+                mutex_unlock(&ht->buckets[i].lock);
         }
 }
 
@@ -2194,12 +2257,16 @@ static uint64_t ht_hash(taddr_t addr) {
         return x;
 }
 
+static struct bucket *ht_bucket(struct ht *ht, taddr_t addr) {
+       uint64_t hash = ht_hash(addr) & ((1 << ht->shift) - 1);
+       return &ht->buckets[hash];
+}
+
 static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
-        uint64_t     hash = ht_hash(addr) & ((1 << ht->shift) - 1);
-        struct cds_hlist_head *head = &ht->buckets[hash].chain;
+        struct cds_hlist_head *head = &ht_bucket(ht, addr)->chain;
         struct node           *scan;
         cds_hlist_for_each_entry_rcu_2(scan, head, hash) {
-                if (scan->addr == addr) {
+                if (scan->addr == addr && LIKELY((scan->flags & HEARD_BANSHEE) == 0)) {
                         return scan;
                 }
         }
@@ -2208,19 +2275,13 @@ static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
 
 static void ht_insert(struct ht *ht, struct node *n) {
         struct bucket *b = &ht->buckets[ht_hash(n->addr) & ((1 << ht->shift) - 1)];
-        pthread_mutex_lock(&b->lock);
         cds_hlist_add_head_rcu(&n->hash, &b->chain);
-        pthread_mutex_unlock(&b->lock);
 }
 
 static void ht_delete(struct node *n) {
-        struct ht *ht = &n->mod->ht;
-        struct bucket *b = &ht->buckets[ht_hash(n->addr) & ((1 << ht->shift) - 1)];
         ASSERT(n->hash.prev != &n->hash);
         ASSERT(n->hash.next != &n->hash);
-        pthread_mutex_lock(&b->lock);
         cds_hlist_del_rcu(&n->hash);
-        pthread_mutex_unlock(&b->lock);
 }
 
 /* @buf */
@@ -3689,6 +3750,7 @@ void corrupt_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        corrupt_ut();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -3704,7 +3766,6 @@ int main(int argc, char **argv) {
         seq_ut();
         counters_print();
         counters_clear();
-        corrupt_ut();
         return 0;
 }
 
