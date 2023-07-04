@@ -101,6 +101,7 @@
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
+#include <urcu/rcuhlist.h>
 #include "t2.h"
 #include "config.h"
 
@@ -308,14 +309,14 @@ enum {
 
 struct node;
 
-struct link {
-        struct link *next;
-        struct link *prev;
+struct bucket {
+        pthread_mutex_t       lock;
+        struct cds_hlist_head chain;
 };
 
 struct ht {
-        int          shift;
-        struct link *chains;
+        int            shift;
+        struct bucket *buckets;
 };
 
 struct t2 {
@@ -353,7 +354,7 @@ enum node_flags {
 };
 
 struct node {
-        struct link             hash;
+        struct cds_hlist_node   hash;
         taddr_t                 addr;
         uint64_t                seq;
         atomic_int              ref;
@@ -515,8 +516,6 @@ static void ht_clean(struct ht *ht);
 static struct node *ht_lookup(struct ht *ht, taddr_t addr);
 static void ht_insert(struct ht *ht, struct node *n);
 static void ht_delete(struct node *n);
-static void link_init(struct link *l);
-static void link_fini(struct link *l);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
 static void buf_clip_node(struct t2_buf *b, const struct node *n);
@@ -908,7 +907,6 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
         if (LIKELY(n != NULL && data != NULL)) {
                 result = pthread_rwlock_init(&n->lock, NULL);
                 if (LIKELY(result == 0)) {
-                        link_init(&n->hash);
                         n->addr = addr;
                         n->mod = mod;
                         n->data = data;
@@ -2099,12 +2097,14 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
         printf("\nGot: %i errno: %i addr: %p code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_addr, si->si_code, si->si_pid, si->si_uid, uctx);
         stacktrace();
+        --insigsegv;
         if (osa.sa_handler != SIG_DFL && osa.sa_handler != SIG_IGN) {
                 if (osa.sa_flags & SA_SIGINFO) {
                         (*osa.sa_sigaction)(signo, si, uctx);
                 }
+        } else {
+                abort();
         }
-        --insigsegv;
 }
 
 static int signal_init(void) {
@@ -2130,20 +2130,13 @@ static void signal_fini(void) {
 }
 /* @ht */
 
-static void link_init(struct link *l) {
-        l->next = l->prev = l;
-}
-
-static void link_fini(struct link *l) {
-        ASSERT(l->next == l && l->prev == l);
-}
-
 static int ht_init(struct ht *ht, int shift) {
         ht->shift = shift;
-        ht->chains = mem_alloc(sizeof ht->chains[0] << shift);
-        if (ht->chains != NULL) {
-                for (int i = 0; i < (1 << shift); i++) {
-                        link_init(&ht->chains[i]);
+        ht->buckets = mem_alloc(sizeof ht->buckets[0] << shift);
+        if (ht->buckets != NULL) {
+                for (int i = 0; i < (1 << shift); ++i) {
+                        int result = pthread_mutex_init(&ht->buckets[i].lock, NULL);
+                        ASSERT(result == 0);
                 }
                 return 0;
         }
@@ -2152,16 +2145,20 @@ static int ht_init(struct ht *ht, int shift) {
 
 static void ht_fini(struct ht *ht) {
         for (int i = 0; i < (1 << ht->shift); i++) {
-                link_fini(&ht->chains[i]);
+                int result = pthread_mutex_destroy(&ht->buckets[i].lock);
+                ASSERT(result == 0);
+                ASSERT(ht->buckets[i].chain.next == NULL);
         }
-        mem_free(ht->chains);
+        mem_free(ht->buckets);
 }
 
 static void ht_clean(struct ht *ht) {
         for (int i = 0; i < (1 << ht->shift); i++) {
-                struct link *head = &ht->chains[i];
-                for (struct link *scan = head->next, *next = scan->next; scan != head; scan = next, next = scan->next) {
-                        nfini(COF(scan, struct node, hash));
+                struct cds_hlist_head *head = &ht->buckets[i].chain;
+                struct node           *scan;
+                struct node           *next;
+                cds_hlist_for_each_entry_safe_2(scan, next, head, hash) {
+                        nfini(scan);
                 }
         }
 }
@@ -2180,30 +2177,31 @@ static uint64_t ht_hash(taddr_t addr) {
 
 static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
         uint64_t     hash = ht_hash(addr) & ((1 << ht->shift) - 1);
-        struct link *scan;
-        struct link *head = &ht->chains[hash];
-        for (scan = head->next; scan != head; scan = scan->next) {
-                if (((struct node *)scan)->addr == addr) {
-                        return (void *)scan;
+        struct cds_hlist_head *head = &ht->buckets[hash].chain;
+        struct node           *scan;
+        cds_hlist_for_each_entry_rcu_2(scan, head, hash) {
+                if (scan->addr == addr) {
+                        return scan;
                 }
         }
         return NULL;
 }
 
 static void ht_insert(struct ht *ht, struct node *n) {
-        uint64_t     hash = ht_hash(n->addr) & ((1 << ht->shift) - 1);
-        struct link *head = &ht->chains[hash];
-        head->next->prev = &n->hash;
-        n->hash.next     = head->next;
-        n->hash.prev     = head;
-        head->next       = &n->hash;
+        struct bucket *b = &ht->buckets[ht_hash(n->addr) & ((1 << ht->shift) - 1)];
+        pthread_mutex_lock(&b->lock);
+        cds_hlist_add_head_rcu(&n->hash, &b->chain);
+        pthread_mutex_unlock(&b->lock);
 }
 
 static void ht_delete(struct node *n) {
+        struct ht *ht = &n->mod->ht;
+        struct bucket *b = &ht->buckets[ht_hash(n->addr) & ((1 << ht->shift) - 1)];
         ASSERT(n->hash.prev != &n->hash);
         ASSERT(n->hash.next != &n->hash);
-        n->hash.next->prev = n->hash.prev;
-        n->hash.prev->next = n->hash.next;
+        pthread_mutex_lock(&b->lock);
+        cds_hlist_del_rcu(&n->hash);
+        pthread_mutex_unlock(&b->lock);
 }
 
 /* @buf */
@@ -2939,15 +2937,16 @@ static void simple_ut(void) {
         utestdone();
 }
 
-static struct node *node_alloc_ut(uint64_t blk) {
+static struct node *node_alloc_ut(struct t2 *mod, uint64_t blk) {
         struct node *n = mem_alloc(sizeof *n);
         n->addr = taddr_make(blk & TADDR_ADDR_MASK, 9);
+        n->mod = mod;
         return n;
 }
 
 static void ht_ut() {
         const uint64_t N = 10000;
-        struct ht ht;
+        struct t2 mod = {};
         usuite("ht");
         utest("collision");
         for (uint64_t i = 0; i < N; ++i) {
@@ -2956,26 +2955,26 @@ static void ht_ut() {
                         ASSERT(ht_hash(2 * N + i * i * i) != ht_hash(2 * N + j * j * j));
                 }
         }
-        ht_init(&ht, 10);
+        ht_init(&mod.ht, 10);
         utest("insert");
         for (uint64_t i = 0; i < N; ++i) {
-                ht_insert(&ht, node_alloc_ut(ht_hash(i)));
+                ht_insert(&mod.ht, node_alloc_ut(&mod, ht_hash(i)));
         }
         utest("lookup");
         for (uint64_t i = 0; i < N; ++i) {
                 taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
-                struct node *n = ht_lookup(&ht, blk);
+                struct node *n = ht_lookup(&mod.ht, blk);
                 ASSERT(n != NULL);
                 ASSERT(n->addr == blk);
         }
         utest("delete");
         for (uint64_t i = 0; i < N; ++i) {
                 taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
-                struct node *n = ht_lookup(&ht, blk);
+                struct node *n = ht_lookup(&mod.ht, blk);
                 ht_delete(n);
         }
         utest("fini");
-        ht_fini(&ht);
+        ht_fini(&mod.ht);
         utestdone();
 }
 
@@ -3024,6 +3023,7 @@ static void traverse_ut() {
         ttype.mod = mod;
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
+        n.mod = mod;
         utest("prepare");
         simple_make(&n);
         ht_insert(&mod->ht, &n);
