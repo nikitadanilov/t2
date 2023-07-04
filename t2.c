@@ -31,8 +31,6 @@
  *
  * - tools: dump, load, repair
  *
- * - iterator, cursor
- *
  * - in-place operations
  *
  * - single-move shift
@@ -49,7 +47,7 @@
  *
  * - balancing policies (per-level?)
  *
- * - check validity of user input (2 records in a node, etc.)
+ * - check validity of user input (4 records in a node, etc.)
  *
  * - handle IO failures
  *
@@ -64,6 +62,8 @@
  * + error reporting: per-thread error propagation stack, (mostly) static error descriptors
  *
  * + metrics
+ *
+ * + iterator, cursor
  *
  * + variably-sized taddr_t encoding in internal nodes
  *
@@ -297,6 +297,12 @@ enum {
 #define CVAL(cnt) (__t_counters.cnt)
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
 #define CAVG(cnt) ({ struct counter_var *v = &(__t_counters.cnt); v->nr ? 1.0 * v->sum / v->nr : 0.0; })
+
+/* Is Parallel Programming Hard, And, If So, What Can You Do About It? */
+#define ACCESS_ONCE(x)     (*(volatile typeof(x) *)&(x))
+#define READ_ONCE(x)       ({ typeof(x) ___x = ACCESS_ONCE(x); ___x; })
+#define WRITE_ONCE(x, val) do { ACCESS_ONCE(x) = (val); } while (0)
+#define barrier()          __asm__ __volatile__("": : :"memory")
 
 /* @types */
 
@@ -839,8 +845,16 @@ static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
 }
 
 static uint64_t node_seq(const struct node *n) {
-        /* Barrier? */
-        return n->seq;
+        uint64_t seq = READ_ONCE(n->seq);
+        __sync_synchronize();
+        return seq & ~(uint64_t)1;
+}
+
+static bool node_seq_is_valid(const struct node *n, uint64_t expected) {
+        uint64_t seq;
+        __sync_synchronize();
+        seq = READ_ONCE(n->seq);
+        return seq == expected;
 }
 
 /* @node */
@@ -858,6 +872,7 @@ static void lock(struct node *n, enum lock_mode mode) {
                 ASSERT(result == 0);
                 ASSERT(is_stable(n));
                 n->seq++;
+                __sync_synchronize();
                 CINC(wlock);
         } else if (mode == READ) {
                 result = pthread_rwlock_rdlock(&n->lock);
@@ -869,6 +884,7 @@ static void unlock(struct node *n, enum lock_mode mode) {
         int result;
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         if (mode == WRITE) {
+                __sync_synchronize();
                 n->seq++;
                 ASSERT(is_stable(n));
                 result = pthread_rwlock_unlock(&n->lock);
@@ -1344,7 +1360,7 @@ static bool rung_is_valid(const struct path *p, int i) {
         const struct node *n    = r->node;
         return  n != NULL &&
                 n->data != NULL &&
-                node_seq(n) == r->seq + (r->lm == WRITE) && /* Account for our own lock. */
+                node_seq_is_valid(n, r->seq + (r->lm == WRITE)) && /* Account for our own lock. */
                 is_stable(n) == (r->lm != WRITE) &&
                 !is_leaf(n) ? r->pos < nr(n) : true &&
                 (i == 0 ? p->tree->root == n->addr :
