@@ -3747,10 +3747,78 @@ void corrupt_ut() {
         utestdone();
 }
 
+enum { THREADS = 17, OPS = 1000000 };
+
+void *worker(void *arg) {
+        struct t2_tree *t = arg;
+        uint64_t key;
+        uint64_t val;
+        struct t2_buf keyb;
+        struct t2_buf valb;
+        struct t2_rec r = {};
+        t2_thread_register();
+        for (long i = 0; i < OPS; ++i) {
+                keyb = BUF_VAL(key);
+                valb = BUF_VAL(val);
+                r.key = &keyb;
+                r.val = &valb;
+                long seed = rand();
+                key = ht_hash(seed);
+                int result = t2_lookup(t, &r);
+                ASSERT(result == 0 || result == -ENOENT || result == -EIO);
+                ASSERT(result == 0 ? val == ht_hash(seed + 1) : true);
+        }
+        t2_thread_degister();
+}
+
+void mt_ut() {
+        uint64_t key;
+        uint64_t val;
+        struct t2_buf keyb;
+        struct t2_buf valb;
+        struct t2_rec r = {};
+        struct t2      *mod;
+        struct t2_tree *t;
+        pthread_t tid[THREADS];
+        int     result;
+        usuite("mt");
+        utest("init");
+        mod = t2_init(&mock_storage, 20);
+        ASSERT(EISOK(mod));
+        ttype.mod = NULL;
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        t = t2_tree_create(&ttype);
+        ASSERT(EISOK(t));
+        utest("populate");
+        for (long i = 0; i < OPS; ++i) {
+                keyb = BUF_VAL(key);
+                valb = BUF_VAL(val);
+                r.key = &keyb;
+                r.val = &valb;
+                key = ht_hash(i);
+                val = ht_hash(i + 1);
+                result = t2_insert(t, &r);
+                ASSERT(result == 0);
+        }
+        utest("lookup");
+        for (int i = 0; i < THREADS; ++i) {
+                result = pthread_create(&tid[i], NULL, &worker, t);
+                ASSERT(result == 0);
+        }
+        for (int i = 0; i < THREADS; ++i) {
+                pthread_join(&tid[i], NULL);
+        }
+        utest("fini");
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utestdone();
+}
+
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        corrupt_ut();
+        mt_ut();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -3766,6 +3834,7 @@ int main(int argc, char **argv) {
         seq_ut();
         counters_print();
         counters_clear();
+        corrupt_ut();
         return 0;
 }
 
