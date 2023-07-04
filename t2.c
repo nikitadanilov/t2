@@ -3,7 +3,7 @@
 /*
  * To do:
  *
- * - integrate rcu: https://github.com/urcu/userspace-rcu/blob/master/include/urcu/rculist.h
+ * - integrate rcu: https://github.com/urcu/userspace-rcu/blob/master/include/urcu/rculist.h (rculfhash.c)
  *
  * - path locking and re-checking (allocate new nodes outside of the lock)
  *
@@ -98,6 +98,8 @@
 #include <setjmp.h>
 #include <limits.h>
 #include <execinfo.h>
+#include <stdalign.h>
+#include <unistd.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -115,7 +117,8 @@ enum {
         MAX_TREE_TYPE   = 1024,
         MAX_NODE_TYPE   = 1024,
         MAX_ERR_CODE    = 1024,
-        MAX_ERR_DEPTH   =   16
+        MAX_ERR_DEPTH   =   16,
+        MAX_CACHELINE   =   64
 };
 
 /* @macro */
@@ -310,8 +313,8 @@ enum {
 struct node;
 
 struct bucket {
-        pthread_mutex_t       lock;
-        struct cds_hlist_head chain;
+        alignas(MAX_CACHELINE) struct cds_hlist_head chain;
+        pthread_mutex_t                              lock;
 };
 
 struct ht {
@@ -527,6 +530,7 @@ static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn)
 static void *mem_alloc(size_t size);
 static void *mem_alloc_align(size_t size);
 static void  mem_free(void *ptr);
+static int cacheline_size();
 static void llog(const struct msg_ctx *ctx, ...);
 static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1);
 static void eclear(void);
@@ -591,6 +595,7 @@ static __thread volatile struct {
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
         struct t2 *mod = mem_alloc(sizeof *mod);
+        ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
         t2_thread_register();
         eclear();
         cookie_init();
@@ -1879,6 +1884,10 @@ int t2_cursor_next(struct t2_cursor *c) {
 
 #if ON_LINUX
 
+static int cacheline_size() {
+        return sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+}
+
 static bool addr_is_valid(void *addr) {
         bool result;
         jmp_buf buf;
@@ -1896,6 +1905,16 @@ static bool addr_is_valid(void *addr) {
 }
 
 #elif ON_DARWIN
+
+#include <sys/sysctl.h>
+
+static int cacheline_size() {
+    size_t cacheline = 0;
+    size_t size      = sizeof(cacheline);
+    int    result    = sysctlbyname("hw.cachelinesize", &cacheline, &size, NULL, 0);
+    ASSERT(result == 0);
+    return cacheline;
+}
 
 /* https://stackoverflow.com/questions/56177752/safely-checking-a-pointer-for-validity-in-macos */
 static bool addr_is_valid(void *addr) {
