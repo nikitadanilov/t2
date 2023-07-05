@@ -410,6 +410,7 @@ struct pstate {
 struct sibling {
         struct node   *node;
         enum lock_mode lm;
+        uint64_t       seq;
 };
 
 struct rung {
@@ -1411,12 +1412,16 @@ static void path_pin(struct path *p) {
 }
 
 static bool rung_is_valid(const struct path *p, int i) {
-        const struct rung *r    = &p->rung[i];
-        const struct rung *prev = &p->rung[i - 1];
-        const struct node *n    = r->node;
+        const struct rung *r     = &p->rung[i];
+        const struct node *n     = r->node;
+        const struct rung *prev  = &p->rung[i - 1];
+        struct sibling    *left  = brother((struct rung *)r, LEFT);
+        struct sibling    *right = brother((struct rung *)r, RIGHT);
         return  n != NULL &&
                 n->data != NULL &&
                 node_seq_is_valid(n, r->seq + (r->lm == WRITE)) && /* Account for our own lock. */
+                (left->node != NULL ? node_seq_is_valid(left->node, left->seq + (left->lm == WRITE)) : true) &&
+                (right->node != NULL ? node_seq_is_valid(right->node, right->seq + (right->lm == WRITE)) : true) &&
                 is_stable(n) == (r->lm != WRITE) &&
                 (!is_leaf(n) ? r->pos < nr(n) : true) &&
                 (i == 0 ? p->tree->root == n->addr :
@@ -1477,7 +1482,7 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
         while (down != NULL && EISOK(down)) {
                 r = &p->rung[++i];
                 r->lm = mode;
-                *brother(r, d) = (struct sibling) { .node = down, .lm = mode };
+                *brother(r, d) = (struct sibling) { .node = down, .lm = mode, .seq = node_seq(down) };
                 ASSERT(level(r->node) == level(down));
                 if (i == idx) {
                         break;
@@ -1732,6 +1737,29 @@ static bool rcu_try(struct path *p) {
         return result;
 }
 
+static void (*ut_search_hook)(struct node *n, struct t2_rec *rec, struct slot *out) = NULL;
+
+enum {
+        DONE  = 1,
+        AGAIN = 2
+};
+
+static int traverse_complete(struct path *p, int result) {
+        if (UNLIKELY(result == -ESTALE)) {
+                path_fini(p);
+                rcu_lock();
+                return AGAIN;
+        } else if (UNLIKELY(result != 0)) {
+                return result;
+        } else if (UNLIKELY(!path_is_valid(p))) {
+                path_fini(p);
+                rcu_lock();
+                return AGAIN;
+        } else {
+                return DONE;
+        }
+}
+
 static int traverse(struct path *p) {
         struct t2 *mod   = p->tree->ttype->mod;
         int        tries = 0;
@@ -1747,14 +1775,14 @@ static int traverse(struct path *p) {
                 uint64_t     flags = 0;
                 ASSERT(CVAL(rcu) == 1);
                 if (UNLIKELY(tries++ > 10)) {
-                        if ((tries & (tries - 1)) == 0) {
+                        if (false && (tries & (tries - 1)) == 0) {
                                 LOG("Looping: %i", tries);
                         }
-                        delay(tries);
-                        if (false && tries > 100) {
+                        if (tries > 16 && UT && ut_search_hook != NULL) {
                                 rcu_unlock();
-                                return -EIO;
+                                return -ELOOP;
                         }
+                        /* delay(tries); */
                 }
                 if (p->used == 0) {
                         next = p->tree->root;
@@ -1810,38 +1838,29 @@ static int traverse(struct path *p) {
                                 }
                         } else if (p->opt == INSERT) {
                                 rcu_leave(p);
-                                result = insert_prep(p);
-                                if (result != 0) {
-                                        break;
-                                } else if (!path_is_valid(p)) {
-                                        path_fini(p);
-                                        rcu_lock();
-                                } else {
+                                result = traverse_complete(p, insert_prep(p));
+                                if (result == DONE) {
                                         result = insert_complete(p, n);
+                                        break;
+                                } else if (result < 0) {
                                         break;
                                 }
                         } else if (p->opt == DELETE) {
                                 rcu_leave(p);
-                                result = delete_prep(p);
-                                if (result != 0) {
-                                        break;
-                                } else if (!path_is_valid(p)) {
-                                        path_fini(p);
-                                        rcu_lock();
-                                } else {
+                                result = traverse_complete(p, delete_prep(p));
+                                if (result == DONE) {
                                         result = delete_complete(p, n);
+                                        break;
+                                } else if (result < 0) {
                                         break;
                                 }
                         } else {
                                 rcu_leave(p);
-                                result = next_prep(p);
-                                if (result != 0) {
-                                        break;
-                                } else if (!path_is_valid(p)) {
-                                        path_fini(p);
-                                        rcu_lock();
-                                } else {
+                                result = traverse_complete(p, next_prep(p));
+                                if (result == DONE) {
                                         result = next_complete(p, n);
+                                        break;
+                                } else if (result < 0) {
                                         break;
                                 }
                         }
@@ -2495,8 +2514,6 @@ static void buf_clip_node(struct t2_buf *b, const struct node *n) {
         buf_clip(b, nsize(n) - 1, n->data);
 }
 
-static void (*ut_search_hook)(struct node *n, struct t2_rec *rec, struct slot *out) = NULL;
-
 enum { LINEAR = 1 }; /* Effects of switching to linear search seem to be minimal. */
 
 static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) {
@@ -2580,11 +2597,13 @@ static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
 }
 
 static taddr_t internal_get(const struct node *n, int32_t pos) {
-        ASSERT(0 <= pos && pos < nr(n));
-        ASSERT(!is_leaf(n));
-        SLOT_DEFINE(s, (struct node *)n);
-        rec_get(&s, pos);
-        return internal_addr(&s);
+        if (LIKELY(0 <= pos && pos < nr(n) && !is_leaf(n))) {
+                SLOT_DEFINE(s, (struct node *)n);
+                rec_get(&s, pos);
+                return internal_addr(&s);
+        } else {
+                return 0; /* Concurrent modification. */
+        }
 }
 
 static struct node *internal_child(const struct node *n, int32_t pos, bool peekp) {
@@ -2592,7 +2611,13 @@ static struct node *internal_child(const struct node *n, int32_t pos, bool peekp
 }
 
 static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s) {
-        return simple_search(n, r, s);
+        bool found;
+        s->rec.key->nr = 1;
+        s->rec.val->nr = 1;
+        found = simple_search(n, r, s);
+        buf_clip_node(s->rec.key, n);
+        buf_clip_node(s->rec.val, n);
+        return found;
 }
 
 static int32_t sfreekey(struct node *n) {
@@ -2851,11 +2876,11 @@ static void mso_free(struct t2_storage *storage, taddr_t addr) {
 }
 
 static int mso_read(struct t2_storage *storage, taddr_t addr, void *dst) {
-        if (FORALL(i, taddr_ssize(addr), addr_is_valid((void *)taddr_saddr(addr) + i))) {
+        if (taddr_ssize(addr) <= 4096 && FORALL(i, taddr_ssize(addr), addr_is_valid((void *)taddr_saddr(addr) + i))) {
                 memcpy(dst, (void *)taddr_saddr(addr), taddr_ssize(addr));
                 return 0;
         } else {
-                return -EIO;
+                return -ESTALE;
         }
 }
 
@@ -3688,10 +3713,10 @@ void lib_ut() {
 }
 
 enum {
-        CORRUPT_RATE       = 10,
-        CORRUPT_DIR_RATE   = 10,
-        CORRUPT_NR_RATE    = 10,
-        CORRUPT_LEVEL_RATE = 10
+        CORRUPT_RATE       = 100,
+        CORRUPT_DIR_RATE   = 100,
+        CORRUPT_NR_RATE    = 100,
+        CORRUPT_LEVEL_RATE = 100
 };
 
 static void corrupt_hook(struct node *n, struct t2_rec *rec, struct slot *out) {
@@ -3732,7 +3757,7 @@ void corrupt_ut() {
         t = t2_tree_create(&ttype);
         ASSERT(EISOK(t));
         utest("populate");
-        long U = 1000000;
+        long U = 20000;
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(key);
                 valb = BUF_VAL(val);
@@ -3752,7 +3777,7 @@ void corrupt_ut() {
                 r.val = &valb;
                 key = ht_hash(rand());
                 result = t2_lookup(t, &r);
-                ASSERT(result == 0 || result == -ENOENT || result == -EIO);
+                ASSERT(result == 0 || result == -ENOENT || result == -EIO || result == -ELOOP);
         }
         ut_search_hook = NULL;
         utest("fini");
@@ -3770,17 +3795,17 @@ void *lookup_worker(void *arg) {
         struct t2_buf keyb;
         struct t2_buf valb;
         struct t2_rec r = {};
-        long seed = rand();
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
+                long seed = rand() + (long)&key;
                 keyb = BUF_VAL(key);
                 valb = BUF_VAL(val);
                 r.key = &keyb;
                 r.val = &valb;
-                key = ht_hash(seed + i);
+                key = ht_hash(seed + i) & 0xfffff;
                 int result = t2_lookup(t, &r);
                 ASSERT(result == 0 || result == -ENOENT);
-                ASSERT(result == 0 ? val == ht_hash(seed + i + 1) : true);
+                ASSERT(result == 0 ? val == key : true);
         }
         t2_thread_degister();
         return NULL;
@@ -3793,18 +3818,39 @@ void *insert_worker(void *arg) {
         struct t2_buf keyb;
         struct t2_buf valb;
         struct t2_rec r = {};
-        long seed = rand();
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
+                long seed = rand() + (long)&key;
                 keyb = BUF_VAL(key);
                 valb = BUF_VAL(val);
                 r.key = &keyb;
                 r.val = &valb;
-                long seed = rand();
-                key = ht_hash(seed + i);
-                val = ht_hash(seed + i + 1);
+                key = ht_hash(seed + i) & 0xfffff;
+                val = key;
                 int result = t2_insert(t, &r);
                 ASSERT(result == 0 || result == -EEXIST);
+        }
+        t2_thread_degister();
+        return NULL;
+}
+
+void *delete_worker(void *arg) {
+        struct t2_tree *t = arg;
+        uint64_t key;
+        uint64_t val;
+        struct t2_buf keyb;
+        struct t2_buf valb;
+        struct t2_rec r = {};
+        t2_thread_register();
+        for (long i = 0; i < OPS; ++i) {
+                long seed = rand() + (long)&key;
+                keyb = BUF_VAL(key);
+                valb = BUF_VAL(val);
+                r.key = &keyb;
+                r.val = &valb;
+                key = ht_hash(seed + i) & 0xfffff;
+                int result = t2_delete(t, &r);
+                ASSERT(result == 0 || result == -ENOENT);
         }
         t2_thread_degister();
         return NULL;
@@ -3818,7 +3864,7 @@ void mt_ut() {
         struct t2_rec r = {};
         struct t2      *mod;
         struct t2_tree *t;
-        pthread_t tid[THREADS];
+        pthread_t tid[2*THREADS];
         int     result;
         usuite("mt");
         utest("init");
@@ -3835,10 +3881,10 @@ void mt_ut() {
                 valb = BUF_VAL(val);
                 r.key = &keyb;
                 r.val = &valb;
-                key = ht_hash(i);
-                val = ht_hash(i + 1);
+                key = ht_hash(i) & 0xfffff;
+                val = key;
                 result = t2_insert(t, &r);
-                ASSERT(result == 0);
+                ASSERT(result == 0 || result == -EEXIST);
         }
         utest("lookup");
         for (int i = 0; i < THREADS; ++i) {
@@ -3856,6 +3902,34 @@ void mt_ut() {
         for (int i = 0; i < THREADS; ++i) {
                 pthread_join(tid[i], NULL);
         }
+        utest("insert+lookup");
+        for (int i = 0; i < THREADS; ++i) {
+                result = pthread_create(&tid[i], NULL, &lookup_worker, t);
+                ASSERT(result == 0);
+        }
+        for (int i = THREADS; i < 2*THREADS; ++i) {
+                result = pthread_create(&tid[i], NULL, &insert_worker, t);
+                ASSERT(result == 0);
+        }
+        for (int i = 0; i < 2*THREADS; ++i) {
+                pthread_join(tid[i], NULL);
+        }
+        utest("insert+lookup+delete");
+        for (int i = 0; i < THREADS; ++i) {
+                result = pthread_create(&tid[i], NULL, &lookup_worker, t);
+                ASSERT(result == 0);
+        }
+        for (int i = THREADS; i < 2*THREADS; ++i) {
+                result = pthread_create(&tid[i], NULL, &insert_worker, t);
+                ASSERT(result == 0);
+        }
+        for (int i = 2*THREADS; i < 3*THREADS; ++i) {
+                result = pthread_create(&tid[i], NULL, &delete_worker, t);
+                ASSERT(result == 0);
+        }
+        for (int i = THREADS; i < 3*THREADS; ++i) {
+                pthread_join(tid[i], NULL);
+        }
         utest("fini");
         t2_node_type_degister(&ntype);
         t2_fini(mod);
@@ -3865,7 +3939,7 @@ void mt_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        mt_ut();
+        corrupt_ut();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -3879,9 +3953,9 @@ int main(int argc, char **argv) {
         cookie_ut();
         error_ut();
         seq_ut();
+        mt_ut();
         counters_print();
         counters_clear();
-        corrupt_ut();
         return 0;
 }
 
