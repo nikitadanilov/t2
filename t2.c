@@ -100,6 +100,7 @@
 #include <execinfo.h>
 #include <stdalign.h>
 #include <unistd.h>
+#include <time.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -113,12 +114,13 @@
 #endif
 
 enum {
-        MAX_TREE_HEIGHT =   10,
-        MAX_TREE_TYPE   = 1024,
-        MAX_NODE_TYPE   = 1024,
-        MAX_ERR_CODE    = 1024,
-        MAX_ERR_DEPTH   =   16,
-        MAX_CACHELINE   =   64
+        MAX_TREE_HEIGHT =      10,
+        MAX_TREE_TYPE   =    1024,
+        MAX_NODE_TYPE   =    1024,
+        MAX_ERR_CODE    =    1024,
+        MAX_ERR_DEPTH   =      16,
+        MAX_CACHELINE   =      64,
+        DELAY_STEP      = 1000000
 };
 
 /* @macro */
@@ -588,6 +590,7 @@ static void cookie_complete(struct path *p, struct node *n);
 static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
+static void delay(int attempt);
 
 static __thread struct counters __t_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
@@ -633,6 +636,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
 
 void t2_fini(struct t2 *mod) {
         eclear();
+        urcu_memb_barrier();
         ht_clean(&mod->ht);
         ht_fini(&mod->ht);
         mod->stor->op->fini(mod->stor);
@@ -1414,7 +1418,7 @@ static bool rung_is_valid(const struct path *p, int i) {
                 n->data != NULL &&
                 node_seq_is_valid(n, r->seq + (r->lm == WRITE)) && /* Account for our own lock. */
                 is_stable(n) == (r->lm != WRITE) &&
-                !is_leaf(n) ? r->pos < nr(n) : true &&
+                (!is_leaf(n) ? r->pos < nr(n) : true) &&
                 (i == 0 ? p->tree->root == n->addr :
                           n->addr == internal_get(prev->node, prev->pos) &&
                           level(prev->node) == level(n) + 1) &&
@@ -1742,9 +1746,12 @@ static int traverse(struct path *p) {
                 struct rung *r;
                 uint64_t     flags = 0;
                 ASSERT(CVAL(rcu) == 1);
-                if (UNLIKELY(tries++ > 10 && (tries & (tries - 1)) == 0)) {
-                        LOG("Looping: %i", tries);
-                        if (tries > 100) {
+                if (UNLIKELY(tries++ > 10)) {
+                        if ((tries & (tries - 1)) == 0) {
+                                LOG("Looping: %i", tries);
+                        }
+                        delay(tries);
+                        if (false && tries > 100) {
                                 rcu_unlock();
                                 return -EIO;
                         }
@@ -2205,6 +2212,13 @@ static void mutex_lock(pthread_mutex_t *lock) {
 static void mutex_unlock(pthread_mutex_t *lock) {
         int result = pthread_mutex_unlock(lock);
         ASSERT(result == 0);
+}
+
+static void delay(int attempt) {
+        struct timespec ts = {
+                .tv_nsec = DELAY_STEP * attempt + rand() % (DELAY_STEP * attempt / 2)
+        };
+        nanosleep(&ts, NULL);
 }
 
 /* @ht */
@@ -3749,13 +3763,37 @@ void corrupt_ut() {
 
 enum { THREADS = 17, OPS = 1000000 };
 
-void *worker(void *arg) {
+void *lookup_worker(void *arg) {
         struct t2_tree *t = arg;
         uint64_t key;
         uint64_t val;
         struct t2_buf keyb;
         struct t2_buf valb;
         struct t2_rec r = {};
+        long seed = rand();
+        t2_thread_register();
+        for (long i = 0; i < OPS; ++i) {
+                keyb = BUF_VAL(key);
+                valb = BUF_VAL(val);
+                r.key = &keyb;
+                r.val = &valb;
+                key = ht_hash(seed + i);
+                int result = t2_lookup(t, &r);
+                ASSERT(result == 0 || result == -ENOENT);
+                ASSERT(result == 0 ? val == ht_hash(seed + i + 1) : true);
+        }
+        t2_thread_degister();
+        return NULL;
+}
+
+void *insert_worker(void *arg) {
+        struct t2_tree *t = arg;
+        uint64_t key;
+        uint64_t val;
+        struct t2_buf keyb;
+        struct t2_buf valb;
+        struct t2_rec r = {};
+        long seed = rand();
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
                 keyb = BUF_VAL(key);
@@ -3763,12 +3801,13 @@ void *worker(void *arg) {
                 r.key = &keyb;
                 r.val = &valb;
                 long seed = rand();
-                key = ht_hash(seed);
-                int result = t2_lookup(t, &r);
-                ASSERT(result == 0 || result == -ENOENT || result == -EIO);
-                ASSERT(result == 0 ? val == ht_hash(seed + 1) : true);
+                key = ht_hash(seed + i);
+                val = ht_hash(seed + i + 1);
+                int result = t2_insert(t, &r);
+                ASSERT(result == 0 || result == -EEXIST);
         }
         t2_thread_degister();
+        return NULL;
 }
 
 void mt_ut() {
@@ -3803,11 +3842,19 @@ void mt_ut() {
         }
         utest("lookup");
         for (int i = 0; i < THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &worker, t);
+                result = pthread_create(&tid[i], NULL, &lookup_worker, t);
                 ASSERT(result == 0);
         }
         for (int i = 0; i < THREADS; ++i) {
-                pthread_join(&tid[i], NULL);
+                pthread_join(tid[i], NULL);
+        }
+        utest("insert");
+        for (int i = 0; i < THREADS; ++i) {
+                result = pthread_create(&tid[i], NULL, &insert_worker, t);
+                ASSERT(result == 0);
+        }
+        for (int i = 0; i < THREADS; ++i) {
+                pthread_join(tid[i], NULL);
         }
         utest("fini");
         t2_node_type_degister(&ntype);
