@@ -1,5 +1,5 @@
 /* -*- C -*- */
-
+/* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licening information. */
 /*
  * To do:
  *
@@ -8,8 +8,6 @@
  * - path locking and re-checking (allocate new nodes outside of the lock)
  *
  * - abstract node and tree type operations (no direct simple_* calls)
- *
- * - binary search is inefficient (infinity keys)
  *
  * - multi-segment buffers
  *
@@ -583,7 +581,6 @@ static void stacktrace(void);
 static int lookup(struct t2_tree *t, struct t2_rec *r);
 static int insert(struct t2_tree *t, struct t2_rec *r);
 static int delete(struct t2_tree *t, struct t2_rec *r);
-static void cookie_init(void);
 static bool cookie_is_valid(const struct t2_cookie *k);
 static void cookie_invalidate(uint64_t *addr);
 static void cookie_make(uint64_t *addr);
@@ -607,7 +604,6 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
         t2_thread_register();
         eclear();
-        cookie_init();
         if (mod != NULL) {
                 result = signal_init();
                 if (LIKELY(result == 0)) {
@@ -864,6 +860,11 @@ static uint64_t node_seq(const struct node *n) {
         return seq & ~(uint64_t)1;
 }
 
+static void node_seq_increase(struct node *n) {
+        __sync_synchronize();
+        n->seq++;
+}
+
 static bool node_seq_is_valid(const struct node *n, uint64_t expected) {
         uint64_t seq;
         __sync_synchronize();
@@ -885,8 +886,6 @@ static void lock(struct node *n, enum lock_mode mode) {
                 result = pthread_rwlock_wrlock(&n->lock);
                 ASSERT(result == 0);
                 ASSERT(is_stable(n));
-                n->seq++;
-                __sync_synchronize();
                 CINC(wlock);
         } else if (mode == READ) {
                 result = pthread_rwlock_rdlock(&n->lock);
@@ -898,9 +897,9 @@ static void unlock(struct node *n, enum lock_mode mode) {
         int result;
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         if (mode == WRITE) {
-                __sync_synchronize();
-                n->seq++;
-                ASSERT(is_stable(n));
+                if (!is_stable(n)) {
+                        node_seq_increase(n);
+                }
                 result = pthread_rwlock_unlock(&n->lock);
                 ASSERT(result == 0);
                 CDEC(wlock);
@@ -939,9 +938,11 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
 }
 
 static void nfini(struct node *n) {
+        int result;
         ASSERT(n->ref == 0);
         cookie_invalidate(&n->cookie);
-        pthread_rwlock_destroy(&n->lock);
+        result = pthread_rwlock_destroy(&n->lock);
+        ASSERT(result == 0);
         mem_free(n->data);
         SET0(n);
         mem_free(n);
@@ -1258,12 +1259,18 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
                 struct node  *child = brother(&p->rung[idx + 1], RIGHT)->node;
                 struct t2_buf cptr;
                 SLOT_DEFINE(sub, child);
-                ASSERT(child != NULL && !is_leaf(child));
-                rec_get(&sub, 0);
-                *s->rec.key = *sub.rec.key;
-                *s->rec.val = *ptr_buf(child, &cptr);
-                result = simple_insert(s);
-                ASSERT(result == 0);
+                {       /* A new scope for the second SLOT_DEFINE(). */
+                        SLOT_DEFINE(leaf, p->rung[p->used - 1].node);
+                        ASSERT(child != NULL && !is_leaf(child));
+                        rec_get(&sub, 0);
+                        *s->rec.key = *sub.rec.key;
+                        *s->rec.val = *ptr_buf(child, &cptr);
+                        /* Take the rightmost key in the leaf. */
+                        rec_get(&leaf, nr(leaf.node) - 1);
+                        prefix_separator(leaf.rec.key, s->rec.key);
+                        result = simple_insert(s);
+                        ASSERT(result == 0);
+                }
         }
 }
 
@@ -1273,7 +1280,7 @@ static int split_right_exec_delete(struct path *p, int idx) {
         struct node *right = brother(r, RIGHT)->node;
         SLOT_DEFINE(s, r->node);
         if (!is_leaf(r->node)) {
-                if (r->pos + 1 < nr(r->node)) {
+                if (r->pos + RIGHT < nr(r->node)) {
                         s.idx = r->pos + 1;
                         delete_update(p, idx, &s);
                 } else {
@@ -1351,6 +1358,24 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum 
         p->opt  = opt;
 }
 
+static void touch(struct node *n, enum lock_mode lm) {
+        if (n != NULL && lm == WRITE) {
+                ASSERT(is_stable(n));
+                node_seq_increase(n);
+        }
+}
+
+static void path_touch(struct path *p) {
+        for (int i = p->used - 1; i >= 0; --i) {
+                struct rung    *r     = &p->rung[i];
+                struct sibling *left  = brother(r, LEFT);
+                struct sibling *right = brother(r, RIGHT);
+                touch(r->node, r->lm);
+                touch(left->node, left->lm);
+                touch(right->node, right->lm);
+        }
+}
+
 static void path_lock(struct path *p) {
         /* Top to bottom, left to right. */
         for (int i = p->used - 1; i >= 0; --i) {
@@ -1385,7 +1410,7 @@ static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
                         put(r->node);
                 }
                 if (UNLIKELY(r->allocated != NULL)) {
-                        if (UNLIKELY(r->flags & ALUSED)) {
+                        if (LIKELY(r->flags & ALUSED)) {
                                 put(r->allocated);
                         } else {
                                 dealloc(r->allocated);
@@ -1419,10 +1444,10 @@ static bool rung_is_valid(const struct path *p, int i) {
         struct sibling    *right = brother((struct rung *)r, RIGHT);
         return  n != NULL &&
                 n->data != NULL &&
-                node_seq_is_valid(n, r->seq + (r->lm == WRITE)) && /* Account for our own lock. */
-                (left->node != NULL ? node_seq_is_valid(left->node, left->seq + (left->lm == WRITE)) : true) &&
-                (right->node != NULL ? node_seq_is_valid(right->node, right->seq + (right->lm == WRITE)) : true) &&
-                is_stable(n) == (r->lm != WRITE) &&
+                node_seq_is_valid(n, r->seq) &&
+                (left->node != NULL ? node_seq_is_valid(left->node, left->seq) : true) &&
+                (right->node != NULL ? node_seq_is_valid(right->node, right->seq) : true) &&
+                is_stable(n) &&
                 (!is_leaf(n) ? r->pos < nr(n) : true) &&
                 (i == 0 ? p->tree->root == n->addr :
                           n->addr == internal_get(prev->node, prev->pos) &&
@@ -1477,10 +1502,12 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
         if (i < 0) {
                 return NULL;
         }
+        ASSERT(r->lm == NONE || r->lm == mode);
         r->lm = mode;
         down = internal_child(r->node, r->pos + d, false);
         while (down != NULL && EISOK(down)) {
                 r = &p->rung[++i];
+                ASSERT(r->lm == NONE || r->lm == mode);
                 r->lm = mode;
                 *brother(r, d) = (struct sibling) { .node = down, .lm = mode, .seq = node_seq(down) };
                 ASSERT(level(r->node) == level(down));
@@ -1756,6 +1783,7 @@ static int traverse_complete(struct path *p, int result) {
                 rcu_lock();
                 return AGAIN;
         } else {
+                path_touch(p);
                 return DONE;
         }
 }
@@ -1811,10 +1839,10 @@ static int traverse(struct path *p) {
                                 CINC(op[p->opt].l[level(n)].get);
                                 flags |= PINNED;
                         }
-                } else if (!is_stable(n)) {
+                } else if (!is_stable(n)) { /* This is racy, but OK. */
                         rcu_leave(p);
-                        lock(n, WRITE); /* Wait for stabilisation. */
-                        unlock(n, WRITE);
+                        lock(n, READ); /* Wait for stabilisation. */
+                        unlock(n, READ);
                         if (rcu_try(p)) {
                                 continue;
                         }
@@ -1984,11 +2012,11 @@ static bool addr_is_valid(void *addr) {
 #include <sys/sysctl.h>
 
 static int cacheline_size() {
-    size_t cacheline = 0;
-    size_t size      = sizeof(cacheline);
-    int    result    = sysctlbyname("hw.cachelinesize", &cacheline, &size, NULL, 0);
-    ASSERT(result == 0);
-    return cacheline;
+        size_t cacheline = 0;
+        size_t size      = sizeof(cacheline);
+        int    result    = sysctlbyname("hw.cachelinesize", &cacheline, &size, NULL, 0);
+        ASSERT(result == 0);
+        return cacheline;
 }
 
 /* https://stackoverflow.com/questions/56177752/safely-checking-a-pointer-for-validity-in-macos */
@@ -2009,11 +2037,7 @@ static bool addr_is_valid(void *addr) {
 
 #endif
 
-static uint64_t cgen;
-
-static void cookie_init(void) {
-        cgen = time(NULL) * (int64_t)1000000000;
-}
+static uint64_t cgen = 0;
 
 static void cookie_complete(struct path *p, struct node *n) {
         cookie_load(&n->cookie, &p->rec->cookie);
@@ -2876,7 +2900,7 @@ static void mso_free(struct t2_storage *storage, taddr_t addr) {
 }
 
 static int mso_read(struct t2_storage *storage, taddr_t addr, void *dst) {
-        if (taddr_ssize(addr) <= 4096 && FORALL(i, taddr_ssize(addr), addr_is_valid((void *)taddr_saddr(addr) + i))) {
+        if (taddr_ssize(addr) <= 4096 && FORALL(i, taddr_ssize(addr) / 8, addr_is_valid((void *)taddr_saddr(addr) + 8 * i))) {
                 memcpy(dst, (void *)taddr_saddr(addr), taddr_ssize(addr));
                 return 0;
         } else {
@@ -3597,7 +3621,6 @@ static void cookie_ut() {
         uint64_t v[10];
         struct t2_cookie k;
         int result;
-        cookie_init();
         result = signal_init();
         ASSERT(result == 0);
         cookie_make(&v[0]);
@@ -3864,7 +3887,7 @@ void mt_ut() {
         struct t2_rec r = {};
         struct t2      *mod;
         struct t2_tree *t;
-        pthread_t tid[2*THREADS];
+        pthread_t tid[3*THREADS];
         int     result;
         usuite("mt");
         utest("init");
@@ -3916,7 +3939,7 @@ void mt_ut() {
         }
         utest("insert+lookup+delete");
         for (int i = 0; i < THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &lookup_worker, t);
+                result = pthread_create(&tid[i], NULL, &delete_worker, t);
                 ASSERT(result == 0);
         }
         for (int i = THREADS; i < 2*THREADS; ++i) {
@@ -3924,10 +3947,10 @@ void mt_ut() {
                 ASSERT(result == 0);
         }
         for (int i = 2*THREADS; i < 3*THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &delete_worker, t);
+                result = pthread_create(&tid[i], NULL, &lookup_worker, t);
                 ASSERT(result == 0);
         }
-        for (int i = THREADS; i < 3*THREADS; ++i) {
+        for (int i = 0; i < 3*THREADS; ++i) {
                 pthread_join(tid[i], NULL);
         }
         utest("fini");
@@ -3939,7 +3962,6 @@ void mt_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        corrupt_ut();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -3953,9 +3975,10 @@ int main(int argc, char **argv) {
         cookie_ut();
         error_ut();
         seq_ut();
-        mt_ut();
         counters_print();
         counters_clear();
+        corrupt_ut();
+        mt_ut();
         return 0;
 }
 
