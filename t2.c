@@ -19,6 +19,7 @@
 #include <stdalign.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -916,7 +917,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                 if (LIKELY(IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL)) {
                                         rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                 } else {
-                                        result = ERROR(-EIO);
+                                        result = ERROR(-ESTALE);
                                 }
                         }
                         if (UNLIKELY(result != 0)) {
@@ -1177,8 +1178,6 @@ static bool can_merge(struct node *n0, struct node *n1) {
 static void delete_update(struct path *p, int idx, struct slot *s) {
         ASSERT(idx + 1 < p->used);
         simple_get(s);
-        uint32_t oldkey = buf_len(s->rec.key);
-        uint32_t oldval = buf_len(s->rec.val);
         simple_delete(s);
         if (p->rung[idx + 1].flags & SEPCHG) {
                 int           result;
@@ -2892,7 +2891,77 @@ static struct t2_storage mock_storage = {
         .op = &mock_storage_op
 };
 
+/* @file */
+
+struct file_storage {
+        struct t2_storage gen;
+        const char       *filename;
+        pthread_mutex_t   lock;
+        int               fd;
+        uint64_t          free;
+};
+
+static int file_init(struct t2_storage *storage) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        fs->fd = open(fs->filename, O_RDWR | O_CREAT);
+        if (fs->fd > 0) {
+                fs->free = 512;
+                return pthread_mutex_init(&fs->lock, NULL);
+        } else {
+                return ERROR(-errno);
+        }
+}
+
+static void file_fini(struct t2_storage *storage) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        if (fs->fd > 0) {
+                pthread_mutex_destroy(&fs->lock);
+                close(fs->fd);
+                fs->fd = -1;
+        }
+}
+
+static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_max) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        taddr_t              result;
+        pthread_mutex_lock(&fs->lock);
+        result = taddr_make((uint64_t)fs->free, shift_min);
+        fs->free += (uint64_t)1 << shift_min;
+        pthread_mutex_unlock(&fs->lock);
+        return result;
+}
+
+static void file_free(struct t2_storage *storage, taddr_t addr) {
+}
+
+static int file_read(struct t2_storage *storage, taddr_t addr, void *dst) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        return pread(fs->fd, dst, taddr_ssize(addr), taddr_saddr(addr)) >= 0 ? 0 : ERROR(-errno);
+}
+
+static int file_write(struct t2_storage *storage, taddr_t addr, void *src) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        return pread(fs->fd, src, taddr_ssize(addr), taddr_saddr(addr)) >= 0 ? 0 : ERROR(-errno);
+}
+
+static struct t2_storage_op file_storage_op = {
+        .name     = "file-storage-op",
+        .init     = &file_init,
+        .fini     = &file_fini,
+        .alloc    = &file_alloc,
+        .free     = &file_free,
+        .read     = &file_read,
+        .write    = &file_write
+};
+
+static struct file_storage file_storage = {
+        .gen      = { .op = &file_storage_op },
+        .filename = "./pages"
+};
+
 /* @ut */
+
+static struct t2_storage *ut_storage = &file_storage.gen;
 
 static void usuite(const char *suite) {
         printf("        %s\n", suite);
@@ -3126,7 +3195,7 @@ static void traverse_ut() {
         int result;
         usuite("traverse");
         utest("t2_init");
-        struct t2 *mod = t2_init(&mock_storage, 10);
+        struct t2 *mod = t2_init(ut_storage, 10);
         t2_node_type_register(mod, &ntype);
         ttype.mod = mod;
         buf_init_str(&key, key0);
@@ -3184,7 +3253,7 @@ static void insert_ut() {
         struct t2_tree t = {
                 .ttype = &ttype
         };
-        struct t2 *mod = t2_init(&mock_storage, 10);
+        struct t2 *mod = t2_init(ut_storage, 10);
         struct t2_rec r = {
                 .key = &key,
                 .val = &val
@@ -3227,7 +3296,7 @@ static void tree_ut() {
         uint64_t k64;
         uint64_t v64;
         int result;
-        mod = t2_init(&mock_storage, 20);
+        mod = t2_init(ut_storage, 20);
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
@@ -3301,7 +3370,7 @@ static void stress_ut() {
         int     result;
         usuite("stress");
         utest("init");
-        mod = t2_init(&mock_storage, 20);
+        mod = t2_init(ut_storage, 20);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -3396,7 +3465,7 @@ static void delete_ut() {
         int     result;
         usuite("delete");
         utest("init");
-        mod = t2_init(&mock_storage, 20);
+        mod = t2_init(ut_storage, 20);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -3513,7 +3582,7 @@ static void next_ut() {
         int     result;
         usuite("next");
         utest("init");
-        mod = t2_init(&mock_storage, 20);
+        mod = t2_init(ut_storage, 20);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -3644,7 +3713,7 @@ void seq_ut(void) {
         int     result;
         usuite("seq");
         utest("init");
-        mod = t2_init(&mock_storage, 20);
+        mod = t2_init(ut_storage, 20);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -3743,7 +3812,7 @@ void corrupt_ut() {
         int     result;
         usuite("corrupt");
         utest("init");
-        mod = t2_init(&mock_storage, 20);
+        mod = t2_init(ut_storage, 20);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -3802,6 +3871,7 @@ void *lookup_worker(void *arg) {
                 int result = t2_lookup_ptr(t, kbuf, ksize, vbuf, sizeof vbuf);
                 if (result != 0 && result != -ENOENT) {
                         printf("%i\n", result);
+                        t2_error_print();
                 }
                 ASSERT(result == 0 || result == -ENOENT);
         }
@@ -3878,7 +3948,7 @@ void mt_ut() {
         int     result;
         usuite("mt");
         utest("init");
-        mod = t2_init(&mock_storage, 20);
+        mod = t2_init(ut_storage, 20);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
