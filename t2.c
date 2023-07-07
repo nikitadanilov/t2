@@ -233,9 +233,14 @@ enum {
 
 struct node;
 
+enum bucket_flags {
+        DIRTY = 1ull << 0
+};
+
 struct bucket {
         alignas(MAX_CACHELINE) struct cds_hlist_head chain;
         pthread_mutex_t                              lock;
+        uint64_t                                     flags;
 };
 
 struct ht {
@@ -248,6 +253,7 @@ struct t2 {
         const struct node_type    *ntypes[MAX_NODE_TYPE];
         struct t2_storage         *stor;
         struct ht                  ht;
+        int32_t                    writescan;
 };
 
 SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
@@ -275,7 +281,8 @@ enum optype {
 
 enum node_flags {
         HEARD_BANSHEE = 1ull << 0,
-        NOCACHE       = 1ull << 1
+        NOCACHE       = 1ull << 1,
+        MODIFIED      = 1ull << 2
 };
 
 struct node {
@@ -460,7 +467,7 @@ static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1)
 static void eclear(void);
 static void eprint(void);
 static void put(struct node *n);
-static void put_locked(struct node *n);
+static void put_locked(struct node *n, struct bucket *bucket);
 static void ref(struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level);
@@ -511,6 +518,7 @@ static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
 static void delay(int attempt);
+static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite);
 
 static __thread struct counters __t_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
@@ -897,11 +905,11 @@ static void ref(struct node *n) {
 }
 
 static void ndelete(struct node *n) {
-        pthread_mutex_t *bucket = &ht_bucket(&n->mod->ht, n->addr)->lock;
-        mutex_lock(bucket);
+        struct bucket *bucket = ht_bucket(&n->mod->ht, n->addr);
+        mutex_lock(&bucket->lock);
         n->flags |= NOCACHE | HEARD_BANSHEE;
-        put_locked(n);
-        mutex_unlock(bucket);
+        put_locked(n, bucket);
+        mutex_unlock(&bucket->lock);
 }
 
 static struct node *get(struct t2 *mod, taddr_t addr) {
@@ -947,6 +955,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
                                 .treeid = t->id
                         };
                         n->ntype = ntype;
+                        n->flags |= MODIFIED;
                         simple_make(n);
                 }
         } else {
@@ -966,23 +975,25 @@ static void put_final(struct node *n) {
         call_rcu_memb(&n->rcu, &free_callback);
 }
 
-static void put_locked(struct node *n) {
+static void put_locked(struct node *n, struct bucket *b) {
         ASSERT(n->ref > 0);
         EXPENSIVE_ASSERT(n->data != NULL ? is_sorted(n) : true);
         if (--n->ref == 0) {
                 /* TODO: lru. */
                 if (n->flags & NOCACHE) {
                         put_final(n);
+                } else if (n->flags & MODIFIED) {
+                        b->flags |= DIRTY;
                 }
         }
         CDEC(node);
 }
 
 static void put(struct node *n) {
-        pthread_mutex_t *bucket = &ht_bucket(&n->mod->ht, n->addr)->lock;
-        mutex_lock(bucket);
-        put_locked(n);
-        mutex_unlock(bucket);
+        struct bucket *bucket = ht_bucket(&n->mod->ht, n->addr);
+        mutex_lock(&bucket->lock);
+        put_locked(n, bucket);
+        mutex_unlock(&bucket->lock);
 }
 
 static int dealloc(struct node *n) {
@@ -1287,6 +1298,7 @@ static void touch(struct node *n, enum lock_mode lm) {
         if (n != NULL && lm == WRITE) {
                 ASSERT(is_stable(n));
                 node_seq_increase(n);
+                n->flags |= MODIFIED;
         }
 }
 
@@ -2020,6 +2032,72 @@ static void cookie_invalidate(uint64_t *addr) {
 
 static void cookie_make(uint64_t *addr) {
         *addr = ++cgen;
+}
+
+/* @cache */
+
+static void pageout(struct node *n) {
+        if (LIKELY(n->flags & MODIFIED)) {
+                int result = SCALL(n->mod, write, n->addr, n->data);
+                if (LIKELY(result == 0)) {
+                        n->flags &= ~MODIFIED;
+                } else {
+                        LOG("Pageout failure: %"PRIx64": %i\n", n->addr, result);
+                }
+        }
+}
+
+static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
+        int32_t scan0   = mod->writescan;
+        int32_t scan    = scan0;
+        int32_t scanned = 0;
+        int32_t written = 0;
+        int32_t mask    = (1 << mod->ht.shift) - 1;
+        ASSERT(mod->ht.shift < 32);
+        ASSERT((scan0 & mask) == scan0);
+        while (true) {
+                struct bucket *bucket;
+                bool           clean;
+                while (!(mod->ht.buckets[scan].flags & DIRTY)) {
+                        if (++scanned >= toscan) {
+                                mod->writescan = scan;
+                                return;
+                        }
+                        scan = (scan + 1) & mask;
+                        if (scan == scan0) {
+                                return;
+                        }
+                }
+                bucket = &mod->ht.buckets[scan];
+                mutex_lock(&bucket->lock);
+                do {
+                        struct cds_hlist_head *head = &bucket->chain;
+                        struct node           *n;
+                        struct node           *next;
+                        clean = true;
+                        cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
+                                if (n->flags & MODIFIED) {
+                                        ref(n);
+                                        mutex_unlock(&bucket->lock);
+                                        lock(n, READ);
+                                        pageout(n);
+                                        unlock(n, READ);
+                                        clean = false;
+                                        written++;
+                                        mutex_lock(&bucket->lock);
+                                        put_locked(n, bucket);
+                                        break;
+                                }
+                        }
+                } while (!clean);
+                bucket->flags &= ~DIRTY;
+                mutex_unlock(&bucket->lock);
+                scan = (scan + 1) & mask;
+                if (written >= towrite) {
+                        mod->writescan = scan;
+                        return;
+                }
+        }
 }
 
 /* @lib */
@@ -2924,10 +3002,10 @@ static void file_fini(struct t2_storage *storage) {
 static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_max) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         taddr_t              result;
-        pthread_mutex_lock(&fs->lock);
+        mutex_lock(&fs->lock);
         result = taddr_make((uint64_t)fs->free, shift_min);
         fs->free += (uint64_t)1 << shift_min;
-        pthread_mutex_unlock(&fs->lock);
+        mutex_unlock(&fs->lock);
         return result;
 }
 
@@ -2936,12 +3014,26 @@ static void file_free(struct t2_storage *storage, taddr_t addr) {
 
 static int file_read(struct t2_storage *storage, taddr_t addr, void *dst) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        return pread(fs->fd, dst, taddr_ssize(addr), taddr_saddr(addr)) >= 0 ? 0 : ERROR(-errno);
+        int result = pread(fs->fd, dst, taddr_ssize(addr), taddr_saddr(addr));
+        if (LIKELY(result == taddr_ssize(addr))) {
+                return 0;
+        } else if (result < 0) {
+                return ERROR(result);
+        } else {
+                return ERROR(-EIO);
+        }
 }
 
 static int file_write(struct t2_storage *storage, taddr_t addr, void *src) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        return pread(fs->fd, src, taddr_ssize(addr), taddr_saddr(addr)) >= 0 ? 0 : ERROR(-errno);
+        int result = pwrite(fs->fd, src, taddr_ssize(addr), taddr_saddr(addr));
+        if (LIKELY(result == taddr_ssize(addr))) {
+                return 0;
+        } else if (result < 0) {
+                return ERROR(result);
+        } else {
+                return ERROR(-EIO);
+        }
 }
 
 static struct t2_storage_op file_storage_op = {
@@ -3407,6 +3499,7 @@ static void stress_ut() {
                         put(r);
                         exist = 0;
                 }
+                writeout(t->ttype->mod, 1000, 10);
         }
         for (long j = 0; j < U; ++j) {
                 *(long *)key = j;
@@ -3439,6 +3532,7 @@ static void stress_ut() {
                         put(r);
                         exist = 0;
                 }
+                writeout(t->ttype->mod, 1000, 10);
         }
         utest("fini");
         t2_node_type_degister(&ntype);
