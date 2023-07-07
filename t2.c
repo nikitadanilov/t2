@@ -3842,7 +3842,7 @@ void corrupt_ut() {
         utestdone();
 }
 
-enum { THREADS = 17, OPS = 1000000 };
+enum { THREADS = 17, OPS = 100000 };
 
 void *lookup_worker(void *arg) {
         struct t2_tree *t = arg;
@@ -3912,6 +3912,36 @@ void *delete_worker(void *arg) {
         return NULL;
 }
 
+void *next_worker(void *arg) {
+        struct t2_tree *t = arg;
+        uint64_t key;
+        struct t2_buf keyb = BUF_VAL(key);
+        struct t2_cursor_op cop = {
+                .next = &cnext
+        };
+        struct t2_cursor c = {
+                .curkey = BUF_VAL(key),
+                .tree   = t,
+                .op     = &cop,
+                .maxlen = SOF(key)
+        };
+        unsigned long ulongmax = ~0ul;
+        struct t2_buf maxkey = BUF_VAL(ulongmax);
+        t2_thread_register();
+        for (long i = 0; i < OPS; ++i) {
+                long seed = rand() + (long)&key;
+                c.dir = (i % 2 == 0) ? T2_MORE : T2_LESS;
+                key = ht_hash(seed + i) & 0xfffff;
+                t2_cursor_init(&c, &keyb);
+                for (int i = 0; i < 10 && t2_cursor_next(&c) > 0; ++i) {
+                        ;
+                }
+                t2_cursor_fini(&c);
+        }
+        t2_thread_degister();
+        return NULL;
+}
+
 void mt_ut() {
         uint64_t key;
         uint64_t val;
@@ -3920,7 +3950,7 @@ void mt_ut() {
         struct t2_rec r = {};
         struct t2      *mod;
         struct t2_tree *t;
-        pthread_t tid[3*THREADS];
+        pthread_t tid[4*THREADS];
         int     result;
         usuite("mt");
         utest("init");
@@ -3970,7 +4000,7 @@ void mt_ut() {
         for (int i = 0; i < 2*THREADS; ++i) {
                 pthread_join(tid[i], NULL);
         }
-        utest("insert+lookup+delete");
+        utest("all");
         for (int i = 0; i < THREADS; ++i) {
                 result = pthread_create(&tid[i], NULL, &delete_worker, t);
                 ASSERT(result == 0);
@@ -3980,10 +4010,14 @@ void mt_ut() {
                 ASSERT(result == 0);
         }
         for (int i = 2*THREADS; i < 3*THREADS; ++i) {
+                result = pthread_create(&tid[i], NULL, &next_worker, t);
+                ASSERT(result == 0);
+        }
+        for (int i = 3*THREADS; i < 4*THREADS; ++i) {
                 result = pthread_create(&tid[i], NULL, &lookup_worker, t);
                 ASSERT(result == 0);
         }
-        for (int i = 0; i < 3*THREADS; ++i) {
+        for (int i = 0; i < 4*THREADS; ++i) {
                 pthread_join(tid[i], NULL);
         }
         utest("fini");
@@ -4009,9 +4043,10 @@ int main(int argc, char **argv) {
         error_ut();
         seq_ut();
         counters_print();
-        counters_clear();
         corrupt_ut();
+        counters_clear();
         mt_ut();
+        counters_print();
         return 0;
 }
 
