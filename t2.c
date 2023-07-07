@@ -234,7 +234,8 @@ enum {
 struct node;
 
 enum bucket_flags {
-        DIRTY = 1ull << 0
+        DIRTY    = 1ull << 0,
+        ACCESSED = 1ull << 1
 };
 
 struct bucket {
@@ -254,6 +255,7 @@ struct t2 {
         struct t2_storage         *stor;
         struct ht                  ht;
         int32_t                    writescan;
+        int32_t                    cleanscan;
 };
 
 SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
@@ -519,6 +521,7 @@ static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
 static void delay(int attempt);
 static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite);
+static void clean(struct t2 *mod, int32_t toscan, int32_t toclean);
 
 static __thread struct counters __t_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
@@ -983,7 +986,9 @@ static void put_locked(struct node *n, struct bucket *b) {
                 if (n->flags & NOCACHE) {
                         put_final(n);
                 } else if (n->flags & MODIFIED) {
-                        b->flags |= DIRTY;
+                        b->flags |= ACCESSED | DIRTY;
+                } else {
+                        b->flags |= ACCESSED;
                 }
         }
         CDEC(node);
@@ -2076,6 +2081,9 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                         struct node           *next;
                         clean = true;
                         cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
+                                if (n->ref > 0) {
+                                        continue;
+                                }
                                 if (n->flags & MODIFIED) {
                                         ref(n);
                                         mutex_unlock(&bucket->lock);
@@ -2095,6 +2103,43 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                 scan = (scan + 1) & mask;
                 if (written >= towrite) {
                         mod->writescan = scan;
+                        return;
+                }
+        }
+}
+
+static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
+        int32_t scan0   = mod->cleanscan;
+        int32_t scan    = scan0;
+        int32_t scanned = 0;
+        int32_t cleaned = 0;
+        int32_t mask    = (1 << mod->ht.shift) - 1;
+        ASSERT(mod->ht.shift < 32);
+        ASSERT((scan0 & mask) == scan0);
+        while (true) {
+                struct bucket         *bucket = &mod->ht.buckets[scan];
+                struct cds_hlist_head *head;
+                struct node           *n;
+                struct node           *next;
+                if (bucket->flags & ACCESSED) {
+                        bucket->flags &= ~ACCESSED;
+                } else {
+                        mutex_lock(&bucket->lock);
+                        head = &bucket->chain;
+                        cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
+                                if (n->ref == 0 && !(n->flags & MODIFIED)) {
+                                        put_final(n);
+                                        cleaned++;
+                                }
+                        }
+                        mutex_unlock(&bucket->lock);
+                }
+                if (++scanned >= toscan || cleaned >= toclean) {
+                        mod->writescan = scan;
+                        return;
+                }
+                scan = (scan + 1) & mask;
+                if (scan == scan0) {
                         return;
                 }
         }
@@ -3500,6 +3545,7 @@ static void stress_ut() {
                         exist = 0;
                 }
                 writeout(t->ttype->mod, 1000, 10);
+                clean(t->ttype->mod, 1000, 1000);
         }
         for (long j = 0; j < U; ++j) {
                 *(long *)key = j;
@@ -3533,6 +3579,7 @@ static void stress_ut() {
                         exist = 0;
                 }
                 writeout(t->ttype->mod, 1000, 10);
+                clean(t->ttype->mod, 1000, 1000);
         }
         utest("fini");
         t2_node_type_degister(&ntype);
