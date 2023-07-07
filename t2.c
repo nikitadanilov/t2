@@ -1253,6 +1253,9 @@ static bool can_merge(struct node *n0, struct node *n1) {
 
 static void delete_update(struct path *p, int idx, struct slot *s) {
         ASSERT(idx + 1 < p->used);
+        simple_get(s);
+        uint32_t oldkey = buf_len(s->rec.key);
+        uint32_t oldval = buf_len(s->rec.val);
         simple_delete(s);
         if (p->rung[idx + 1].flags & SEPCHG) {
                 int           result;
@@ -1269,6 +1272,9 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
                         rec_get(&leaf, nr(leaf.node) - 1);
                         prefix_separator(leaf.rec.key, s->rec.key);
                         result = simple_insert(s);
+                        if (result != 0) {
+                                printf("%i %i+%i %i+%i\n", result, oldkey, oldval, buf_len(s->rec.key), buf_len(s->rec.val));
+                        }
                         ASSERT(result == 0);
                 }
         }
@@ -1764,7 +1770,8 @@ static bool rcu_try(struct path *p) {
         return result;
 }
 
-static void (*ut_search_hook)(struct node *n, struct t2_rec *rec, struct slot *out) = NULL;
+static void (*ut_pre_search_hook)(struct node *n) = NULL;
+static void (*ut_post_search_hook)(struct node *n) = NULL;
 
 enum {
         DONE  = 1,
@@ -1806,7 +1813,7 @@ static int traverse(struct path *p) {
                         if (false && (tries & (tries - 1)) == 0) {
                                 LOG("Looping: %i", tries);
                         }
-                        if (tries > 16 && UT && ut_search_hook != NULL) {
+                        if (tries > 16 && UT && ut_pre_search_hook != NULL) {
                                 rcu_unlock();
                                 return -ELOOP;
                         }
@@ -2554,8 +2561,8 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         CINC(op[LOOKUP].l[level(n)].search);
-        if (UT && ut_search_hook != NULL) {
-                (ut_search_hook)(n, rec, out);
+        if (UT && ut_pre_search_hook != NULL) {
+                (ut_pre_search_hook)(n);
         }
         while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
@@ -2592,6 +2599,9 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                 val->nr = 1;
                 val->seg[0].addr = sval(sh, l, &val->seg[0].len);
                 buf_clip(val, mask, sh);
+        }
+        if (UT && ut_post_search_hook != NULL) {
+                (ut_post_search_hook)(n);
         }
         return found;
 }
@@ -3736,17 +3746,27 @@ void lib_ut() {
 }
 
 enum {
-        CORRUPT_RATE       = 100,
-        CORRUPT_DIR_RATE   = 100,
-        CORRUPT_NR_RATE    = 100,
-        CORRUPT_LEVEL_RATE = 100
+        CORRUPT_RATE       = 10,
+        CORRUPT_DIR_RATE   = 10,
+        CORRUPT_NR_RATE    = 10,
+        CORRUPT_LEVEL_RATE = 10
 };
 
-static void corrupt_hook(struct node *n, struct t2_rec *rec, struct slot *out) {
+static int obyte;
+static int obit;
+static int32_t onr;
+static int32_t odir;
+static int32_t olevel;
+
+static void corrupt_hook(struct node *n) {
         struct sheader *sh = simple_header(n);
+        onr = sh->nr;
+        odir = sh->dir_off;
+        olevel = sh->head.level;
+        obyte = obit = -1;
         if (rand() % CORRUPT_RATE == 0) {
-                int off = rand() % (nsize(n) - sizeof *sh);
-                int bit = rand() % 8;
+                int off = obyte = rand() % (nsize(n) - sizeof *sh);
+                int bit = obit = rand() % 8;
                 ((char *)n->data)[off + sizeof *sh] ^= 1 << bit;
         } else if (rand() % CORRUPT_NR_RATE == 0) {
                 struct sheader *sh = simple_header(n);
@@ -3759,6 +3779,16 @@ static void corrupt_hook(struct node *n, struct t2_rec *rec, struct slot *out) {
                 sh->head.level += 2*(rand() % 2) - 1;
                 sh->head.level = min_32(max_32(sh->nr, 0), MAX_TREE_HEIGHT - 1);
         }
+}
+
+static void uncorrupt_hook(struct node *n) {
+        struct sheader *sh = simple_header(n);
+        if (obyte != -1) {
+                ((char *)n->data)[obyte + sizeof *sh] ^= 1 << obit;
+        }
+        sh->nr = onr;
+        sh->dir_off = odir;
+        sh->head.level = olevel;
 }
 
 void corrupt_ut() {
@@ -3792,7 +3822,8 @@ void corrupt_ut() {
                 ASSERT(result == 0);
         }
         utest("corrupt");
-        ut_search_hook = &corrupt_hook;
+        ut_pre_search_hook = &corrupt_hook;
+        ut_post_search_hook = &uncorrupt_hook;
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(key);
                 valb = BUF_VAL(val);
@@ -3802,7 +3833,8 @@ void corrupt_ut() {
                 result = t2_lookup(t, &r);
                 ASSERT(result == 0 || result == -ENOENT || result == -EIO || result == -ELOOP);
         }
-        ut_search_hook = NULL;
+        ut_pre_search_hook = NULL;
+        ut_post_search_hook = NULL;
         utest("fini");
         t2_node_type_degister(&ntype);
         t2_fini(mod);
