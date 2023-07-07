@@ -1111,6 +1111,7 @@ static void rcu_quiescent(void) {
 static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r) {
         ASSERT(buf_cmp(l, r) < 0);
         ASSERT(r->nr == 1);
+        return r->seg[0].len; /* TODO: Cannot handle delete properly. */
         do {
                 r->seg[0].len--;
         } while (buf_cmp(l, r) < 0);
