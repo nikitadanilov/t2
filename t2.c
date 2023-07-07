@@ -567,6 +567,7 @@ static int32_t simple_used(const struct node *n);
 static bool simple_can_merge(const struct node *n0, const struct node *n1);
 static void simple_print(struct node *n);
 static bool simple_invariant(const struct node *n);
+static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 static int shift(struct node *d, struct node *s, const struct slot *insert, enum dir dir);
 static int merge(struct node *d, struct node *s, enum dir dir);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
@@ -1141,13 +1142,13 @@ static void internal_parent_rec(struct path *p, int idx) {
         r->keyout = *s.rec.key;
         for (int32_t i = 0; i < nr(r->node); ++i) {
                 rec_get(&s, i);
+                buf_clip_node(s.rec.key, r->node);
                 keylen = buf_len(s.rec.key);
                 if (keylen > maxlen) {
                         maxlen = keylen;
                         r->keyout = *s.rec.key;
                 }
         }
-        buf_clip_node(&r->keyout, r->node);
         ptr_buf(r->allocated, &r->valout);
 }
 
@@ -1209,8 +1210,9 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
                 result = simple_insert(&s);
+                ASSERT(result == 0);
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node));
-                if (LIKELY(result == 0) && (r->flags & ALUSED)) {
+                if (r->flags & ALUSED) {
                         struct t2_buf lkey = {};
                         struct t2_buf rkey;
                         if (is_leaf(right)) {
@@ -2522,7 +2524,7 @@ static char cmpch(int cmp) {
         return cmp < 0 ? '<' : cmp == 0 ? '=' : '>';
 }
 
-static void print_range(void *orig, int32_t nsize, void *start, int32_t nob);
+static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 
 static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen, uint32_t mask) {
         int32_t ksize;
@@ -2784,7 +2786,7 @@ static int32_t simple_nr(const struct node *n) {
         return simple_header(n)->nr;
 }
 
-static void print_range(void *orig, int32_t nsize, void *start, int32_t nob) {
+static void range_print(void *orig, int32_t nsize, void *start, int32_t nob) {
         static const char hexdigit[] = "0123456789abcdef";
         int32_t off = (int32_t)(start - orig);
         printf("[%4u .. %4u : ", off, off + nob);
@@ -2815,10 +2817,10 @@ static void simple_print(struct node *n) {
                 if (i < sh->nr) {
                         int32_t kvsize;
                         void   *addr = skey(sh, i, &kvsize);
-                        print_range(sh, size, addr, kvsize);
+                        range_print(sh, size, addr, kvsize);
                         printf(" ");
                         addr = sval(sh, i, &kvsize);
-                        print_range(sh, size, addr, kvsize);
+                        range_print(sh, size, addr, kvsize);
                         if (!is_leaf(n)) {
                                 printf("    (%p)", peek(n->mod, internal_get(n, i)));
                         }
@@ -2829,7 +2831,7 @@ static void simple_print(struct node *n) {
 
 static void buf_print(const struct t2_buf *b) {
         ASSERT(b->nr == 1);
-        print_range(b->seg[0].addr, b->seg[0].len, b->seg[0].addr, b->seg[0].len);
+        range_print(b->seg[0].addr, b->seg[0].len, b->seg[0].addr, b->seg[0].len);
 }
 
 static void rec_print(const struct t2_rec *r) {
@@ -2990,10 +2992,10 @@ static bool is_sorted(struct node *n) {
                         int cmp = skeycmp(sh, i, keyarea, keysize, nsize(n) - 1);
                         if (cmp <= 0) {
                                 printf("Misordered at %i: ", i);
-                                print_range(keyarea, keysize,
+                                range_print(keyarea, keysize,
                                             keyarea, keysize);
                                 printf(" %c ", cmpch(cmp));
-                                print_range(n->data, nsize(n),
+                                range_print(n->data, nsize(n),
                                             ss.rec.key->seg[0].addr,
                                             ss.rec.key->seg[0].len);
                                 printf("\n");
