@@ -1,86 +1,6 @@
 /* -*- C -*- */
-/* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licening information. */
-/*
- * To do:
- *
- * - integrate rcu: https://github.com/urcu/userspace-rcu/blob/master/include/urcu/rculist.h (rculfhash.c)
- *
- * - path locking and re-checking (allocate new nodes outside of the lock)
- *
- * - abstract node and tree type operations (no direct simple_* calls)
- *
- * - multi-segment buffers
- *
- * - prefix compression for keys
- *
- * - checksums (re-use user-supplied ones)
- *
- * - other node formats: fixed-sized keys and values. Key prefixes in the directory
- *
- * - large keys and values stored outside of nodes
- *
- * - "streams" (sequential, random)
- *
- * - decaying node temperature (see bits/avg.c)
- *
- * - cache replacement (arc, clock?)
- *
- * - transaction engine hooks
- *
- * - tools: dump, load, repair
- *
- * - in-place operations
- *
- * - single-move shift
- *
- * - invariants for key data-strctures
- *
- * - simple node: expand and shrink directory left or right, as cheaper
- *
- * - update value (and key?) in place
- *
- * - pre-allocated struct path (to reduce stack pressure)
- *
- * - node format that avoids memmove (always add at the end, compact as needed)
- *
- * - balancing policies (per-level?)
- *
- * - check validity of user input (4 records in a node, etc.)
- *
- * - handle IO failures
- *
- * - avoid dynamic allocations in *_balance(), pre-allocate in *_prepare()
- *
- * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
- *
- * - simple node: store key offsets separately from value offsets
- *
- * Done:
- *
- * + error reporting: per-thread error propagation stack, (mostly) static error descriptors
- *
- * + metrics
- *
- * + iterator, cursor
- *
- * + variably-sized taddr_t encoding in internal nodes
- *
- * + binary search is inefficient (infinity keys)
- *
- * + cookies to avoid tree traversal
- *
- * + simple node functions should be robust in the face of concurrent modifications
- *
- * References:
- *
- * - D. Knuth, The Art of Computer Programming, Volume 3: Sorting and
- *   Searching; 6.2.4. Multiway Trees.
- *
- * - D. Lomet, The evolution of effective B-tree: page organization and
- *   techniques: a personal account (https://dl.acm.org/doi/pdf/10.1145/603867.603878)
- *
- * - R. Bayer, K. Unterauer, Prefix B-Trees (https://dl.acm.org/doi/abs/10.1145/320521.320530)
- */
+
+/* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licencing information. */
 
 #include <stdbool.h>
 #include <assert.h>
@@ -4065,6 +3985,88 @@ int main(int argc, char **argv) {
 }
 
 #endif /* UT */
+
+/*
+ * To do:
+ *
+ * - integrate rcu: https://github.com/urcu/userspace-rcu/blob/master/include/urcu/rculist.h (rculfhash.c)
+ *
+ * - path locking and re-checking (allocate new nodes outside of the lock)
+ *
+ * - abstract node and tree type operations (no direct simple_* calls)
+ *
+ * - multi-segment buffers
+ *
+ * - prefix compression for keys
+ *
+ * - checksums (re-use user-supplied ones)
+ *
+ * - other node formats: fixed-sized keys and values. Key prefixes in the directory
+ *
+ * - large keys and values stored outside of nodes
+ *
+ * - "streams" (sequential, random)
+ *
+ * - decaying node temperature (see bits/avg.c)
+ *
+ * - cache replacement (arc, clock?)
+ *
+ * - transaction engine hooks
+ *
+ * - tools: dump, load, repair
+ *
+ * - in-place operations
+ *
+ * - single-move shift
+ *
+ * - invariants for key data-strctures
+ *
+ * - simple node: expand and shrink directory left or right, as cheaper
+ *
+ * - update value (and key?) in place
+ *
+ * - pre-allocated struct path (to reduce stack pressure)
+ *
+ * - node format that avoids memmove (always add at the end, compact as needed)
+ *
+ * - balancing policies (per-level?)
+ *
+ * - check validity of user input (4 records in a node, etc.)
+ *
+ * - handle IO failures
+ *
+ * - avoid dynamic allocations in *_balance(), pre-allocate in *_prepare()
+ *
+ * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
+ *
+ * - simple node: store key offsets separately from value offsets
+ *
+ * Done:
+ *
+ * + error reporting: per-thread error propagation stack, (mostly) static error descriptors
+ *
+ * + metrics
+ *
+ * + iterator, cursor
+ *
+ * + variably-sized taddr_t encoding in internal nodes
+ *
+ * + binary search is inefficient (infinity keys)
+ *
+ * + cookies to avoid tree traversal
+ *
+ * + simple node functions should be robust in the face of concurrent modifications
+ *
+ * References:
+ *
+ * - D. Knuth, The Art of Computer Programming, Volume 3: Sorting and
+ *   Searching; 6.2.4. Multiway Trees.
+ *
+ * - D. Lomet, The evolution of effective B-tree: page organization and
+ *   techniques: a personal account (https://dl.acm.org/doi/pdf/10.1145/603867.603878)
+ *
+ * - R. Bayer, K. Unterauer, Prefix B-Trees (https://dl.acm.org/doi/abs/10.1145/320521.320530)
+ */
 
 /*
  *  Local variables:
