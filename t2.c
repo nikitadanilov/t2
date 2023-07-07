@@ -1195,9 +1195,6 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
                         rec_get(&leaf, nr(leaf.node) - 1);
                         prefix_separator(leaf.rec.key, s->rec.key);
                         result = simple_insert(s);
-                        if (result != 0) {
-                                printf("%i %i+%i %i+%i\n", result, oldkey, oldval, buf_len(s->rec.key), buf_len(s->rec.val));
-                        }
                         ASSERT(result == 0);
                 }
         }
@@ -3496,20 +3493,6 @@ static void delete_ut() {
         utestdone();
 }
 
-static void rand_ut() {
-        int64_t i;
-        usuite("prng");
-        utest("cycle");
-        rand();
-        rand();
-        long s = rand();
-        for (i = 0; LIKELY(rand() != s); ++i) {
-                ;
-        }
-        printf("Cycle: %"PRId64"\n", i);
-        utestdone();
-}
-
 static long cit;
 static int cnext(struct t2_cursor *c, const struct t2_rec *rec) {
         ++cit;
@@ -3817,6 +3800,9 @@ void *lookup_worker(void *arg) {
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 int result = t2_lookup_ptr(t, kbuf, ksize, vbuf, sizeof vbuf);
+                if (result != 0 && result != -ENOENT) {
+                        printf("%i\n", result);
+                }
                 ASSERT(result == 0 || result == -ENOENT);
         }
         t2_thread_degister();
@@ -3972,7 +3958,6 @@ int main(int argc, char **argv) {
         stress_ut();
         delete_ut();
         next_ut();
-        rand_ut();
         cookie_ut();
         error_ut();
         seq_ut();
@@ -4040,6 +4025,8 @@ int main(int argc, char **argv) {
  * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
  *
  * - simple node: store key offsets separately from value offsets
+ *
+ * - replace cookie with get(), benchmark (sigprocmask is expensive).
  *
  * Done:
  *
