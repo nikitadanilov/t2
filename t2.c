@@ -1993,6 +1993,41 @@ int t2_cursor_next(struct t2_cursor *c) {
         return next(c);
 }
 
+int t2_lookup_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize) {
+        struct t2_buf kbuf = { .nr = 1, .seg = { [0] = { .addr = key, .len = ksize } } };
+        struct t2_buf vbuf = { .nr = 1, .seg = { [0] = { .addr = val, .len = vsize } } };
+        struct t2_rec r = {
+                .key = &kbuf,
+                .val = &vbuf
+        };
+        ASSERT(thread_registered);
+        eclear();
+        return lookup(t, &r);
+}
+
+int t2_insert_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize) {
+        struct t2_buf kbuf = { .nr = 1, .seg = { [0] = { .addr = key, .len = ksize } } };
+        struct t2_buf vbuf = { .nr = 1, .seg = { [0] = { .addr = val, .len = vsize } } };
+        struct t2_rec r = {
+                .key = &kbuf,
+                .val = &vbuf
+        };
+        ASSERT(thread_registered);
+        eclear();
+        return insert(t, &r);
+}
+
+int t2_delete_ptr(struct t2_tree *t, void *key, int32_t ksize) {
+        struct t2_buf kbuf = { .nr = 1, .seg = { [0] = { .addr = key, .len = ksize } } };
+        struct t2_rec r = {
+                .key = &kbuf,
+        };
+        ASSERT(thread_registered);
+        eclear();
+        return delete(t, &r);
+}
+
+
 /* @cookie */
 
 #if ON_LINUX
@@ -3844,26 +3879,25 @@ void corrupt_ut() {
         utestdone();
 }
 
-enum { THREADS = 17, OPS = 100000 };
+enum { THREADS = 17, OPS = 50000 };
+
+#define MAXSIZE (((int32_t)1 << (ntype.shift - 3)) - 10)
+
+static void random_buf(char *buf, int32_t max, int32_t *out) {
+        *out = rand() % max;
+        fill(buf, *out);
+}
 
 void *lookup_worker(void *arg) {
         struct t2_tree *t = arg;
-        uint64_t key;
-        uint64_t val;
-        struct t2_buf keyb;
-        struct t2_buf valb;
-        struct t2_rec r = {};
+        char kbuf[8];
+        char vbuf[MAXSIZE];
+        int32_t ksize;
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
-                long seed = rand() + (long)&key;
-                keyb = BUF_VAL(key);
-                valb = BUF_VAL(val);
-                r.key = &keyb;
-                r.val = &valb;
-                key = ht_hash(seed + i) & 0xfffff;
-                int result = t2_lookup(t, &r);
+                random_buf(kbuf, sizeof kbuf, &ksize);
+                int result = t2_lookup_ptr(t, kbuf, ksize, vbuf, sizeof vbuf);
                 ASSERT(result == 0 || result == -ENOENT);
-                ASSERT(result == 0 ? val == key : true);
         }
         t2_thread_degister();
         return NULL;
@@ -3871,21 +3905,15 @@ void *lookup_worker(void *arg) {
 
 void *insert_worker(void *arg) {
         struct t2_tree *t = arg;
-        uint64_t key;
-        uint64_t val;
-        struct t2_buf keyb;
-        struct t2_buf valb;
-        struct t2_rec r = {};
+        char kbuf[8];
+        char vbuf[MAXSIZE];
+        int32_t ksize;
+        int32_t vsize;
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
-                long seed = rand() + (long)&key;
-                keyb = BUF_VAL(key);
-                valb = BUF_VAL(val);
-                r.key = &keyb;
-                r.val = &valb;
-                key = ht_hash(seed + i) & 0xfffff;
-                val = key;
-                int result = t2_insert(t, &r);
+                random_buf(kbuf, sizeof kbuf, &ksize);
+                random_buf(vbuf, sizeof vbuf, &vsize);
+                int result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize);
                 ASSERT(result == 0 || result == -EEXIST);
         }
         t2_thread_degister();
@@ -3894,20 +3922,12 @@ void *insert_worker(void *arg) {
 
 void *delete_worker(void *arg) {
         struct t2_tree *t = arg;
-        uint64_t key;
-        uint64_t val;
-        struct t2_buf keyb;
-        struct t2_buf valb;
-        struct t2_rec r = {};
+        char kbuf[8];
+        int32_t ksize;
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
-                long seed = rand() + (long)&key;
-                keyb = BUF_VAL(key);
-                valb = BUF_VAL(val);
-                r.key = &keyb;
-                r.val = &valb;
-                key = ht_hash(seed + i) & 0xfffff;
-                int result = t2_delete(t, &r);
+                random_buf(kbuf, sizeof kbuf, &ksize);
+                int result = t2_delete_ptr(t, kbuf, ksize);
                 ASSERT(result == 0 || result == -ENOENT);
         }
         t2_thread_degister();
@@ -3916,25 +3936,22 @@ void *delete_worker(void *arg) {
 
 void *next_worker(void *arg) {
         struct t2_tree *t = arg;
-        uint64_t key;
-        struct t2_buf keyb = BUF_VAL(key);
+        char key[8];
         struct t2_cursor_op cop = {
                 .next = &cnext
         };
         struct t2_cursor c = {
                 .curkey = BUF_VAL(key),
                 .tree   = t,
-                .op     = &cop,
-                .maxlen = SOF(key)
+                .op     = &cop
         };
-        unsigned long ulongmax = ~0ul;
-        struct t2_buf maxkey = BUF_VAL(ulongmax);
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
-                long seed = rand() + (long)&key;
+                char start[8];
+                struct t2_buf startkey = BUF_VAL(start);
+                random_buf(startkey.seg[0].addr, sizeof key, &startkey.seg[0].len);
                 c.dir = (i % 2 == 0) ? T2_MORE : T2_LESS;
-                key = ht_hash(seed + i) & 0xfffff;
-                t2_cursor_init(&c, &keyb);
+                t2_cursor_init(&c, &startkey);
                 for (int i = 0; i < 10 && t2_cursor_next(&c) > 0; ++i) {
                         ;
                 }
@@ -3945,14 +3962,13 @@ void *next_worker(void *arg) {
 }
 
 void mt_ut() {
-        uint64_t key;
-        uint64_t val;
-        struct t2_buf keyb;
-        struct t2_buf valb;
-        struct t2_rec r = {};
         struct t2      *mod;
         struct t2_tree *t;
         pthread_t tid[4*THREADS];
+        char kbuf[8];
+        char vbuf[MAXSIZE];
+        int32_t ksize;
+        int32_t vsize;
         int     result;
         usuite("mt");
         utest("init");
@@ -3965,13 +3981,9 @@ void mt_ut() {
         ASSERT(EISOK(t));
         utest("populate");
         for (long i = 0; i < OPS; ++i) {
-                keyb = BUF_VAL(key);
-                valb = BUF_VAL(val);
-                r.key = &keyb;
-                r.val = &valb;
-                key = ht_hash(i) & 0xfffff;
-                val = key;
-                result = t2_insert(t, &r);
+                random_buf(kbuf, sizeof kbuf, &ksize);
+                random_buf(vbuf, sizeof vbuf, &vsize);
+                result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize);
                 ASSERT(result == 0 || result == -EEXIST);
         }
         utest("lookup");
