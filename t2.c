@@ -1031,8 +1031,9 @@ static void put(struct node *n) {
 }
 
 static int dealloc(struct node *n) {
+        struct t2 *mod = n->mod;
         ndelete(n);
-        SCALL(n->mod, free, n->addr);
+        SCALL(mod, free, n->addr);
         return 0;
 }
 
