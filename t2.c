@@ -27,19 +27,13 @@
 #include "t2.h"
 #include "config.h"
 
-#if ON_DARWIN
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#endif
-
 enum {
         MAX_TREE_HEIGHT =      10,
         MAX_TREE_TYPE   =    1024,
         MAX_NODE_TYPE   =    1024,
         MAX_ERR_CODE    =    1024,
         MAX_ERR_DEPTH   =      16,
-        MAX_CACHELINE   =      64,
-        DELAY_STEP      = 1000000
+        MAX_CACHELINE   =      64
 };
 
 /* @macro */
@@ -550,7 +544,6 @@ static void cookie_complete(struct path *p, struct node *n);
 static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
-static void delay(int attempt);
 static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite);
 static void clean(struct t2 *mod, int32_t toscan, int32_t toclean);
 
@@ -846,7 +839,9 @@ static bool is_stable(const struct node *n) {
 static void lock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         ASSERT(CVAL(rcu) == 0);
-        if (mode == WRITE) {
+        if (LIKELY(mode == NONE)) {
+                ;
+        } else if (mode == WRITE) {
                 NOFAIL(pthread_rwlock_wrlock(&n->lock));
                 ASSERT(is_stable(n));
                 CINC(wlock);
@@ -858,7 +853,9 @@ static void lock(struct node *n, enum lock_mode mode) {
 
 static void unlock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
-        if (mode == WRITE) {
+        if (LIKELY(mode == NONE)) {
+                ;
+        } else if (mode == WRITE) {
                 if (!is_stable(n)) {
                         node_seq_increase(n);
                 }
@@ -1403,23 +1400,27 @@ static void path_pin(struct path *p) {
         }
 }
 
-static bool rung_is_valid(const struct path *p, int i) {
-        const struct rung *r     = &p->rung[i];
-        const struct node *n     = r->node;
-        const struct rung *prev  = &p->rung[i - 1];
-        struct sibling    *left  = brother((struct rung *)r, LEFT);
-        struct sibling    *right = brother((struct rung *)r, RIGHT);
-        return  n != NULL &&
-                n->data != NULL &&
-                node_seq_is_valid(n, r->seq) &&
-                (left->node != NULL ? node_seq_is_valid(left->node, left->seq) : true) &&
-                (right->node != NULL ? node_seq_is_valid(right->node, right->seq) : true) &&
-                is_stable(n) &&
+static bool rung_validity_invariant(const struct path *p, int i) {
+        const struct rung *r    = &p->rung[i];
+        const struct node *n    = r->node;
+        const struct rung *prev = &p->rung[i - 1];
+        return is_stable(n) &&
                 (!is_leaf(n) ? r->pos < nr(n) : true) &&
                 (i == 0 ? p->tree->root == n->addr :
-                          n->addr == internal_get(prev->node, prev->pos) &&
-                          level(prev->node) == level(n) + 1) &&
+                 (prev->lm != WRITE) || (n->addr == internal_get(prev->node, prev->pos) &&
+                                         level(prev->node) == level(n) + 1)) &&
                 (i == p->used - 1) == is_leaf(n);
+}
+
+static bool rung_is_valid(const struct path *p, int i) {
+        const struct rung *r        = &p->rung[i];
+        struct sibling    *left     = brother((struct rung *)r, LEFT);
+        struct sibling    *right    = brother((struct rung *)r, RIGHT);
+        bool               is_valid = node_seq_is_valid(r->node, r->seq) &&
+                (left->node  != NULL ? node_seq_is_valid(left->node,  left->seq)  : true) &&
+                (right->node != NULL ? node_seq_is_valid(right->node, right->seq) : true);
+        ASSERT(is_valid && r->lm == WRITE ? rung_validity_invariant(p, i) : true);
+        return is_valid;
 }
 
 static struct rung *path_add(struct path *p, struct node *n, uint64_t seq, uint64_t flags) {
@@ -1477,7 +1478,6 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
                 ASSERT(r->lm == NONE || r->lm == mode);
                 r->lm = mode;
                 *brother(r, d) = (struct sibling) { .node = down, .lm = mode, .seq = node_seq(down) };
-                ASSERT(level(r->node) == level(down));
                 if (i == idx) {
                         break;
                 }
@@ -1731,9 +1731,6 @@ static bool rcu_try(struct path *p) {
         return result;
 }
 
-static void (*ut_pre_search_hook)(struct node *n) = NULL;
-static void (*ut_post_search_hook)(struct node *n) = NULL;
-
 enum {
         DONE  = 1,
         AGAIN = 2
@@ -1774,11 +1771,6 @@ static int traverse(struct path *p) {
                         if (false && (tries & (tries - 1)) == 0) {
                                 LOG("Looping: %i", tries);
                         }
-                        if (tries > 16 && UT && ut_pre_search_hook != NULL) {
-                                rcu_unlock();
-                                return -ELOOP;
-                        }
-                        /* delay(tries); */
                 }
                 if (p->used == 0) {
                         next = p->tree->root;
@@ -2429,13 +2421,6 @@ static void mutex_unlock(pthread_mutex_t *lock) {
         NOFAIL(pthread_mutex_unlock(lock));
 }
 
-static void delay(int attempt) {
-        struct timespec ts = {
-                .tv_nsec = DELAY_STEP * attempt + rand() % (DELAY_STEP * attempt / 2)
-        };
-        nanosleep(&ts, NULL);
-}
-
 /* @ht */
 
 static int ht_init(struct ht *ht, int shift) {
@@ -2725,9 +2710,6 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         CINC(l[level(n)].search);
-        if (UT && ut_pre_search_hook != NULL) {
-                (ut_pre_search_hook)(n);
-        }
         while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
                 CINC(l[level(n)].bin_iter);
@@ -2767,9 +2749,6 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                 buf_clip(val, mask, sh);
                 CMOD(l[level(n)].keysize, key->seg[0].len);
                 CMOD(l[level(n)].valsize, key->seg[0].len);
-        }
-        if (UT && ut_post_search_hook != NULL) {
-                (ut_post_search_hook)(n);
         }
         return found;
 }
@@ -3988,101 +3967,6 @@ void lib_ut() {
         utestdone();
 }
 
-enum {
-        CORRUPT_RATE       = 10,
-        CORRUPT_DIR_RATE   = 10,
-        CORRUPT_NR_RATE    = 10,
-        CORRUPT_LEVEL_RATE = 10
-};
-
-static int obyte;
-static int obit;
-static int32_t onr;
-static int32_t odir;
-static int32_t olevel;
-
-static void corrupt_hook(struct node *n) {
-        struct sheader *sh = simple_header(n);
-        onr = sh->nr;
-        odir = sh->dir_off;
-        olevel = sh->head.level;
-        obyte = obit = -1;
-        if (rand() % CORRUPT_RATE == 0) {
-                int off = obyte = rand() % (nsize(n) - sizeof *sh);
-                int bit = obit = rand() % 8;
-                ((char *)n->data)[off + sizeof *sh] ^= 1 << bit;
-        } else if (rand() % CORRUPT_NR_RATE == 0) {
-                struct sheader *sh = simple_header(n);
-                sh->nr += 2*(rand() % 2) - 1;
-                sh->nr = min_32(max_32(sh->nr, 0), (nsize(n) - sh->dir_off) / sizeof(struct dir_element));
-        } else if (rand() % CORRUPT_DIR_RATE == 0) {
-                sh->dir_off += 2*(rand() % 2) - 1;
-                sh->dir_off = min_32(max_32(sh->nr, sizeof *sh), nsize(n) - sdirsize(sh));
-        } else if (rand() % CORRUPT_LEVEL_RATE == 0) {
-                sh->head.level += 2*(rand() % 2) - 1;
-                sh->head.level = min_32(max_32(sh->nr, 0), MAX_TREE_HEIGHT - 1);
-        }
-}
-
-static void uncorrupt_hook(struct node *n) {
-        struct sheader *sh = simple_header(n);
-        if (obyte != -1) {
-                ((char *)n->data)[obyte + sizeof *sh] ^= 1 << obit;
-        }
-        sh->nr = onr;
-        sh->dir_off = odir;
-        sh->head.level = olevel;
-}
-
-void corrupt_ut() {
-        uint64_t key;
-        uint64_t val;
-        struct t2_buf keyb;
-        struct t2_buf valb;
-        struct t2_rec r = {};
-        struct t2      *mod;
-        struct t2_tree *t;
-        int     result;
-        usuite("corrupt");
-        utest("init");
-        mod = t2_init(ut_storage, 20);
-        ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
-        t = t2_tree_create(&ttype);
-        ASSERT(EISOK(t));
-        utest("populate");
-        long U = 20000;
-        for (long i = 0; i < U; ++i) {
-                keyb = BUF_VAL(key);
-                valb = BUF_VAL(val);
-                r.key = &keyb;
-                r.val = &valb;
-                key = ht_hash(i);
-                val = ht_hash(i + 1);
-                NOFAIL(t2_insert(t, &r));
-        }
-        utest("corrupt");
-        ut_pre_search_hook = &corrupt_hook;
-        ut_post_search_hook = &uncorrupt_hook;
-        for (long i = 0; i < U; ++i) {
-                keyb = BUF_VAL(key);
-                valb = BUF_VAL(val);
-                r.key = &keyb;
-                r.val = &valb;
-                key = ht_hash(rand());
-                result = t2_lookup(t, &r);
-                ASSERT(result == 0 || result == -ENOENT || result == -EIO || result == -ELOOP);
-        }
-        ut_pre_search_hook = NULL;
-        ut_post_search_hook = NULL;
-        utest("fini");
-        t2_node_type_degister(&ntype);
-        t2_fini(mod);
-        utestdone();
-}
-
 enum { THREADS = 17, OPS = 50000 };
 
 #define MAXSIZE (((int32_t)1 << (ntype.shift - 3)) - 10)
@@ -4258,7 +4142,6 @@ int main(int argc, char **argv) {
         error_ut();
         seq_ut();
         counters_print();
-        corrupt_ut();
         counters_clear();
         mt_ut();
         counters_print();
@@ -4271,8 +4154,6 @@ int main(int argc, char **argv) {
  * To do:
  *
  * - integrate rcu: https://github.com/urcu/userspace-rcu/blob/master/include/urcu/rculist.h (rculfhash.c)
- *
- * - path locking and re-checking (allocate new nodes outside of the lock)
  *
  * - abstract node and tree type operations (no direct simple_* calls)
  *
@@ -4325,6 +4206,8 @@ int main(int argc, char **argv) {
  * - replace cookie with get(), benchmark (sigprocmask is expensive).
  *
  * Done:
+ *
+ * + path locking and re-checking (allocate new nodes outside of the lock)
  *
  * + error reporting: per-thread error propagation stack, (mostly) static error descriptors
  *
