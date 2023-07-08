@@ -220,8 +220,9 @@ enum {
 #define CINC(cnt) (++__t_counters.cnt)
 #define CDEC(cnt) (--__t_counters.cnt)
 #define CVAL(cnt) (__t_counters.cnt)
+#define GVAL(cnt) (__g_counters.cnt)
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
-#define CAVG(cnt) ({ struct counter_var *v = &(__t_counters.cnt); v->nr ? 1.0 * v->sum / v->nr : 0.0; })
+#define GAVG(cnt) ({ struct counter_var *v = &(__g_counters.cnt); v->nr ? 1.0 * v->sum / v->nr : 0.0; })
 
 /* Is Parallel Programming Hard, And, If So, What Can You Do About It? */
 #define ACCESS_ONCE(x)     (*(volatile typeof(x) *)&(x))
@@ -409,22 +410,22 @@ struct counter_var {
 };
 
 struct op_counters {
-        int32_t nr;
-        int32_t traverse;
-        int32_t ok;
+        int64_t nr;
+        int64_t traverse;
+        int64_t ok;
         struct {
-                int32_t nr;
-                int32_t get;
-                int32_t search;
-                int32_t balance;
+                int64_t nr;
+                int64_t get;
+                int64_t search;
+                int64_t balance;
         } l[MAX_TREE_HEIGHT];
 };
 
-struct counters {
-        int32_t node;
-        int32_t rlock;
-        int32_t wlock;
-        int32_t rcu;
+struct counters { /* Must be all 64-bit integers, see counters_fold(). */
+        int64_t node;
+        int64_t rlock;
+        int64_t wlock;
+        int64_t rcu;
         struct op_counters op[OP_NR];
         struct counter_var nr[MAX_TREE_HEIGHT];
         struct counter_var free[MAX_TREE_HEIGHT];
@@ -466,8 +467,8 @@ static void  mem_free(void *ptr);
 static int cacheline_size();
 static void llog(const struct msg_ctx *ctx, ...);
 static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1);
-static void eclear(void);
-static void eprint(void);
+static void eclear();
+static void eprint();
 static void put(struct node *n);
 static void put_locked(struct node *n, struct bucket *bucket);
 static void ref(struct node *n);
@@ -484,8 +485,8 @@ static int32_t nsize(const struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static struct header *nheader(const struct node *n);
-static void rcu_lock(void);
-static void rcu_unlock(void);
+static void rcu_lock();
+static void rcu_unlock();
 static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
@@ -502,13 +503,14 @@ static int shift(struct node *d, struct node *s, const struct slot *insert, enum
 static int merge(struct node *d, struct node *s, enum dir dir);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
-static void counters_check(void);
-static void counters_print(void);
-static void counters_clear(void);
+static void counters_check();
+static void counters_print();
+static void counters_clear();
+static void counters_fold();
 static bool is_sorted(struct node *n);
-static int signal_init(void);
-static void signal_fini(void);
-static void stacktrace(void);
+static int signal_init();
+static void signal_fini();
+static void stacktrace();
 static int lookup(struct t2_tree *t, struct t2_rec *r);
 static int insert(struct t2_tree *t, struct t2_rec *r);
 static int delete(struct t2_tree *t, struct t2_rec *r);
@@ -529,7 +531,8 @@ static __thread int edepth = 0;
 static __thread volatile struct {
         volatile jmp_buf *buf;
 } addr_check = {};
-
+static struct counters __g_counters = {};
+static pthread_mutex_t __g_counters_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
         int result;
@@ -624,21 +627,22 @@ int t2_error(int idx, char *buf, int nob, int *err) {
         }
 }
 
-void t2_error_print(void) {
+void t2_error_print() {
         eprint();
 }
 
 static __thread bool thread_registered = false;
 
-void t2_thread_register(void) {
+void t2_thread_register() {
         ASSERT(!thread_registered);
         urcu_memb_register_thread();
         thread_registered = true;
 }
 
-void t2_thread_degister(void) {
+void t2_thread_degister() {
         ASSERT(thread_registered);
         urcu_memb_unregister_thread();
+        counters_fold();
         thread_registered = false;
 }
 
@@ -1028,18 +1032,18 @@ static int32_t nsize(const struct node *n) {
         return (int32_t)1 << n->ntype->shift;
 }
 
-static void rcu_lock(void) {
+static void rcu_lock() {
         urcu_memb_read_lock();
         ASSERT(CVAL(rcu) == 0);
         CINC(rcu);
 }
 
-static void rcu_unlock(void) {
+static void rcu_unlock() {
         CDEC(rcu);
         urcu_memb_read_unlock();
 }
 
-static void rcu_quiescent(void) {
+static void rcu_quiescent() {
         urcu_memb_quiescent_state();
 }
 
@@ -2219,11 +2223,11 @@ static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1)
         }
 }
 
-static void eclear(void) {
+static void eclear() {
         edepth = 0;
 }
 
-static void eprint(void) {
+static void eprint() {
         for (int i = 0; i < edepth; ++i) {
                 struct error_descr *ed = &estack[i];
                 printf("[%s] (%i): ", strerror(-ed->err), ed->err);
@@ -2231,7 +2235,7 @@ static void eprint(void) {
         }
 }
 
-static void counters_check(void) {
+static void counters_check() {
         if (CVAL(node) != 0) {
                 LOG("Leaked node: %i", CVAL(node));
         }
@@ -2247,30 +2251,44 @@ static void counters_check(void) {
 }
 
 static void op_counter_print(int opt, const char *label) {
-        printf("%10s nr: %10i traverse: %10i ok: %10i\n", label, CVAL(op[opt].nr), CVAL(op[opt].traverse), CVAL(op[opt].ok));
+        printf("%10s nr: %10"PRId64" traverse: %10"PRId64" ok: %10"PRId64"\n", label,
+               GVAL(op[opt].nr), GVAL(op[opt].traverse), GVAL(op[opt].ok));
         printf("%3s %10s %10s %10s %10s\n", "lv", "nr", "get", "search", "balance");
-        for (int i = 0; i < ARRAY_SIZE(CVAL(op[opt].l)); ++i) {
-                printf("%3i %10i %10i %10i %10i\n", i,
-                       CVAL(op[opt].l[i].nr), CVAL(op[opt].l[i].get), CVAL(op[opt].l[i].search), CVAL(op[opt].l[i].balance));
+        for (int i = 0; i < ARRAY_SIZE(GVAL(op[opt].l)); ++i) {
+                printf("%3i %10"PRId64" %10"PRId64" %10"PRId64" %10"PRId64"\n", i,
+                       GVAL(op[opt].l[i].nr), GVAL(op[opt].l[i].get), GVAL(op[opt].l[i].search), GVAL(op[opt].l[i].balance));
         }
 }
 
-static void counters_print(void) {
-        printf("node:  %i\n", CVAL(node));
-        printf("rlock: %i\n", CVAL(rlock));
-        printf("wlock: %i\n", CVAL(wlock));
-        printf("rcu:   %i\n", CVAL(rcu));
+static void counters_print() {
+        counters_fold();
+        printf("node:  %"PRId64"\n", GVAL(node));
+        printf("rlock: %"PRId64"\n", GVAL(rlock));
+        printf("wlock: %"PRId64"\n", GVAL(wlock));
+        printf("rcu:   %"PRId64"\n", GVAL(rcu));
         op_counter_print(LOOKUP, "lookup");
         op_counter_print(INSERT, "insert");
         op_counter_print(DELETE, "delete");
         op_counter_print(NEXT,   "next");
         printf("%3s %10s %10s\n", "lv", "nr", "free");
         for (int i = 0; i < MAX_TREE_HEIGHT; ++i) {
-                printf("%3i %10.1f %10.1f\n", i, CAVG(nr[i]), CAVG(free[i]));
+                printf("%3i %10.1f %10.1f\n", i, GAVG(nr[i]), GAVG(free[i]));
         }
 }
 
-static void counters_clear(void) {
+static void counters_clear() {
+        SET0(&__g_counters);
+}
+
+static void counters_fold() {
+        uint64_t *dst = (uint64_t *)&__g_counters;
+        uint64_t *src = (uint64_t *)&__t_counters;
+        SASSERT(sizeof __g_counters % sizeof(int64_t) == 0);
+        mutex_lock(&__g_counters_lock);
+        for (long unsigned i = 0; i < (sizeof __g_counters / sizeof(int64_t)); ++i) {
+                dst[i] += src[i];
+        }
+        mutex_unlock(&__g_counters_lock);
         SET0(&__t_counters);
 }
 
@@ -2278,7 +2296,7 @@ static __thread int insigsegv = 0;
 static struct sigaction osa = {};
 static int signal_set = 0;
 
-static void stacktrace(void) {
+static void stacktrace() {
     int    size;
     void  *tracebuf[512];
 
@@ -2309,7 +2327,7 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
         }
 }
 
-static int signal_init(void) {
+static int signal_init() {
         struct sigaction sa = {
                 .sa_sigaction = &sigsegv,
                 .sa_flags     = SA_SIGINFO,
@@ -2324,7 +2342,7 @@ static int signal_init(void) {
         return result;
 }
 
-static void signal_fini(void) {
+static void signal_fini() {
         ASSERT(signal_set > 0);
         if (--signal_set == 0) {
                 sigaction(SIGSEGV, &osa, NULL);
@@ -3106,7 +3124,7 @@ static void usuite(const char *suite) {
 
 static const char *test = NULL;
 
-static void utestdone(void) {
+static void utestdone() {
         printf("done.\n");
         test = NULL;
 }
@@ -3183,7 +3201,7 @@ static struct t2_tree_type ttype = {
         .ntype    = &tree_ntype
 };
 
-static void simple_ut(void) {
+static void simple_ut() {
         struct node n = {
                 .ntype = &ntype,
                 .addr  = taddr_make(0x100000, ntype.shift),
@@ -3807,7 +3825,7 @@ static void cookie_ut() {
         stacktrace(); /* Test it here. */
 }
 
-static void error_ut(void) {
+static void error_ut() {
         int e0 = ERROR(-ENOMEM);
         int e1 = ERROR_INFO(e0, "error: %i", 6, 0);
         int e2 = ERROR_INFO(-EINVAL, "bump!", 0, 0);
@@ -3843,7 +3861,7 @@ static void inc(char *key, int len) {
         }
 }
 
-void seq_ut(void) {
+void seq_ut() {
         char key[] = "999999999";
         char val[] = "*VALUE*";
         struct t2_buf keyb;
