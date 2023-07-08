@@ -1989,7 +1989,7 @@ static bool addr_is_valid(void *addr) {
         bool result;
         jmp_buf buf;
         ASSERT(addr_check.buf == NULL);
-        if (sigsetjmp(buf, true) != 0) {
+        if (setjmp(buf) != 0) {
                 result = false;
         } else {
                 addr_check.buf = &buf;
@@ -2376,7 +2376,7 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
         if (ON_LINUX && LIKELY(buf != NULL)) {
                 addr_check.buf = NULL;
                 --insigsegv;
-                siglongjmp((void *)*buf, 1);
+                longjmp((void *)*buf, 1);
         }
         printf("\nGot: %i errno: %i addr: %p code: %i pid: %i uid: %i ucontext: %p\n",
                signo, si->si_errno, si->si_addr, si->si_code, si->si_pid, si->si_uid, uctx);
@@ -2394,7 +2394,7 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
 static int signal_init() {
         struct sigaction sa = {
                 .sa_sigaction = &sigsegv,
-                .sa_flags     = SA_SIGINFO,
+                .sa_flags     = SA_SIGINFO | SA_NODEFER,
         };
         int result = 0;
         if (signal_set == 0) {
