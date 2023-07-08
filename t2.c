@@ -91,6 +91,12 @@ enum {
 #define EISOK(val) (!EISERR(val))
 #define EDESCR(err, fmt, a0, a1) edescr(MSG_PREP(fmt), err, (uint64_t)a0, (uint64_t)a1)
 
+#define NOFAIL(expr)                            \
+({                                              \
+        int result = (expr);                    \
+        ASSERT(result == 0);                    \
+})
+
 /* Returns the number of array elements that satisfy given criteria. */
 #define COUNT(var, nr, ...)                             \
 ({                                                      \
@@ -221,8 +227,8 @@ enum {
 #define CDEC(cnt) (--__t_counters.cnt)
 #define CVAL(cnt) (__t_counters.cnt)
 #define GVAL(cnt) (__g_counters.cnt)
+#define CADD(cnt, d) (__t_counters.cnt += (d))
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
-#define GAVG(cnt) ({ struct counter_var *v = &(__g_counters.cnt); v->nr ? 1.0 * v->sum / v->nr : 0.0; })
 
 /* Is Parallel Programming Hard, And, If So, What Can You Do About It? */
 #define ACCESS_ONCE(x)     (*(volatile typeof(x) *)&(x))
@@ -409,26 +415,49 @@ struct counter_var {
         int64_t nr;
 };
 
-struct op_counters {
-        int64_t nr;
-        int64_t traverse;
-        int64_t ok;
-        struct {
-                int64_t nr;
-                int64_t get;
-                int64_t search;
-                int64_t balance;
-        } l[MAX_TREE_HEIGHT];
-};
-
 struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t node;
         int64_t rlock;
         int64_t wlock;
         int64_t rcu;
-        struct op_counters op[OP_NR];
-        struct counter_var nr[MAX_TREE_HEIGHT];
-        struct counter_var free[MAX_TREE_HEIGHT];
+        int64_t peek;
+        int64_t alloc;
+        int64_t traverse;
+        int64_t wscan_clean;
+        int64_t wscan_dirty;
+        int64_t wscan_node;
+        int64_t wscan_busy;
+        int64_t wscan_written;
+        int64_t cscan_accessed;
+        int64_t cscan_not_accessed;
+        int64_t cscan_node;
+        int64_t cscan_cleaned;
+        int64_t read;
+        int64_t read_bytes;
+        int64_t write;
+        int64_t write_bytes;
+        struct level_counters {
+                int64_t insert_balance;
+                int64_t delete_balance;
+                int64_t get;
+                int64_t search;
+                int64_t bin_iter;
+                int64_t lin_iter;
+                int64_t nospc;
+                int64_t dirmove;
+                int64_t insert;
+                int64_t delete;
+                int64_t recget;
+                int64_t moves;
+                int64_t make;
+                int64_t shift;
+                int64_t shift_one;
+                int64_t merge;
+                struct counter_var nr;
+                struct counter_var free;
+                struct counter_var keysize;
+                struct counter_var valsize;
+        } l[MAX_TREE_HEIGHT];
 };
 
 struct error_descr {
@@ -771,7 +800,6 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
 
 static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         enum lock_mode mode = opt == LOOKUP || opt == NEXT ? READ : WRITE;
-        CINC(op[opt].nr);
         rcu_lock();
         if (cookie_is_valid(&r->cookie)) {
                 struct node *n = COF(r->cookie.hi, struct node, cookie);
@@ -816,38 +844,34 @@ static bool is_stable(const struct node *n) {
 }
 
 static void lock(struct node *n, enum lock_mode mode) {
-        int result;
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         ASSERT(CVAL(rcu) == 0);
         if (mode == WRITE) {
-                result = pthread_rwlock_wrlock(&n->lock);
-                ASSERT(result == 0);
+                NOFAIL(pthread_rwlock_wrlock(&n->lock));
                 ASSERT(is_stable(n));
                 CINC(wlock);
         } else if (mode == READ) {
-                result = pthread_rwlock_rdlock(&n->lock);
+                NOFAIL(pthread_rwlock_rdlock(&n->lock));
                 CINC(rlock);
         }
 }
 
 static void unlock(struct node *n, enum lock_mode mode) {
-        int result;
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         if (mode == WRITE) {
                 if (!is_stable(n)) {
                         node_seq_increase(n);
                 }
-                result = pthread_rwlock_unlock(&n->lock);
-                ASSERT(result == 0);
+                NOFAIL(pthread_rwlock_unlock(&n->lock));
                 CDEC(wlock);
         } else if (mode == READ) {
-                result = pthread_rwlock_unlock(&n->lock);
-                ASSERT(result == 0);
+                NOFAIL(pthread_rwlock_unlock(&n->lock));
                 CDEC(rlock);
         }
 }
 
 static struct node *peek(struct t2 *mod, taddr_t addr) {
+        CINC(peek);
         return ht_lookup(&mod->ht, addr);
 }
 
@@ -855,6 +879,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
         struct node *n    = mem_alloc(sizeof *n);
         void        *data = mem_alloc_align(taddr_ssize(addr));
         int          result;
+        CINC(alloc);
         if (LIKELY(n != NULL && data != NULL)) {
                 result = pthread_rwlock_init(&n->lock, NULL);
                 if (LIKELY(result == 0)) {
@@ -875,11 +900,9 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
 }
 
 static void nfini(struct node *n) {
-        int result;
         ASSERT(n->ref == 0);
         cookie_invalidate(&n->cookie);
-        result = pthread_rwlock_destroy(&n->lock);
-        ASSERT(result == 0);
+        NOFAIL(pthread_rwlock_destroy(&n->lock));
         mem_free(n->data);
         SET0(n);
         mem_free(n);
@@ -934,6 +957,8 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                 } else {
                                         result = ERROR(-ESTALE);
                                 }
+                                CINC(read);
+                                CADD(read_bytes, taddr_ssize(n->addr));
                         }
                         if (UNLIKELY(result != 0)) {
                                 unlock(n, WRITE);
@@ -1150,8 +1175,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 }
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
-                result = simple_insert(&s);
-                ASSERT(result == 0);
+                NOFAIL(simple_insert(&s));
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node));
                 if (r->flags & ALUSED) {
                         struct t2_buf lkey = {};
@@ -1167,8 +1191,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
                         if (is_leaf(right)) {
                                 prefix_separator(&lkey, &rkey);
                         }
-                        result = buf_alloc(&r->scratch, &rkey);
-                        ASSERT(result == 0);
+                        NOFAIL(buf_alloc(&r->scratch, &rkey));
                         r->keyout = r->scratch;
                         ptr_buf(right, &r->valout);
                         return +1;
@@ -1200,7 +1223,6 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
         simple_get(s);
         simple_delete(s);
         if (p->rung[idx + 1].flags & SEPCHG) {
-                int           result;
                 struct node  *child = brother(&p->rung[idx + 1], RIGHT)->node;
                 struct t2_buf cptr;
                 SLOT_DEFINE(sub, child);
@@ -1213,8 +1235,7 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
                         /* Take the rightmost key in the leaf. */
                         rec_get(&leaf, nr(leaf.node) - 1);
                         prefix_separator(leaf.rec.key, s->rec.key);
-                        result = simple_insert(s);
-                        ASSERT(result == 0);
+                        NOFAIL(simple_insert(s));
                 }
         }
 }
@@ -1238,8 +1259,7 @@ static int split_right_exec_delete(struct path *p, int idx) {
                 }
         }
         if (right != NULL && can_merge(r->node, right)) {
-                result = merge(r->node, right, LEFT);
-                ASSERT(result == 0);
+                NOFAIL(merge(r->node, right, LEFT));
                 EXPENSIVE_ASSERT(is_sorted(r->node));
                 r->flags &= ~SEPCHG;
                 result = +1;
@@ -1610,7 +1630,7 @@ static int insert_balance(struct path *p) {
         for (idx = p->used - 1; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->lm == WRITE);
-                CINC(op[INSERT].l[level(r->node)].balance);
+                CINC(l[level(r->node)].insert_balance);
                 result = dispatch[r->pd.id].exec_insert(p, idx);
                 if (result <= 0) {
                         break;
@@ -1640,7 +1660,7 @@ static int delete_balance(struct path *p) {
         for (idx = p->used - 1; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->lm == WRITE);
-                CINC(op[DELETE].l[level(r->node)].balance);
+                CINC(l[level(r->node)].delete_balance);
                 result = dispatch[r->pd.id].exec_delete(p, idx);
                 if (result <= 0) {
                         break;
@@ -1742,7 +1762,7 @@ static int traverse(struct path *p) {
         uint64_t   next = 0;
         ASSERT(p->used == 0);
         ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
-        CINC(op[p->opt].traverse);
+        CINC(traverse);
         rcu_lock();
         while (true) {
                 struct node *n;
@@ -1783,7 +1803,7 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else {
-                                CINC(op[p->opt].l[level(n)].get);
+                                CINC(l[level(n)].get);
                                 flags |= PINNED;
                         }
                 } else if (!is_stable(n)) { /* This is racy, but OK. */
@@ -1799,9 +1819,8 @@ static int traverse(struct path *p) {
                         continue;
                 }
                 r = path_add(p, n, node_seq(n), flags);
-                CINC(op[p->opt].l[level(n)].nr);
-                CMOD(nr[level(n)], nr(n));
-                CMOD(free[level(n)], simple_free(n));
+                CMOD(l[level(n)].nr, nr(n));
+                CMOD(l[level(n)].free, simple_free(n));
                 if (is_leaf(n)) {
                         if (p->opt == LOOKUP) {
                                 result = lookup_complete(p, n);
@@ -1996,8 +2015,7 @@ static bool addr_is_valid(void *addr) {
 static int cacheline_size() {
         size_t cacheline = 0;
         size_t size      = sizeof(cacheline);
-        int    result    = sysctlbyname("hw.cachelinesize", &cacheline, &size, NULL, 0);
-        ASSERT(result == 0);
+        NOFAIL(sysctlbyname("hw.cachelinesize", &cacheline, &size, NULL, 0));
         return cacheline;
 }
 
@@ -2049,6 +2067,8 @@ static void pageout(struct node *n) {
         if (LIKELY(n->flags & MODIFIED)) {
                 int result = SCALL(n->mod, write, n->addr, n->data);
                 if (LIKELY(result == 0)) {
+                        CINC(write);
+                        CADD(write_bytes, taddr_ssize(n->addr));
                         n->flags &= ~MODIFIED;
                 } else {
                         LOG("Pageout failure: %"PRIx64": %i\n", n->addr, result);
@@ -2068,6 +2088,7 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                 struct bucket *bucket;
                 bool           clean;
                 while (!(mod->ht.buckets[scan].flags & DIRTY)) {
+                        CINC(wscan_clean);
                         if (++scanned >= toscan) {
                                 mod->writescan = scan;
                                 return;
@@ -2077,6 +2098,7 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                                 return;
                         }
                 }
+                CINC(wscan_dirty);
                 bucket = &mod->ht.buckets[scan];
                 mutex_lock(&bucket->lock);
                 do {
@@ -2085,10 +2107,13 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                         struct node           *next;
                         clean = true;
                         cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
+                                CINC(wscan_node);
                                 if (n->ref > 0) {
+                                        CINC(wscan_busy);
                                         continue;
                                 }
                                 if (n->flags & MODIFIED) {
+                                        CINC(wscan_written);
                                         ref(n);
                                         mutex_unlock(&bucket->lock);
                                         lock(n, READ);
@@ -2126,12 +2151,16 @@ static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
                 struct node           *n;
                 struct node           *next;
                 if (bucket->flags & ACCESSED) {
+                        CINC(cscan_accessed);
                         bucket->flags &= ~ACCESSED;
                 } else {
+                        CINC(cscan_not_accessed);
                         mutex_lock(&bucket->lock);
                         head = &bucket->chain;
                         cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
+                                CINC(cscan_node);
                                 if (n->ref == 0 && !(n->flags & MODIFIED)) {
+                                        CINC(cscan_cleaned);
                                         put_final(n);
                                         cleaned++;
                                 }
@@ -2250,30 +2279,72 @@ static void counters_check() {
         }
 }
 
-static void op_counter_print(int opt, const char *label) {
-        printf("%10s nr: %10"PRId64" traverse: %10"PRId64" ok: %10"PRId64"\n", label,
-               GVAL(op[opt].nr), GVAL(op[opt].traverse), GVAL(op[opt].ok));
-        printf("%3s %10s %10s %10s %10s\n", "lv", "nr", "get", "search", "balance");
-        for (int i = 0; i < ARRAY_SIZE(GVAL(op[opt].l)); ++i) {
-                printf("%3i %10"PRId64" %10"PRId64" %10"PRId64" %10"PRId64"\n", i,
-                       GVAL(op[opt].l[i].nr), GVAL(op[opt].l[i].get), GVAL(op[opt].l[i].search), GVAL(op[opt].l[i].balance));
+static void counter_print(int offset, const char *label) {
+        printf("%-15s ", label);
+        for (int i = 0; i < ARRAY_SIZE(GVAL(l)); ++i) {
+                printf("%10"PRId64" ", *(uint64_t *)(((void *)&GVAL(l[i])) + offset));
         }
+        puts("");
 }
+
+static void counter_var_print(int offset, const char *label) {
+        printf("%-15s ", label);
+        for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
+                struct counter_var *v = (((void *)&GVAL(l[i])) + offset);
+                printf("%10.1f ", v->nr ? 1.0 * v->sum / v->nr : 0.0);
+        }
+        puts("");
+}
+
+#define COUNTER_PRINT(counter) \
+        counter_print(offsetof(struct level_counters, counter), #counter)
+
+#define COUNTER_VAR_PRINT(counter) \
+        counter_var_print(offsetof(struct level_counters, counter), #counter)
 
 static void counters_print() {
         counters_fold();
-        printf("node:  %"PRId64"\n", GVAL(node));
-        printf("rlock: %"PRId64"\n", GVAL(rlock));
-        printf("wlock: %"PRId64"\n", GVAL(wlock));
-        printf("rcu:   %"PRId64"\n", GVAL(rcu));
-        op_counter_print(LOOKUP, "lookup");
-        op_counter_print(INSERT, "insert");
-        op_counter_print(DELETE, "delete");
-        op_counter_print(NEXT,   "next");
-        printf("%3s %10s %10s\n", "lv", "nr", "free");
-        for (int i = 0; i < MAX_TREE_HEIGHT; ++i) {
-                printf("%3i %10.1f %10.1f\n", i, GAVG(nr[i]), GAVG(free[i]));
+        printf("peek:               %10"PRId64"\n", GVAL(peek));
+        printf("alloc:              %10"PRId64"\n", GVAL(alloc));
+        printf("traverse:           %10"PRId64"\n", GVAL(traverse));
+        printf("wscan.clean:        %10"PRId64"\n", GVAL(wscan_clean));
+        printf("wscan.dirty:        %10"PRId64"\n", GVAL(wscan_dirty));
+        printf("wscan.node:         %10"PRId64"\n", GVAL(wscan_node));
+        printf("wscan.busy:         %10"PRId64"\n", GVAL(wscan_busy));
+        printf("wscan.written:      %10"PRId64"\n", GVAL(wscan_written));
+        printf("cscan.accessed:     %10"PRId64"\n", GVAL(cscan_accessed));
+        printf("cscan.not_accessed: %10"PRId64"\n", GVAL(cscan_not_accessed));
+        printf("cscan.node:         %10"PRId64"\n", GVAL(cscan_node));
+        printf("cscan.cleaned:      %10"PRId64"\n", GVAL(cscan_cleaned));
+        printf("read:               %10"PRId64"\n", GVAL(read));
+        printf("read.bytes:         %10"PRId64"\n", GVAL(read_bytes));
+        printf("write:              %10"PRId64"\n", GVAL(write));
+        printf("write.bytes:        %10"PRId64"\n", GVAL(write_bytes));
+        printf("%15s ", "");
+        for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
+                printf("%10i ", i);
         }
+        puts("");
+        COUNTER_PRINT(insert_balance);
+        COUNTER_PRINT(delete_balance);
+        COUNTER_PRINT(get);
+        COUNTER_PRINT(search);
+        COUNTER_PRINT(insert);
+        COUNTER_PRINT(delete);
+        COUNTER_PRINT(bin_iter);
+        COUNTER_PRINT(lin_iter);
+        COUNTER_PRINT(nospc);
+        COUNTER_PRINT(dirmove);
+        COUNTER_PRINT(recget);
+        COUNTER_PRINT(moves);
+        COUNTER_PRINT(make);
+        COUNTER_PRINT(shift);
+        COUNTER_PRINT(shift_one);
+        COUNTER_PRINT(merge);
+        COUNTER_VAR_PRINT(nr);
+        COUNTER_VAR_PRINT(free);
+        COUNTER_VAR_PRINT(keysize);
+        COUNTER_VAR_PRINT(valsize);
 }
 
 static void counters_clear() {
@@ -2310,7 +2381,7 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
                 abort(); /* Don't try to print anything. */
         }
         if (ON_LINUX && LIKELY(buf != NULL)) {
-		addr_check.buf = NULL;
+                addr_check.buf = NULL;
                 --insigsegv;
                 siglongjmp((void *)*buf, 1);
         }
@@ -2350,13 +2421,11 @@ static void signal_fini() {
 }
 
 static void mutex_lock(pthread_mutex_t *lock) {
-        int result = pthread_mutex_lock(lock);
-        ASSERT(result == 0);
+        NOFAIL(pthread_mutex_lock(lock));
 }
 
 static void mutex_unlock(pthread_mutex_t *lock) {
-        int result = pthread_mutex_unlock(lock);
-        ASSERT(result == 0);
+        NOFAIL(pthread_mutex_unlock(lock));
 }
 
 static void delay(int attempt) {
@@ -2373,8 +2442,7 @@ static int ht_init(struct ht *ht, int shift) {
         ht->buckets = mem_alloc(sizeof ht->buckets[0] << shift);
         if (ht->buckets != NULL) {
                 for (int i = 0; i < (1 << shift); ++i) {
-                        int result = pthread_mutex_init(&ht->buckets[i].lock, NULL);
-                        ASSERT(result == 0);
+                        NOFAIL(pthread_mutex_init(&ht->buckets[i].lock, NULL));
                 }
                 return 0;
         }
@@ -2383,8 +2451,7 @@ static int ht_init(struct ht *ht, int shift) {
 
 static void ht_fini(struct ht *ht) {
         for (int i = 0; i < (1 << ht->shift); i++) {
-                int result = pthread_mutex_destroy(&ht->buckets[i].lock);
-                ASSERT(result == 0);
+                NOFAIL(pthread_mutex_destroy(&ht->buckets[i].lock));
                 ASSERT(ht->buckets[i].chain.next == NULL);
         }
         mem_free(ht->buckets);
@@ -2622,6 +2689,7 @@ static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen, uint32_
         int32_t ksize;
         int32_t koff = skeyoff(sh, pos, &ksize) & mask;
         ksize = min_32(ksize & mask, mask + 1 - koff);
+        CMOD(l[sh->head.level].keysize, ksize);
         return memcmp((void *)sh + koff, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
 }
 
@@ -2655,12 +2723,13 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
-        CINC(op[LOOKUP].l[level(n)].search);
+        CINC(l[level(n)].search);
         if (UT && ut_pre_search_hook != NULL) {
                 (ut_pre_search_hook)(n);
         }
         while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
+                CINC(l[level(n)].bin_iter);
                 cmp = skeycmp(sh, m, kaddr, klen, mask);
                 if (cmp > 0) {
                         r = m;
@@ -2673,6 +2742,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                 }
         }
         while (r - l > 1) {
+                CINC(l[level(n)].lin_iter);
                 cmp = skeycmp(sh, ++l, kaddr, klen, mask);
                 if (cmp >= 0) {
                         if (cmp > 0) {
@@ -2694,6 +2764,8 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                 val->nr = 1;
                 val->seg[0].addr = sval(sh, l, &val->seg[0].len);
                 buf_clip(val, mask, sh);
+                CMOD(l[level(n)].keysize, key->seg[0].len);
+                CMOD(l[level(n)].valsize, key->seg[0].len);
         }
         if (UT && ut_post_search_hook != NULL) {
                 (ut_post_search_hook)(n);
@@ -2768,6 +2840,7 @@ static int32_t simple_free(const struct node *n) {
 static void move(void *sh, int32_t start, int32_t end, int delta) {
         ASSERT(start <= end);
         memmove(sh + start + delta, sh + start, end - start);
+        CADD(l[((struct sheader *)sh)->head.level].moves, end - start);
 }
 
 static void sdirmove(struct sheader *sh, int32_t nsize,
@@ -2806,7 +2879,9 @@ static int simple_insert(struct slot *s) {
         int32_t             vlen = buf_len(s->rec.val);
         ASSERT(s->idx <= sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
+        CINC(l[sh->head.level].insert);
         if (simple_free(s->node) < klen + vlen + SOF(struct dir_element)) {
+                CINC(l[sh->head.level].nospc);
                 return -ENOSPC;
         }
         if (sfreekey(s->node) < klen || sfreeval(s->node) < vlen + SOF(*end)) {
@@ -2814,6 +2889,7 @@ static int simple_insert(struct slot *s) {
                 sdirmove(sh, beg->voff, end->koff - beg->koff + klen,
                          beg->voff - end->voff + vlen, sh->nr + 1);
                 end = sat(sh, sh->nr);
+                CINC(l[sh->head.level].dirmove);
         }
         piv = sat(sh, s->idx);
         move(sh, piv->koff, end->koff, +klen);
@@ -2845,6 +2921,7 @@ static void simple_delete(struct slot *s) {
         int32_t             vlen = piv->voff - inn->voff;
         ASSERT(s->idx < sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
+        CINC(l[sh->head.level].delete);
         move(sh, inn->koff, end->koff, -klen);
         move(sh, end->voff, inn->voff, +vlen);
         for (int32_t i = s->idx; i < sh->nr; ++i) {
@@ -2865,6 +2942,7 @@ static void simple_get(struct slot *s) {
         s->rec.key->seg[0].addr = skey(sh, s->idx, &s->rec.key->seg[0].len);
         s->rec.val->seg[0].addr = sval(sh, s->idx, &s->rec.val->seg[0].len);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
+        CINC(l[sh->head.level].recget);
 }
 
 static void simple_make(struct node *n) {
@@ -2872,6 +2950,7 @@ static void simple_make(struct node *n) {
         struct sheader *sh   = simple_header(n);
         sh->dir_off = SOF(*sh) + (size - SOF(*sh)) / 2;
         *sat(sh, 0) = (struct dir_element){ .koff = SOF(*sh), .voff = size };
+        CINC(l[sh->head.level].make);
 }
 
 static int32_t simple_nr(const struct node *n) {
@@ -2941,6 +3020,7 @@ static int shift_one(struct node *d, struct node *s, enum dir dir) {
         ASSERT(nr(s) > 0);
         rec_get(&src, utmost(s, dir));
         dst.idx = dir == LEFT ? nr(d) : 0;
+        CINC(l[level(d)].shift_one);
         return simple_insert(&dst) ?: (simple_delete(&src), 0);
 }
 
@@ -2950,6 +3030,7 @@ static int shift(struct node *d, struct node *s, const struct slot *point, enum 
         ASSERT(point->idx >= 0 && point->idx <= nr(s));
         ASSERT(simple_free(d) > simple_free(s));
         ASSERT(4 * rec_len(&point->rec) < min_32(nsize(d), nsize(s)));
+        CINC(l[level(d)].shift);
         while (LIKELY(result == 0)) {
                 SLOT_DEFINE(slot, s);
                 rec_get(&slot, utmost(s, dir));
@@ -2968,6 +3049,7 @@ static int merge(struct node *d, struct node *s, enum dir dir) {
         while (LIKELY(result == 0) && nr(s) > 0) {
                 result = shift_one(d, s, dir);
         }
+        CINC(l[level(d)].merge);
         return result;
 }
 
@@ -3076,21 +3158,34 @@ static void file_free(struct t2_storage *storage, taddr_t addr) {
 }
 
 static int file_read(struct t2_storage *storage, taddr_t addr, void *dst) {
-        struct file_storage *fs = COF(storage, struct file_storage, gen);
-        int result = pread(fs->fd, dst, taddr_ssize(addr), taddr_saddr(addr));
-        if (LIKELY(result == taddr_ssize(addr))) {
+        struct file_storage *fs    = COF(storage, struct file_storage, gen);
+        uint64_t             off   = taddr_saddr(addr);
+        int                  count = taddr_ssize(addr);
+        int                  result;
+        if (UNLIKELY(off >= fs->free)) {
+                return -ESTALE;
+        }
+        result = pread(fs->fd, dst, count, off);
+        if (LIKELY(result == count)) {
                 return 0;
         } else if (result < 0) {
                 return ERROR(result);
         } else {
+                printf("%"PRIx64" %i %i\n", off, count, result);
                 return ERROR(-EIO);
         }
 }
 
 static int file_write(struct t2_storage *storage, taddr_t addr, void *src) {
-        struct file_storage *fs = COF(storage, struct file_storage, gen);
-        int result = pwrite(fs->fd, src, taddr_ssize(addr), taddr_saddr(addr));
-        if (LIKELY(result == taddr_ssize(addr))) {
+        struct file_storage *fs    = COF(storage, struct file_storage, gen);
+        uint64_t             off   = taddr_saddr(addr);
+        int                  count = taddr_ssize(addr);
+        int                  result;
+        if (UNLIKELY(off >= fs->free)) {
+                return -ESTALE;
+        }
+        result = pwrite(fs->fd, src, count, off);
+        if (LIKELY(result == count)) {
                 return 0;
         } else if (result < 0) {
                 return ERROR(result);
@@ -3139,11 +3234,9 @@ static void utest(const char *t) {
 
 static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         struct sheader *sh = simple_header(s->node);
-        int result;
         for (int32_t i = 0; simple_free(s->node) >=
                      buf_len(key) + buf_len(val) + SOF(struct dir_element); ++i) {
-                result = simple_insert(s);
-                ASSERT(result == 0);
+                NOFAIL(simple_insert(s));
                 ASSERT(sh->nr == i + 1);
                 ((char *)key->seg[0].addr)[1]++;
                 ((char *)val->seg[0].addr)[1]++;
@@ -3257,8 +3350,7 @@ static void simple_ut() {
                 s.idx++;
                 key = BUF_VAL(key0);
                 val = BUF_VAL(val0);
-                result = simple_insert(&s);
-                ASSERT(result == 0);
+                NOFAIL(simple_insert(&s));
                 ASSERT(is_sorted(&n));
                 key0[1] += 251; /* Co-prime with 256. */
                 if (key0[1] == 'a') {
@@ -3365,22 +3457,18 @@ static void traverse_ut() {
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
-                result = simple_insert(&s);
-                ASSERT(result == 0);
+                NOFAIL(simple_insert(&s));
                 ASSERT(is_sorted(&n));
         }
         utest("existing");
         key0[0] = '0';
-        result = traverse(&p);
-        ASSERT(result == 0);
+        NOFAIL(traverse(&p));
         key0[0] = '2';
         p.used = 0;
-        result = traverse(&p);
-        ASSERT(result == 0);
+        NOFAIL(traverse(&p));
         key0[0] = '8';
         p.used = 0;
-        result = traverse(&p);
-        ASSERT(result == 0);
+        NOFAIL(traverse(&p));
         utest("too-small");
         key0[0] = ' ';
         p.used = 0;
@@ -3424,8 +3512,7 @@ static void insert_ut() {
         t.root = n->addr;
         put(n);
         utest("insert-1");
-        result = t2_insert(&t, &r);
-        ASSERT(result == 0);
+        NOFAIL(t2_insert(&t, &r));
         utest("eexist");
         result = t2_insert(&t, &r);
         ASSERT(result == -EEXIST);
@@ -3460,8 +3547,7 @@ static void tree_ut() {
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         utest("insert-1");
-        result = t2_insert(t, &r);
-        ASSERT(result == 0);
+        NOFAIL(t2_insert(t, &r));
         utest("eexist");
         result = t2_insert(t, &r);
         ASSERT(result == -EEXIST);
@@ -3469,8 +3555,7 @@ static void tree_ut() {
         key = BUF_VAL(k64);
         val = BUF_VAL(v64);
         for (k64 = 0; k64 < 5000; ++k64) {
-                result = t2_insert(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_insert(t, &r));
         }
         utest("20K");
         key = BUF_VAL(k64);
@@ -3478,8 +3563,7 @@ static void tree_ut() {
         for (int i = 0; i < 20000; ++i) {
                 k64 = ht_hash(i);
                 v64 = ht_hash(i + 1);
-                result = t2_insert(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_insert(t, &r));
         }
         utest("50K");
         for (int i = 0; i < 50000; ++i) {
@@ -3491,8 +3575,7 @@ static void tree_ut() {
         utest("check");
         for (int i = 0; i < 50000; ++i) {
                 k64 = ht_hash(i);
-                result = t2_lookup(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_lookup(t, &r));
                 ASSERT(v64 == ht_hash(i + 1));
         }
         utest("fini");
@@ -3544,8 +3627,7 @@ static void stress_ut() {
                 fill(val, vsize);
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = vsize, .addr = &val };
-                result = t2_insert(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_insert(t, &r));
                 for (int j = 0; j < 10; ++j) {
                         long probe = rand();
                         *(long *)key = probe;
@@ -3569,8 +3651,7 @@ static void stress_ut() {
                 *(long *)key = j;
                 keyb.seg[0] = (struct t2_seg){ .len = ksize,    .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = SOF(val), .addr = &val };
-                result = t2_lookup(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_lookup(t, &r));
         }
         utest("rand");
         U *= 1;
@@ -3643,8 +3724,7 @@ static void delete_ut() {
                 fill(val, vsize);
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = vsize, .addr = &val };
-                result = t2_insert(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_insert(t, &r));
         }
         for (long i = U - 1; i >= 0; --i) {
                 for (long j = 0; j < U; ++j) {
@@ -3663,8 +3743,7 @@ static void delete_ut() {
                 *(long *)key = i;
                 keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
                 valb.seg[0] = (struct t2_seg){ .len = vsize, .addr = &val };
-                result = t2_delete(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_delete(t, &r));
         }
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
@@ -3738,7 +3817,6 @@ static void next_ut() {
                 .key = &keyb,
                 .val = &valb
         };
-        int     result;
         usuite("next");
         utest("init");
         mod = t2_init(ut_storage, 20);
@@ -3762,8 +3840,7 @@ static void next_ut() {
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(i);
                 valb = BUF_VAL(i);
-                result = t2_insert(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_insert(t, &r));
         }
         utest("smoke");
         for (long i = 0, del = 0; i < U; ++i, del += 7, del %= U) {
@@ -3771,8 +3848,7 @@ static void next_ut() {
                 struct t2_buf maxkey = BUF_VAL(ulongmax);
                 keyb = BUF_VAL(del);
                 valb = BUF_VAL(del);
-                result = t2_delete(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_delete(t, &r));
                 c.dir = T2_MORE;
                 t2_cursor_init(&c, &zero);
                 cit = 0;
@@ -3800,8 +3876,7 @@ static void cookie_ut() {
         uint64_t v[10];
         struct t2_cookie k;
         int result;
-        result = signal_init();
-        ASSERT(result == 0);
+        NOFAIL(signal_init());
         cookie_make(&v[0]);
         cookie_load(&v[0], &k);
         result = cookie_is_valid(&k);
@@ -3869,7 +3944,6 @@ void seq_ut() {
         struct t2_rec r = {};
         struct t2      *mod;
         struct t2_tree *t;
-        int     result;
         usuite("seq");
         utest("init");
         mod = t2_init(ut_storage, 20);
@@ -3886,8 +3960,7 @@ void seq_ut() {
                 valb = BUF_VAL(val);
                 r.key = &keyb;
                 r.val = &valb;
-                result = t2_insert(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_insert(t, &r));
                 inc(key, (sizeof key) - 1);
         }
         utest("fini");
@@ -3987,8 +4060,7 @@ void corrupt_ut() {
                 r.val = &valb;
                 key = ht_hash(i);
                 val = ht_hash(i + 1);
-                result = t2_insert(t, &r);
-                ASSERT(result == 0);
+                NOFAIL(t2_insert(t, &r));
         }
         utest("corrupt");
         ut_pre_search_hook = &corrupt_hook;
@@ -4123,48 +4195,40 @@ void mt_ut() {
         }
         utest("lookup");
         for (int i = 0; i < THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &lookup_worker, t);
-                ASSERT(result == 0);
+                NOFAIL(pthread_create(&tid[i], NULL, &lookup_worker, t));
         }
         for (int i = 0; i < THREADS; ++i) {
                 pthread_join(tid[i], NULL);
         }
         utest("insert");
         for (int i = 0; i < THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &insert_worker, t);
-                ASSERT(result == 0);
+                NOFAIL(pthread_create(&tid[i], NULL, &insert_worker, t));
         }
         for (int i = 0; i < THREADS; ++i) {
                 pthread_join(tid[i], NULL);
         }
         utest("insert+lookup");
         for (int i = 0; i < THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &lookup_worker, t);
-                ASSERT(result == 0);
+                NOFAIL(pthread_create(&tid[i], NULL, &lookup_worker, t));
         }
         for (int i = THREADS; i < 2*THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &insert_worker, t);
-                ASSERT(result == 0);
+                NOFAIL(pthread_create(&tid[i], NULL, &insert_worker, t));
         }
         for (int i = 0; i < 2*THREADS; ++i) {
                 pthread_join(tid[i], NULL);
         }
         utest("all");
         for (int i = 0; i < THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &delete_worker, t);
-                ASSERT(result == 0);
+                NOFAIL(pthread_create(&tid[i], NULL, &delete_worker, t));
         }
         for (int i = THREADS; i < 2*THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &insert_worker, t);
-                ASSERT(result == 0);
+                NOFAIL(pthread_create(&tid[i], NULL, &insert_worker, t));
         }
         for (int i = 2*THREADS; i < 3*THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &next_worker, t);
-                ASSERT(result == 0);
+                NOFAIL(pthread_create(&tid[i], NULL, &next_worker, t));
         }
         for (int i = 3*THREADS; i < 4*THREADS; ++i) {
-                result = pthread_create(&tid[i], NULL, &lookup_worker, t);
-                ASSERT(result == 0);
+                NOFAIL(pthread_create(&tid[i], NULL, &lookup_worker, t));
         }
         for (int i = 0; i < 4*THREADS; ++i) {
                 pthread_join(tid[i], NULL);
@@ -4184,7 +4248,9 @@ int main(int argc, char **argv) {
         traverse_ut();
         insert_ut();
         tree_ut();
+        counters_clear();
         stress_ut();
+        counters_print();
         delete_ut();
         next_ut();
         cookie_ut();
