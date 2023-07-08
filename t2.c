@@ -3106,7 +3106,7 @@ struct file_storage {
 
 static int file_init(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        fs->fd = open(fs->filename, O_RDWR | O_CREAT);
+        fs->fd = open(fs->filename, O_RDWR | O_CREAT, 0777);
         if (fs->fd > 0) {
                 fs->free = 512;
                 return pthread_mutex_init(&fs->lock, NULL);
@@ -3482,6 +3482,7 @@ static void insert_ut() {
                 .val = &val
         };
         int result;
+        ASSERT(EISOK(mod));
         t2_node_type_register(mod, &ntype);
         ttype.mod = mod;
         buf_init_str(&key, key0);
