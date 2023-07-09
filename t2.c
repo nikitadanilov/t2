@@ -432,6 +432,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t peek;
         int64_t alloc;
         int64_t traverse;
+        int64_t traverse_start;
+        int64_t traverse_iter;
         int64_t wscan_clean;
         int64_t wscan_dirty;
         int64_t wscan_node;
@@ -1009,7 +1011,9 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
 
 static void free_callback(struct rcu_head *head) {
         struct node *n = COF(head, struct node, rcu);
-        nfini(n);
+        if (n->ref == 0) {
+                nfini(n);
+        }
 }
 
 static void put_final(struct node *n) {
@@ -1737,7 +1741,9 @@ static void rcu_leave(struct path *p) {
 }
 
 static bool rcu_try(struct path *p) {
-        bool result = false;
+        bool result;
+        urcu_memb_barrier(); /* Alternatively, always restart. */
+        result = EXISTS(i, p->used, p->rung[i].node->flags & HEARD_BANSHEE);
         if (result) {
                 path_fini(p);
         }
@@ -1787,12 +1793,14 @@ static int traverse(struct path *p) {
                 struct rung *r;
                 uint64_t     flags = 0;
                 ASSERT(CVAL(rcu) == 1);
+                CINC(traverse_iter);
                 if (UNLIKELY(tries++ > 10)) {
                         if (false && (tries & (tries - 1)) == 0) {
                                 LOG("Looping: %i", tries);
                         }
                 }
                 if (p->used == 0) {
+                        CINC(traverse_start);
                         next = p->tree->root;
                 }
                 n = peek(mod, next);
@@ -2336,6 +2344,8 @@ static void counters_print() {
         printf("peek:               %10"PRId64"\n", GVAL(peek));
         printf("alloc:              %10"PRId64"\n", GVAL(alloc));
         printf("traverse:           %10"PRId64"\n", GVAL(traverse));
+        printf("traverse.start:     %10"PRId64"\n", GVAL(traverse_start));
+        printf("traverse.iter:      %10"PRId64"\n", GVAL(traverse_iter));
         printf("wscan.clean:        %10"PRId64"\n", GVAL(wscan_clean));
         printf("wscan.dirty:        %10"PRId64"\n", GVAL(wscan_dirty));
         printf("wscan.node:         %10"PRId64"\n", GVAL(wscan_node));
@@ -2527,8 +2537,6 @@ static void ht_insert(struct ht *ht, struct node *n) {
 }
 
 static void ht_delete(struct node *n) {
-        ASSERT(n->hash.prev != &n->hash);
-        ASSERT(n->hash.next != &n->hash);
         cds_hlist_del_rcu(&n->hash);
 }
 
