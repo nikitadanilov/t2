@@ -72,14 +72,14 @@ enum {
 })
 #define COF(ptr, type, member) ((type *)((char *)(ptr) - (char *)(&((type *)0)->member)))
 #define LOG(fmt, ...) llog(MSG_PREP(fmt) , ## __VA_ARGS__)
-#define ERROR_INFO(errcode, fmt, a0, a1)        \
-({                                              \
-        int __errc = (int)(errcode);            \
-        EDESCR(__errc, fmt, a0, a1);            \
-        __errc;                                 \
+#define ERROR_INFO(errcode, fmt, a0, a1)                \
+({                                                      \
+        typeof(errcode) __errc = (int)(errcode);        \
+        EDESCR(__errc, fmt, a0, a1);                    \
+        __errc;                                         \
 })
 #define ERROR(errcode)  ERROR_INFO(errcode, "", 0, 0)
-#define EPTR(errcode) ((void *)(uint64_t)(errcode))
+#define EPTR(errcode) ((void *)ERROR((int64_t)(errcode)))
 #define ERRCODE(val) ((int)(intptr_t)(val))
 #define EISERR(val) UNLIKELY((uint64_t)(val) >= (uint64_t)-MAX_ERR_CODE)
 #define EISOK(val) (!EISERR(val))
@@ -717,10 +717,6 @@ static taddr_t taddr_make(uint64_t addr, int shift) {
 
 static struct t2_buf zero = { .nr = 1 };
 
-static int zerokey_insert(struct t2_tree *t) {
-        return insert(t, &(struct t2_rec) { .key = &zero, .val = &zero });
-}
-
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         ASSERT(thread_registered);
         eclear();
@@ -732,7 +728,7 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
                         int result;
                         t->root = root->addr;
                         put(root); /* Release earlier to keep counters happy. */
-                        result = zerokey_insert(t);
+                        result = insert(t, &(struct t2_rec) { .key = &zero, .val = &zero });
                         if (result != 0) {
                                 t = EPTR(result);
                         }
