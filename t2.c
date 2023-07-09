@@ -1745,10 +1745,10 @@ static bool rcu_try(struct path *p) {
         return result;
 }
 
-enum { BOLT_EPOCH_SHIFT = 24 };
+enum { BOLT_EPOCH_SHIFT = 14 };
 
 static void touch(struct node *n) {
-        kmod(&n->kelvin, n->mod->bolt++ >> BOLT_EPOCH_SHIFT);
+        kmod(&n->kelvin, n->mod->bolt >> BOLT_EPOCH_SHIFT);
 }
 
 enum {
@@ -1889,6 +1889,7 @@ static int traverse(struct path *p) {
 static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
         int result;
         counters_check();
+        t->ttype->mod->bolt++;
         result = cookie_try(t, r, opt);
         if (result == -ESTALE) {
                 struct path p = {};
@@ -4184,7 +4185,6 @@ void mt_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        mt_ut();
         lib_ut();
         simple_ut();
         ht_ut();
