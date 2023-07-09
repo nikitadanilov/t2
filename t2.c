@@ -434,15 +434,18 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t traverse;
         int64_t traverse_start;
         int64_t traverse_iter;
+        int64_t wscan_scanned;
         int64_t wscan_clean;
         int64_t wscan_dirty;
         int64_t wscan_node;
         int64_t wscan_busy;
         int64_t wscan_written;
+        int64_t cscan_scanned;
         int64_t cscan_accessed;
         int64_t cscan_not_accessed;
         int64_t cscan_node;
-        int64_t cscan_cleaned;
+        int64_t cscan_busy;
+        int64_t cscan_dropped;
         int64_t read;
         int64_t read_bytes;
         int64_t write;
@@ -613,6 +616,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
 void t2_fini(struct t2 *mod) {
         eclear();
         urcu_memb_barrier();
+        writeout(mod, 0x7fffffff, 0x7fffffff);
         SCALL(mod, fini);
         ht_clean(&mod->ht);
         ht_fini(&mod->ht);
@@ -739,6 +743,23 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         } else {
                 return EPTR(-ENOMEM);
         }
+}
+
+struct t2_tree *t2_tree_open(struct t2_tree_type *ttype, taddr_t root) {
+        ASSERT(thread_registered);
+        eclear();
+        struct t2_tree *t = mem_alloc(sizeof *t);
+        if (t != NULL) {
+                t->ttype = ttype;
+                t->root  = root;
+                return t;
+        } else {
+                return EPTR(-ENOMEM);
+        }
+}
+
+static void t2_tree_close(struct t2_tree *t) {
+        mem_free(t);
 }
 
 static int rec_insert(struct node *n, int32_t idx, struct t2_rec *r) {
@@ -2099,7 +2120,7 @@ static void pageout(struct node *n) {
                         CADD(write_bytes, taddr_ssize(n->addr));
                         n->flags &= ~MODIFIED;
                 } else {
-                        LOG("Pageout failure: %"PRIx64": %i\n", n->addr, result);
+                        LOG("Pageout failure: %"PRIx64": %i/%i\n", n->addr, result, errno);
                 }
         }
 }
@@ -2117,6 +2138,7 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                 bool           clean;
                 while (!(mod->ht.buckets[scan].flags & DIRTY)) {
                         CINC(wscan_clean);
+                        CINC(wscan_scanned);
                         if (++scanned >= toscan) {
                                 mod->writescan = scan;
                                 return;
@@ -2157,6 +2179,8 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                 } while (!clean);
                 bucket->flags &= ~DIRTY;
                 mutex_unlock(&bucket->lock);
+                CINC(wscan_scanned);
+                ++scanned;
                 scan = (scan + 1) & mask;
                 if (written >= towrite) {
                         mod->writescan = scan;
@@ -2187,14 +2211,19 @@ static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
                         head = &bucket->chain;
                         cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
                                 CINC(cscan_node);
-                                if (n->ref == 0 && !(n->flags & MODIFIED)) {
-                                        CINC(cscan_cleaned);
-                                        put_final(n);
-                                        cleaned++;
+                                if (n->ref == 0) {
+                                        if (!(n->flags & MODIFIED)) {
+                                                CINC(cscan_dropped);
+                                                put_final(n);
+                                                cleaned++;
+                                        }
+                                } else {
+                                        CINC(cscan_busy);
                                 }
                         }
                         mutex_unlock(&bucket->lock);
                 }
+                CINC(cscan_scanned);
                 if (++scanned >= toscan || cleaned >= toclean) {
                         mod->writescan = scan;
                         return;
@@ -2350,15 +2379,18 @@ static void counters_print() {
         printf("traverse:           %10"PRId64"\n", GVAL(traverse));
         printf("traverse.start:     %10"PRId64"\n", GVAL(traverse_start));
         printf("traverse.iter:      %10"PRId64"\n", GVAL(traverse_iter));
+        printf("wscan.scanned:      %10"PRId64"\n", GVAL(wscan_scanned));
         printf("wscan.clean:        %10"PRId64"\n", GVAL(wscan_clean));
         printf("wscan.dirty:        %10"PRId64"\n", GVAL(wscan_dirty));
         printf("wscan.node:         %10"PRId64"\n", GVAL(wscan_node));
         printf("wscan.busy:         %10"PRId64"\n", GVAL(wscan_busy));
         printf("wscan.written:      %10"PRId64"\n", GVAL(wscan_written));
+        printf("cscan.scanned:      %10"PRId64"\n", GVAL(cscan_scanned));
         printf("cscan.accessed:     %10"PRId64"\n", GVAL(cscan_accessed));
         printf("cscan.not_accessed: %10"PRId64"\n", GVAL(cscan_not_accessed));
         printf("cscan.node:         %10"PRId64"\n", GVAL(cscan_node));
-        printf("cscan.cleaned:      %10"PRId64"\n", GVAL(cscan_cleaned));
+        printf("cscan.busy:         %10"PRId64"\n", GVAL(cscan_busy));
+        printf("cscan.dropped:      %10"PRId64"\n", GVAL(cscan_dropped));
         printf("read:               %10"PRId64"\n", GVAL(read));
         printf("read.bytes:         %10"PRId64"\n", GVAL(read_bytes));
         printf("write:              %10"PRId64"\n", GVAL(write));
@@ -4194,6 +4226,69 @@ void mt_ut() {
         utestdone();
 }
 
+static void open_ut() {
+        struct t2      *mod;
+        struct t2_tree *t;
+        pthread_t tid[4*THREADS];
+        char kbuf[8];
+        char vbuf[MAXSIZE];
+        int32_t ksize;
+        int32_t vsize;
+        int     result;
+        taddr_t root;
+        uint64_t free;
+        usuite("open");
+        utest("populate");
+        mod = t2_init(ut_storage, 20);
+        ASSERT(EISOK(mod));
+        ttype.mod = NULL;
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        t = t2_tree_create(&ttype);
+        ASSERT(EISOK(t));
+        for (long i = 0; i < 4*OPS; ++i) {
+                random_buf(kbuf, sizeof kbuf, &ksize);
+                random_buf(vbuf, sizeof vbuf, &vsize);
+                result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize);
+                ASSERT(result == 0 || result == -EEXIST);
+        }
+        root = t->root;
+        free = file_storage.free;
+        t2_tree_close(t);
+        t2_tree_type_degister(&ttype);
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utest("open");
+        mod = t2_init(ut_storage, 20);
+        ASSERT(EISOK(mod));
+        ttype.mod = NULL;
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        file_storage.free = free;
+        t = t2_tree_open(&ttype, root);
+        ASSERT(EISOK(t));
+        utest("ops");
+        for (int i = 0; i < THREADS; ++i) {
+                NOFAIL(pthread_create(&tid[i], NULL, &delete_worker, t));
+        }
+        for (int i = THREADS; i < 2*THREADS; ++i) {
+                NOFAIL(pthread_create(&tid[i], NULL, &insert_worker, t));
+        }
+        for (int i = 2*THREADS; i < 3*THREADS; ++i) {
+                NOFAIL(pthread_create(&tid[i], NULL, &next_worker, t));
+        }
+        for (int i = 3*THREADS; i < 4*THREADS; ++i) {
+                NOFAIL(pthread_create(&tid[i], NULL, &lookup_worker, t));
+        }
+        for (int i = 0; i < 4*THREADS; ++i) {
+                pthread_join(tid[i], NULL);
+        }
+        utest("fini");
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utestdone();
+}
+
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
@@ -4214,6 +4309,8 @@ int main(int argc, char **argv) {
         counters_print();
         counters_clear();
         mt_ut();
+        counters_print();
+        open_ut();
         counters_print();
         return 0;
 }
