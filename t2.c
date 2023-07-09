@@ -1738,11 +1738,16 @@ static void rcu_leave(struct path *p) {
 
 static bool rcu_try(struct path *p) {
         bool result;
-        urcu_memb_barrier(); /* Alternatively, always restart. */
         result = EXISTS(i, p->used, p->rung[i].node->flags & HEARD_BANSHEE);
         if (result) {
+                urcu_memb_barrier();
                 path_fini(p);
         }
+        return result;
+}
+
+static bool rcu_enter(struct path *p) {
+        bool result = rcu_try(p);
         rcu_lock();
         return result;
 }
@@ -1759,7 +1764,10 @@ enum {
 };
 
 static int traverse_complete(struct path *p, int result) {
-        if (UNLIKELY(result == -ESTALE)) {
+        if (UNLIKELY(rcu_try(p))) {
+                rcu_lock();
+                return AGAIN;
+        } else if (UNLIKELY(result == -ESTALE)) {
                 path_fini(p);
                 rcu_lock();
                 return AGAIN;
@@ -1807,7 +1815,7 @@ static int traverse(struct path *p) {
                 } else if (n == NULL || rcu_dereference(n->ntype) == NULL) {
                         rcu_leave(p);
                         n = get(mod, next);
-                        if (rcu_try(p)) {
+                        if (rcu_enter(p)) {
                                 continue;
                         }
                         if (EISERR(n)) {
@@ -1827,7 +1835,7 @@ static int traverse(struct path *p) {
                         rcu_leave(p);
                         lock(n, READ); /* Wait for stabilisation. */
                         unlock(n, READ);
-                        if (rcu_try(p)) {
+                        if (rcu_enter(p)) {
                                 continue;
                         }
                 } else {
