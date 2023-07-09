@@ -224,6 +224,12 @@ enum {
 #define CADD(cnt, d) (__t_counters.cnt += (d))
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
 
+#define SCALL(mod, method, ...)                         \
+({                                                      \
+        struct t2_storage *__stor = (mod)->stor;        \
+        __stor->op->method(__stor , ##  __VA_ARGS__);   \
+})
+
 /* Is Parallel Programming Hard, And, If So, What Can You Do About It? */
 #define ACCESS_ONCE(x)     (*(volatile typeof(x) *)&(x))
 #define READ_ONCE(x)       ({ typeof(x) ___x = ACCESS_ONCE(x); ___x; })
@@ -251,12 +257,13 @@ struct ht {
 };
 
 struct t2 {
+        struct ht                  ht;
+        _Atomic(uint64_t)          bolt;
+        int32_t                    writescan;
+        int32_t                    cleanscan;
         const struct t2_tree_type *ttypes[MAX_TREE_TYPE];
         const struct node_type    *ntypes[MAX_NODE_TYPE];
         struct t2_storage         *stor;
-        struct ht                  ht;
-        int32_t                    writescan;
-        int32_t                    cleanscan;
 };
 
 SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
@@ -282,6 +289,13 @@ enum optype {
         OP_NR
 };
 
+struct ewma {
+        uint32_t count;
+        uint32_t cur;
+        uint32_t last;
+        uint32_t avg;
+};
+
 enum node_flags {
         HEARD_BANSHEE = 1ull << 0,
         NOCACHE       = 1ull << 1,
@@ -297,6 +311,7 @@ struct node {
         uint64_t                flags;
         void                   *data;
         struct t2              *mod;
+        struct ewma             kelvin;
         uint64_t                cookie;
         pthread_rwlock_t        lock;
         struct rcu_head         rcu;
@@ -495,6 +510,7 @@ static void eprint();
 static void put(struct node *n);
 static void put_locked(struct node *n, struct bucket *bucket);
 static void ref(struct node *n);
+static void touch(struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
@@ -546,10 +562,13 @@ static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
 static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite);
 static void clean(struct t2 *mod, int32_t toscan, int32_t toclean);
+static void kmod(struct ewma *a, uint32_t t);
+static uint32_t kavg(struct ewma *a, uint32_t t);
 
 static __thread struct counters __t_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
 static __thread int edepth = 0;
+static __thread bool thread_registered = false;
 static __thread volatile struct {
         volatile jmp_buf *buf;
 } addr_check = {};
@@ -566,11 +585,11 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
                 result = signal_init();
                 if (LIKELY(result == 0)) {
                         mod->stor = storage;
-                        result = storage->op->init(storage);
+                        result = SCALL(mod, init);
                         if (LIKELY(result == 0)) {
                                 result = ht_init(&mod->ht, hshift);
                                 if (result != 0) {
-                                        storage->op->fini(storage);
+                                        SCALL(mod, fini);
                                 }
                         }
                         if (result != 0) {
@@ -592,6 +611,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
 void t2_fini(struct t2 *mod) {
         eclear();
         urcu_memb_barrier();
+        SCALL(mod, fini);
         ht_clean(&mod->ht);
         ht_fini(&mod->ht);
         mod->stor->op->fini(mod->stor);
@@ -653,8 +673,6 @@ void t2_error_print() {
         eprint();
 }
 
-static __thread bool thread_registered = false;
-
 void t2_thread_register() {
         ASSERT(!thread_registered);
         urcu_memb_register_thread();
@@ -667,12 +685,6 @@ void t2_thread_degister() {
         counters_fold();
         thread_registered = false;
 }
-
-#define SCALL(mod, method, ...)                         \
-({                                                      \
-        struct t2_storage *__stor = (mod)->stor;        \
-        __stor->op->method(__stor, __VA_ARGS__);        \
-})
 
 enum {
         TADDR_SIZE_MASK =              0xfull,
@@ -803,6 +815,7 @@ static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
                         lock(n, mode); /* TODO: Lock-less lookup. */
                         /* TODO: re-check node. */
                         result = cookie_node_complete(t, r, n, opt);
+                        touch(n);
                         unlock(n, mode);
                         put(n);
                         return result;
@@ -922,6 +935,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                         ref(n);
                 }
                 mutex_unlock(bucket);
+                touch(n);
         }
         return n;
 }
@@ -1257,7 +1271,7 @@ static int split_right_exec_delete(struct path *p, int idx) {
                 }
         }
         if (right != NULL && can_merge(r->node, right)) {
-                NOFAIL(merge(r->node, right, LEFT));
+                NOFAIL(merge(r->node, right, LEFT)); /* TODO: deallocate the empty node. */
                 EXPENSIVE_ASSERT(is_sorted(r->node));
                 r->flags &= ~SEPCHG;
                 result = +1;
@@ -1321,7 +1335,7 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum 
         p->opt  = opt;
 }
 
-static void touch(struct node *n, enum lock_mode lm) {
+static void dirty(struct node *n, enum lock_mode lm) {
         if (n != NULL && lm == WRITE) {
                 ASSERT(is_stable(n));
                 node_seq_increase(n);
@@ -1329,14 +1343,14 @@ static void touch(struct node *n, enum lock_mode lm) {
         }
 }
 
-static void path_touch(struct path *p) {
+static void path_dirty(struct path *p) {
         for (int i = p->used - 1; i >= 0; --i) {
                 struct rung    *r     = &p->rung[i];
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
-                touch(r->node, r->lm);
-                touch(left->node, left->lm);
-                touch(right->node, right->lm);
+                dirty(r->node, r->lm);
+                dirty(left->node, left->lm);
+                dirty(right->node, right->lm);
         }
 }
 
@@ -1731,6 +1745,12 @@ static bool rcu_try(struct path *p) {
         return result;
 }
 
+enum { BOLT_EPOCH_SHIFT = 24 };
+
+static void touch(struct node *n) {
+        kmod(&n->kelvin, n->mod->bolt++ >> BOLT_EPOCH_SHIFT);
+}
+
 enum {
         DONE  = 1,
         AGAIN = 2
@@ -1748,7 +1768,7 @@ static int traverse_complete(struct path *p, int result) {
                 rcu_lock();
                 return AGAIN;
         } else {
-                path_touch(p);
+                path_dirty(p);
                 return DONE;
         }
 }
@@ -1806,6 +1826,8 @@ static int traverse(struct path *p) {
                         if (rcu_try(p)) {
                                 continue;
                         }
+                } else {
+                        touch(n);
                 }
                 if (UNLIKELY(p->used == ARRAY_SIZE(p->rung))) {
                         path_fini(p);
@@ -2234,6 +2256,19 @@ static int32_t max_32(int32_t a, int32_t b) {
         return a > b ? a : b;
 }
 
+static int nlz(uint32_t x) { /* Hacker's Delight. */
+        x = x | (x >>  1);
+        x = x | (x >>  2);
+        x = x | (x >>  4);
+        x = x | (x >>  8);
+        x = x | (x >> 16);
+        return __builtin_popcount(~x);
+}
+
+static int ilog2(uint32_t x) {
+        return 31 - nlz(x);
+}
+
 static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1) {
         if (edepth < (int)ARRAY_SIZE(estack)) {
                 estack[edepth++] = (struct error_descr) {
@@ -2494,6 +2529,27 @@ static void ht_delete(struct node *n) {
         ASSERT(n->hash.prev != &n->hash);
         ASSERT(n->hash.next != &n->hash);
         cds_hlist_del_rcu(&n->hash);
+}
+
+/* @avg */
+
+static uint32_t kval(struct ewma *a) {
+        return a->count + (a->avg >> (a->cur - a->last));
+}
+
+static void kmod(struct ewma *a, uint32_t t) {
+        if (t == a->cur) {
+                a->count++;
+        } else {
+                a->avg   = kval(a);
+                a->last  = a->cur;
+                a->cur   = t;
+                a->count = 1;
+        }
+}
+
+static uint32_t kavg(struct ewma *a, uint32_t t) {
+        return t == a->cur ? a->avg : kval(a) >> (t - a->cur);
 }
 
 /* @buf */
@@ -3090,7 +3146,7 @@ static struct t2_storage_op mock_storage_op = {
         .write    = &mso_write
 };
 
-static struct t2_storage mock_storage = {
+static __attribute__((unused)) struct t2_storage mock_storage = {
         .op = &mock_storage_op
 };
 
@@ -4128,6 +4184,7 @@ void mt_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        mt_ut();
         lib_ut();
         simple_ut();
         ht_ut();

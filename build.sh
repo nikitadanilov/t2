@@ -43,7 +43,7 @@ function run() {
 }
 
 function build() {
-    CFLAGS="-O0 -I/usr/local/include -g3 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
+    CFLAGS="-O0 -I/usr/local/include -march=native -g3 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
     LDFLAGS="-L/usr/local/lib/ -lurcu -lpthread -rdynamic -lprofiler"
     run ut ${CC:-cc} $CFLAGS -DUT=1 t2.c $LDFLAGS -o ut
     run object ${CC:-cc} $CFLAGS -DUT=0 -c t2.c
