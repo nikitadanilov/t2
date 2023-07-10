@@ -257,13 +257,13 @@ struct ht {
 };
 
 struct t2 {
-        struct ht                  ht;
-        _Atomic(uint64_t)          bolt;
-        int32_t                    writescan;
-        int32_t                    cleanscan;
-        const struct t2_tree_type *ttypes[MAX_TREE_TYPE];
-        const struct node_type    *ntypes[MAX_NODE_TYPE];
-        struct t2_storage         *stor;
+        alignas(MAX_CACHELINE) struct ht         ht;
+        alignas(MAX_CACHELINE) _Atomic(uint64_t) bolt;
+        alignas(MAX_CACHELINE) int32_t           writescan;
+        alignas(MAX_CACHELINE) int32_t           cleanscan;
+        const struct t2_tree_type               *ttypes[MAX_TREE_TYPE];
+        const struct node_type                  *ntypes[MAX_NODE_TYPE];
+        struct t2_storage                       *stor;
 };
 
 SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
