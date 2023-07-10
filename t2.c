@@ -221,8 +221,10 @@ enum {
 #define CDEC(cnt) (--__t_counters.cnt)
 #define CVAL(cnt) (__t_counters.cnt)
 #define GVAL(cnt) (__g_counters.cnt)
+#define GDVAL(cnt) (__G_counters.cnt)
 #define CADD(cnt, d) (__t_counters.cnt += (d))
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
+#define DMOD(cnt, d) ({ struct double_var *v = &(__d_counters.cnt); v->sum += (d); v->nr++; })
 
 #define SCALL(mod, method, ...)                         \
 ({                                                      \
@@ -234,7 +236,7 @@ enum {
 #define ACCESS_ONCE(x)     (*(volatile typeof(x) *)&(x))
 #define READ_ONCE(x)       ({ typeof(x) ___x = ACCESS_ONCE(x); ___x; })
 #define WRITE_ONCE(x, val) do { ACCESS_ONCE(x) = (val); } while (0)
-#define barrier()          __asm__ __volatile__("": : :"memory")
+#define BARRIER()          __asm__ __volatile__("": : :"memory")
 
 /* @types */
 
@@ -424,6 +426,11 @@ struct counter_var {
         int64_t nr;
 };
 
+struct double_var {
+        double  sum;
+        int64_t nr;
+};
+
 struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t node;
         int64_t rlock;
@@ -469,8 +476,15 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t merge;
                 struct counter_var nr;
                 struct counter_var free;
+                struct counter_var modified;
                 struct counter_var keysize;
                 struct counter_var valsize;
+        } l[MAX_TREE_HEIGHT];
+};
+
+struct double_counters {
+        struct double_level_counters {
+                struct double_var temperature;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -479,6 +493,12 @@ struct error_descr {
         const struct msg_ctx *ctx;
         uint64_t              v0;
         uint64_t              v1;
+};
+
+struct node_ref {
+        struct node *node;
+        int          nr;
+        void        *trace[8];
 };
 
 /* @static */
@@ -568,9 +588,13 @@ static void mutex_unlock(pthread_mutex_t *lock);
 static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite);
 static void clean(struct t2 *mod, int32_t toscan, int32_t toclean);
 static void kmod(struct ewma *a, uint32_t t);
-static uint32_t kavg(struct ewma *a, uint32_t t);
+static uint64_t kavg(struct ewma *a, uint32_t t);
+static void ref_add(struct node *n);
+static void ref_del(struct node *n);
+static void ref_print(void);
 
 static __thread struct counters __t_counters = {};
+static __thread struct double_counters __d_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
 static __thread int edepth = 0;
 static __thread bool thread_registered = false;
@@ -578,6 +602,7 @@ static __thread volatile struct {
         volatile jmp_buf *buf;
 } addr_check = {};
 static struct counters __g_counters = {};
+static struct double_counters __G_counters = {};
 static pthread_mutex_t __g_counters_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift) {
@@ -593,7 +618,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift) {
                         result = SCALL(mod, init);
                         if (LIKELY(result == 0)) {
                                 result = ht_init(&mod->ht, hshift);
-                                if (result != 0) {
+                                if (UNLIKELY(result != 0)) {
                                         SCALL(mod, fini);
                                 }
                         }
@@ -831,11 +856,11 @@ static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
                         int result;
                         ref(n);
                         rcu_unlock();
-                        lock(n, mode); /* TODO: Lock-less lookup. */
+                        lock(n, mode); /* TODO: Lock-less lookup. */ /* TODO: rcu_try(). */
                         /* TODO: re-check node. */
                         result = cookie_node_complete(t, r, n, opt);
-                        touch(n);
                         unlock(n, mode);
+                        touch(n);
                         put(n);
                         return result;
                 }
@@ -918,6 +943,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
                         n->ref = 1;
                         cookie_make(&n->cookie);
                         CINC(node);
+                        ref_add(n);
                         return n;
                 }
         } else {
@@ -949,6 +975,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 } else {
                         n->ref = 0;
                         CDEC(node);
+                        ref_del(n);
                         nfini(n);
                         n = other;
                         ref(n);
@@ -962,6 +989,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
 static void ref(struct node *n) {
         n->ref++;
         CINC(node);
+        ref_add(n);
 }
 
 static void ndelete(struct node *n) {
@@ -1053,6 +1081,7 @@ static void put_locked(struct node *n, struct bucket *b) {
                 }
         }
         CDEC(node);
+        ref_del(n);
 }
 
 static void put(struct node *n) {
@@ -1773,10 +1802,14 @@ static bool rcu_enter(struct path *p) {
         return result;
 }
 
-enum { BOLT_EPOCH_SHIFT = 14 };
+enum { BOLT_EPOCH_SHIFT = 16 };
+
+static uint64_t bolt(const struct node *n) {
+        return n->mod->bolt >> BOLT_EPOCH_SHIFT;
+}
 
 static void touch(struct node *n) {
-        kmod(&n->kelvin, n->mod->bolt >> BOLT_EPOCH_SHIFT);
+        kmod(&n->kelvin, bolt(n));
 }
 
 enum {
@@ -1867,8 +1900,6 @@ static int traverse(struct path *p) {
                         continue;
                 }
                 r = path_add(p, n, node_seq(n), flags);
-                CMOD(l[level(n)].nr, nr(n));
-                CMOD(l[level(n)].free, simple_free(n));
                 if (is_leaf(n)) {
                         if (p->opt == LOOKUP) {
                                 result = lookup_complete(p, n);
@@ -2113,6 +2144,7 @@ static void cookie_make(uint64_t *addr) {
 /* @cache */
 
 static void pageout(struct node *n) {
+        lock(n, READ);
         if (LIKELY(n->flags & MODIFIED)) {
                 int result = SCALL(n->mod, write, n->addr, n->data);
                 if (LIKELY(result == 0)) {
@@ -2123,6 +2155,7 @@ static void pageout(struct node *n) {
                         LOG("Pageout failure: %"PRIx64": %i/%i\n", n->addr, result, errno);
                 }
         }
+        unlock(n, READ);
 }
 
 static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
@@ -2166,9 +2199,7 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                                         CINC(wscan_written);
                                         ref(n);
                                         mutex_unlock(&bucket->lock);
-                                        lock(n, READ);
-                                        pageout(n);
-                                        unlock(n, READ);
+                                        pageout(n); /* TODO: check for io errors. */
                                         clean = false;
                                         written++;
                                         mutex_lock(&bucket->lock);
@@ -2187,6 +2218,14 @@ static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
                         return;
                 }
         }
+}
+
+static void nodescan(struct node *n) {
+        uint8_t lev = level(n);
+        CMOD(l[lev].nr,          nr(n));
+        CMOD(l[lev].free,        simple_free(n));
+        CMOD(l[lev].modified,    !!(n->flags & MODIFIED));
+        DMOD(l[lev].temperature, (float)kavg(&n->kelvin, bolt(n)) / (1ull << (63 - BOLT_EPOCH_SHIFT)));
 }
 
 static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
@@ -2211,6 +2250,7 @@ static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
                         head = &bucket->chain;
                         cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
                                 CINC(cscan_node);
+                                nodescan(n);
                                 if (n->ref == 0) {
                                         if (!(n->flags & MODIFIED)) {
                                                 CINC(cscan_dropped);
@@ -2298,17 +2338,13 @@ static int32_t max_32(int32_t a, int32_t b) {
         return a > b ? a : b;
 }
 
-static int nlz(uint32_t x) { /* Hacker's Delight. */
+static int ilog2(uint32_t x) { /* Hacker's Delight. */
         x = x | (x >>  1);
         x = x | (x >>  2);
         x = x | (x >>  4);
         x = x | (x >>  8);
         x = x | (x >> 16);
-        return __builtin_popcount(~x);
-}
-
-static int ilog2(uint32_t x) {
-        return 31 - nlz(x);
+        return __builtin_popcount(x) - 1;
 }
 
 static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1) {
@@ -2337,6 +2373,8 @@ static void eprint() {
 static void counters_check() {
         if (CVAL(node) != 0) {
                 LOG("Leaked node: %i", CVAL(node));
+                ref_print();
+                ASSERT(false);
         }
         if (CVAL(rlock) != 0) {
                 LOG("Leaked rlock: %i", CVAL(rlock));
@@ -2366,11 +2404,23 @@ static void counter_var_print(int offset, const char *label) {
         puts("");
 }
 
+static void double_var_print(int offset, const char *label) {
+        printf("%-15s ", label);
+        for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
+                struct double_var *v = (((void *)&GDVAL(l[i])) + offset);
+                printf("%10.4f ", v->nr ? 1.0 * v->sum / v->nr : 0.0);
+        }
+        puts("");
+}
+
 #define COUNTER_PRINT(counter) \
         counter_print(offsetof(struct level_counters, counter), #counter)
 
 #define COUNTER_VAR_PRINT(counter) \
         counter_var_print(offsetof(struct level_counters, counter), #counter)
+
+#define DOUBLE_VAR_PRINT(counter) \
+        double_var_print(offsetof(struct double_level_counters, counter), #counter)
 
 static void counters_print() {
         counters_fold();
@@ -2418,21 +2468,30 @@ static void counters_print() {
         COUNTER_PRINT(merge);
         COUNTER_VAR_PRINT(nr);
         COUNTER_VAR_PRINT(free);
+        COUNTER_VAR_PRINT(modified);
         COUNTER_VAR_PRINT(keysize);
         COUNTER_VAR_PRINT(valsize);
+        DOUBLE_VAR_PRINT(temperature);
 }
 
 static void counters_clear() {
         SET0(&__g_counters);
+        SET0(&__G_counters);
 }
 
 static void counters_fold() {
-        uint64_t *dst = (uint64_t *)&__g_counters;
-        uint64_t *src = (uint64_t *)&__t_counters;
+        uint64_t          *dst = (void *)&__g_counters;
+        uint64_t          *src = (void *)&__t_counters;
+        struct double_var *ds  = (void *)&__d_counters;
+        struct double_var *dd  = (void *)&__G_counters;
         SASSERT(sizeof __g_counters % sizeof(int64_t) == 0);
         mutex_lock(&__g_counters_lock);
         for (long unsigned i = 0; i < (sizeof __g_counters / sizeof(int64_t)); ++i) {
                 dst[i] += src[i];
+        }
+        for (long unsigned i = 0; i < (sizeof __d_counters / sizeof *ds); ++i) {
+                dd[i].sum += ds[i].sum;
+                dd[i].nr  += ds[i].nr;
         }
         mutex_unlock(&__g_counters_lock);
         SET0(&__t_counters);
@@ -2443,11 +2502,11 @@ static struct sigaction osa = {};
 static int signal_set = 0;
 
 static void stacktrace() {
-    int    size;
-    void  *tracebuf[512];
+        int    size;
+        void  *tracebuf[512];
 
-    size = backtrace(tracebuf, ARRAY_SIZE(tracebuf));
-    backtrace_symbols_fd(tracebuf, size, 1);
+        size = backtrace(tracebuf, ARRAY_SIZE(tracebuf));
+        backtrace_symbols_fd(tracebuf, size, 1);
 }
 
 static void sigsegv(int signo, siginfo_t *si, void *uctx) {
@@ -2502,6 +2561,45 @@ static void mutex_lock(pthread_mutex_t *lock) {
 static void mutex_unlock(pthread_mutex_t *lock) {
         NOFAIL(pthread_mutex_unlock(lock));
 }
+
+#if 0 && DEBUG
+
+static __thread struct node_ref refs[16] = {};
+
+static void ref_add(struct node *n) {
+        for (int i = 0; i < ARRAY_SIZE(refs); ++i) {
+                if (refs[i].node == NULL) {
+                        refs[i].nr = backtrace(refs[i].trace, ARRAY_SIZE(refs[i].trace));
+                }
+        }
+}
+
+static void ref_del(struct node *n) {
+        for (int i = 0; i < ARRAY_SIZE(refs); ++i) {
+                if (refs[i].node == n) {
+                        refs[i].node = NULL;
+                }
+        }
+}
+
+static void ref_print(void) {
+        for (int i = 0; i < ARRAY_SIZE(refs); ++i) {
+                if (refs[i].node != NULL) {
+                        printf("%p\n", refs[i].node);
+                        backtrace_symbols_fd(refs[i].trace, refs[i].nr, 1);
+                }
+        }
+}
+#else
+static void ref_add(struct node *n) {
+}
+
+static void ref_del(struct node *n) {
+}
+
+static void ref_print(void) {
+}
+#endif
 
 /* @ht */
 
@@ -2593,8 +2691,8 @@ static void kmod(struct ewma *a, uint32_t t) {
         }
 }
 
-static uint32_t kavg(struct ewma *a, uint32_t t) {
-        return t == a->cur ? a->avg : kval(a) >> (t - a->cur);
+static uint64_t kavg(struct ewma *a, uint32_t t) { /* Typical unit: quarter of nano-Kelvin (of nabi-Kelvin, technically). */
+        return ((uint64_t)kval(a) << (63 - BOLT_EPOCH_SHIFT)) >> (t - a->cur);
 }
 
 /* @buf */
@@ -3726,8 +3824,10 @@ static void stress_ut() {
                         put(r);
                         exist = 0;
                 }
-                writeout(t->ttype->mod, 1000, 10);
-                clean(t->ttype->mod, 1000, 1000);
+                if (i % 1000 == 0) {
+                        writeout(t->ttype->mod, 1000, 10);
+                        clean(t->ttype->mod, 1000, 1000);
+                }
         }
         for (long j = 0; j < U; ++j) {
                 *(long *)key = j;
@@ -3759,9 +3859,11 @@ static void stress_ut() {
                         put(r);
                         exist = 0;
                 }
-                writeout(t->ttype->mod, 1000, 10);
-                clean(t->ttype->mod, 1000, 1000);
-        }
+                if (i % 1000 == 0) {
+                        writeout(t->ttype->mod, 1000, 10);
+                        clean(t->ttype->mod, 1000, 1000);
+                }
+       }
         utest("fini");
         t2_node_type_degister(&ntype);
         t2_fini(mod);
@@ -3958,11 +4060,14 @@ static void cookie_ut() {
         uint64_t v[10];
         struct t2_cookie k;
         int result;
+        usuite("cookie");
+        utest("init");
         NOFAIL(signal_init());
         cookie_make(&v[0]);
         cookie_load(&v[0], &k);
         result = cookie_is_valid(&k);
         ASSERT(result);
+        utest("addr-is-valid");
         for (uint64_t b = 0; b <= 0xff; ++b) {
                 void *addr = (void *)((b << 20) ^ (uint64_t)&v[0]);
                 addr_is_valid(addr);
@@ -3978,11 +4083,15 @@ static void cookie_ut() {
         result = addr_is_valid((void *)&cit);
         ASSERT(result);
         signal_fini();
+        utest("stacktrace");
         LOG("Testing stacktrace");
         stacktrace(); /* Test it here. */
+        utestdone();
 }
 
 static void error_ut() {
+        usuite("error");
+        utest("macros");
         int e0 = ERROR(-ENOMEM);
         int e1 = ERROR_INFO(e0, "error: %i", 6, 0);
         int e2 = ERROR_INFO(-EINVAL, "bump!", 0, 0);
@@ -4002,6 +4111,7 @@ static void error_ut() {
                 e3 = ERROR_INFO(e3, "More! %i", i, 0);
         }
         eprint();
+        utestdone();
 }
 
 static void inc(char *key, int len) {
@@ -4066,10 +4176,20 @@ void lib_ut() {
         ASSERT(MINMAX(INT_MIN / 2, 1000));
         ASSERT(MINMAX(INT_MIN / 2, INT_MAX / 2));
 #undef MINMAX
+        utest("ilog2");
+        ASSERT(ilog2  (0) == -1);
+        ASSERT(ilog2  (1) ==  0);
+        ASSERT(ilog2  (2) ==  1);
+        ASSERT(ilog2  (3) ==  1);
+        ASSERT(ilog2  (4) ==  2);
+        ASSERT(ilog2  (5) ==  2);
+        ASSERT(ilog2  (8) ==  3);
+        ASSERT(ilog2(256) ==  8);
+        ASSERT(ilog2(257) ==  8);
         utestdone();
 }
 
-enum { THREADS = 17, OPS = 50000 };
+enum { THREADS = 17, OPS = 500000 };
 
 #define MAXSIZE (((int32_t)1 << (ntype.shift - 3)) - 10)
 
@@ -4092,6 +4212,10 @@ void *lookup_worker(void *arg) {
                         t2_error_print();
                 }
                 ASSERT(result == 0 || result == -ENOENT);
+                if (i % 1000 == 0) {
+                        writeout(t->ttype->mod, 1000, 10);
+                        clean(t->ttype->mod, 1000, 1000);
+                }
         }
         t2_thread_degister();
         return NULL;
@@ -4109,6 +4233,10 @@ void *insert_worker(void *arg) {
                 random_buf(vbuf, sizeof vbuf, &vsize);
                 int result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize);
                 ASSERT(result == 0 || result == -EEXIST);
+                if (i % 1000 == 0) {
+                        writeout(t->ttype->mod, 1000, 10);
+                        clean(t->ttype->mod, 1000, 1000);
+                }
         }
         t2_thread_degister();
         return NULL;
@@ -4123,6 +4251,10 @@ void *delete_worker(void *arg) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 int result = t2_delete_ptr(t, kbuf, ksize);
                 ASSERT(result == 0 || result == -ENOENT);
+                if (i % 1000 == 0) {
+                        writeout(t->ttype->mod, 1000, 10);
+                        clean(t->ttype->mod, 1000, 1000);
+                }
         }
         t2_thread_degister();
         return NULL;
@@ -4150,6 +4282,10 @@ void *next_worker(void *arg) {
                         ;
                 }
                 t2_cursor_fini(&c);
+                if (i % 1000 == 0) {
+                        writeout(t->ttype->mod, 1000, 10);
+                        clean(t->ttype->mod, 1000, 1000);
+                }
         }
         t2_thread_degister();
         return NULL;
@@ -4292,6 +4428,7 @@ static void open_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        open_ut();
         lib_ut();
         simple_ut();
         ht_ut();
