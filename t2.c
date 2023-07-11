@@ -55,7 +55,7 @@ enum {
 #if DEBUG
 #define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
 #else
-#define ASSERT(expr) ((void)sizeof((expr), 0))
+#define ASSERT(expr) ((void)sizeof(expr))
 #endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
 #define SOF(x) ((int32_t)sizeof(x))
@@ -528,6 +528,7 @@ static void *mem_alloc(size_t size);
 static void *mem_alloc_align(size_t size);
 static void  mem_free(void *ptr);
 static int cacheline_size();
+static uint64_t threadid(void);
 static void llog(const struct msg_ctx *ctx, ...);
 static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1);
 static void eclear();
@@ -551,6 +552,9 @@ static void unlock(struct node *n, enum lock_mode mode);
 static struct header *nheader(const struct node *n);
 static void rcu_lock();
 static void rcu_unlock();
+static void rcu_leave(struct path *p, struct node *extra);
+static bool rcu_try(struct path *p, struct node *extra);
+static bool rcu_enter(struct path *p, struct node *extra);
 static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
@@ -847,22 +851,28 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
         return result;
 }
 
-static int cookie_try(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
-        enum lock_mode mode = opt == LOOKUP || opt == NEXT ? READ : WRITE;
+static int cookie_try(struct path *p) {
+        enum lock_mode mode = p->opt == LOOKUP || p->opt == NEXT ? READ : WRITE;
+        struct t2_rec *r    = p->rec;
+        ASSERT(p->used == 0);
         rcu_lock();
         if (cookie_is_valid(&r->cookie)) {
                 struct node *n = COF(r->cookie.hi, struct node, cookie);
                 if (is_leaf(n) && nr(n) > 0) { /* TODO: More checks? */
                         int result;
-                        ref(n);
-                        rcu_unlock();
-                        lock(n, mode); /* TODO: Lock-less lookup. */ /* TODO: rcu_try(). */
-                        /* TODO: re-check node. */
-                        result = cookie_node_complete(t, r, n, opt);
-                        unlock(n, mode);
-                        touch(n);
-                        put(n);
-                        return result;
+                        rcu_leave(p, n);
+                        lock(n, mode); /* TODO: Lock-less lookup. */
+                        if (LIKELY(!rcu_try(p, n))) {
+                                /* TODO: re-check node. */
+                                result = cookie_node_complete(p->tree, r, n, p->opt);
+                                unlock(n, mode);
+                                touch(n);
+                                put(n);
+                                return result;
+                        } else {
+                                unlock(n, mode);
+                                return -ESTALE;
+                        }
                 }
         }
         rcu_unlock();
@@ -1025,6 +1035,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                         }
                 }
                 unlock(n, WRITE);
+                CINC(l[level(n)].get);
         }
         return n;
 }
@@ -1781,23 +1792,29 @@ static int next_complete(struct path *p, struct node *n) {
         return result;
 }
 
-static void rcu_leave(struct path *p) {
+static void rcu_leave(struct path *p, struct node *extra) {
         path_pin(p);
+        if (extra != NULL) {
+                ref(extra);
+        }
         rcu_unlock();
 }
 
-static bool rcu_try(struct path *p) {
+static bool rcu_try(struct path *p, struct node *extra) {
         bool result;
-        result = EXISTS(i, p->used, p->rung[i].node->flags & HEARD_BANSHEE);
-        if (result) {
+        result = EXISTS(i, p->used, p->rung[i].node->flags & HEARD_BANSHEE) || (extra != NULL && (extra->flags & HEARD_BANSHEE));
+        if (UNLIKELY(result)) {
                 urcu_memb_barrier();
                 path_fini(p);
+                if (extra != NULL) {
+                        put(extra);
+                }
         }
         return result;
 }
 
-static bool rcu_enter(struct path *p) {
-        bool result = rcu_try(p);
+static bool rcu_enter(struct path *p, struct node *extra) {
+        bool result = rcu_try(p, extra);
         rcu_lock();
         return result;
 }
@@ -1818,7 +1835,7 @@ enum {
 };
 
 static int traverse_complete(struct path *p, int result) {
-        if (UNLIKELY(rcu_try(p))) {
+        if (UNLIKELY(rcu_try(p, NULL))) {
                 rcu_lock();
                 return AGAIN;
         } else if (UNLIKELY(result == -ESTALE)) {
@@ -1854,7 +1871,7 @@ static int traverse(struct path *p) {
                 CINC(traverse_iter);
                 if (UNLIKELY(tries++ > 10)) {
                         if (false && (tries & (tries - 1)) == 0) {
-                                LOG("Looping: %i", tries);
+                                LOG("Looping: %i.", tries);
                         }
                 }
                 if (p->used == 0) {
@@ -1867,31 +1884,31 @@ static int traverse(struct path *p) {
                         rcu_unlock();
                         break;
                 } else if (n == NULL || rcu_dereference(n->ntype) == NULL) {
-                        rcu_leave(p);
+                        rcu_leave(p, NULL);
                         n = get(mod, next);
-                        if (rcu_enter(p)) {
-                                continue;
-                        }
                         if (EISERR(n)) {
                                 if (ERRCODE(n) == -ESTALE) {
                                         path_fini(p);
+                                        rcu_lock();
                                         continue;
                                 } else {
                                         result = ERROR(ERRCODE(n));
-                                        rcu_unlock();
                                         break;
                                 }
                         } else {
-                                CINC(l[level(n)].get);
+                                if (UNLIKELY(rcu_enter(p, n))) {
+                                        continue;
+                                }
                                 flags |= PINNED;
                         }
                 } else if (!is_stable(n)) { /* This is racy, but OK. */
-                        rcu_leave(p);
+                        rcu_leave(p, n);
                         lock(n, READ); /* Wait for stabilisation. */
                         unlock(n, READ);
-                        if (rcu_enter(p)) {
+                        if (UNLIKELY(rcu_enter(p, n))) {
                                 continue;
                         }
+                        flags |= PINNED;
                 } else {
                         touch(n);
                 }
@@ -1910,7 +1927,7 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else if (p->opt == INSERT) {
-                                rcu_leave(p);
+                                rcu_leave(p, NULL);
                                 result = traverse_complete(p, insert_prep(p));
                                 if (result == DONE) {
                                         result = insert_complete(p, n);
@@ -1919,7 +1936,7 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else if (p->opt == DELETE) {
-                                rcu_leave(p);
+                                rcu_leave(p, NULL);
                                 result = traverse_complete(p, delete_prep(p));
                                 if (result == DONE) {
                                         result = delete_complete(p, n);
@@ -1928,7 +1945,7 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else {
-                                rcu_leave(p);
+                                rcu_leave(p, NULL);
                                 result = traverse_complete(p, next_prep(p));
                                 if (result == DONE) {
                                         result = next_complete(p, n);
@@ -1951,16 +1968,16 @@ static int traverse(struct path *p) {
 }
 
 static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
-        int result;
+        int         result;
+        struct path p = {};
         counters_check();
+        path_init(&p, t, r, opt);
         t->ttype->mod->bolt++;
-        result = cookie_try(t, r, opt);
+        result = cookie_try(&p);
         if (result == -ESTALE) {
-                struct path p = {};
-                path_init(&p, t, r, opt);
                 result = traverse(&p);
-                path_fini(&p);
         }
+        path_fini(&p);
         counters_check();
         return result;
 }
@@ -2152,7 +2169,7 @@ static void pageout(struct node *n) {
                         CADD(write_bytes, taddr_ssize(n->addr));
                         n->flags &= ~MODIFIED;
                 } else {
-                        LOG("Pageout failure: %"PRIx64": %i/%i\n", n->addr, result, errno);
+                        LOG("Pageout failure: %"PRIx64": %i/%i.\n", n->addr, result, errno);
                 }
         }
         unlock(n, READ);
@@ -2284,8 +2301,11 @@ __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...
         va_start(args, ctx);
         vfprintf(stderr, ctx->fmt, args);
         va_end(args);
-        puts(".\n");
+        puts("");
         stacktrace();
+        printf("pid: %lu tid: %lu pthread: %"PRIx64" errno: %i\n",
+               (unsigned long)getpid(), (unsigned long)threadid(), (uint64_t)pthread_self(), errno);
+        eprint();
         abort();
 }
 
@@ -2327,7 +2347,7 @@ static void llog(const struct msg_ctx *ctx, ...) {
         va_start(args, ctx);
         vfprintf(stderr, ctx->fmt, args);
         va_end(args);
-        puts(".");
+        puts("");
 }
 
 static int32_t min_32(int32_t a, int32_t b) {
@@ -2372,18 +2392,18 @@ static void eprint() {
 
 static void counters_check() {
         if (CVAL(node) != 0) {
-                LOG("Leaked node: %i", CVAL(node));
+                LOG("Leaked node: %i.", CVAL(node));
                 ref_print();
                 ASSERT(false);
         }
         if (CVAL(rlock) != 0) {
-                LOG("Leaked rlock: %i", CVAL(rlock));
+                LOG("Leaked rlock: %i.", CVAL(rlock));
         }
         if (CVAL(wlock) != 0) {
-                LOG("Leaked wlock: %i", CVAL(wlock));
+                LOG("Leaked wlock: %i.", CVAL(wlock));
         }
         if (CVAL(rcu) != 0) {
-                LOG("Leaked rcu: %i", CVAL(rcu));
+                LOG("Leaked rcu: %i.", CVAL(rcu));
         }
 }
 
@@ -2562,14 +2582,18 @@ static void mutex_unlock(pthread_mutex_t *lock) {
         NOFAIL(pthread_mutex_unlock(lock));
 }
 
-#if 0 && DEBUG
+#define REF_DEBUG (0)
 
-static __thread struct node_ref refs[16] = {};
+#if REF_DEBUG
+
+static __thread struct node_ref refs[8] = {};
 
 static void ref_add(struct node *n) {
         for (int i = 0; i < ARRAY_SIZE(refs); ++i) {
                 if (refs[i].node == NULL) {
-                        refs[i].nr = backtrace(refs[i].trace, ARRAY_SIZE(refs[i].trace));
+                        refs[i].trace[0] = __builtin_return_address(2);
+                        refs[i].node = n;
+                        break;
                 }
         }
 }
@@ -2578,15 +2602,17 @@ static void ref_del(struct node *n) {
         for (int i = 0; i < ARRAY_SIZE(refs); ++i) {
                 if (refs[i].node == n) {
                         refs[i].node = NULL;
+                        break;
                 }
         }
 }
 
 static void ref_print(void) {
+        printf("Leaked references:\n");
         for (int i = 0; i < ARRAY_SIZE(refs); ++i) {
                 if (refs[i].node != NULL) {
                         printf("%p\n", refs[i].node);
-                        backtrace_symbols_fd(refs[i].trace, refs[i].nr, 1);
+                        backtrace_symbols_fd(refs[i].trace, 1, 1);
                 }
         }
 }
@@ -2598,6 +2624,20 @@ static void ref_del(struct node *n) {
 }
 
 static void ref_print(void) {
+}
+#endif
+
+#if ON_DARWIN
+static uint64_t threadid(void)
+{
+	uint64_t tid;
+	pthread_threadid_np(NULL, &tid);
+	return tid;
+}
+#elif ON_LINUX
+static uint64_t threadid(void)
+{
+	return syscall(SYS_gettid);
 }
 #endif
 
@@ -4084,7 +4124,7 @@ static void cookie_ut() {
         ASSERT(result);
         signal_fini();
         utest("stacktrace");
-        LOG("Testing stacktrace");
+        LOG("Testing stacktrace.");
         stacktrace(); /* Test it here. */
         utestdone();
 }
@@ -4189,7 +4229,7 @@ void lib_ut() {
         utestdone();
 }
 
-enum { THREADS = 17, OPS = 500000 };
+enum { THREADS = 17, OPS = 50000 };
 
 #define MAXSIZE (((int32_t)1 << (ntype.shift - 3)) - 10)
 
@@ -4428,7 +4468,6 @@ static void open_ut() {
 int main(int argc, char **argv) {
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        open_ut();
         lib_ut();
         simple_ut();
         ht_ut();

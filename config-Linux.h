@@ -5,6 +5,7 @@
 
 #define DEBUG     (1)
 
+#include <sys/syscall.h>
 
 /*
  *  Local variables:
