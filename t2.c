@@ -4958,9 +4958,9 @@ static void *bworker(void *arg) {
                 var[ch].ssq += delta * delta;
                 var[ch].min  = MIN(var[ch].min, delta);
                 var[ch].max  = MAX(var[ch].max, delta);
-                if (now() - reported > 1000000) {
+                if (end - reported > 1000000) {
                         var_fold(ph, bt, var);
-                        reported = now();
+                        reported = end;
                 }
         }
         blog(BINFO, "        Thread %3i in group %2i completed %i operations.\n", rt->idx, bt->parent->idx, i);
