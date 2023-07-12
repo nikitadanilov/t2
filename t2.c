@@ -947,17 +947,15 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
         int          result;
         CINC(alloc);
         if (LIKELY(n != NULL && data != NULL)) {
-                result = pthread_rwlock_init(&n->lock, NULL);
-                if (LIKELY(result == 0)) {
-                        n->addr = addr;
-                        n->mod = mod;
-                        n->data = data;
-                        n->ref = 1;
-                        cookie_make(&n->cookie);
-                        CINC(node);
-                        ref_add(n);
-                        return n;
-                }
+                NOFAIL(pthread_rwlock_init(&n->lock, NULL));
+                n->addr = addr;
+                n->mod = mod;
+                n->data = data;
+                n->ref = 1;
+                cookie_make(&n->cookie);
+                CINC(node);
+                ref_add(n);
+                return n;
         } else {
                 result = ERROR(-ENOMEM);
         }
@@ -2633,7 +2631,7 @@ static void ref_print(void) {
 static uint64_t threadid(void)
 {
 	uint64_t tid;
-	pthread_threadid_np(NULL, &tid);
+	NOFAIL(pthread_threadid_np(NULL, &tid));
 	return tid;
 }
 #elif ON_LINUX
@@ -3359,7 +3357,7 @@ static int file_init(struct t2_storage *storage) {
 static void file_fini(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         if (fs->fd > 0) {
-                pthread_mutex_destroy(&fs->lock);
+                NOFAIL(pthread_mutex_destroy(&fs->lock));
                 close(fs->fd);
                 fs->fd = -1;
         }
@@ -4885,9 +4883,9 @@ static void *bworker(void *arg) {
         mutex_lock(&ph->lock);
         rt->ready = true;
         ph->active++;
-        pthread_cond_signal(&ph->start);
+        NOFAIL(pthread_cond_signal(&ph->start));
         while (!ph->run) {
-                pthread_cond_wait(&ph->cond, &ph->lock);
+                NOFAIL(pthread_cond_wait(&ph->cond, &ph->lock));
         }
         mutex_unlock(&ph->lock);
         for (i = 0; i < g->ops; ++i) {
@@ -4971,7 +4969,7 @@ static void bthread_start(struct bthread *bt, int idx) {
         NOFAIL(pthread_create(&rt->self, NULL, &bworker, rt));
         mutex_lock(&ph->lock);
         while (!rt->ready) {
-                pthread_cond_wait(&ph->start, &ph->lock);
+                NOFAIL(pthread_cond_wait(&ph->start, &ph->lock));
         }
         mutex_unlock(&ph->lock);
 }
@@ -4994,7 +4992,7 @@ static void bphase(struct bphase *ph, int i) {
         printf("    Threads started. Run!\n");
         mutex_lock(&ph->lock);
         ph->run = true;
-        pthread_cond_broadcast(&ph->cond);
+        NOFAIL(pthread_cond_broadcast(&ph->cond));
         mutex_unlock(&ph->lock);
         while (ph->active > 0) {
                 sleep(10);
