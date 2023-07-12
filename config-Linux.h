@@ -6,6 +6,7 @@
 #define DEBUG     (1)
 
 #include <sys/syscall.h>
+#include <sys/time.h>
 
 /*
  *  Local variables:
