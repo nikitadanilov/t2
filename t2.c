@@ -51,7 +51,7 @@ enum {
         };                                      \
         &__ctx;                                 \
 })
-#define IMMANENTISE(fmt, ...) immanentise(MSG_PREP(fmt), __VA_ARGS__)
+#define IMMANENTISE(fmt, ...) immanentise(MSG_PREP(fmt) , ## __VA_ARGS__)
 #if DEBUG
 #define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
 #else
@@ -3272,7 +3272,7 @@ static int merge(struct node *d, struct node *s, enum dir dir) {
         return result;
 }
 
-#if UT
+#if UT || BN
 
 /* @mock */
 
@@ -3428,7 +3428,11 @@ static struct file_storage file_storage = {
         .filename = "./pages"
 };
 
+#endif /* UT || BN */
+
 /* @ut */
+
+#if UT
 
 static struct t2_storage *ut_storage = &file_storage.gen;
 
@@ -3758,7 +3762,7 @@ static void tree_ut() {
         uint64_t k64;
         uint64_t v64;
         int result;
-        mod = t2_init(ut_storage, 20);
+        mod = t2_init(ut_storage, 10);
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
@@ -3828,7 +3832,7 @@ static void stress_ut() {
         int     result;
         usuite("stress");
         utest("init");
-        mod = t2_init(ut_storage, 20);
+        mod = t2_init(ut_storage, 10);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -3929,7 +3933,7 @@ static void delete_ut() {
         int     result;
         usuite("delete");
         utest("init");
-        mod = t2_init(ut_storage, 20);
+        mod = t2_init(ut_storage, 10);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4043,7 +4047,7 @@ static void next_ut() {
         };
         usuite("next");
         utest("init");
-        mod = t2_init(ut_storage, 20);
+        mod = t2_init(ut_storage, 10);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4178,7 +4182,7 @@ void seq_ut() {
         struct t2_tree *t;
         usuite("seq");
         utest("init");
-        mod = t2_init(ut_storage, 20);
+        mod = t2_init(ut_storage, 10);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4247,10 +4251,6 @@ void *lookup_worker(void *arg) {
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 int result = t2_lookup_ptr(t, kbuf, ksize, vbuf, sizeof vbuf);
-                if (result != 0 && result != -ENOENT) {
-                        printf("%i\n", result);
-                        t2_error_print();
-                }
                 ASSERT(result == 0 || result == -ENOENT);
                 if (i % 1000 == 0) {
                         writeout(t->ttype->mod, 1000, 10);
@@ -4342,7 +4342,7 @@ void mt_ut() {
         int     result;
         usuite("mt");
         utest("init");
-        mod = t2_init(ut_storage, 20);
+        mod = t2_init(ut_storage, 10);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4415,7 +4415,7 @@ static void open_ut() {
         uint64_t free;
         usuite("open");
         utest("populate");
-        mod = t2_init(ut_storage, 20);
+        mod = t2_init(ut_storage, 10);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4435,7 +4435,7 @@ static void open_ut() {
         t2_node_type_degister(&ntype);
         t2_fini(mod);
         utest("open");
-        mod = t2_init(ut_storage, 20);
+        mod = t2_init(ut_storage, 10);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4492,6 +4492,493 @@ int main(int argc, char **argv) {
 }
 
 #endif /* UT */
+
+/* @bn */
+
+#if BN
+
+struct bthread;
+
+struct rthread {
+        pthread_t self;
+        struct bthread *parent;
+        int idx;
+        bool ready;
+};
+
+enum bop_type {
+        BSLEEP,
+        BLOOKUP,
+        BINSERT,
+        BDELETE,
+        BNEXT
+};
+
+enum border {
+        RND,
+        EXI,
+        SEQ
+};
+
+struct bspec {
+        enum border ord;
+        int min;
+        int max;
+};
+
+struct boption {
+        enum bop_type opt;
+        int delay;
+        int iter;
+        struct bspec key;
+        struct bspec val;
+};
+
+struct bchoice {
+        int percent;
+        struct boption option;
+};
+
+struct bthread {
+        int nr;
+        struct bchoice *choice;
+        struct bgroup *parent;
+        struct rthread *rt;
+};
+
+struct bgroup {
+        int nr;
+        int ops;
+        struct bthread thread;
+        struct bphase *parent;
+        int idx;
+};
+
+struct bphase {
+        int nr;
+        struct bgroup *group;
+        pthread_mutex_t lock;
+        pthread_cond_t cond;
+        pthread_cond_t start;
+        struct benchmark *parent;
+        bool run;
+};
+
+struct benchmark {
+        int nr;
+        struct bphase *phase;
+        uint64_t seed;
+        struct t2_tree *tree;
+};
+
+struct span {
+        const char *start;
+        const char *end;
+};
+
+#define SPAN(s, e) ((const struct span) { .start = (s), .end = (e) })
+
+static const char *total;
+
+#if 0
+static void logspan(const struct span *s) {
+        puts(total);
+        for (const char *c = total; c < s->start; ++c) {
+                putchar(' ');
+        }
+        putchar('^');
+        for (const char *c = s->start + 1; c < s->end; ++c) {
+                putchar('.');
+        }
+        putchar('^');
+        puts("");
+}
+#else
+static void logspan(const struct span *s) {
+}
+#endif
+
+static void bskip(struct span *s) {
+        while (s->start < s->end && *s->start == ' ') {
+                s->start++;
+        }
+}
+
+static int span_nr(const struct span *s, char delim) {
+        return COUNT(i, s->end - s->start, s->start[i] == delim) + 1;
+}
+
+static struct span *span_next(const struct span *super, char delim, struct span *sub) {
+        logspan(super);
+        if (sub->start == NULL) {
+                sub->start = sub->end = super->start;
+        } else {
+                sub->start = ++sub->end; /* Skip delimiter. */
+        }
+        if (sub->start >= super->end) {
+                return NULL;
+        }
+        while (sub->end < super->end && *sub->end != delim) {
+                sub->end++;
+        }
+        bskip(sub);
+        return sub;
+}
+
+static int bnumber(struct span *s) {
+        char *end;
+        errno = 0;
+        long n = strtol(s->start, &end, 0);
+        logspan(s);
+        bskip(s);
+        if ((n == 0 && errno != 0) || end > s->end) {
+                IMMANENTISE("Nan: %s\n", s->start);
+        }
+        s->start = end;
+        return n;
+}
+
+static bool bstarts(struct span *s, const char *prefix) {
+        int len = strlen(prefix);
+        logspan(s);
+        bskip(s);
+        if (s->start + len <= s->end && strncmp(s->start, prefix, len) == 0) {
+                s->start += len;
+                return true;
+        } else {
+                return false;
+        }
+}
+
+static void bspec_parse(struct bspec *sp, struct span *s) {
+        struct span sub = {};
+        logspan(s);
+        if (bstarts(s, "rnd")) {
+                sp->ord = RND;
+        } else if (bstarts(s, "exi")) {
+                sp->ord = EXI;
+        } else if (bstarts(s, "seq")) {
+                sp->ord = SEQ;
+        } else {
+                puts(s->start);
+                IMMANENTISE("Cannot parse spec.");
+        }
+        if (span_nr(s, '-') != 2) {
+                puts(s->start);
+        }
+        sp->min = bnumber(span_next(s, '-', &sub));
+        sp->max = bnumber(span_next(s, '-', &sub));
+        s->start = sub.end;
+}
+
+static void boption_parse(struct boption *o, const struct span *s) {
+        struct span sub = {};
+        struct span rest = *s;
+        logspan(s);
+        if (bstarts(&rest, "sleep$")) {
+                o->opt = BSLEEP;
+                o->delay = bnumber(&rest);
+        } else if (bstarts(&rest, "lookup$")) {
+                o->opt = BLOOKUP;
+                bspec_parse(&o->key, &rest);
+        } else if (bstarts(&rest, "insert$")) {
+                o->opt = BINSERT;
+                bspec_parse(&o->key, span_next(&rest, '/', &sub));
+                bspec_parse(&o->val, span_next(&rest, '/', &sub));
+        } else if (bstarts(&rest, "delete$")) {
+                o->opt = BDELETE;
+                bspec_parse(&o->key, &rest);
+        } else if (bstarts(&rest, "next$")) {
+                o->opt = BNEXT;
+                bspec_parse(&o->key, span_next(&rest, '/', &sub));
+                o->iter = bnumber(span_next(&rest, '/', &sub));
+        } else {
+                IMMANENTISE("Unknown option.");
+        }
+}
+
+static void bchoice_parse(struct bchoice *choice, const struct span *s) {
+        struct span sub = {};
+        logspan(s);
+        choice->percent = bnumber(span_next(s, ':', &sub));
+        boption_parse(&choice->option, span_next(s, ':', &sub));
+        ASSERT(span_next(s, ':', &sub) == NULL);
+}
+
+static void bthread_parse(struct bthread *th, const struct span *s) {
+        int total = 0;
+        struct span sub = {};
+        struct span *cur;
+        logspan(s);
+        th->nr = span_nr(s, '|');
+        th->choice = mem_alloc(th->nr * sizeof th->choice[0]);
+        for (int i = 0; (cur = span_next(s, '|', &sub)) != NULL; i++) {
+                bchoice_parse(&th->choice[i], cur);
+                total += th->choice[i].percent;
+        }
+        ASSERT(total == 100);
+}
+
+static void bgroup_parse(struct bgroup *g, const struct span *s) {
+        struct span sub = {};
+        logspan(s);
+        g->nr = bnumber(span_next(s, '*', &sub));
+        g->ops = bnumber(span_next(s, '*', &sub));
+        bthread_parse(&g->thread, span_next(s, '*', &sub));
+        g->thread.parent = g;
+        ASSERT(span_next(s, '*', &sub) == NULL);
+}
+
+static void bphase_parse(struct bphase *ph, const struct span *s) {
+        struct span sub = {};
+        struct span *cur;
+        logspan(s);
+        ph->nr = span_nr(s, '+');
+        ph->group = mem_alloc(ph->nr * sizeof ph->group[0]);
+        for (int i = 0; (cur = span_next(s, '+', &sub)) != NULL; i++) {
+                ph->group[i].parent = ph;
+                bgroup_parse(&ph->group[i], cur);
+        }
+}
+
+static struct benchmark *bparse(const struct span *s) {
+        struct benchmark *b = mem_alloc(sizeof *b);
+        struct span sub = {};
+        struct span *cur;
+        logspan(s);
+        b->nr = span_nr(s, ';');
+        b->phase = mem_alloc(b->nr * sizeof b->phase[0]);
+        for (int i = 0; (cur = span_next(s, ';', &sub)) != NULL; i++) {
+                b->phase[i].parent = b;
+                bphase_parse(&b->phase[i], cur);
+        }
+        return b;
+}
+
+static uint64_t brnd(uint64_t prev) {
+	return (prev * 6364136223846793005ULL + 1442695040888963407ULL) >> 11;
+}
+
+static int bn_next(struct t2_cursor *c, const struct t2_rec *rec) {
+        return +1;
+}
+
+static void binc(unsigned char *key, int len) {
+        int i;
+        for (i = len - 1; i >= 0 && key[i] == 0xff; --i) {
+                ;
+        }
+        if (i >= 0) {
+                key[i]++;
+        }
+        while (++i < len) {
+                key[i] = 0;
+        }
+}
+
+static void bfill(char *buf, int len, uint64_t seed) {
+        for (int i = 0; i < len; ++i) {
+                buf[i] = (seed = brnd(seed)) & 0xff;
+        }
+}
+
+static int rnd_between(int lo, int hi, uint64_t seed) {
+        return lo + (hi - lo) * (brnd(seed) % (hi - lo + 1)) / (hi - lo + 1);
+}
+
+static int32_t bufgen(void *key, uint64_t seed0, int max, int delta, struct bspec *sp) {
+        uint64_t seed = seed0 + max + delta;
+        int len;
+        switch (sp->ord) {
+        case EXI:
+                seed = rnd_between(seed0, seed0 + max, seed) + delta;
+        case RND:
+                len = rnd_between(sp->min, sp->max, seed);
+                bfill(key, len, seed);
+                break;
+        case SEQ:
+                len = rnd_between(sp->min, sp->max, seed);
+                binc(key, len);
+                break;
+        }
+        return len;
+}
+
+static void *bworker(void *arg) {
+        struct rthread *rt = arg;
+        struct bthread *bt = rt->parent;
+        struct bgroup *g = bt->parent;
+        struct bphase *ph = g->parent;
+        struct t2_tree *t = ph->parent->tree;
+        int choice[100] = {};
+        int32_t maxkey = 0;
+        int32_t maxval = 0;
+        void *key;
+        void *val;
+        void *cur;
+        int i;
+        int finger = 0;
+        uint64_t seed0 = ph->parent->seed + g->idx * 100000 + rt->idx;
+        struct t2_cursor_op cop = {
+                .next = &bn_next
+        };
+        struct t2_cursor c = {
+                .curkey = BUF_VAL(key),
+                .tree   = t,
+                .op     = &cop
+        };
+        t2_thread_register();
+        printf("        Thread %3i in group %2i started.\n", rt->idx, g->idx);
+        for (i = 0; i < bt->nr; ++i) {
+                maxkey = max_32(maxkey, bt->choice[i].option.key.max);
+                maxval = max_32(maxval, bt->choice[i].option.val.max);
+                for (int j = 0; j < bt->choice[i].percent; ++j) {
+                        choice[finger++] = i;
+                }
+        }
+        ASSERT(finger == 100);
+        key = mem_alloc(maxkey);
+        val = mem_alloc(maxval);
+        cur = mem_alloc(maxval);
+        ASSERT(key != NULL && val != NULL);
+        struct t2_buf curkey = {
+                .nr = 1,
+                .seg = { [0] = { .addr = cur, .len = maxkey } }
+        };
+        mutex_lock(&ph->lock);
+        rt->ready = true;
+        pthread_cond_signal(&ph->start);
+        while (!ph->run) {
+                pthread_cond_wait(&ph->cond, &ph->lock);
+        }
+        mutex_unlock(&ph->lock);
+        for (i = 0; i < g->ops; ++i) {
+                uint64_t seed = seed0 + (i << 3);
+                struct boption *opt = &bt->choice[choice[brnd(seed) % 100]].option;
+                if (opt->opt == BSLEEP) {
+                        struct timespec sleep = {
+                                .tv_nsec = (brnd(seed + 1) % opt->delay) * 1000
+                        };
+                        NOFAIL(nanosleep(&sleep, NULL));
+                } else {
+                        int32_t ksize = bufgen(key, seed0, i, 1, &opt->key);
+                        int result;
+                        if (opt->opt == BLOOKUP) {
+                                t2_lookup_ptr(t, key, ksize, val, maxval);
+                                ASSERT(result == 0 || result == -ENOENT);
+                        } else if (opt->opt == BINSERT) {
+                                int32_t vsize = bufgen(val, seed0, i, 2, &opt->val);
+                                result = t2_insert_ptr(t, key, ksize, val, vsize);
+                                ASSERT(result == 0 || result == -EEXIST);
+                        } else if (opt->opt == BDELETE) {
+                                result = t2_delete_ptr(t, key, ksize);
+                                ASSERT(result == 0 || result == -ENOENT);
+                        } else if (opt->opt == BNEXT) {
+                                int it = brnd(seed + 3) % opt->iter;
+                                c.dir = (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS;
+                                t2_cursor_init(&c, &curkey);
+                                for (int i = 0; i < it && t2_cursor_next(&c) > 0; ++i) {
+                                        ;
+                                }
+                                t2_cursor_fini(&c);
+                        } else {
+                                ASSERT(false);
+                        }
+                }
+        }
+        printf("        Thread %3i in group %2i completed %i operations.\n", rt->idx, bt->parent->idx, i);
+        mem_free(cur);
+        mem_free(key);
+        mem_free(val);
+        t2_thread_degister();
+        return NULL;
+}
+
+static void bthread_start(struct bthread *bt, int idx) {
+        struct rthread *rt = &bt->rt[idx];
+        struct bphase *ph = bt->parent->parent;
+        ASSERT(idx < bt->parent->nr);
+        rt->idx = idx;
+        rt->parent = bt;
+        NOFAIL(pthread_create(&rt->self, NULL, &bworker, rt));
+        mutex_lock(&ph->lock);
+        while (!rt->ready) {
+                pthread_cond_wait(&ph->start, &ph->lock);
+        }
+        mutex_unlock(&ph->lock);
+}
+
+static void bphase(struct bphase *ph, int i) {
+        NOFAIL(pthread_mutex_init(&ph->lock, NULL));
+        NOFAIL(pthread_cond_init(&ph->cond, NULL));
+        NOFAIL(pthread_cond_init(&ph->start, NULL));
+        printf("    Starting phase %2i.\n", i);
+        for (int i = 0; i < ph->nr; ++i) {
+                ph->group[i].thread.rt = mem_alloc(ph->group[i].thread.nr * sizeof(struct rthread));
+                ph->group[i].idx = i;
+                ASSERT(ph->group[i].thread.rt != NULL);
+                for (int j = 0; j < ph->group[i].nr; ++j) {
+                        bthread_start(&ph->group[i].thread, j);
+                }
+        }
+        printf("    Threads started. Run!\n");
+        mutex_lock(&ph->lock);
+        ph->run = true;
+        pthread_cond_broadcast(&ph->cond);
+        mutex_unlock(&ph->lock);
+        for (int i = 0; i < ph->nr; ++i) {
+                for (int j = 0; j < ph->group[i].nr; ++j) {
+                        pthread_join(ph->group[i].thread.rt[j].self, NULL);
+                }
+        }
+        printf("    Phase %2i done.\n", i);
+        NOFAIL(pthread_cond_destroy(&ph->start));
+        NOFAIL(pthread_cond_destroy(&ph->cond));
+        NOFAIL(pthread_mutex_destroy(&ph->lock));
+}
+
+static struct node_type bn_ntype = {
+        .id    = 1,
+        .name  = "simple-bn",
+        .shift = 9
+};
+
+static struct node_type *bn_tree_ntype(struct t2_tree *t, int level) {
+        return &bn_ntype;
+}
+
+static struct t2_tree_type bn_ttype = {
+        .id       = 2,
+        .name     = "tree-type-bn",
+        .ntype    = &bn_tree_ntype
+};
+
+static void brun(struct benchmark *b) {
+        struct t2 *mod = t2_init(&file_storage.gen, 10);
+        ASSERT(EISOK(mod));
+        t2_tree_type_register(mod, &bn_ttype);
+        t2_node_type_register(mod, &bn_ntype);
+        b->tree = t2_tree_create(&bn_ttype);
+        ASSERT(EISOK(b->tree));
+        printf("Starting benchmark.\n");
+        for (int i = 0; i < b->nr; ++i) {
+                bphase(&b->phase[i], i);
+        }
+        printf("Benchmark done.\n");
+        t2_tree_close(b->tree);
+        t2_tree_type_degister(&bn_ttype);
+        t2_node_type_degister(&bn_ntype);
+        t2_fini(mod);
+}
+
+int main(int argc, char **argv) {
+        total = argv[1];
+        struct benchmark *b = bparse(&SPAN(argv[1], argv[1] + strlen(argv[1])));
+        brun(b);
+        return 1;
+}
+
+#endif /* BN */
 
 /*
  * To do:
