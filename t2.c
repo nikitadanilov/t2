@@ -1510,7 +1510,7 @@ static struct rung *path_add(struct path *p, struct node *n, uint64_t seq, uint6
 }
 
 static bool path_is_valid(const struct path *p) {
-        return FORALL(i, p->used, rung_is_valid(p, i));
+        return p->rung[0].node->addr == p->tree->root && FORALL(i, p->used, rung_is_valid(p, i));
 }
 
 static bool can_insert(const struct node *n, const struct t2_rec *r) {
@@ -4496,6 +4496,13 @@ int main(int argc, char **argv) {
 
 #if BN
 
+struct bvar {
+        uint64_t sum;
+        uint64_t min;
+        uint64_t max;
+        uint64_t ssq;
+};
+
 struct bthread;
 
 struct rthread {
@@ -4531,6 +4538,7 @@ struct boption {
         int iter;
         struct bspec key;
         struct bspec val;
+        struct bvar  var;
 };
 
 struct bchoice {
@@ -4804,19 +4812,25 @@ static int32_t bufgen(void *key, uint64_t seed0, int max, int delta, struct bspe
         return len;
 }
 
+static uint64_t now(void) {
+        struct timeval t;
+        NOFAIL(gettimeofday(&t, NULL));
+        return t.tv_sec * 1000000 + t.tv_usec;
+}
+
 static void *bworker(void *arg) {
         struct rthread *rt = arg;
         struct bthread *bt = rt->parent;
         struct bgroup *g = bt->parent;
         struct bphase *ph = g->parent;
         struct t2_tree *t = ph->parent->tree;
-        int idx = rt->idx;
         int choice[100] = {};
         int32_t maxkey = 0;
         int32_t maxval = 0;
         void *key;
         void *val;
         void *cur;
+        struct bvar *var;
         int i;
         int finger = 0;
         uint64_t seed0 = ph->parent->seed + g->idx * 100000 + rt->idx;
@@ -4830,17 +4844,19 @@ static void *bworker(void *arg) {
         t2_thread_register();
         ASSERT(rt->self == pthread_self());
         printf("        Thread %3i in group %2i started.\n", rt->idx, g->idx);
+        key = mem_alloc(maxkey);
+        val = mem_alloc(maxval);
+        cur = mem_alloc(maxkey);
+        var = mem_alloc(bt->nr * sizeof var[0]);
         for (i = 0; i < bt->nr; ++i) {
                 maxkey = max_32(maxkey, bt->choice[i].option.key.max);
                 maxval = max_32(maxval, bt->choice[i].option.val.max);
                 for (int j = 0; j < bt->choice[i].percent; ++j) {
                         choice[finger++] = i;
                 }
+                var[i].min = ~0ull;
         }
         ASSERT(finger == 100);
-        key = mem_alloc(maxkey);
-        val = mem_alloc(maxval);
-        cur = mem_alloc(maxkey);
         c.curkey = (struct t2_buf){ .nr = 1, .seg = { [0] = { .addr = cur, .len = maxkey } } };
         ASSERT(key != NULL && val != NULL);
         mutex_lock(&ph->lock);
@@ -4852,7 +4868,10 @@ static void *bworker(void *arg) {
         mutex_unlock(&ph->lock);
         for (i = 0; i < g->ops; ++i) {
                 uint64_t seed = seed0 + (i << 3);
-                struct boption *opt = &bt->choice[choice[brnd(seed) % 100]].option;
+                int ch = choice[brnd(seed) % 100];
+                struct boption *opt = &bt->choice[ch].option;
+                uint64_t start;
+                uint64_t end;
                 if (opt->opt == BSLEEP) {
                         struct timespec sleep = {
                                 .tv_nsec = (brnd(seed + 1) % opt->delay) * 1000
@@ -4862,14 +4881,19 @@ static void *bworker(void *arg) {
                         int32_t ksize = bufgen(key, seed0, i, 1, &opt->key);
                         int result;
                         if (opt->opt == BLOOKUP) {
+                                start = now();
                                 result = t2_lookup_ptr(t, key, ksize, val, maxval);
+                                end = now();
                                 ASSERT(result == 0 || result == -ENOENT);
                         } else if (opt->opt == BINSERT) {
                                 int32_t vsize = bufgen(val, seed0, i, 2, &opt->val);
+                                start = now();
                                 result = t2_insert_ptr(t, key, ksize, val, vsize);
                                 ASSERT(result == 0 || result == -EEXIST);
                         } else if (opt->opt == BDELETE) {
+                                start = now();
                                 result = t2_delete_ptr(t, key, ksize);
+                                end = now();
                                 ASSERT(result == 0 || result == -ENOENT);
                         } else if (opt->opt == BNEXT) {
                                 struct t2_buf nextkey = {
@@ -4878,20 +4902,36 @@ static void *bworker(void *arg) {
                                 };
                                 int it = brnd(seed + 3) % opt->iter;
                                 c.dir = (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS;
+                                start = now();
                                 t2_cursor_init(&c, &nextkey);
                                 for (int i = 0; i < it && t2_cursor_next(&c) > 0; ++i) {
                                         ;
                                 }
                                 t2_cursor_fini(&c);
+                                end = now();
                         } else {
                                 ASSERT(false);
                         }
                 }
+                uint64_t delta = end - start;
+                var[ch].sum += delta;
+                var[ch].ssq += delta * delta;
+                var[ch].max = MIN(var[ch].min, delta);
+                var[ch].max = MAX(var[ch].max, delta);
         }
         printf("        Thread %3i in group %2i completed %i operations.\n", rt->idx, bt->parent->idx, i);
+        mutex_lock(&ph->lock);
+        for (i = 0; i < bt->nr; ++i) {
+                bt->choice[i].option.var.sum += var[i].sum;
+                bt->choice[i].option.var.ssq += var[i].ssq;
+                bt->choice[i].option.var.min += MIN(bt->choice[i].option.var.min, var[i].min);
+                bt->choice[i].option.var.max += MAX(bt->choice[i].option.var.max, var[i].max);
+        }
+        mutex_unlock(&ph->lock);
         mem_free(cur);
         mem_free(key);
         mem_free(val);
+        mem_free(var);
         t2_thread_degister();
         return NULL;
 }
@@ -4955,6 +4995,20 @@ static struct t2_tree_type bn_ttype = {
         .ntype    = &bn_tree_ntype
 };
 
+static void bphase_report(struct bphase *ph, int i) {
+        for (int i = 0; i < ph->nr; ++i) {
+                struct bthread *bt = &ph->group[i].thread;
+                double ops = ph->group[i].ops;
+                printf("        Group %2i:\n", i);
+                for (int k = 0; k < bt->nr; ++k) {
+                        uint64_t t = bt->choice[k].option.var.sum;
+                        double sec = 1.0 * t / 1000000.0;
+                        double avg = sec / ops;
+                        printf("            Option %2i: %14.4f sec %14.4f op/sec %14.4g sec/op min %14.4g max %14.4g dev %14.4g\n", k, sec, ops/sec, avg, bt->choice[k].option.var.min, bt->choice[k].option.var.max, 1.0 * bt->choice[k].option.var.ssq / ops - avg * avg);
+                } 
+        }
+}
+
 static void brun(struct benchmark *b) {
         struct t2 *mod = t2_init(&file_storage.gen, 10);
         ASSERT(EISOK(mod));
@@ -4971,6 +5025,10 @@ static void brun(struct benchmark *b) {
         t2_tree_type_degister(&bn_ttype);
         t2_node_type_degister(&bn_ntype);
         t2_fini(mod);
+        for (int i = 0; i < b->nr; ++i) {
+                printf("    Phase %2i report:\n", i);
+                bphase_report(&b->phase[i], i);
+        }
 }
 
 int main(int argc, char **argv) {
