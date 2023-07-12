@@ -4988,14 +4988,14 @@ static void bthread_start(struct bthread *bt, int idx) {
 
 static void bphase_report(struct bphase *ph, bool final);
 
-enum { REPORT_INTERVAL = 10 };
+static int report_interval = 10;
 
 static void *breport_thread(void *arg) {
         struct bphase *ph = arg;
         NOFAIL(pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL));
         NOFAIL(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL));
         while (true) {
-                sleep(REPORT_INTERVAL);
+                sleep(report_interval);
                 bphase_report(ph, false);
                 pthread_testcancel();
         }
@@ -5103,13 +5103,16 @@ static void brun(struct benchmark *b) {
 
 int main(int argc, char **argv) {
         char ch;
-        while ((ch = getopt(argc, argv, "vf:")) != -1) {
+        while ((ch = getopt(argc, argv, "vf:r:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
                         break;
                 case 'f':
                         total = optarg;
+                        break;
+                case 'r':
+                        report_interval = atoi(optarg);
                         break;
                 }
         }
