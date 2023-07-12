@@ -5104,7 +5104,8 @@ static void brun(struct benchmark *b) {
 
 int main(int argc, char **argv) {
         char ch;
-        while ((ch = getopt(argc, argv, "vf:r:N:")) != -1) {
+        bool counters = 0;
+        while ((ch = getopt(argc, argv, "vf:r:N:c")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -5118,11 +5119,17 @@ int main(int argc, char **argv) {
                 case 'N':
                         bn_ntype.shift = atoi(optarg);
                         break;
+                case 'c':
+                        counters = true;
+                        break;
                 }
         }
         if (total != NULL) {
                 struct benchmark *b = bparse(&SPAN(total, total + strlen(total)));
                 brun(b);
+                if (counters) {
+                        counters_print();
+                }
                 return 0;
         } else {
                 puts("Huh?");
