@@ -4974,7 +4974,7 @@ static void bthread_start(struct bthread *bt, int idx) {
         mutex_unlock(&ph->lock);
 }
 
-static void bphase_report(struct bphase *ph, int i);
+static void bphase_report(struct bphase *ph, int i, bool final);
 
 static void bphase(struct bphase *ph, int i) {
         NOFAIL(pthread_mutex_init(&ph->lock, NULL));
@@ -4995,8 +4995,8 @@ static void bphase(struct bphase *ph, int i) {
         NOFAIL(pthread_cond_broadcast(&ph->cond));
         mutex_unlock(&ph->lock);
         while (ph->active > 0) {
-                sleep(10);
-                bphase_report(ph, i);
+                sleep(1);
+                bphase_report(ph, i, false);
         }
         for (int i = 0; i < ph->nr; ++i) {
                 for (int j = 0; j < ph->group[i].nr; ++j) {
@@ -5025,23 +5025,29 @@ static struct t2_tree_type bn_ttype = {
         .ntype    = &bn_tree_ntype
 };
 
-static void bphase_report(struct bphase *ph, int i) {
+static void bphase_report(struct bphase *ph, int i, bool final) {
         for (int i = 0; i < ph->nr; ++i) {
                 struct bthread *bt = &ph->group[i].thread;
                 printf("        Group %2i:\n", i);
                 for (int k = 0; k < bt->nr; ++k) {
                         const double M = 1000000.0;
-                        mutex_lock(&ph->lock);
+                        //mutex_lock(&ph->lock);
                         struct bvar prev = bt->choice[k].option.prev;
                         struct bvar var = bt->choice[k].option.var;
                         bt->choice[k].option.prev = var;
-                        mutex_unlock(&ph->lock);
-                        var.sum -= prev.sum;
-                        var.nr  -= prev.nr;
-                        var.ssq -= prev.ssq;
-                        double avg = var.sum / var.nr;
-                        printf("            Option %2i: ops: %10llu sec: %10.4f op/sec: %12.4f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
-                               k, var.nr, var.sum / M, M / avg, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
+                        //mutex_unlock(&ph->lock);
+                        if (!final) {
+                                var.sum -= prev.sum;
+                                var.nr  -= prev.nr;
+                                var.ssq -= prev.ssq;
+                        }
+                        if (var.nr != 0) {
+                                double avg = var.sum / var.nr;
+                                printf("            Option %2i: ops: %10llu sec: %10.4f op/sec: %12.4f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
+                                       k, var.nr, var.sum / M, M / avg, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
+                        } else {
+                                printf("            Option %2i: idle.\n", k);
+                        }
                 }
         }
 }
@@ -5064,7 +5070,7 @@ static void brun(struct benchmark *b) {
         t2_fini(mod);
         for (int i = 0; i < b->nr; ++i) {
                 printf("    Phase %2i report:\n", i);
-                bphase_report(&b->phase[i], i);
+                bphase_report(&b->phase[i], i, true);
         }
 }
 
