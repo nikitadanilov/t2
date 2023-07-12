@@ -4496,7 +4496,10 @@ int main(int argc, char **argv) {
 
 #if BN
 
+#include <math.h>
+
 struct bvar {
+        uint64_t nr;
         uint64_t sum;
         uint64_t min;
         uint64_t max;
@@ -4539,6 +4542,7 @@ struct boption {
         struct bspec key;
         struct bspec val;
         struct bvar  var;
+        struct bvar  prev;
 };
 
 struct bchoice {
@@ -4569,6 +4573,7 @@ struct bphase {
         pthread_cond_t start;
         struct benchmark *parent;
         bool run;
+        int active;
 };
 
 struct benchmark {
@@ -4818,6 +4823,21 @@ static uint64_t now(void) {
         return t.tv_sec * 1000000 + t.tv_usec;
 }
 
+static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var) {
+        mutex_lock(&ph->lock);
+        for (int i = 0; i < bt->nr; ++i) {
+                struct bvar *v = &bt->choice[i].option.var;
+                v->nr  += var[i].nr;
+                v->sum += var[i].sum;
+                v->ssq += var[i].ssq;
+                v->min  = MIN(v->min, var[i].min);
+                v->max  = MAX(v->max, var[i].max);
+                SET0(&var[i]);
+        }
+        mutex_unlock(&ph->lock);
+        SET0(var);
+}
+
 static void *bworker(void *arg) {
         struct rthread *rt = arg;
         struct bthread *bt = rt->parent;
@@ -4834,6 +4854,7 @@ static void *bworker(void *arg) {
         int i;
         int finger = 0;
         uint64_t seed0 = ph->parent->seed + g->idx * 100000 + rt->idx;
+        uint64_t reported = now() - rt->idx * 10000;
         struct t2_cursor_op cop = {
                 .next = &bn_next
         };
@@ -4844,9 +4865,6 @@ static void *bworker(void *arg) {
         t2_thread_register();
         ASSERT(rt->self == pthread_self());
         printf("        Thread %3i in group %2i started.\n", rt->idx, g->idx);
-        key = mem_alloc(maxkey);
-        val = mem_alloc(maxval);
-        cur = mem_alloc(maxkey);
         var = mem_alloc(bt->nr * sizeof var[0]);
         for (i = 0; i < bt->nr; ++i) {
                 maxkey = max_32(maxkey, bt->choice[i].option.key.max);
@@ -4857,10 +4875,14 @@ static void *bworker(void *arg) {
                 var[i].min = ~0ull;
         }
         ASSERT(finger == 100);
+        key = mem_alloc(maxkey);
+        val = mem_alloc(maxval);
+        cur = mem_alloc(maxkey);
         c.curkey = (struct t2_buf){ .nr = 1, .seg = { [0] = { .addr = cur, .len = maxkey } } };
         ASSERT(key != NULL && val != NULL);
         mutex_lock(&ph->lock);
         rt->ready = true;
+        ph->active++;
         pthread_cond_signal(&ph->start);
         while (!ph->run) {
                 pthread_cond_wait(&ph->cond, &ph->lock);
@@ -4889,6 +4911,7 @@ static void *bworker(void *arg) {
                                 int32_t vsize = bufgen(val, seed0, i, 2, &opt->val);
                                 start = now();
                                 result = t2_insert_ptr(t, key, ksize, val, vsize);
+                                end = now();
                                 ASSERT(result == 0 || result == -EEXIST);
                         } else if (opt->opt == BDELETE) {
                                 start = now();
@@ -4914,19 +4937,20 @@ static void *bworker(void *arg) {
                         }
                 }
                 uint64_t delta = end - start;
+                var[ch].nr++;
                 var[ch].sum += delta;
                 var[ch].ssq += delta * delta;
-                var[ch].max = MIN(var[ch].min, delta);
-                var[ch].max = MAX(var[ch].max, delta);
+                var[ch].min  = MIN(var[ch].min, delta);
+                var[ch].max  = MAX(var[ch].max, delta);
+                if (now() - reported > 1000000) {
+                        var_fold(ph, bt, var);
+                        reported = now();
+                }
         }
         printf("        Thread %3i in group %2i completed %i operations.\n", rt->idx, bt->parent->idx, i);
+        var_fold(ph, bt, var);
         mutex_lock(&ph->lock);
-        for (i = 0; i < bt->nr; ++i) {
-                bt->choice[i].option.var.sum += var[i].sum;
-                bt->choice[i].option.var.ssq += var[i].ssq;
-                bt->choice[i].option.var.min += MIN(bt->choice[i].option.var.min, var[i].min);
-                bt->choice[i].option.var.max += MAX(bt->choice[i].option.var.max, var[i].max);
-        }
+        ph->active--;
         mutex_unlock(&ph->lock);
         mem_free(cur);
         mem_free(key);
@@ -4950,6 +4974,8 @@ static void bthread_start(struct bthread *bt, int idx) {
         mutex_unlock(&ph->lock);
 }
 
+static void bphase_report(struct bphase *ph, int i);
+
 static void bphase(struct bphase *ph, int i) {
         NOFAIL(pthread_mutex_init(&ph->lock, NULL));
         NOFAIL(pthread_cond_init(&ph->cond, NULL));
@@ -4968,6 +4994,10 @@ static void bphase(struct bphase *ph, int i) {
         ph->run = true;
         pthread_cond_broadcast(&ph->cond);
         mutex_unlock(&ph->lock);
+        while (ph->active > 0) {
+                sleep(10);
+                bphase_report(ph, i);
+        }
         for (int i = 0; i < ph->nr; ++i) {
                 for (int j = 0; j < ph->group[i].nr; ++j) {
                         pthread_join(ph->group[i].thread.rt[j].self, NULL);
@@ -4998,13 +5028,20 @@ static struct t2_tree_type bn_ttype = {
 static void bphase_report(struct bphase *ph, int i) {
         for (int i = 0; i < ph->nr; ++i) {
                 struct bthread *bt = &ph->group[i].thread;
-                double ops = ph->group[i].ops;
                 printf("        Group %2i:\n", i);
                 for (int k = 0; k < bt->nr; ++k) {
-                        uint64_t t = bt->choice[k].option.var.sum;
-                        double sec = 1.0 * t / 1000000.0;
-                        double avg = sec / ops;
-                        printf("            Option %2i: %14.4f sec %14.4f op/sec %14.4g sec/op min %14.4g max %14.4g dev %14.4g\n", k, sec, ops/sec, avg, bt->choice[k].option.var.min, bt->choice[k].option.var.max, 1.0 * bt->choice[k].option.var.ssq / ops - avg * avg);
+                        const double M = 1000000.0;
+                        mutex_lock(&ph->lock);
+                        struct bvar prev = bt->choice[k].option.prev;
+                        struct bvar var = bt->choice[k].option.var;
+                        bt->choice[k].option.prev = var;
+                        mutex_unlock(&ph->lock);
+                        var.sum -= prev.sum;
+                        var.nr  -= prev.nr;
+                        var.ssq -= prev.ssq;
+                        double avg = var.sum / var.nr;
+                        printf("            Option %2i: ops: %10llu sec: %10.4f op/sec: %12.4f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
+                               k, var.nr, var.sum / M, M / avg, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
                 } 
         }
 }
