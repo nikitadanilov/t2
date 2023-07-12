@@ -85,10 +85,12 @@ enum {
 #define EISOK(val) (!EISERR(val))
 #define EDESCR(err, fmt, a0, a1) edescr(MSG_PREP(fmt), err, (uint64_t)a0, (uint64_t)a1)
 
-#define NOFAIL(expr)                            \
-({                                              \
-        int result = (expr);                    \
-        ASSERT(result == 0);                    \
+#define NOFAIL(expr)                                            \
+({                                                              \
+        int result = (expr);                                    \
+        if (UNLIKELY(result != 0)) {                            \
+                IMMANENTISE("Got %i instead of 0.", result);    \
+        }                                                       \
 })
 
 /* Returns the number of array elements that satisfy given criteria. */
@@ -5042,7 +5044,7 @@ static void bphase_report(struct bphase *ph, int i) {
                         double avg = var.sum / var.nr;
                         printf("            Option %2i: ops: %10llu sec: %10.4f op/sec: %12.4f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
                                k, var.nr, var.sum / M, M / avg, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
-                } 
+                }
         }
 }
 
