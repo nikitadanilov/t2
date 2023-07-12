@@ -4792,6 +4792,7 @@ static int32_t bufgen(void *key, uint64_t seed0, int max, int delta, struct bspe
         switch (sp->ord) {
         case EXI:
                 seed = rnd_between(seed0, seed0 + max, seed) + delta;
+                /* Fallthrough. */
         case RND:
                 len = rnd_between(sp->min, sp->max, seed);
                 bfill(key, len, seed);
@@ -4823,9 +4824,8 @@ static void *bworker(void *arg) {
                 .next = &bn_next
         };
         struct t2_cursor c = {
-                .curkey = BUF_VAL(key),
-                .tree   = t,
-                .op     = &cop
+                .tree = t,
+                .op   = &cop
         };
         t2_thread_register();
         printf("        Thread %3i in group %2i started.\n", rt->idx, g->idx);
@@ -4839,12 +4839,9 @@ static void *bworker(void *arg) {
         ASSERT(finger == 100);
         key = mem_alloc(maxkey);
         val = mem_alloc(maxval);
-        cur = mem_alloc(maxval);
+        cur = mem_alloc(maxkey);
+        c.curkey = (struct t2_buf){ .nr = 1, .seg = { [0] = { .addr = cur, .len = maxkey } } };
         ASSERT(key != NULL && val != NULL);
-        struct t2_buf curkey = {
-                .nr = 1,
-                .seg = { [0] = { .addr = cur, .len = maxkey } }
-        };
         mutex_lock(&ph->lock);
         rt->ready = true;
         pthread_cond_signal(&ph->start);
@@ -4864,7 +4861,7 @@ static void *bworker(void *arg) {
                         int32_t ksize = bufgen(key, seed0, i, 1, &opt->key);
                         int result;
                         if (opt->opt == BLOOKUP) {
-                                t2_lookup_ptr(t, key, ksize, val, maxval);
+                                result = t2_lookup_ptr(t, key, ksize, val, maxval);
                                 ASSERT(result == 0 || result == -ENOENT);
                         } else if (opt->opt == BINSERT) {
                                 int32_t vsize = bufgen(val, seed0, i, 2, &opt->val);
@@ -4874,9 +4871,13 @@ static void *bworker(void *arg) {
                                 result = t2_delete_ptr(t, key, ksize);
                                 ASSERT(result == 0 || result == -ENOENT);
                         } else if (opt->opt == BNEXT) {
+                                struct t2_buf nextkey = {
+                                        .nr = 1,
+                                        .seg = { [0] = { .addr = key, .len = ksize } }
+                                };
                                 int it = brnd(seed + 3) % opt->iter;
                                 c.dir = (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS;
-                                t2_cursor_init(&c, &curkey);
+                                t2_cursor_init(&c, &nextkey);
                                 for (int i = 0; i < it && t2_cursor_next(&c) > 0; ++i) {
                                         ;
                                 }
