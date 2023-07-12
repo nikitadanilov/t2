@@ -89,7 +89,7 @@ enum {
 ({                                                              \
         int result = (expr);                                    \
         if (UNLIKELY(result != 0)) {                            \
-                IMMANENTISE("Got %i instead of 0.", result);    \
+                IMMANENTISE(#expr " failed with %i.", result);  \
         }                                                       \
 })
 
@@ -4573,7 +4573,6 @@ struct bphase {
         pthread_cond_t start;
         struct benchmark *parent;
         bool run;
-        int active;
 };
 
 struct benchmark {
@@ -4592,23 +4591,35 @@ struct span {
 
 static const char *total;
 
-#if 0
+enum {
+        BRESULTS,
+        BPROGRESS,
+        BINFO,
+        BTRACE,
+        BDEBUG
+};
+
+static int blog_level = BRESULTS;
+static void blog(int level, const char *fmt, ...) {
+        if (level <= blog_level) {
+                va_list args;
+                va_start(args, fmt);
+                vfprintf(stdout, fmt, args);
+                va_end(args);
+        }
+}
+
 static void logspan(const struct span *s) {
-        puts(total);
+        blog(BDEBUG, "%s\n", total);
         for (const char *c = total; c < s->start; ++c) {
-                putchar(' ');
+                blog(BDEBUG, " ");
         }
-        putchar('^');
+        blog(BDEBUG, "^");
         for (const char *c = s->start + 1; c < s->end; ++c) {
-                putchar('.');
+                blog(BDEBUG, ".");
         }
-        putchar('^');
-        puts("");
+        blog(BDEBUG, "^\n");
 }
-#else
-static void logspan(const struct span *s) {
-}
-#endif
 
 static void bskip(struct span *s) {
         while (s->start < s->end && *s->start == ' ') {
@@ -4672,7 +4683,6 @@ static void bspec_parse(struct bspec *sp, struct span *s) {
         } else if (bstarts(s, "seq")) {
                 sp->ord = SEQ;
         } else {
-                puts(s->start);
                 IMMANENTISE("Cannot parse spec.");
         }
         if (span_nr(s, '-') != 2) {
@@ -4798,14 +4808,17 @@ static int rnd_between(int lo, int hi, uint64_t seed) {
         return lo + (hi - lo) * (brnd(seed) % (hi - lo + 1)) / (hi - lo + 1);
 }
 
-static int32_t bufgen(void *key, uint64_t seed0, int max, int delta, struct bspec *sp) {
+static int32_t bufgen(void *key, uint64_t seed0, int max, int *rndmax, int delta, struct bspec *sp) {
         uint64_t seed = seed0 + max + delta;
         int len;
         switch (sp->ord) {
         case EXI:
-                seed = rnd_between(seed0, seed0 + max, seed) + delta;
-                /* Fallthrough. */
+                seed = rnd_between(seed0, seed0 + *rndmax, seed) + delta;
+                len = rnd_between(sp->min, sp->max, seed);
+                bfill(key, len, seed);
+                break;
         case RND:
+                seed = seed0 + (*rndmax)++ + delta;
                 len = rnd_between(sp->min, sp->max, seed);
                 bfill(key, len, seed);
                 break;
@@ -4847,6 +4860,7 @@ static void *bworker(void *arg) {
         int choice[100] = {};
         int32_t maxkey = 0;
         int32_t maxval = 0;
+        int rndmax = 0;
         void *key;
         void *val;
         void *cur;
@@ -4864,7 +4878,7 @@ static void *bworker(void *arg) {
         };
         t2_thread_register();
         ASSERT(rt->self == pthread_self());
-        printf("        Thread %3i in group %2i started.\n", rt->idx, g->idx);
+        blog(BINFO, "        Thread %3i in group %2i started.\n", rt->idx, g->idx);
         var = mem_alloc(bt->nr * sizeof var[0]);
         for (i = 0; i < bt->nr; ++i) {
                 maxkey = max_32(maxkey, bt->choice[i].option.key.max);
@@ -4882,7 +4896,6 @@ static void *bworker(void *arg) {
         ASSERT(key != NULL && val != NULL);
         mutex_lock(&ph->lock);
         rt->ready = true;
-        ph->active++;
         NOFAIL(pthread_cond_signal(&ph->start));
         while (!ph->run) {
                 NOFAIL(pthread_cond_wait(&ph->cond, &ph->lock));
@@ -4898,9 +4911,11 @@ static void *bworker(void *arg) {
                         struct timespec sleep = {
                                 .tv_nsec = (brnd(seed + 1) % opt->delay) * 1000
                         };
+                        start = now();
                         NOFAIL(nanosleep(&sleep, NULL));
+                        end = now();
                 } else {
-                        int32_t ksize = bufgen(key, seed0, i, 1, &opt->key);
+                        int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
                         int result;
                         if (opt->opt == BLOOKUP) {
                                 start = now();
@@ -4908,7 +4923,7 @@ static void *bworker(void *arg) {
                                 end = now();
                                 ASSERT(result == 0 || result == -ENOENT);
                         } else if (opt->opt == BINSERT) {
-                                int32_t vsize = bufgen(val, seed0, i, 2, &opt->val);
+                                int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val);
                                 start = now();
                                 result = t2_insert_ptr(t, key, ksize, val, vsize);
                                 end = now();
@@ -4947,11 +4962,8 @@ static void *bworker(void *arg) {
                         reported = now();
                 }
         }
-        printf("        Thread %3i in group %2i completed %i operations.\n", rt->idx, bt->parent->idx, i);
+        blog(BINFO, "        Thread %3i in group %2i completed %i operations.\n", rt->idx, bt->parent->idx, i);
         var_fold(ph, bt, var);
-        mutex_lock(&ph->lock);
-        ph->active--;
-        mutex_unlock(&ph->lock);
         mem_free(cur);
         mem_free(key);
         mem_free(val);
@@ -4974,13 +4986,27 @@ static void bthread_start(struct bthread *bt, int idx) {
         mutex_unlock(&ph->lock);
 }
 
-static void bphase_report(struct bphase *ph, int i, bool final);
+static void bphase_report(struct bphase *ph, bool final);
+
+enum { REPORT_INTERVAL = 10 };
+
+static void *breport_thread(void *arg) {
+        struct bphase *ph = arg;
+        NOFAIL(pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL));
+        NOFAIL(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL));
+        while (true) {
+                sleep(REPORT_INTERVAL);
+                bphase_report(ph, false);
+                pthread_testcancel();
+        }
+}
 
 static void bphase(struct bphase *ph, int i) {
+        pthread_t reporter;
         NOFAIL(pthread_mutex_init(&ph->lock, NULL));
         NOFAIL(pthread_cond_init(&ph->cond, NULL));
         NOFAIL(pthread_cond_init(&ph->start, NULL));
-        printf("    Starting phase %2i.\n", i);
+        blog(BINFO, "    Starting phase %2i.\n", i);
         for (int i = 0; i < ph->nr; ++i) {
                 ph->group[i].thread.rt = mem_alloc(ph->group[i].nr * sizeof(struct rthread));
                 ph->group[i].idx = i;
@@ -4989,21 +5015,19 @@ static void bphase(struct bphase *ph, int i) {
                         bthread_start(&ph->group[i].thread, j);
                 }
         }
-        printf("    Threads started. Run!\n");
+        blog(BINFO, "    Threads started. Run!\n");
         mutex_lock(&ph->lock);
         ph->run = true;
         NOFAIL(pthread_cond_broadcast(&ph->cond));
         mutex_unlock(&ph->lock);
-        while (ph->active > 0) {
-                sleep(1);
-                bphase_report(ph, i, false);
-        }
+        NOFAIL(pthread_create(&reporter, NULL, *breport_thread, ph));
         for (int i = 0; i < ph->nr; ++i) {
                 for (int j = 0; j < ph->group[i].nr; ++j) {
                         pthread_join(ph->group[i].thread.rt[j].self, NULL);
                 }
         }
-        printf("    Phase %2i done.\n", i);
+        blog(BINFO, "    Phase %2i done.\n", i);
+        NOFAIL(pthread_cancel(reporter));
         NOFAIL(pthread_cond_destroy(&ph->start));
         NOFAIL(pthread_cond_destroy(&ph->cond));
         NOFAIL(pthread_mutex_destroy(&ph->lock));
@@ -5025,28 +5049,31 @@ static struct t2_tree_type bn_ttype = {
         .ntype    = &bn_tree_ntype
 };
 
-static void bphase_report(struct bphase *ph, int i, bool final) {
+static void bphase_report(struct bphase *ph, bool final) {
+        int lev = final ? BRESULTS : BPROGRESS;
         for (int i = 0; i < ph->nr; ++i) {
                 struct bthread *bt = &ph->group[i].thread;
-                printf("        Group %2i:\n", i);
+                blog(lev, "        Group %2i:\n", i);
                 for (int k = 0; k < bt->nr; ++k) {
                         const double M = 1000000.0;
-                        //mutex_lock(&ph->lock);
+                        if (!final) {
+                                mutex_lock(&ph->lock);
+                        }
                         struct bvar prev = bt->choice[k].option.prev;
                         struct bvar var = bt->choice[k].option.var;
                         bt->choice[k].option.prev = var;
-                        //mutex_unlock(&ph->lock);
                         if (!final) {
+                                mutex_unlock(&ph->lock);
                                 var.sum -= prev.sum;
                                 var.nr  -= prev.nr;
                                 var.ssq -= prev.ssq;
                         }
                         if (var.nr != 0) {
                                 double avg = var.sum / var.nr;
-                                printf("            Option %2i: ops: %10llu sec: %10.4f op/sec: %12.4f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
-                                       k, var.nr, var.sum / M, M / avg, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
+                                blog(lev, "            Option %2i: ops: %10llu sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
+                                     k, var.nr, var.sum / M, M / avg, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
                         } else {
-                                printf("            Option %2i: idle.\n", k);
+                                blog(lev, "            Option %2i: idle.\n", k);
                         }
                 }
         }
@@ -5059,26 +5086,41 @@ static void brun(struct benchmark *b) {
         t2_node_type_register(mod, &bn_ntype);
         b->tree = t2_tree_create(&bn_ttype);
         ASSERT(EISOK(b->tree));
-        printf("Starting benchmark.\n");
+        blog(BINFO, "Starting benchmark.\n");
         for (int i = 0; i < b->nr; ++i) {
                 bphase(&b->phase[i], i);
         }
-        printf("Benchmark done.\n");
+        blog(BINFO, "Benchmark done.\n");
         t2_tree_close(b->tree);
         t2_tree_type_degister(&bn_ttype);
         t2_node_type_degister(&bn_ntype);
         t2_fini(mod);
         for (int i = 0; i < b->nr; ++i) {
-                printf("    Phase %2i report:\n", i);
-                bphase_report(&b->phase[i], i, true);
+                blog(BRESULTS, "    Phase %2i report:\n", i);
+                bphase_report(&b->phase[i], true);
         }
 }
 
 int main(int argc, char **argv) {
-        total = argv[1];
-        struct benchmark *b = bparse(&SPAN(argv[1], argv[1] + strlen(argv[1])));
-        brun(b);
-        return 1;
+        char ch;
+        while ((ch = getopt(argc, argv, "vf:")) != -1) {
+                switch (ch) {
+                case 'v':
+                        blog_level++;
+                        break;
+                case 'f':
+                        total = optarg;
+                        break;
+                }
+        }
+        if (total != NULL) {
+                struct benchmark *b = bparse(&SPAN(total, total + strlen(total)));
+                brun(b);
+                return 0;
+        } else {
+                puts("Huh?");
+                return 1;
+        }
 }
 
 #endif /* BN */
