@@ -3390,8 +3390,7 @@ static int file_read(struct t2_storage *storage, taddr_t addr, void *dst) {
         } else if (result < 0) {
                 return ERROR(result);
         } else {
-                printf("%"PRIx64" %i %i\n", off, count, result);
-                return ERROR(-EIO);
+                return -ESTALE;
         }
 }
 
@@ -4811,6 +4810,7 @@ static void *bworker(void *arg) {
         struct bgroup *g = bt->parent;
         struct bphase *ph = g->parent;
         struct t2_tree *t = ph->parent->tree;
+        int idx = rt->idx;
         int choice[100] = {};
         int32_t maxkey = 0;
         int32_t maxval = 0;
@@ -4828,6 +4828,7 @@ static void *bworker(void *arg) {
                 .op   = &cop
         };
         t2_thread_register();
+        ASSERT(rt->self == pthread_self());
         printf("        Thread %3i in group %2i started.\n", rt->idx, g->idx);
         for (i = 0; i < bt->nr; ++i) {
                 maxkey = max_32(maxkey, bt->choice[i].option.key.max);
@@ -4915,7 +4916,7 @@ static void bphase(struct bphase *ph, int i) {
         NOFAIL(pthread_cond_init(&ph->start, NULL));
         printf("    Starting phase %2i.\n", i);
         for (int i = 0; i < ph->nr; ++i) {
-                ph->group[i].thread.rt = mem_alloc(ph->group[i].thread.nr * sizeof(struct rthread));
+                ph->group[i].thread.rt = mem_alloc(ph->group[i].nr * sizeof(struct rthread));
                 ph->group[i].idx = i;
                 ASSERT(ph->group[i].thread.rt != NULL);
                 for (int j = 0; j < ph->group[i].nr; ++j) {
