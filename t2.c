@@ -4717,6 +4717,7 @@ static void boption_parse(struct boption *o, const struct span *s) {
         } else {
                 IMMANENTISE("Unknown option.");
         }
+        o->var.min = ~0ull;
 }
 
 static void bchoice_parse(struct bchoice *choice, const struct span *s) {
@@ -5071,7 +5072,7 @@ static void bphase_report(struct bphase *ph, bool final) {
                         if (var.nr != 0) {
                                 double avg = var.sum / var.nr;
                                 blog(lev, "            Option %2i: ops: %10llu sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
-                                     k, var.nr, var.sum / M, M / avg, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
+                                     k, var.nr, var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
                         } else {
                                 blog(lev, "            Option %2i: idle.\n", k);
                         }
@@ -5103,7 +5104,7 @@ static void brun(struct benchmark *b) {
 
 int main(int argc, char **argv) {
         char ch;
-        while ((ch = getopt(argc, argv, "vf:r:")) != -1) {
+        while ((ch = getopt(argc, argv, "vf:r:N:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -5113,6 +5114,9 @@ int main(int argc, char **argv) {
                         break;
                 case 'r':
                         report_interval = atoi(optarg);
+                        break;
+                case 'N':
+                        bn_ntype.shift = atoi(optarg);
                         break;
                 }
         }
