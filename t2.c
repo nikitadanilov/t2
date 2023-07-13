@@ -5121,10 +5121,11 @@ static void brun(struct benchmark *b) {
                 bphase(&b->phase[i], i);
         }
         blog(BINFO, "Benchmark done.\n");
+        mod = b->tree->ttype->mod;
         t2_tree_close(b->tree);
         t2_tree_type_degister(&bn_ttype);
         t2_node_type_degister(&bn_ntype);
-        t2_fini(b->tree->ttype->mod);
+        t2_fini(mod);
         for (int i = 0; i < b->nr; ++i) {
                 blog(BRESULTS, "    Phase %2i report:\n", i);
                 bphase_report(&b->phase[i], true);
@@ -5135,7 +5136,7 @@ int main(int argc, char **argv) {
         char ch;
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        while ((ch = getopt(argc, argv, "vf:r:N:h:c:")) != -1) {
+        while ((ch = getopt(argc, argv, "vf:r:N:h:c")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -5153,7 +5154,7 @@ int main(int argc, char **argv) {
                         ht_shift = atoi(optarg);
                         break;
                 case 'c':
-                        counters_level = atoi(optarg);
+                        counters_level++;
                         break;
                 }
         }
