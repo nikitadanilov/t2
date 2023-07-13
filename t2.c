@@ -5070,7 +5070,7 @@ static void bphase_report(struct bphase *ph, bool final) {
                                 var.ssq -= prev.ssq;
                         }
                         if (var.nr != 0) {
-                                double avg = var.sum / var.nr;
+                                double avg = 1.0 * var.sum / var.nr;
                                 blog(lev, "            Option %2i: ops: %10llu sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
                                      k, var.nr, var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
                         } else {
