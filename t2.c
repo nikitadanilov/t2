@@ -2847,8 +2847,7 @@ struct dir_element {
 struct sheader { /* Simple node format. */
         struct header head;
         int32_t       dir_off;
-        int16_t       nr;
-        int16_t       pad;
+        int32_t       nr;
 };
 
 static struct dir_element *sdir(struct sheader *sh) {
@@ -4859,14 +4858,20 @@ static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var) {
 static int ht_shift = 20;
 static int counters_level = 0;
 
-static struct node_type bn_ntype = {
+static struct node_type bn_ntype_internal = {
         .id    = 1,
-        .name  = "simple-bn",
+        .name  = "simple-bn-internal",
+        .shift = 9
+};
+
+static struct node_type bn_ntype_leaf = {
+        .id    = 2,
+        .name  = "simple-bn-leaf",
         .shift = 9
 };
 
 static struct node_type *bn_tree_ntype(struct t2_tree *t, int level) {
-        return &bn_ntype;
+        return level == 0 ? &bn_ntype_leaf : &bn_ntype_internal;
 }
 
 static struct t2_tree_type bn_ttype = {
@@ -4943,14 +4948,16 @@ static void *bworker(void *arg) {
                         taddr_t root = t->root;
                         t2_tree_close(ph->parent->tree);
                         t2_tree_type_degister(&bn_ttype);
-                        t2_node_type_degister(&bn_ntype);
+                        t2_node_type_degister(&bn_ntype_internal);
+                        t2_node_type_degister(&bn_ntype_leaf);
                         t2_fini(mod);
                         uint64_t free = file_storage.free;
                         mod = t2_init(&file_storage.gen, ht_shift);
                         ASSERT(EISOK(mod));
                         bn_ttype.mod = NULL;
                         t2_tree_type_register(mod, &bn_ttype);
-                        t2_node_type_register(mod, &bn_ntype);
+                        t2_node_type_register(mod, &bn_ntype_internal);
+                        t2_node_type_register(mod, &bn_ntype_leaf);
                         file_storage.free = free;
                         ph->parent->tree = t = t2_tree_open(&bn_ttype, root);
                         ASSERT(EISOK(t));
@@ -4961,7 +4968,7 @@ static void *bworker(void *arg) {
                                 start = now();
                                 result = t2_lookup_ptr(t, key, ksize, val, maxval);
                                 end = now();
-                                ASSERT(result == 0 || result == -ENOENT);
+                                ASSERT(result == 0 || result == -ENOENT || result == -ENAMETOOLONG);
                         } else if (opt->opt == BINSERT) {
                                 int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val);
                                 start = now();
@@ -5113,7 +5120,8 @@ static void brun(struct benchmark *b) {
         struct t2 *mod = t2_init(&file_storage.gen, ht_shift);
         ASSERT(EISOK(mod));
         t2_tree_type_register(mod, &bn_ttype);
-        t2_node_type_register(mod, &bn_ntype);
+        t2_node_type_register(mod, &bn_ntype_internal);
+        t2_node_type_register(mod, &bn_ntype_leaf);
         b->tree = t2_tree_create(&bn_ttype);
         ASSERT(EISOK(b->tree));
         blog(BINFO, "Starting benchmark.\n");
@@ -5124,7 +5132,8 @@ static void brun(struct benchmark *b) {
         mod = b->tree->ttype->mod;
         t2_tree_close(b->tree);
         t2_tree_type_degister(&bn_ttype);
-        t2_node_type_degister(&bn_ntype);
+        t2_node_type_degister(&bn_ntype_internal);
+        t2_node_type_degister(&bn_ntype_leaf);
         t2_fini(mod);
         for (int i = 0; i < b->nr; ++i) {
                 blog(BRESULTS, "    Phase %2i report:\n", i);
@@ -5136,7 +5145,7 @@ int main(int argc, char **argv) {
         char ch;
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        while ((ch = getopt(argc, argv, "vf:r:N:h:c")) != -1) {
+        while ((ch = getopt(argc, argv, "vf:r:n:N:h:c")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -5147,8 +5156,11 @@ int main(int argc, char **argv) {
                 case 'r':
                         report_interval = atoi(optarg);
                         break;
+                case 'n':
+                        bn_ntype_leaf.shift = atoi(optarg);
+                        break;
                 case 'N':
-                        bn_ntype.shift = atoi(optarg);
+                        bn_ntype_internal.shift = atoi(optarg);
                         break;
                 case 'h':
                         ht_shift = atoi(optarg);
