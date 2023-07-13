@@ -4520,7 +4520,8 @@ enum bop_type {
         BLOOKUP,
         BINSERT,
         BDELETE,
-        BNEXT
+        BNEXT,
+        BREMOUNT
 };
 
 enum border {
@@ -4702,7 +4703,8 @@ static void boption_parse(struct boption *o, const struct span *s) {
                 o->delay = bnumber(&rest);
         } else if (bstarts(&rest, "lookup$")) {
                 o->opt = BLOOKUP;
-                bspec_parse(&o->key, &rest);
+                bspec_parse(&o->key, span_next(&rest, '/', &sub));
+                o->val.max = bnumber(span_next(&rest, '/', &sub));
         } else if (bstarts(&rest, "insert$")) {
                 o->opt = BINSERT;
                 bspec_parse(&o->key, span_next(&rest, '/', &sub));
@@ -4714,6 +4716,8 @@ static void boption_parse(struct boption *o, const struct span *s) {
                 o->opt = BNEXT;
                 bspec_parse(&o->key, span_next(&rest, '/', &sub));
                 o->iter = bnumber(span_next(&rest, '/', &sub));
+        } else if (bstarts(&rest, "remount$")) {
+                o->opt = BREMOUNT;
         } else {
                 IMMANENTISE("Unknown option.");
         }
@@ -4852,6 +4856,25 @@ static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var) {
         SET0(var);
 }
 
+static int ht_shift = 20;
+static int counters_level = 0;
+
+static struct node_type bn_ntype = {
+        .id    = 1,
+        .name  = "simple-bn",
+        .shift = 9
+};
+
+static struct node_type *bn_tree_ntype(struct t2_tree *t, int level) {
+        return &bn_ntype;
+}
+
+static struct t2_tree_type bn_ttype = {
+        .id       = 2,
+        .name     = "tree-type-bn",
+        .ntype    = &bn_tree_ntype
+};
+
 static void *bworker(void *arg) {
         struct rthread *rt = arg;
         struct bthread *bt = rt->parent;
@@ -4915,6 +4938,22 @@ static void *bworker(void *arg) {
                         start = now();
                         NOFAIL(nanosleep(&sleep, NULL));
                         end = now();
+                } else if (opt->opt == BREMOUNT) {
+                        struct t2 *mod = t->ttype->mod;
+                        taddr_t root = t->root;
+                        t2_tree_close(ph->parent->tree);
+                        t2_tree_type_degister(&bn_ttype);
+                        t2_node_type_degister(&bn_ntype);
+                        t2_fini(mod);
+                        uint64_t free = file_storage.free;
+                        mod = t2_init(&file_storage.gen, ht_shift);
+                        ASSERT(EISOK(mod));
+                        bn_ttype.mod = NULL;
+                        t2_tree_type_register(mod, &bn_ttype);
+                        t2_node_type_register(mod, &bn_ntype);
+                        file_storage.free = free;
+                        ph->parent->tree = t = t2_tree_open(&bn_ttype, root);
+                        ASSERT(EISOK(t));
                 } else {
                         int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
                         int result;
@@ -4998,6 +5037,9 @@ static void *breport_thread(void *arg) {
         while (true) {
                 sleep(report_interval);
                 bphase_report(ph, false);
+                if (counters_level > 1) {
+                        counters_print();
+                }
                 pthread_testcancel();
         }
 }
@@ -5028,27 +5070,14 @@ static void bphase(struct bphase *ph, int i) {
                 }
         }
         blog(BINFO, "    Phase %2i done.\n", i);
+        if (counters_level > 0) {
+                counters_print();
+        }
         NOFAIL(pthread_cancel(reporter));
         NOFAIL(pthread_cond_destroy(&ph->start));
         NOFAIL(pthread_cond_destroy(&ph->cond));
         NOFAIL(pthread_mutex_destroy(&ph->lock));
 }
-
-static struct node_type bn_ntype = {
-        .id    = 1,
-        .name  = "simple-bn",
-        .shift = 9
-};
-
-static struct node_type *bn_tree_ntype(struct t2_tree *t, int level) {
-        return &bn_ntype;
-}
-
-static struct t2_tree_type bn_ttype = {
-        .id       = 2,
-        .name     = "tree-type-bn",
-        .ntype    = &bn_tree_ntype
-};
 
 static void bphase_report(struct bphase *ph, bool final) {
         int lev = final ? BRESULTS : BPROGRESS;
@@ -5081,7 +5110,7 @@ static void bphase_report(struct bphase *ph, bool final) {
 }
 
 static void brun(struct benchmark *b) {
-        struct t2 *mod = t2_init(&file_storage.gen, 10);
+        struct t2 *mod = t2_init(&file_storage.gen, ht_shift);
         ASSERT(EISOK(mod));
         t2_tree_type_register(mod, &bn_ttype);
         t2_node_type_register(mod, &bn_ntype);
@@ -5095,7 +5124,7 @@ static void brun(struct benchmark *b) {
         t2_tree_close(b->tree);
         t2_tree_type_degister(&bn_ttype);
         t2_node_type_degister(&bn_ntype);
-        t2_fini(mod);
+        t2_fini(b->tree->ttype->mod);
         for (int i = 0; i < b->nr; ++i) {
                 blog(BRESULTS, "    Phase %2i report:\n", i);
                 bphase_report(&b->phase[i], true);
@@ -5104,8 +5133,9 @@ static void brun(struct benchmark *b) {
 
 int main(int argc, char **argv) {
         char ch;
-        bool counters = 0;
-        while ((ch = getopt(argc, argv, "vf:r:N:c")) != -1) {
+        setbuf(stdout, NULL);
+        setbuf(stderr, NULL);
+        while ((ch = getopt(argc, argv, "vf:r:N:h:c:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -5119,17 +5149,17 @@ int main(int argc, char **argv) {
                 case 'N':
                         bn_ntype.shift = atoi(optarg);
                         break;
+                case 'h':
+                        ht_shift = atoi(optarg);
+                        break;
                 case 'c':
-                        counters = true;
+                        counters_level = atoi(optarg);
                         break;
                 }
         }
         if (total != NULL) {
                 struct benchmark *b = bparse(&SPAN(total, total + strlen(total)));
                 brun(b);
-                if (counters) {
-                        counters_print();
-                }
                 return 0;
         } else {
                 puts("Huh?");
