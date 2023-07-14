@@ -2702,14 +2702,14 @@ static void ref_print(void) {
 #if ON_DARWIN
 static uint64_t threadid(void)
 {
-	uint64_t tid;
-	NOFAIL(pthread_threadid_np(NULL, &tid));
-	return tid;
+        uint64_t tid;
+        NOFAIL(pthread_threadid_np(NULL, &tid));
+        return tid;
 }
 #elif ON_LINUX
 static uint64_t threadid(void)
 {
-	return syscall(SYS_gettid);
+        return syscall(SYS_gettid);
 }
 #endif
 
@@ -4854,7 +4854,7 @@ static struct benchmark *bparse(const struct span *s) {
 }
 
 static uint64_t brnd(uint64_t prev) {
-	return (prev * 6364136223846793005ULL + 1442695040888963407ULL) >> 11;
+        return (prev * 6364136223846793005ULL + 1442695040888963407ULL) >> 11;
 }
 
 static int bn_next(struct t2_cursor *c, const struct t2_rec *rec) {
@@ -5273,8 +5273,6 @@ int main(int argc, char **argv) {
  *
  * - "streams" (sequential, random)
  *
- * - decaying node temperature (see bits/avg.c)
- *
  * - cache replacement (arc, clock?)
  *
  * - transaction engine hooks
@@ -5326,6 +5324,8 @@ int main(int argc, char **argv) {
  * + cookies to avoid tree traversal
  *
  * + simple node functions should be robust in the face of concurrent modifications
+ *
+ * + decaying node temperature (see bits/avg.c)
  *
  * References:
  *
