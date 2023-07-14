@@ -267,7 +267,7 @@ struct t2 {
         alignas(MAX_CACHELINE) int32_t           cleanscan;
         alignas(MAX_CACHELINE) int32_t           tscan;
         const struct t2_tree_type               *ttypes[MAX_TREE_TYPE];
-        const struct node_type                  *ntypes[MAX_NODE_TYPE];
+        const struct t2_node_type               *ntypes[MAX_NODE_TYPE];
         struct t2_storage                       *stor;
 };
 
@@ -308,18 +308,17 @@ enum node_flags {
 };
 
 struct node {
-        struct cds_hlist_node   hash;
-        taddr_t                 addr;
-        uint64_t                seq;
-        atomic_int              ref;
-        const struct node_type *ntype;
-        uint64_t                flags;
-        void                   *data;
-        struct t2              *mod;
-        struct ewma             kelvin;
-        uint64_t                cookie;
-        pthread_rwlock_t        lock;
-        struct rcu_head         rcu;
+        struct cds_hlist_node      hash;
+        taddr_t                    addr;
+        uint64_t                   seq;
+        atomic_int                 ref;
+        const struct t2_node_type *ntype;
+        uint64_t                   flags;
+        void                      *data;
+        struct t2                 *mod;
+        uint64_t                   cookie;
+        pthread_rwlock_t           lock;
+        struct rcu_head            rcu;
 };
 
 enum lock_mode {
@@ -392,7 +391,7 @@ struct policy {
         int (*exec_delete)(struct path *p, int idx);
 };
 
-struct node_type {
+struct t2_node_type {
         int16_t     id;
         const char *name;
         struct t2  *mod;
@@ -404,12 +403,13 @@ enum {
 };
 
 struct header {
-        int8_t   level;
-        uint8_t  pad8;
-        uint16_t ntype;
-        uint32_t magix;
-        uint32_t csum;
-        uint32_t treeid;
+        int8_t      level;
+        uint8_t     pad8;
+        uint16_t    ntype;
+        uint32_t    magix;
+        uint32_t    csum;
+        uint32_t    treeid;
+        struct ewma kelvin;
 };
 
 struct msg_ctx {
@@ -488,6 +488,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var modified;
                 struct counter_var keysize;
                 struct counter_var valsize;
+                struct counter_var repage;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -508,6 +509,10 @@ struct node_ref {
         struct node *node;
         int          nr;
         void        *trace[8];
+};
+
+struct cacheinfo {
+        int32_t touched;
 };
 
 /* @static */
@@ -546,9 +551,12 @@ static void put(struct node *n);
 static void put_locked(struct node *n, struct bucket *bucket);
 static void ref(struct node *n);
 static void touch(struct node *n);
+static uint64_t temperature(struct node *n);
+static uint64_t bolt(const struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
+static struct rung *path_add(struct path *p, struct node *n, uint64_t flags);
 static bool can_insert(const struct node *n, const struct t2_rec *r);
 static bool keep(const struct node *n);
 static int dealloc(struct node *n);
@@ -612,6 +620,7 @@ static __thread struct double_counters __d_counters = {};
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
 static __thread int edepth = 0;
 static __thread bool thread_registered = false;
+static __thread struct cacheinfo ci = {};
 static __thread volatile struct {
         volatile jmp_buf *buf;
 } addr_check = {};
@@ -685,7 +694,7 @@ void t2_tree_type_degister(struct t2_tree_type *ttype)
         eclear();
 }
 
-void t2_node_type_register(struct t2 *mod, struct node_type *ntype) {
+void t2_node_type_register(struct t2 *mod, struct t2_node_type *ntype) {
         ASSERT(IS_IN(ntype->id, mod->ntypes));
         ASSERT(mod->ntypes[ntype->id] == NULL);
         ASSERT(ntype->mod == NULL);
@@ -695,7 +704,7 @@ void t2_node_type_register(struct t2 *mod, struct node_type *ntype) {
 }
 
 
-void t2_node_type_degister(struct node_type *ntype)
+void t2_node_type_degister(struct t2_node_type *ntype)
 {
         ASSERT(IS_IN(ntype->id, ntype->mod->ntypes));
         ASSERT(ntype->mod->ntypes[ntype->id] == ntype);
@@ -1027,10 +1036,11 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                 if (LIKELY(n->ntype == NULL)) {
                         int result = SCALL(n->mod, read, n->addr, n->data);
                         if (LIKELY(result == 0)) {
-                                struct header *h = n->data;
+                                struct header *h = nheader(n);
                                 /* TODO: check node. */
                                 if (LIKELY(IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL)) {
                                         rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
+                                        CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
                                 } else {
                                         result = ERROR(-ESTALE);
                                 }
@@ -1050,9 +1060,9 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
 }
 
 static struct node *alloc(struct t2_tree *t, int8_t level) {
-        struct t2        *mod   = t->ttype->mod;
-        struct node_type *ntype = t->ttype->ntype(t, level);
-        taddr_t           addr  = SCALL(mod, alloc, ntype->shift, ntype->shift);
+        struct t2           *mod   = t->ttype->mod;
+        struct t2_node_type *ntype = t->ttype->ntype(t, level);
+        taddr_t              addr  = SCALL(mod, alloc, ntype->shift, ntype->shift);
         struct node      *n;
         ASSERT(CVAL(rcu) == 0);
         if (EISOK(addr)) {
@@ -1118,6 +1128,9 @@ static int dealloc(struct node *n) {
         return 0;
 }
 
+static uint64_t temperature(struct node *n) {
+        return kavg(&nheader(n)->kelvin, bolt(n));
+}
 
 static struct header *nheader(const struct node *n) {
         return n->data;
@@ -1507,11 +1520,11 @@ static bool rung_is_valid(const struct path *p, int i) {
         return is_valid;
 }
 
-static struct rung *path_add(struct path *p, struct node *n, uint64_t seq, uint64_t flags) {
+static struct rung *path_add(struct path *p, struct node *n, uint64_t flags) {
         ASSERT(IS_IN(p->used, p->rung));
         p->rung[p->used] = (struct rung) {
                 .node  = n,
-                .seq   = seq,
+                .seq   = node_seq(n),
                 .flags = flags,
                 .pos   = 0
         };
@@ -1831,11 +1844,12 @@ static bool rcu_enter(struct path *p, struct node *extra) {
 enum { BOLT_EPOCH_SHIFT = 16 };
 
 static uint64_t bolt(const struct node *n) {
-        return n->mod->bolt >> BOLT_EPOCH_SHIFT;
+        return (n->mod->bolt + ci.touched) >> BOLT_EPOCH_SHIFT;
 }
 
 static void touch(struct node *n) {
-        kmod(&n->kelvin, bolt(n));
+        kmod(&nheader(n)->kelvin, bolt(n));
+        ci.touched++;
 }
 
 enum {
@@ -1925,7 +1939,7 @@ static int traverse(struct path *p) {
                         path_fini(p);
                         continue;
                 }
-                r = path_add(p, n, node_seq(n), flags);
+                r = path_add(p, n, flags);
                 if (is_leaf(n)) {
                         if (p->opt == LOOKUP) {
                                 result = lookup_complete(p, n);
@@ -1981,11 +1995,12 @@ static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt)
         struct path p = {};
         counters_check();
         path_init(&p, t, r, opt);
-        t->ttype->mod->bolt++;
         result = cookie_try(&p);
         if (result == -ESTALE) {
                 result = traverse(&p);
         }
+        t->ttype->mod->bolt += ci.touched;
+        ci.touched = 0;
         path_fini(&p);
         counters_check();
         return result;
@@ -2251,7 +2266,7 @@ static void nodescan(struct node *n) {
         CMOD(l[lev].nr,          nr(n));
         CMOD(l[lev].free,        simple_free(n));
         CMOD(l[lev].modified,    !!(n->flags & MODIFIED));
-        DMOD(l[lev].temperature, (float)kavg(&n->kelvin, bolt(n)) / (1ull << (63 - BOLT_EPOCH_SHIFT)));
+        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT)));
 }
 
 static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
@@ -2302,7 +2317,7 @@ static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
 }
 
 static bool is_hot(struct node *n) {
-        return kavg(&n->kelvin, bolt(n)) >> ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT)) != 0;
+        return kavg(&nheader(n)->kelvin, bolt(n)) >> ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT)) != 0;
 }
 
 static void maxwelld(struct t2 *mod, int32_t toscan, int32_t tofree) {
@@ -2339,7 +2354,6 @@ static void maxwelld(struct t2 *mod, int32_t toscan, int32_t tofree) {
                                         mutex_unlock(&bucket->lock);
                                         pageout(n);
                                         done = false;
-                                        ASSERT(!(n->flags & MODIFIED)); /* TODO: handle io errors, add node flag? */
                                         mutex_lock(&bucket->lock);
                                         put_locked(n, bucket);
                                         break;
@@ -2356,6 +2370,7 @@ static void maxwelld(struct t2 *mod, int32_t toscan, int32_t tofree) {
                         break;
                 }
         }
+        mod->tscan = scan;
 }
 
 /* @lib */
@@ -2563,6 +2578,7 @@ static void counters_print() {
         COUNTER_VAR_PRINT(modified);
         COUNTER_VAR_PRINT(keysize);
         COUNTER_VAR_PRINT(valsize);
+        COUNTER_VAR_PRINT(repage);
         DOUBLE_VAR_PRINT(temperature);
 }
 
@@ -2938,7 +2954,7 @@ static int32_t dirsize(int32_t n) {
         return n * SOF(struct dir_element);
 }
 
-static bool scheck(struct sheader *sh, const struct node_type *nt) {
+static bool scheck(struct sheader *sh, const struct t2_node_type *nt) {
         int32_t size = (int32_t)1 << nt->shift;
         int32_t dend = sh->dir_off + dirsize(sh->nr + 1);
         return  is_in(SOF(*sh), sh->dir_off, size) &&
@@ -3571,13 +3587,13 @@ static bool is_sorted(struct node *n) {
         return true;
 }
 
-static struct node_type ntype = {
+static struct t2_node_type ntype = {
         .id    = 8,
         .name  = "simple-ut",
         .shift = 9
 };
 
-static struct node_type *tree_ntype(struct t2_tree *t, int level) {
+static struct t2_node_type *tree_ntype(struct t2_tree *t, int level) {
         return &ntype;
 }
 
@@ -4930,19 +4946,19 @@ static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var) {
 static int ht_shift = 20;
 static int counters_level = 0;
 
-static struct node_type bn_ntype_internal = {
+static struct t2_node_type bn_ntype_internal = {
         .id    = 1,
         .name  = "simple-bn-internal",
         .shift = 9
 };
 
-static struct node_type bn_ntype_leaf = {
+static struct t2_node_type bn_ntype_leaf = {
         .id    = 2,
         .name  = "simple-bn-leaf",
         .shift = 9
 };
 
-static struct node_type *bn_tree_ntype(struct t2_tree *t, int level) {
+static struct t2_node_type *bn_tree_ntype(struct t2_tree *t, int level) {
         return level == 0 ? &bn_ntype_leaf : &bn_ntype_internal;
 }
 
