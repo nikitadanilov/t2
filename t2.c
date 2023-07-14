@@ -265,6 +265,7 @@ struct t2 {
         alignas(MAX_CACHELINE) _Atomic(uint64_t) bolt;
         alignas(MAX_CACHELINE) int32_t           writescan;
         alignas(MAX_CACHELINE) int32_t           cleanscan;
+        alignas(MAX_CACHELINE) int32_t           tscan;
         const struct t2_tree_type               *ttypes[MAX_TREE_TYPE];
         const struct node_type                  *ntypes[MAX_NODE_TYPE];
         struct t2_storage                       *stor;
@@ -459,6 +460,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t read_bytes;
         int64_t write;
         int64_t write_bytes;
+        int64_t tscan_bucket;
         struct level_counters {
                 int64_t insert_balance;
                 int64_t delete_balance;
@@ -476,6 +478,11 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t shift;
                 int64_t shift_one;
                 int64_t merge;
+                int64_t tscan_node;
+                int64_t tscan_busy;
+                int64_t tscan_hot;
+                int64_t tscan_pageout;
+                int64_t tscan_freed;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
@@ -593,6 +600,7 @@ static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
 static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite);
 static void clean(struct t2 *mod, int32_t toscan, int32_t toclean);
+static void maxwelld(struct t2 *mod, int32_t toscan, int32_t tofree);
 static void kmod(struct ewma *a, uint32_t t);
 static uint64_t kavg(struct ewma *a, uint32_t t);
 static void ref_add(struct node *n);
@@ -974,6 +982,7 @@ static void nfini(struct node *n) {
 }
 
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
+        maxwelld(mod, 10, 1);
         struct node *n = nalloc(mod, addr);
         if (EISOK(n)) {
                 struct node     *other;
@@ -2292,6 +2301,63 @@ static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
         }
 }
 
+static bool is_hot(struct node *n) {
+        return kavg(&n->kelvin, bolt(n)) >> ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT)) != 0;
+}
+
+static void maxwelld(struct t2 *mod, int32_t toscan, int32_t tofree) {
+        int32_t scan0 = mod->tscan;
+        int32_t scan  = scan0;
+        int32_t mask  = (1 << mod->ht.shift) - 1;
+        ASSERT(mod->ht.shift < 32);
+        ASSERT((scan0 & mask) == scan0);
+        while (toscan > 0 && tofree > 0) {
+                struct bucket *bucket = &mod->ht.buckets[scan];
+                bool           done;
+                CINC(tscan_bucket);
+                /* TODO: Try rcu-protected scan first. */
+                mutex_lock(&bucket->lock);
+                do {
+                        struct cds_hlist_head *head = &bucket->chain;
+                        struct node           *n;
+                        struct node           *next;
+                        done = true;
+                        cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
+                                uint8_t lev = level(n);
+                                CINC(l[lev].tscan_node);
+                                nodescan(n);
+                                toscan--;
+                                if (n->ref > 0) {
+                                        CINC(l[lev].tscan_busy);
+                                        continue;
+                                } else if (is_hot(n)) {
+                                        CINC(l[lev].tscan_hot);
+                                        continue;
+                                } else if (n->flags & MODIFIED) {
+                                        CINC(l[lev].tscan_pageout);
+                                        ref(n);
+                                        mutex_unlock(&bucket->lock);
+                                        pageout(n);
+                                        done = false;
+                                        ASSERT(!(n->flags & MODIFIED)); /* TODO: handle io errors, add node flag? */
+                                        mutex_lock(&bucket->lock);
+                                        put_locked(n, bucket);
+                                        break;
+                                } else {
+                                        CINC(l[lev].tscan_freed);
+                                        put_final(n);
+                                        tofree--;
+                                }
+                        }
+                } while (!done);
+                mutex_unlock(&bucket->lock);
+                scan = (scan + 1) & mask;
+                if (scan == scan0) {
+                        break;
+                }
+        }
+}
+
 /* @lib */
 
 __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...)
@@ -2461,6 +2527,7 @@ static void counters_print() {
         printf("cscan.node:         %10"PRId64"\n", GVAL(cscan_node));
         printf("cscan.busy:         %10"PRId64"\n", GVAL(cscan_busy));
         printf("cscan.dropped:      %10"PRId64"\n", GVAL(cscan_dropped));
+        printf("tscan.bucket:       %10"PRId64"\n", GVAL(tscan_bucket));
         printf("read:               %10"PRId64"\n", GVAL(read));
         printf("read.bytes:         %10"PRId64"\n", GVAL(read_bytes));
         printf("write:              %10"PRId64"\n", GVAL(write));
@@ -2486,6 +2553,11 @@ static void counters_print() {
         COUNTER_PRINT(shift);
         COUNTER_PRINT(shift_one);
         COUNTER_PRINT(merge);
+        COUNTER_PRINT(tscan_node);
+        COUNTER_PRINT(tscan_busy);
+        COUNTER_PRINT(tscan_hot);
+        COUNTER_PRINT(tscan_pageout);
+        COUNTER_PRINT(tscan_freed);
         COUNTER_VAR_PRINT(nr);
         COUNTER_VAR_PRINT(free);
         COUNTER_VAR_PRINT(modified);
