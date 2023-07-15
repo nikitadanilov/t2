@@ -151,12 +151,24 @@ struct bphase {
         bool run;
 };
 
+struct kvbenchmark {
+        union {
+                struct {
+                        struct t2_tree *tree;
+                        struct t2      *mod;
+                        taddr_t         root;
+                        uint64_t        free;
+                } t2;
+                struct {
+                } r;
+        } u;
+};
+
 struct benchmark {
         int nr;
         struct bphase *phase;
         uint64_t seed;
-        struct t2 *mod;
-        struct t2_tree *tree;
+        struct kvbenchmark kv;
 };
 
 struct span {
@@ -176,11 +188,46 @@ enum {
         BDEBUG
 };
 
+enum kvtype {
+        T2,
+        ROCKSDB,
+
+        KVNR
+};
+
+struct kvdata {
+        struct kvbenchmark *b;
+        union {
+                struct {
+                        struct t2_tree      *tree;
+                        struct t2_cursor_op  cop;
+                        struct t2_cursor     c;
+                        void                *cur;
+                } t2;
+                struct {
+                } r;
+        } u;
+};
+
+struct kv {
+        void (*mount)(struct benchmark *b);
+        void (*umount)(struct benchmark *b);
+        void (*worker_init)(struct rthread *rt, struct kvdata *d, int maxkey, int maxval);
+        void (*worker_fini)(struct rthread *rt, struct kvdata *d);
+        void (*lookup)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
+        void (*insert)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
+        void (*delete)(struct rthread *rt, struct kvdata *d, void *key, int ksize);
+        void (*next)  (struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr);
+};
+
 extern struct t2_storage *bn_storage;
 extern taddr_t bn_tree_root(const struct t2_tree *t);
 extern uint64_t bn_file_free(struct t2_storage *storage);
 extern void bn_file_free_set(struct t2_storage *storage, uint64_t free);
 extern void bn_counters_print(void);
+
+static struct kv kv[KVNR];
+static enum kvtype kvt = T2;
 
 static void *mem_alloc(size_t size) {
         void *out = malloc(size);
@@ -480,7 +527,7 @@ static void *bworker(void *arg) {
         struct bthread *bt = rt->parent;
         struct bgroup *g = bt->parent;
         struct bphase *ph = g->parent;
-        struct t2_tree *t = ph->parent->tree;
+        struct benchmark *b = ph->parent;
         int choice[100] = {};
         int32_t maxkey = 0;
         int32_t maxval = 0;
@@ -493,14 +540,7 @@ static void *bworker(void *arg) {
         int finger = 0;
         uint64_t seed0 = ph->parent->seed + g->idx * 100000 + rt->idx;
         uint64_t reported = now() - rt->idx * 10000;
-        struct t2_cursor_op cop = {
-                .next = &bn_next
-        };
-        struct t2_cursor c = {
-                .tree = t,
-                .op   = &cop
-        };
-        t2_thread_register();
+        struct kvdata data = {};
         assert(rt->self == pthread_self());
         blog(BINFO, "        Thread %3i in group %2i started.\n", rt->idx, g->idx);
         var = mem_alloc(bt->nr * sizeof var[0]);
@@ -516,8 +556,9 @@ static void *bworker(void *arg) {
         key = mem_alloc(maxkey);
         val = mem_alloc(maxval);
         cur = mem_alloc(maxkey);
-        c.curkey = (struct t2_buf){ .nr = 1, .seg = { [0] = { .addr = cur, .len = maxkey } } };
         assert(key != NULL && val != NULL);
+        data.b = &b->kv;
+        kv[kvt].worker_init(rt, &data, maxkey, maxval);
         mutex_lock(&ph->lock);
         rt->ready = true;
         NOFAIL(pthread_cond_signal(&ph->start));
@@ -539,53 +580,31 @@ static void *bworker(void *arg) {
                         NOFAIL(nanosleep(&sleep, NULL));
                         end = now();
                 } else if (opt->opt == BREMOUNT) {
-                        struct t2 *mod = ph->parent->mod;
-                        taddr_t root = bn_tree_root(t);
-                        t2_tree_close(ph->parent->tree);
-                        t2_tree_type_degister(&bn_ttype);
-                        t2_node_type_degister(bn_ntype_internal);
-                        t2_node_type_degister(bn_ntype_leaf);
-                        t2_fini(mod);
-                        uint64_t free = bn_file_free(bn_storage);
-                        ph->parent->mod = mod = t2_init(bn_storage, ht_shift);
-                        bn_ttype.mod = NULL;
-                        t2_node_type_register(mod, bn_ntype_internal);
-                        t2_node_type_register(mod, bn_ntype_leaf);
-                        t2_tree_type_register(mod, &bn_ttype);
-                        bn_file_free_set(bn_storage, free);
-                        ph->parent->tree = t = t2_tree_open(&bn_ttype, root);
+                        kv[kvt].umount(b);
+                        kv[kvt].mount(b);
                 } else {
                         int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
                         int result;
                         if (opt->opt == BLOOKUP) {
                                 start = now();
-                                result = t2_lookup_ptr(t, key, ksize, val, maxval);
+                                kv[kvt].lookup(rt, &data, key, ksize, val, maxval);
                                 end = now();
                                 assert(result == 0 || result == -ENOENT || result == -ENAMETOOLONG);
                         } else if (opt->opt == BINSERT) {
                                 int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val);
                                 start = now();
-                                result = t2_insert_ptr(t, key, ksize, val, vsize);
+                                kv[kvt].insert(rt, &data, key, ksize, val, vsize);
                                 end = now();
                                 assert(result == 0 || result == -EEXIST);
                         } else if (opt->opt == BDELETE) {
                                 start = now();
-                                result = t2_delete_ptr(t, key, ksize);
+                                kv[kvt].delete(rt, &data, key, ksize);
                                 end = now();
                                 assert(result == 0 || result == -ENOENT);
                         } else if (opt->opt == BNEXT) {
-                                struct t2_buf nextkey = {
-                                        .nr = 1,
-                                        .seg = { [0] = { .addr = key, .len = ksize } }
-                                };
-                                int it = brnd(seed + 3) % opt->iter;
-                                c.dir = (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS;
                                 start = now();
-                                t2_cursor_init(&c, &nextkey);
-                                for (int i = 0; i < it && t2_cursor_next(&c) > 0; ++i) {
-                                        ;
-                                }
-                                t2_cursor_fini(&c);
+                                kv[kvt].next(rt, &data, key, ksize, brnd(seed + 3) % opt->iter,
+                                             (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS);
                                 end = now();
                         } else {
                                 assert(false);
@@ -608,7 +627,7 @@ static void *bworker(void *arg) {
         mem_free(key);
         mem_free(val);
         mem_free(var);
-        t2_thread_degister();
+        kv[kvt].worker_fini(rt, &data);
         return NULL;
 }
 
@@ -701,7 +720,7 @@ static void bphase_report(struct bphase *ph, bool final) {
                         if (var.nr != 0) {
                                 double avg = 1.0 * var.sum / var.nr;
                                 blog(lev, "            Option %2i: ops: %10llu sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
-                                     k, var.nr, var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(var.ssq / var.nr - avg * avg));
+                                     k, var.nr, var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(1.0 * var.ssq / var.nr - avg * avg));
                         } else {
                                 blog(lev, "            Option %2i: idle.\n", k);
                         }
@@ -710,34 +729,108 @@ static void bphase_report(struct bphase *ph, bool final) {
 }
 
 static void brun(struct benchmark *b) {
-        b->mod = t2_init(bn_storage, ht_shift);
-        bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
-        bn_ntype_leaf     = t2_node_type_init(1, "simple-bn-leaf",     shift_leaf,     0);
-        t2_node_type_register(b->mod, bn_ntype_internal);
-        t2_node_type_register(b->mod, bn_ntype_leaf);
-        t2_tree_type_register(b->mod, &bn_ttype);
-        b->tree = t2_tree_create(&bn_ttype);
+        kv[kvt].mount(b);
         blog(BINFO, "Starting benchmark.\n");
         for (int i = 0; i < b->nr; ++i) {
                 bphase(&b->phase[i], i);
         }
         blog(BINFO, "Benchmark done.\n");
-        t2_tree_close(b->tree);
-        t2_tree_type_degister(&bn_ttype);
-        t2_node_type_degister(bn_ntype_internal);
-        t2_node_type_degister(bn_ntype_leaf);
-        t2_fini(b->mod);
         for (int i = 0; i < b->nr; ++i) {
                 blog(BRESULTS, "    Phase %2i report:\n", i);
                 bphase_report(&b->phase[i], true);
         }
+        kv[kvt].umount(b);
 }
+
+static void t_mount(struct benchmark *b) {
+        b->kv.u.t2.mod = t2_init(bn_storage, ht_shift);
+        bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
+        bn_ntype_leaf     = t2_node_type_init(1, "simple-bn-leaf",     shift_leaf,     0);
+        t2_node_type_register(b->kv.u.t2.mod, bn_ntype_internal);
+        t2_node_type_register(b->kv.u.t2.mod, bn_ntype_leaf);
+        t2_tree_type_register(b->kv.u.t2.mod, &bn_ttype);
+        if (b->kv.u.t2.free != 0) {
+                bn_file_free_set(bn_storage, b->kv.u.t2.free);
+        }
+        if (b->kv.u.t2.root != 0) {
+                b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.root);
+        } else {
+                b->kv.u.t2.tree = t2_tree_create(&bn_ttype);
+        }
+}
+
+static void t_umount(struct benchmark *b) {
+        b->kv.u.t2.root = bn_tree_root(b->kv.u.t2.tree);
+        t2_tree_close(b->kv.u.t2.tree);
+        t2_node_type_degister(bn_ntype_internal);
+        t2_node_type_degister(bn_ntype_leaf);
+        t2_tree_type_degister(&bn_ttype);
+        t2_fini(b->kv.u.t2.mod);
+        b->kv.u.t2.free = bn_file_free(bn_storage);
+        t2_node_type_fini(bn_ntype_internal);
+        t2_node_type_fini(bn_ntype_leaf);
+}
+
+static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {
+        d->u.t2.tree = d->b->u.t2.tree;
+        d->u.t2.cop.next = &bn_next;
+        d->u.t2.c.tree = d->u.t2.tree;
+        d->u.t2.cur = mem_alloc(maxkey);
+        d->u.t2.c.curkey = (struct t2_buf){ .nr = 1, .seg = { [0] = { .addr = d->u.t2.cur, .len = maxkey } } };
+        t2_thread_register();
+}
+
+static void t_worker_fini(struct rthread *rt, struct kvdata *d) {
+        mem_free(d->u.t2.cur);
+        t2_thread_degister();
+}
+
+static void t_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+        int result = t2_lookup_ptr(d->u.t2.tree, key, ksize, val, vsize);
+        assert(result == 0 || result == -ENOENT || result == -ENAMETOOLONG);
+}
+
+static void t_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+        int result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize);
+        assert(result == 0 || result == -EEXIST);
+}
+
+static void t_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+        int result = t2_delete_ptr(d->u.t2.tree, key, ksize);
+        assert(result == 0 || result == -ENOENT);
+}
+
+static void t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
+        struct t2_buf nextkey = {
+                .nr = 1,
+                .seg = { [0] = { .addr = key, .len = ksize } }
+        };
+        d->u.t2.c.dir = dir;
+        t2_cursor_init(&d->u.t2.c, &nextkey);
+        for (int i = 0; i < nr && t2_cursor_next(&d->u.t2.c) > 0; ++i) {
+                ;
+        }
+        t2_cursor_fini(&d->u.t2.c);
+}
+
+static struct kv kv[] = {
+        [T2] = {
+                .mount       = &t_mount,
+                .umount      = &t_umount,
+                .worker_init = &t_worker_init,
+                .worker_fini = &t_worker_fini,
+                .lookup      = &t_lookup,
+                .insert      = &t_insert,
+                .delete      = &t_delete,
+                .next        = &t_next
+        }
+};
 
 int main(int argc, char **argv) {
         char ch;
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        while ((ch = getopt(argc, argv, "vf:r:n:N:h:c")) != -1) {
+        while ((ch = getopt(argc, argv, "vf:r:n:N:h:ck:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -760,6 +853,15 @@ int main(int argc, char **argv) {
                 case 'c':
                         counters_level++;
                         break;
+                case 'k':
+                        if (strcmp(optarg, "t2") == 0) {
+                                kvt = T2;
+                        } else if (strcmp(optarg, "rocksdb") == 0) {
+                                kvt = ROCKSDB;
+                        } else {
+                                printf("Unknown kv: %s\n", optarg);
+                                return 1;
+                        }
                 }
         }
         if (total != NULL) {
