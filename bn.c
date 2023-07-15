@@ -589,23 +589,19 @@ static void *bworker(void *arg) {
                         kv[kvt].mount(b);
                 } else {
                         int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
-                        int result;
                         if (opt->opt == BLOOKUP) {
                                 start = now();
                                 kv[kvt].lookup(rt, &data, key, ksize, val, maxval);
                                 end = now();
-                                assert(result == 0 || result == -ENOENT || result == -ENAMETOOLONG);
                         } else if (opt->opt == BINSERT) {
                                 int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val);
                                 start = now();
                                 kv[kvt].insert(rt, &data, key, ksize, val, vsize);
                                 end = now();
-                                assert(result == 0 || result == -EEXIST);
                         } else if (opt->opt == BDELETE) {
                                 start = now();
                                 kv[kvt].delete(rt, &data, key, ksize);
                                 end = now();
-                                assert(result == 0 || result == -ENOENT);
                         } else if (opt->opt == BNEXT) {
                                 start = now();
                                 kv[kvt].next(rt, &data, key, ksize, brnd(seed + 3) % opt->iter,
@@ -821,7 +817,8 @@ static void t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, e
 static void r_mount(struct benchmark *b) {
 	rocksdb_options_t *opts = rocksdb_options_create();
 	rocksdb_options_set_create_if_missing(opts, 1);
-	// rocksdb_options_set_compression(opts, rocksdb_snappy_compression);
+        rocksdb_options_set_manual_wal_flush(opts, 1);
+	rocksdb_options_set_compression(opts, rocksdb_snappy_compression);
 	char *err = NULL;
 	b->kv.u.r.db = rocksdb_open(opts, "testdb", &err);
 	if (err != NULL) {
