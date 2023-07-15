@@ -708,7 +708,7 @@ void t2_node_type_degister(struct t2_node_type *ntype)
 {
         ASSERT(IS_IN(ntype->id, ntype->mod->ntypes));
         ASSERT(ntype->mod->ntypes[ntype->id] == ntype);
-        ntype->mod->ttypes[ntype->id] = NULL;
+        ntype->mod->ntypes[ntype->id] = NULL;
         ntype->mod = NULL;
         eclear();
 }
