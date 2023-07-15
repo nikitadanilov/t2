@@ -47,7 +47,7 @@ function build() {
     LDFLAGS="-L/usr/local/lib/ -lurcu -lpthread -rdynamic -lprofiler -lm"
     run ut ${CC:-cc} $CFLAGS -DUT=1 -DBN=0 t2.c $LDFLAGS -o ut
     run object ${CC:-cc} $CFLAGS -DUT=0 -DBN=1 -c t2.c
-    run bench ${CC:-cc} $CFLAGS bn.c t2.o $LDFLAGS -o bn
+    run bench ${CC:-cc} $CFLAGS bn.c t2.o $LDFLAGS -lrocksdb -o bn
 }
 
 for cfg in "$(uname -a)" "$(uname -srm)" "$(uname -sm)" "$(uname -s)" "$(uname -m)" "default"
