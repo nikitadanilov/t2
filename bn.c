@@ -841,39 +841,32 @@ static void r_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int 
 static void r_worker_fini(struct rthread *rt, struct kvdata *d) {
 }
 
+static void r_tail(const char *label, char *err) {
+	if (err != NULL) {
+		printf("rocksdb error: %s failed with \"%s\"\n", label, err);
+                abort();
+	}
+	free(err);
+}
+
 static void r_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
         char *err = NULL;
         size_t len;
 	char *value = rocksdb_get(d->b->u.r.db, d->b->u.r.ro, key, ksize, &len, &err);
-	if (err != NULL) {
-		printf("rocksdb_get: %s\n", err);
-                abort();
-	}
-	free(err);
+        r_tail("get", err);
         free(value);
-	err = NULL;
 }
 
 static void r_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
         char *err = NULL;
 	rocksdb_put(d->b->u.r.db, d->b->u.r.wo, key, ksize, val, vsize, &err);
-	if (err != NULL) {
-		printf("rocksdb_put: %s\n", err);
-                abort();
-	}
-	free(err);
-	err = NULL;
+        r_tail("put", err);
 }
 
 static void r_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
         char *err = NULL;
         rocksdb_delete(d->b->u.r.db, d->b->u.r.wo, key, ksize, &err);
-	if (err != NULL) {
-		printf("rocksdb_put: %s\n", err);
-                abort();
-	}
-	free(err);
-	err = NULL;
+        r_tail("delete", err);
 }
 
 static void r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
