@@ -111,10 +111,10 @@ struct t2_cursor {
 };
 
 enum t2_node_type_flags {
-        T2_NTF_VARKEY   = 1ull << 0,
-        T2_NTF_VARVAL   = 1ull << 1,
-        T2_NTF_INTERNAL = 1ull << 2,
-
+        T2_NT_VARKEY   = 1ull << 0,
+        T2_NT_VARVAL   = 1ull << 1,
+        T2_NT_INTERNAL = 1ull << 2,
+        T2_NT_LEAF     = 1ull << 3
 };
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift);
