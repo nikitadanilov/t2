@@ -12,6 +12,8 @@
 #include <assert.h>
 #include <unistd.h>
 #include <sys/time.h>
+
+#include <rocksdb/c.h>
 #include "t2.h"
 
 #define COUNT(var, nr, ...)                             \
@@ -160,6 +162,9 @@ struct kvbenchmark {
                         uint64_t        free;
                 } t2;
                 struct {
+                        rocksdb_t *db;
+                        rocksdb_writeoptions_t *wo;
+                        rocksdb_readoptions_t *ro;
                 } r;
         } u;
 };
@@ -813,6 +818,71 @@ static void t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, e
         t2_cursor_fini(&d->u.t2.c);
 }
 
+static void r_mount(struct benchmark *b) {
+	rocksdb_options_t *opts = rocksdb_options_create();
+	rocksdb_options_set_create_if_missing(opts, 1);
+	// rocksdb_options_set_compression(opts, rocksdb_snappy_compression);
+	char *err = NULL;
+	b->kv.u.r.db = rocksdb_open(opts, "testdb", &err);
+	if (err != NULL) {
+		fprintf(stderr, "database open %s\n", err);
+		abort();
+	}
+	free(err);
+	err = NULL;
+	b->kv.u.r.wo = rocksdb_writeoptions_create();
+	b->kv.u.r.ro = rocksdb_readoptions_create();
+}
+
+static void r_umount(struct benchmark *b) {
+	rocksdb_close(b->kv.u.r.db);
+}
+
+static void r_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {
+}
+
+static void r_worker_fini(struct rthread *rt, struct kvdata *d) {
+}
+
+static void r_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+        char *err = NULL;
+        size_t len;
+	char *value = rocksdb_get(d->b->u.r.db, d->b->u.r.ro, key, ksize, &len, &err);
+	if (err != NULL) {
+		printf("rocksdb_get: %s\n", err);
+                abort();
+	}
+	free(err);
+        free(value);
+	err = NULL;
+}
+
+static void r_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+        char *err = NULL;
+	rocksdb_put(d->b->u.r.db, d->b->u.r.wo, key, ksize, val, vsize, &err);
+	if (err != NULL) {
+		printf("rocksdb_put: %s\n", err);
+                abort();
+	}
+	free(err);
+	err = NULL;
+}
+
+static void r_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+        char *err = NULL;
+        rocksdb_delete(d->b->u.r.db, d->b->u.r.wo, key, ksize, &err);
+	if (err != NULL) {
+		printf("rocksdb_put: %s\n", err);
+                abort();
+	}
+	free(err);
+	err = NULL;
+}
+
+static void r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
+        assert(false);
+}
+
 static struct kv kv[] = {
         [T2] = {
                 .mount       = &t_mount,
@@ -823,6 +893,16 @@ static struct kv kv[] = {
                 .insert      = &t_insert,
                 .delete      = &t_delete,
                 .next        = &t_next
+        },
+        [ROCKSDB] = {
+                .mount       = &r_mount,
+                .umount      = &r_umount,
+                .worker_init = &r_worker_init,
+                .worker_fini = &r_worker_fini,
+                .lookup      = &r_lookup,
+                .insert      = &r_insert,
+                .delete      = &r_delete,
+                .next        = &r_next
         }
 };
 
