@@ -510,9 +510,11 @@ static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var) {
 }
 
 static int ht_shift = 20;
+static int cache_shift = 16;
 static int counters_level = 0;
 static int shift_internal = 9;
 static int shift_leaf     = 9;
+static int report_interval = 10;
 
 static struct t2_node_type *bn_ntype_internal;
 static struct t2_node_type *bn_ntype_leaf;
@@ -585,8 +587,10 @@ static void *bworker(void *arg) {
                         NOFAIL(nanosleep(&sleep, NULL));
                         end = now();
                 } else if (opt->opt == BREMOUNT) {
+                        start = now();
                         kv[kvt].umount(b);
                         kv[kvt].mount(b);
+                        end = now();
                 } else {
                         int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
                         if (opt->opt == BLOOKUP) {
@@ -647,8 +651,6 @@ static void bthread_start(struct bthread *bt, int idx) {
 }
 
 static void bphase_report(struct bphase *ph, bool final);
-
-static int report_interval = 10;
 
 static void *breport_thread(void *arg) {
         struct bphase *ph = arg;
@@ -744,7 +746,7 @@ static void brun(struct benchmark *b) {
 }
 
 static void t_mount(struct benchmark *b) {
-        b->kv.u.t2.mod = t2_init(bn_storage, ht_shift);
+        b->kv.u.t2.mod = t2_init(bn_storage, ht_shift, cache_shift);
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
         bn_ntype_leaf     = t2_node_type_init(1, "simple-bn-leaf",     shift_leaf,     0);
         t2_node_type_register(b->kv.u.t2.mod, bn_ntype_internal);

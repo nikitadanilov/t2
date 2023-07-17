@@ -24,6 +24,7 @@
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
 #include <urcu/rcuhlist.h>
+#include <urcu/list.h>
 #include "t2.h"
 #include "config.h"
 
@@ -227,6 +228,8 @@ enum {
 #define CADD(cnt, d) (__t_counters.cnt += (d))
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
 #define DMOD(cnt, d) ({ struct double_var *v = &(__d_counters.cnt); v->sum += (d); v->nr++; })
+#define KINC(cnt) ({ ci.cnt++; ci.sum++; })
+#define KDEC(cnt) ({ ci.cnt--; ci.sum++; })
 
 #define SCALL(mod, method, ...)                         \
 ({                                                      \
@@ -244,15 +247,9 @@ enum {
 
 struct node;
 
-enum bucket_flags {
-        DIRTY    = 1ull << 0,
-        ACCESSED = 1ull << 1
-};
-
 struct bucket {
         alignas(MAX_CACHELINE) struct cds_hlist_head chain;
         pthread_mutex_t                              lock;
-        uint64_t                                     flags;
 };
 
 struct ht {
@@ -260,15 +257,29 @@ struct ht {
         struct bucket *buckets;
 };
 
+struct cache {
+        alignas(MAX_CACHELINE) pthread_mutex_t lock;
+        uint64_t                               bolt;
+        int32_t                                nr;
+        int32_t                                busy;
+        int32_t                                dirty;
+        int32_t                                incache;
+        alignas(MAX_CACHELINE) pthread_mutex_t guard;
+        struct cds_list_head                   cached;
+        alignas(MAX_CACHELINE) pthread_mutex_t condlock;
+        pthread_cond_t                         need;
+        pthread_cond_t                         got;
+        int                                    shift;
+        pthread_t                              md;
+};
+
 struct t2 {
         alignas(MAX_CACHELINE) struct ht         ht;
-        alignas(MAX_CACHELINE) _Atomic(uint64_t) bolt;
-        alignas(MAX_CACHELINE) int32_t           writescan;
-        alignas(MAX_CACHELINE) int32_t           cleanscan;
-        alignas(MAX_CACHELINE) int32_t           tscan;
+        alignas(MAX_CACHELINE) struct cache      cache;
         const struct t2_tree_type               *ttypes[MAX_TREE_TYPE];
         const struct t2_node_type               *ntypes[MAX_NODE_TYPE];
         struct t2_storage                       *stor;
+        bool                                     shutdown;
 };
 
 SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
@@ -304,7 +315,7 @@ struct ewma {
 enum node_flags {
         HEARD_BANSHEE = 1ull << 0,
         NOCACHE       = 1ull << 1,
-        MODIFIED      = 1ull << 2
+        DIRTY         = 1ull << 2
 };
 
 struct node {
@@ -312,6 +323,7 @@ struct node {
         taddr_t                    addr;
         uint64_t                   seq;
         atomic_int                 ref;
+        struct cds_list_head       cache;
         const struct t2_node_type *ntype;
         uint64_t                   flags;
         void                      *data;
@@ -444,23 +456,10 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t traverse;
         int64_t traverse_start;
         int64_t traverse_iter;
-        int64_t wscan_scanned;
-        int64_t wscan_clean;
-        int64_t wscan_dirty;
-        int64_t wscan_node;
-        int64_t wscan_busy;
-        int64_t wscan_written;
-        int64_t cscan_scanned;
-        int64_t cscan_accessed;
-        int64_t cscan_not_accessed;
-        int64_t cscan_node;
-        int64_t cscan_busy;
-        int64_t cscan_dropped;
         int64_t read;
         int64_t read_bytes;
         int64_t write;
         int64_t write_bytes;
-        int64_t tscan_bucket;
         struct level_counters {
                 int64_t insert_balance;
                 int64_t delete_balance;
@@ -512,7 +511,12 @@ struct node_ref {
 };
 
 struct cacheinfo {
+        int     sum;
         int32_t touched;
+        int32_t added;
+        int32_t busy;
+        int32_t dirty;
+        int32_t cached;
 };
 
 /* @static */
@@ -548,7 +552,7 @@ static void edescr(const struct msg_ctx *ctx, int err, uint64_t a0, uint64_t a1)
 static void eclear();
 static void eprint();
 static void put(struct node *n);
-static void put_locked(struct node *n, struct bucket *bucket);
+static void put_locked(struct node *n);
 static void ref(struct node *n);
 static void touch(struct node *n);
 static uint64_t temperature(struct node *n);
@@ -606,9 +610,9 @@ static void cookie_complete(struct path *p, struct node *n);
 static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
-static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite);
-static void clean(struct t2 *mod, int32_t toscan, int32_t toclean);
-static void maxwelld(struct t2 *mod, int32_t toscan, int32_t tofree);
+static void maxwelld(struct t2 *mod);
+static void cache_sync(struct t2 *mod);
+static void throttle(struct t2 *mod);
 static void kmod(struct ewma *a, uint32_t t);
 static uint64_t kavg(struct ewma *a, uint32_t t);
 static void ref_add(struct node *n);
@@ -628,46 +632,64 @@ static struct counters __g_counters = {};
 static struct double_counters __G_counters = {};
 static pthread_mutex_t __g_counters_lock = PTHREAD_MUTEX_INITIALIZER;
 
-struct t2 *t2_init(struct t2_storage *storage, int hshift) {
+struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift) {
         int result;
         struct t2 *mod = mem_alloc(sizeof *mod);
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
         t2_thread_register();
         eclear();
-        if (mod != NULL) {
-                result = signal_init();
-                if (LIKELY(result == 0)) {
+        result = signal_init();
+        if (LIKELY(result == 0)) {
+                if (LIKELY(mod != NULL)) {
+                        mod->cache.shift = cshift;
+                        NOFAIL(pthread_mutex_init(&mod->cache.lock, NULL));
+                        NOFAIL(pthread_mutex_init(&mod->cache.guard, NULL));
+                        NOFAIL(pthread_mutex_init(&mod->cache.condlock, NULL));
+                        NOFAIL(pthread_cond_init(&mod->cache.need, NULL));
+                        NOFAIL(pthread_cond_init(&mod->cache.got, NULL));
+                        CDS_INIT_LIST_HEAD(&mod->cache.cached);
                         mod->stor = storage;
                         result = SCALL(mod, init);
                         if (LIKELY(result == 0)) {
                                 result = ht_init(&mod->ht, hshift);
-                                if (UNLIKELY(result != 0)) {
+                                if (LIKELY(result == 0)) {
+                                        result = pthread_create(&mod->cache.md, NULL, (void *(*)(void *))&maxwelld, mod);
+                                        if (result != 0) {
+                                                ht_fini(&mod->ht);
+                                        }
+                                }
+                                if (result != 0) {
                                         SCALL(mod, fini);
                                 }
                         }
-                        if (result != 0) {
-                                signal_fini();
-                        }
+                } else {
+                        result = ERROR(-ENOMEM);
                 }
-        } else {
-                result = ERROR(-ENOMEM);
+                if (result != 0) {
+                        signal_fini();
+                }
         }
-        if (result != 0) {
-                mem_free(mod);
-                t2_thread_degister();
-                return EPTR(result);
-        } else {
-                return mod;
-        }
+        return result != 0 ? EPTR(result) : mod;
 }
 
 void t2_fini(struct t2 *mod) {
         eclear();
         urcu_memb_barrier();
-        writeout(mod, 0x7fffffff, 0x7fffffff);
+        SET0(&ci);
+        mod->shutdown = true;
+        mutex_lock(&mod->cache.condlock);
+        NOFAIL(pthread_cond_signal(&mod->cache.need));
+        mutex_unlock(&mod->cache.condlock);
+        pthread_join(mod->cache.md, NULL);
+        NOFAIL(pthread_cond_destroy(&mod->cache.got));
+        NOFAIL(pthread_cond_destroy(&mod->cache.need));
+        NOFAIL(pthread_mutex_destroy(&mod->cache.condlock));
+        NOFAIL(pthread_mutex_destroy(&mod->cache.guard));
+        NOFAIL(pthread_mutex_destroy(&mod->cache.lock));
         SCALL(mod, fini);
         ht_clean(&mod->ht);
         ht_fini(&mod->ht);
+        ASSERT(cds_list_empty(&mod->cache.cached));
         mod->stor->op->fini(mod->stor);
         signal_fini();
         mem_free(mod);
@@ -980,6 +1002,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
         CINC(alloc);
         if (LIKELY(n != NULL && data != NULL)) {
                 NOFAIL(pthread_rwlock_init(&n->lock, NULL));
+                CDS_INIT_LIST_HEAD(&n->cache);
                 n->addr = addr;
                 n->mod = mod;
                 n->data = data;
@@ -987,6 +1010,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
                 cookie_make(&n->cookie);
                 CINC(node);
                 ref_add(n);
+                KINC(busy);
                 return n;
         } else {
                 result = ERROR(-ENOMEM);
@@ -998,6 +1022,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
 
 static void nfini(struct node *n) {
         ASSERT(n->ref == 0);
+        ASSERT(cds_list_empty(&n->cache));
         cookie_invalidate(&n->cookie);
         NOFAIL(pthread_rwlock_destroy(&n->lock));
         mem_free(n->data);
@@ -1006,8 +1031,9 @@ static void nfini(struct node *n) {
 }
 
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
-        maxwelld(mod, 10, 1);
-        struct node *n = nalloc(mod, addr);
+        struct node *n;
+        throttle(mod);
+        n = nalloc(mod, addr);
         if (EISOK(n)) {
                 struct node     *other;
                 pthread_mutex_t *bucket = &ht_bucket(&mod->ht, addr)->lock;
@@ -1015,9 +1041,11 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 other = ht_lookup(&mod->ht, addr);
                 if (LIKELY(other == NULL)) {
                         ht_insert(&mod->ht, n);
+                        KINC(added);
                 } else {
                         n->ref = 0;
                         CDEC(node);
+                        KDEC(busy);
                         ref_del(n);
                         nfini(n);
                         n = other;
@@ -1030,16 +1058,25 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
 }
 
 static void ref(struct node *n) {
-        n->ref++;
+        if (n->ref++ == 0) {
+                mutex_lock(&n->mod->cache.guard);
+                cds_list_del_init(&n->cache);
+                mutex_unlock(&n->mod->cache.guard);
+                KDEC(cached);
+        }
         CINC(node);
         ref_add(n);
+        KINC(busy);
 }
 
 static void ndelete(struct node *n) {
         struct bucket *bucket = ht_bucket(&n->mod->ht, n->addr);
+        ASSERT(n->flags & DIRTY);
+        KDEC(dirty);
         mutex_lock(&bucket->lock);
         n->flags |= NOCACHE | HEARD_BANSHEE;
-        put_locked(n, bucket);
+        n->flags &= ~DIRTY;
+        put_locked(n);
         mutex_unlock(&bucket->lock);
 }
 
@@ -1090,7 +1127,8 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
                                 .treeid = t->id
                         };
                         n->ntype = ntype;
-                        n->flags |= MODIFIED;
+                        n->flags |= DIRTY;
+                        KINC(dirty);
                         simple_make(n);
                 }
         } else {
@@ -1110,29 +1148,32 @@ static void put_final(struct node *n) {
         n->flags |= HEARD_BANSHEE;
         ht_delete(n);
         call_rcu_memb(&n->rcu, &free_callback);
+        KDEC(added);
 }
 
-static void put_locked(struct node *n, struct bucket *b) {
+static void put_locked(struct node *n) {
         ASSERT(n->ref > 0);
         EXPENSIVE_ASSERT(n->data != NULL ? is_sorted(n) : true);
+        ref_del(n);
+        KDEC(busy);
         if (--n->ref == 0) {
-                /* TODO: lru. */
                 if (n->flags & NOCACHE) {
                         put_final(n);
-                } else if (n->flags & MODIFIED) {
-                        b->flags |= ACCESSED | DIRTY;
                 } else {
-                        b->flags |= ACCESSED;
+                        struct cache *c = &n->mod->cache;
+                        mutex_lock(&c->guard);
+                        cds_list_add(&n->cache, &c->cached);
+                        mutex_unlock(&c->guard);
+                        KINC(cached);
                 }
         }
         CDEC(node);
-        ref_del(n);
 }
 
 static void put(struct node *n) {
         struct bucket *bucket = ht_bucket(&n->mod->ht, n->addr);
         mutex_lock(&bucket->lock);
-        put_locked(n, bucket);
+        put_locked(n);
         mutex_unlock(&bucket->lock);
 }
 
@@ -1437,7 +1478,10 @@ static void dirty(struct node *n, enum lock_mode lm) {
         if (n != NULL && lm == WRITE) {
                 ASSERT(is_stable(n));
                 node_seq_increase(n);
-                n->flags |= MODIFIED;
+                if (!(n->flags & DIRTY)) {
+                        n->flags |= DIRTY;
+                        KINC(dirty);
+                }
         }
 }
 
@@ -1856,15 +1900,30 @@ static bool rcu_enter(struct path *p, struct node *extra) {
         return result;
 }
 
+enum { CACHE_SYNC_THRESHOLD = 32 };
+
+static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
+        if (ci.sum > CACHE_SYNC_THRESHOLD) {
+                mutex_lock(&mod->cache.lock);
+                mod->cache.bolt    += ci.touched;
+                mod->cache.busy    += ci.busy;
+                mod->cache.nr      += ci.added;
+                mod->cache.dirty   += ci.dirty;
+                mod->cache.incache += ci.cached;
+                mutex_unlock(&mod->cache.lock);
+                SET0(&ci);
+        }
+}
+
 enum { BOLT_EPOCH_SHIFT = 16 };
 
 static uint64_t bolt(const struct node *n) {
-        return (n->mod->bolt + ci.touched) >> BOLT_EPOCH_SHIFT;
+        return (n->mod->cache.bolt + ci.touched) >> BOLT_EPOCH_SHIFT;
 }
 
 static void touch(struct node *n) {
         kmod(&nheader(n)->kelvin, bolt(n));
-        ci.touched++;
+        KINC(touched);
 }
 
 enum {
@@ -2014,8 +2073,7 @@ static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt)
         if (result == -ESTALE) {
                 result = traverse(&p);
         }
-        t->ttype->mod->bolt += ci.touched;
-        ci.touched = 0;
+        cache_sync(t->ttype->mod);
         path_fini(&p);
         counters_check();
         return result;
@@ -2199,14 +2257,50 @@ static void cookie_make(uint64_t *addr) {
 
 /* @cache */
 
+enum { FREE_BATCH = 16 };
+
+static void throttle(struct t2 *mod) {
+        struct cache *c = &mod->cache;
+        if (c->nr + ci.added >= (1 << c->shift)) {
+                if (UNLIKELY(cds_list_empty(&c->cached))) {
+                        mutex_lock(&c->condlock);
+                        pthread_cond_signal(&c->need);
+                        while (cds_list_empty(&c->cached)) {
+                                pthread_cond_wait(&c->got, &c->condlock);
+                        }
+                        mutex_unlock(&c->condlock);
+                }
+                if (c->nr + ci.added >= (1 << c->shift)) {
+                        mutex_lock(&c->guard);
+                        for (int i = 0; i < FREE_BATCH && LIKELY(!cds_list_empty(&c->cached)); ++i) {
+                                struct node   *tail   = COF(c->cached.prev, struct node, cache);
+                                struct bucket *bucket = ht_bucket(&mod->ht, tail->addr);
+                                int            try    = pthread_mutex_trylock(&bucket->lock);
+                                if (LIKELY(try == 0)) {
+                                        ASSERT(tail->ref == 0);
+                                        cds_list_del(&tail->cache);
+                                        put_final(tail);
+                                        mutex_unlock(&bucket->lock);
+                                        KDEC(cached);
+                                } else {
+                                        ASSERT(try == -EBUSY);
+                                        break;
+                                }
+                        }
+                        mutex_unlock(&c->guard);
+                }
+        }
+}
+
 static void pageout(struct node *n) {
         lock(n, READ);
-        if (LIKELY(n->flags & MODIFIED)) {
+        if (LIKELY(n->flags & DIRTY)) {
                 int result = SCALL(n->mod, write, n->addr, n->data);
                 if (LIKELY(result == 0)) {
                         CINC(write);
                         CADD(write_bytes, taddr_ssize(n->addr));
-                        n->flags &= ~MODIFIED;
+                        n->flags &= ~DIRTY;
+                        KDEC(dirty);
                 } else {
                         LOG("Pageout failure: %"PRIx64": %i/%i.\n", n->addr, result, errno);
                 }
@@ -2214,178 +2308,93 @@ static void pageout(struct node *n) {
         unlock(n, READ);
 }
 
-static void writeout(struct t2 *mod, int32_t toscan, int32_t towrite) {
-        int32_t scan0   = mod->writescan;
-        int32_t scan    = scan0;
-        int32_t scanned = 0;
-        int32_t written = 0;
-        int32_t mask    = (1 << mod->ht.shift) - 1;
-        ASSERT(mod->ht.shift < 32);
-        ASSERT((scan0 & mask) == scan0);
-        while (true) {
-                struct bucket *bucket;
-                bool           clean;
-                while (!(mod->ht.buckets[scan].flags & DIRTY)) {
-                        CINC(wscan_clean);
-                        CINC(wscan_scanned);
-                        if (++scanned >= toscan) {
-                                mod->writescan = scan;
-                                return;
-                        }
-                        scan = (scan + 1) & mask;
-                        if (scan == scan0) {
-                                return;
-                        }
-                }
-                CINC(wscan_dirty);
-                bucket = &mod->ht.buckets[scan];
-                mutex_lock(&bucket->lock);
-                do {
-                        struct cds_hlist_head *head = &bucket->chain;
-                        struct node           *n;
-                        struct node           *next;
-                        clean = true;
-                        cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
-                                CINC(wscan_node);
-                                if (n->ref > 0) {
-                                        CINC(wscan_busy);
-                                        continue;
-                                }
-                                if (n->flags & MODIFIED) {
-                                        CINC(wscan_written);
-                                        ref(n);
-                                        mutex_unlock(&bucket->lock);
-                                        pageout(n); /* TODO: check for io errors. */
-                                        clean = false;
-                                        written++;
-                                        mutex_lock(&bucket->lock);
-                                        put_locked(n, bucket);
-                                        break;
-                                }
-                        }
-                } while (!clean);
-                bucket->flags &= ~DIRTY;
-                mutex_unlock(&bucket->lock);
-                CINC(wscan_scanned);
-                ++scanned;
-                scan = (scan + 1) & mask;
-                if (written >= towrite) {
-                        mod->writescan = scan;
-                        return;
-                }
-        }
-}
-
 static void nodescan(struct node *n) {
         uint8_t lev = level(n);
         CMOD(l[lev].nr,          nr(n));
         CMOD(l[lev].free,        simple_free(n));
-        CMOD(l[lev].modified,    !!(n->flags & MODIFIED));
+        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT)));
-}
-
-static void clean(struct t2 *mod, int32_t toscan, int32_t toclean) {
-        int32_t scan0   = mod->cleanscan;
-        int32_t scan    = scan0;
-        int32_t scanned = 0;
-        int32_t cleaned = 0;
-        int32_t mask    = (1 << mod->ht.shift) - 1;
-        ASSERT(mod->ht.shift < 32);
-        ASSERT((scan0 & mask) == scan0);
-        while (true) {
-                struct bucket         *bucket = &mod->ht.buckets[scan];
-                struct cds_hlist_head *head;
-                struct node           *n;
-                struct node           *next;
-                if (bucket->flags & ACCESSED) {
-                        CINC(cscan_accessed);
-                        bucket->flags &= ~ACCESSED;
-                } else {
-                        CINC(cscan_not_accessed);
-                        mutex_lock(&bucket->lock);
-                        head = &bucket->chain;
-                        cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
-                                CINC(cscan_node);
-                                nodescan(n);
-                                if (n->ref == 0) {
-                                        if (!(n->flags & MODIFIED)) {
-                                                CINC(cscan_dropped);
-                                                put_final(n);
-                                                cleaned++;
-                                        }
-                                } else {
-                                        CINC(cscan_busy);
-                                }
-                        }
-                        mutex_unlock(&bucket->lock);
-                }
-                CINC(cscan_scanned);
-                if (++scanned >= toscan || cleaned >= toclean) {
-                        mod->writescan = scan;
-                        return;
-                }
-                scan = (scan + 1) & mask;
-                if (scan == scan0) {
-                        return;
-                }
-        }
 }
 
 static bool is_hot(struct node *n) {
         return kavg(&nheader(n)->kelvin, bolt(n)) >> ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT)) != 0;
 }
 
-static void maxwelld(struct t2 *mod, int32_t toscan, int32_t tofree) {
-        int32_t scan0 = mod->tscan;
-        int32_t scan  = scan0;
-        int32_t mask  = (1 << mod->ht.shift) - 1;
-        ASSERT(mod->ht.shift < 32);
-        ASSERT((scan0 & mask) == scan0);
+static int good(struct node *n) {
+        uint8_t lev = level(n);
+        nodescan(n);
+        CINC(l[lev].tscan_node);
+        if (n->ref > 0) {
+                CINC(l[lev].tscan_busy);
+                return 0;
+        } else if (is_hot(n)) {
+                CINC(l[lev].tscan_hot);
+                return 0;
+        } else if (n->flags & DIRTY) {
+                CINC(l[lev].tscan_pageout);
+                return -1;
+        } else {
+                CINC(l[lev].tscan_freed);
+                return 1;
+        }
+}
+
+static void mscan(struct t2 *mod, int32_t toscan, int32_t tofree) {
+        struct cache *c = &mod->cache;
         while (toscan > 0 && tofree > 0) {
-                struct bucket *bucket = &mod->ht.buckets[scan];
-                bool           done;
-                CINC(tscan_bucket);
-                /* TODO: Try rcu-protected scan first. */
-                mutex_lock(&bucket->lock);
-                do {
-                        struct cds_hlist_head *head = &bucket->chain;
-                        struct node           *n;
-                        struct node           *next;
-                        done = true;
-                        cds_hlist_for_each_entry_safe_2(n, next, head, hash) {
-                                uint8_t lev = level(n);
-                                CINC(l[lev].tscan_node);
-                                nodescan(n);
-                                toscan--;
-                                if (n->ref > 0) {
-                                        CINC(l[lev].tscan_busy);
-                                        continue;
-                                } else if (is_hot(n)) {
-                                        CINC(l[lev].tscan_hot);
-                                        continue;
-                                } else if (n->flags & MODIFIED) {
-                                        CINC(l[lev].tscan_pageout);
-                                        ref(n);
+                struct node *tail;
+                mutex_lock(&c->guard);
+                if (LIKELY(!cds_list_empty(&c->cached))) {
+                        int virtue;
+                        tail = COF(c->cached.prev, struct node, cache);
+                        virtue = good(tail);
+                        if (virtue != 0) {
+                                struct bucket *bucket = ht_bucket(&mod->ht, tail->addr);
+                                int            try    = pthread_mutex_trylock(&bucket->lock);
+                                ASSERT(try == -EBUSY || try == 0);
+                                if (LIKELY(try == 0)) {
+                                        if (virtue == -1) {
+                                                ref(tail);
+                                                mutex_unlock(&bucket->lock);
+                                                pageout(tail);
+                                                mutex_lock(&bucket->lock);
+                                                put_locked(tail);
+                                        }
+                                        ASSERT(tail->ref == 0);
+                                        cds_list_del(&tail->cache);
+                                        put_final(tail);
                                         mutex_unlock(&bucket->lock);
-                                        pageout(n);
-                                        done = false;
-                                        mutex_lock(&bucket->lock);
-                                        put_locked(n, bucket);
-                                        break;
-                                } else {
-                                        CINC(l[lev].tscan_freed);
-                                        put_final(n);
+                                        KDEC(cached);
                                         tofree--;
                                 }
                         }
-                } while (!done);
-                mutex_unlock(&bucket->lock);
-                scan = (scan + 1) & mask;
-                if (scan == scan0) {
-                        break;
+                        cds_list_move(&tail->cache, &c->cached);
+                        toscan--;
+                } else {
+                        toscan = 0;
                 }
+                mutex_unlock(&c->guard);
         }
-        mod->tscan = scan;
+}
+
+enum { MAXWELL_SLEEP = 1 };
+
+static void maxwelld(struct t2 *mod) {
+        struct cache *c = &mod->cache;
+        while (!mod->shutdown) {
+                struct timeval  cur;
+                struct timespec deadline;
+                gettimeofday(&cur, NULL);
+                deadline.tv_sec  = cur.tv_sec + MAXWELL_SLEEP;
+                deadline.tv_nsec = 0;
+                mutex_lock(&c->condlock);
+                pthread_cond_timedwait(&c->need, &c->condlock, &deadline);
+                mutex_unlock(&c->condlock);
+                mscan(mod, FREE_BATCH * 10, FREE_BATCH * 2);
+                mutex_lock(&c->condlock);
+                pthread_cond_broadcast(&c->got);
+                mutex_unlock(&c->condlock);
+        }
 }
 
 /* @lib */
@@ -2545,19 +2554,6 @@ static void counters_print() {
         printf("traverse:           %10"PRId64"\n", GVAL(traverse));
         printf("traverse.start:     %10"PRId64"\n", GVAL(traverse_start));
         printf("traverse.iter:      %10"PRId64"\n", GVAL(traverse_iter));
-        printf("wscan.scanned:      %10"PRId64"\n", GVAL(wscan_scanned));
-        printf("wscan.clean:        %10"PRId64"\n", GVAL(wscan_clean));
-        printf("wscan.dirty:        %10"PRId64"\n", GVAL(wscan_dirty));
-        printf("wscan.node:         %10"PRId64"\n", GVAL(wscan_node));
-        printf("wscan.busy:         %10"PRId64"\n", GVAL(wscan_busy));
-        printf("wscan.written:      %10"PRId64"\n", GVAL(wscan_written));
-        printf("cscan.scanned:      %10"PRId64"\n", GVAL(cscan_scanned));
-        printf("cscan.accessed:     %10"PRId64"\n", GVAL(cscan_accessed));
-        printf("cscan.not_accessed: %10"PRId64"\n", GVAL(cscan_not_accessed));
-        printf("cscan.node:         %10"PRId64"\n", GVAL(cscan_node));
-        printf("cscan.busy:         %10"PRId64"\n", GVAL(cscan_busy));
-        printf("cscan.dropped:      %10"PRId64"\n", GVAL(cscan_dropped));
-        printf("tscan.bucket:       %10"PRId64"\n", GVAL(tscan_bucket));
         printf("read:               %10"PRId64"\n", GVAL(read));
         printf("read.bytes:         %10"PRId64"\n", GVAL(read_bytes));
         printf("write:              %10"PRId64"\n", GVAL(write));
@@ -3785,7 +3781,7 @@ static void traverse_ut() {
         int result;
         usuite("traverse");
         utest("t2_init");
-        struct t2 *mod = t2_init(ut_storage, 10);
+        struct t2 *mod = t2_init(ut_storage, 10, 16);
         t2_node_type_register(mod, &ntype);
         ttype.mod = mod;
         buf_init_str(&key, key0);
@@ -3839,7 +3835,7 @@ static void insert_ut() {
         struct t2_tree t = {
                 .ttype = &ttype
         };
-        struct t2 *mod = t2_init(ut_storage, 10);
+        struct t2 *mod = t2_init(ut_storage, 10, 16);
         struct t2_rec r = {
                 .key = &key,
                 .val = &val
@@ -3882,7 +3878,7 @@ static void tree_ut() {
         uint64_t k64;
         uint64_t v64;
         int result;
-        mod = t2_init(ut_storage, 10);
+        mod = t2_init(ut_storage, 10, 16);
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
@@ -3952,7 +3948,7 @@ static void stress_ut() {
         int     result;
         usuite("stress");
         utest("init");
-        mod = t2_init(ut_storage, 10);
+        mod = t2_init(ut_storage, 10, 16);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -3975,7 +3971,7 @@ static void stress_ut() {
                 for (int j = 0; j < 10; ++j) {
                         long probe = rand();
                         *(long *)key = probe;
-                        keyb.seg[0] = (struct t2_seg){ .len = ksize,      .addr = &key };
+                        keyb.seg[0] = (struct t2_seg){ .len = ksize, .addr = &key };
                         valb = BUF_VAL(val);
                         result = t2_lookup(t, &r);
                         ASSERT((result ==       0) == (probe <= i) &&
@@ -3987,10 +3983,6 @@ static void stress_ut() {
                                100.0 * exist / (U/10));
                         put(r);
                         exist = 0;
-                }
-                if (i % 1000 == 0) {
-                        writeout(t->ttype->mod, 1000, 10);
-                        clean(t->ttype->mod, 1000, 1000);
                 }
         }
         for (long j = 0; j < U; ++j) {
@@ -4023,11 +4015,7 @@ static void stress_ut() {
                         put(r);
                         exist = 0;
                 }
-                if (i % 1000 == 0) {
-                        writeout(t->ttype->mod, 1000, 10);
-                        clean(t->ttype->mod, 1000, 1000);
-                }
-       }
+        }
         utest("fini");
         t2_node_type_degister(&ntype);
         t2_fini(mod);
@@ -4053,7 +4041,7 @@ static void delete_ut() {
         int     result;
         usuite("delete");
         utest("init");
-        mod = t2_init(ut_storage, 10);
+        mod = t2_init(ut_storage, 10, 16);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4167,7 +4155,7 @@ static void next_ut() {
         };
         usuite("next");
         utest("init");
-        mod = t2_init(ut_storage, 10);
+        mod = t2_init(ut_storage, 10, 16);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4302,7 +4290,7 @@ void seq_ut() {
         struct t2_tree *t;
         usuite("seq");
         utest("init");
-        mod = t2_init(ut_storage, 10);
+        mod = t2_init(ut_storage, 10, 16);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4372,10 +4360,6 @@ void *lookup_worker(void *arg) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 int result = t2_lookup_ptr(t, kbuf, ksize, vbuf, sizeof vbuf);
                 ASSERT(result == 0 || result == -ENOENT);
-                if (i % 1000 == 0) {
-                        writeout(t->ttype->mod, 1000, 10);
-                        clean(t->ttype->mod, 1000, 1000);
-                }
         }
         t2_thread_degister();
         return NULL;
@@ -4393,10 +4377,6 @@ void *insert_worker(void *arg) {
                 random_buf(vbuf, sizeof vbuf, &vsize);
                 int result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize);
                 ASSERT(result == 0 || result == -EEXIST);
-                if (i % 1000 == 0) {
-                        writeout(t->ttype->mod, 1000, 10);
-                        clean(t->ttype->mod, 1000, 1000);
-                }
         }
         t2_thread_degister();
         return NULL;
@@ -4411,10 +4391,6 @@ void *delete_worker(void *arg) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 int result = t2_delete_ptr(t, kbuf, ksize);
                 ASSERT(result == 0 || result == -ENOENT);
-                if (i % 1000 == 0) {
-                        writeout(t->ttype->mod, 1000, 10);
-                        clean(t->ttype->mod, 1000, 1000);
-                }
         }
         t2_thread_degister();
         return NULL;
@@ -4442,10 +4418,6 @@ void *next_worker(void *arg) {
                         ;
                 }
                 t2_cursor_fini(&c);
-                if (i % 1000 == 0) {
-                        writeout(t->ttype->mod, 1000, 10);
-                        clean(t->ttype->mod, 1000, 1000);
-                }
         }
         t2_thread_degister();
         return NULL;
@@ -4462,7 +4434,7 @@ void mt_ut() {
         int     result;
         usuite("mt");
         utest("init");
-        mod = t2_init(ut_storage, 10);
+        mod = t2_init(ut_storage, 10, 16);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4535,7 +4507,7 @@ static void open_ut() {
         uint64_t free;
         usuite("open");
         utest("populate");
-        mod = t2_init(ut_storage, 10);
+        mod = t2_init(ut_storage, 10, 16);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4555,7 +4527,7 @@ static void open_ut() {
         t2_node_type_degister(&ntype);
         t2_fini(mod);
         utest("open");
-        mod = t2_init(ut_storage, 10);
+        mod = t2_init(ut_storage, 10, 16);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);

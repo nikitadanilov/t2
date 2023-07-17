@@ -117,7 +117,7 @@ enum t2_node_type_flags {
         T2_NT_LEAF     = 1ull << 3
 };
 
-struct t2 *t2_init(struct t2_storage *storage, int hshift);
+struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift);
 void       t2_fini(struct t2 *mod);
 
 void t2_thread_register(void);
