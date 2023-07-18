@@ -265,10 +265,11 @@ struct cache {
         int32_t                                dirty;
         int32_t                                incache;
         alignas(MAX_CACHELINE) pthread_mutex_t guard;
-        struct cds_list_head                   cached;
+        struct cds_list_head                   cold;
         alignas(MAX_CACHELINE) pthread_mutex_t condlock;
         pthread_cond_t                         need;
         pthread_cond_t                         got;
+        int32_t                                scan;
         int                                    shift;
         pthread_t                              md;
 };
@@ -460,6 +461,9 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t read_bytes;
         int64_t write;
         int64_t write_bytes;
+        int64_t scan;
+        int64_t scan_bucket;
+        int64_t throttle_trylock;
         struct level_counters {
                 int64_t insert_balance;
                 int64_t delete_balance;
@@ -477,11 +481,13 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t shift;
                 int64_t shift_one;
                 int64_t merge;
-                int64_t tscan_node;
-                int64_t tscan_busy;
-                int64_t tscan_hot;
-                int64_t tscan_pageout;
-                int64_t tscan_freed;
+                int64_t scan_node;
+                int64_t scan_cached;
+                int64_t scan_busy;
+                int64_t scan_hot;
+                int64_t scan_pageout;
+                int64_t scan_cold;
+                int64_t scan_heated;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
@@ -610,7 +616,8 @@ static void cookie_complete(struct path *p, struct node *n);
 static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
-static void maxwelld(struct t2 *mod);
+static void cache_clean(struct t2 *mod);
+static void *maxwelld(struct t2 *mod);
 static void cache_sync(struct t2 *mod);
 static void throttle(struct t2 *mod);
 static void kmod(struct ewma *a, uint32_t t);
@@ -647,7 +654,7 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift) {
                         NOFAIL(pthread_mutex_init(&mod->cache.condlock, NULL));
                         NOFAIL(pthread_cond_init(&mod->cache.need, NULL));
                         NOFAIL(pthread_cond_init(&mod->cache.got, NULL));
-                        CDS_INIT_LIST_HEAD(&mod->cache.cached);
+                        CDS_INIT_LIST_HEAD(&mod->cache.cold);
                         mod->stor = storage;
                         result = SCALL(mod, init);
                         if (LIKELY(result == 0)) {
@@ -681,17 +688,18 @@ void t2_fini(struct t2 *mod) {
         NOFAIL(pthread_cond_signal(&mod->cache.need));
         mutex_unlock(&mod->cache.condlock);
         pthread_join(mod->cache.md, NULL);
+        SCALL(mod, fini);
+        cache_clean(mod);
+        ht_clean(&mod->ht);
+        ht_fini(&mod->ht);
+        ASSERT(cds_list_empty(&mod->cache.cold));
+        mod->stor->op->fini(mod->stor);
+        signal_fini();
         NOFAIL(pthread_cond_destroy(&mod->cache.got));
         NOFAIL(pthread_cond_destroy(&mod->cache.need));
         NOFAIL(pthread_mutex_destroy(&mod->cache.condlock));
         NOFAIL(pthread_mutex_destroy(&mod->cache.guard));
         NOFAIL(pthread_mutex_destroy(&mod->cache.lock));
-        SCALL(mod, fini);
-        ht_clean(&mod->ht);
-        ht_fini(&mod->ht);
-        ASSERT(cds_list_empty(&mod->cache.cached));
-        mod->stor->op->fini(mod->stor);
-        signal_fini();
         mem_free(mod);
         t2_thread_degister();
 }
@@ -800,7 +808,7 @@ static int taddr_ssize(taddr_t addr) {
 static taddr_t taddr_make(uint64_t addr, int shift) {
         ASSERT((addr & TADDR_ADDR_MASK) == addr);
         shift -= TADDR_MIN_SHIFT;
-        ASSERT((shift & TADDR_SIZE_MASK) == shift);
+        ASSERT((shift & TADDR_SIZE_MASK) == (uint64_t)shift);
         return addr | shift;
 }
 
@@ -1058,12 +1066,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
 }
 
 static void ref(struct node *n) {
-        if (n->ref++ == 0) {
-                mutex_lock(&n->mod->cache.guard);
-                cds_list_del_init(&n->cache);
-                mutex_unlock(&n->mod->cache.guard);
-                KDEC(cached);
-        }
+        n->ref++;
         CINC(node);
         ref_add(n);
         KINC(busy);
@@ -1071,11 +1074,12 @@ static void ref(struct node *n) {
 
 static void ndelete(struct node *n) {
         struct bucket *bucket = ht_bucket(&n->mod->ht, n->addr);
-        ASSERT(n->flags & DIRTY);
-        KDEC(dirty);
         mutex_lock(&bucket->lock);
         n->flags |= NOCACHE | HEARD_BANSHEE;
-        n->flags &= ~DIRTY;
+        if (LIKELY(n->flags & DIRTY)) {
+                n->flags &= ~DIRTY;
+                KDEC(dirty);
+        }
         put_locked(n);
         mutex_unlock(&bucket->lock);
 }
@@ -1147,6 +1151,10 @@ static void free_callback(struct rcu_head *head) {
 static void put_final(struct node *n) {
         n->flags |= HEARD_BANSHEE;
         ht_delete(n);
+        if (!cds_list_empty(&n->cache)) {
+                cds_list_del_init(&n->cache);
+                KDEC(cached);
+        }
         call_rcu_memb(&n->rcu, &free_callback);
         KDEC(added);
 }
@@ -1159,12 +1167,6 @@ static void put_locked(struct node *n) {
         if (--n->ref == 0) {
                 if (n->flags & NOCACHE) {
                         put_final(n);
-                } else {
-                        struct cache *c = &n->mod->cache;
-                        mutex_lock(&c->guard);
-                        cds_list_add(&n->cache, &c->cached);
-                        mutex_unlock(&c->guard);
-                        KINC(cached);
                 }
         }
         CDEC(node);
@@ -2259,36 +2261,91 @@ static void cookie_make(uint64_t *addr) {
 
 enum { FREE_BATCH = 16 };
 
+static void cache_clean(struct t2 *mod) {
+        struct node *tail;
+        mutex_lock(&mod->cache.guard);
+        while (!cds_list_empty(&mod->cache.cold)) {
+                tail = COF(mod->cache.cold.prev, struct node, cache);
+                cds_list_del_init(&tail->cache);
+        }
+        mutex_unlock(&mod->cache.guard);
+}
+
+static void nodescan(struct node *n) {
+        uint8_t lev = level(n);
+        CMOD(l[lev].nr,          nr(n));
+        CMOD(l[lev].free,        simple_free(n));
+        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
+        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT)));
+}
+
+static bool is_hot(struct node *n, int shift) {
+        return (kavg(&nheader(n)->kelvin, bolt(n)) >>
+                ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT) + (shift - BOLT_EPOCH_SHIFT))) != 0;
+}
+
+enum cachestate {
+        BUSY,
+        HOT,
+        UNCLEAN,
+        COLD
+};
+
+static enum cachestate nstate(struct node *n, int shift) {
+        uint8_t lev = level(n);
+        nodescan(n);
+        CINC(l[lev].scan_node);
+        if (n->ref > 0) {
+                CINC(l[lev].scan_busy);
+                return BUSY;
+        } else if (is_hot(n, shift)) {
+                CINC(l[lev].scan_hot);
+                return HOT;
+        } else if (n->flags & DIRTY) {
+                CINC(l[lev].scan_pageout);
+                return UNCLEAN;
+        } else {
+                CINC(l[lev].scan_cold);
+                return COLD;
+        }
+}
+
+static void cull(struct t2 *mod) {
+        struct cache *c     = &mod->cache;
+        int           shift = c->shift;
+        if (c->nr + ci.added >= (1 << c->shift)) {
+                mutex_lock(&c->guard);
+                for (int i = 0; i < FREE_BATCH && LIKELY(!cds_list_empty(&c->cold)); ++i) {
+                        struct node   *tail   = COF(c->cold.prev, struct node, cache);
+                        struct bucket *bucket = ht_bucket(&mod->ht, tail->addr);
+                        int            try    = pthread_mutex_trylock(&bucket->lock);
+                        if (LIKELY(try == 0)) {
+                                if (nstate(tail, shift) == COLD) {
+                                        put_final(tail);
+                                }
+                                mutex_unlock(&bucket->lock);
+                        } else {
+                                CINC(throttle_trylock);
+                                ASSERT(try == EBUSY);
+                                break;
+                        }
+                }
+                mutex_unlock(&c->guard);
+        }
+}
+
 static void throttle(struct t2 *mod) {
         struct cache *c = &mod->cache;
         if (c->nr + ci.added >= (1 << c->shift)) {
-                if (UNLIKELY(cds_list_empty(&c->cached))) {
+                if (UNLIKELY(cds_list_empty(&c->cold))) {
                         mutex_lock(&c->condlock);
                         pthread_cond_signal(&c->need);
-                        while (cds_list_empty(&c->cached)) {
+                        while (cds_list_empty(&c->cold)) {
                                 pthread_cond_wait(&c->got, &c->condlock);
                         }
                         mutex_unlock(&c->condlock);
                 }
-                if (c->nr + ci.added >= (1 << c->shift)) {
-                        mutex_lock(&c->guard);
-                        for (int i = 0; i < FREE_BATCH && LIKELY(!cds_list_empty(&c->cached)); ++i) {
-                                struct node   *tail   = COF(c->cached.prev, struct node, cache);
-                                struct bucket *bucket = ht_bucket(&mod->ht, tail->addr);
-                                int            try    = pthread_mutex_trylock(&bucket->lock);
-                                if (LIKELY(try == 0)) {
-                                        ASSERT(tail->ref == 0);
-                                        cds_list_del(&tail->cache);
-                                        put_final(tail);
-                                        mutex_unlock(&bucket->lock);
-                                        KDEC(cached);
-                                } else {
-                                        ASSERT(try == -EBUSY);
-                                        break;
-                                }
-                        }
-                        mutex_unlock(&c->guard);
-                }
+                cull(mod);
         }
 }
 
@@ -2308,78 +2365,78 @@ static void pageout(struct node *n) {
         unlock(n, READ);
 }
 
-static void nodescan(struct node *n) {
-        uint8_t lev = level(n);
-        CMOD(l[lev].nr,          nr(n));
-        CMOD(l[lev].free,        simple_free(n));
-        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
-        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT)));
-}
 
-static bool is_hot(struct node *n) {
-        return kavg(&nheader(n)->kelvin, bolt(n)) >> ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT)) != 0;
-}
-
-static int good(struct node *n) {
-        uint8_t lev = level(n);
-        nodescan(n);
-        CINC(l[lev].tscan_node);
-        if (n->ref > 0) {
-                CINC(l[lev].tscan_busy);
-                return 0;
-        } else if (is_hot(n)) {
-                CINC(l[lev].tscan_hot);
-                return 0;
-        } else if (n->flags & DIRTY) {
-                CINC(l[lev].tscan_pageout);
-                return -1;
-        } else {
-                CINC(l[lev].tscan_freed);
-                return 1;
-        }
-}
-
-static void mscan(struct t2 *mod, int32_t toscan, int32_t tofree) {
-        struct cache *c = &mod->cache;
-        while (toscan > 0 && tofree > 0) {
-                struct node *tail;
-                mutex_lock(&c->guard);
-                if (LIKELY(!cds_list_empty(&c->cached))) {
-                        int virtue;
-                        tail = COF(c->cached.prev, struct node, cache);
-                        virtue = good(tail);
-                        if (virtue != 0) {
-                                struct bucket *bucket = ht_bucket(&mod->ht, tail->addr);
-                                int            try    = pthread_mutex_trylock(&bucket->lock);
-                                ASSERT(try == -EBUSY || try == 0);
-                                if (LIKELY(try == 0)) {
-                                        if (virtue == -1) {
-                                                ref(tail);
-                                                mutex_unlock(&bucket->lock);
-                                                pageout(tail);
-                                                mutex_lock(&bucket->lock);
-                                                put_locked(tail);
-                                        }
-                                        ASSERT(tail->ref == 0);
-                                        cds_list_del(&tail->cache);
-                                        put_final(tail);
+static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocache) {
+        int32_t scan0   = mod->cache.scan;
+        int32_t scan    = scan0;
+        int32_t mask    = (1 << mod->ht.shift) - 1;
+        int     shift   = mod->cache.shift;
+        ASSERT(mod->ht.shift < 32);
+        ASSERT((scan0 & mask) == scan0);
+        CINC(scan);
+        while (toscan > 0 && towrite > 0 && tocache > 0) {
+                struct bucket *bucket = &mod->ht.buckets[scan];
+                bool           done;
+                mutex_lock(&bucket->lock);
+                CINC(scan_bucket);
+                do {
+                        struct cds_hlist_head *head = &bucket->chain;
+                        struct node           *n;
+                        done = true;
+                        cds_hlist_for_each_entry_2(n, head, hash) {
+                                struct node *tail;
+                                toscan--;
+                                if (!cds_list_empty(&n->cache)) {
+                                        CINC(l[level(n)].scan_cached);
+                                        continue;
+                                }
+                                switch(nstate(n, shift)) {
+                                case BUSY:
+                                case HOT:
+                                        continue;
+                                case UNCLEAN:
+                                        ref(n);
                                         mutex_unlock(&bucket->lock);
-                                        KDEC(cached);
-                                        tofree--;
+                                        pageout(n);
+                                        towrite--;
+                                        mutex_lock(&bucket->lock);
+                                        put_locked(n);
+                                        done = false;
+                                        break;
+                                case COLD:
+                                        mutex_lock(&mod->cache.guard);
+                                        ASSERT(cds_list_empty(&n->cache));
+                                        cds_list_add(&n->cache, &mod->cache.cold);
+                                        tail = COF(mod->cache.cold.prev, struct node, cache);
+                                        if (nstate(tail, shift) == COLD) {
+                                                cds_list_move(&n->cache, &mod->cache.cold);
+                                                KINC(cached);
+                                        } else {
+                                                cds_list_del_init(&tail->cache);
+                                                CINC(l[level(tail)].scan_heated);
+                                        }
+                                        mutex_unlock(&mod->cache.guard);
+                                        tocache--;
+                                }
+                                if (!done) {
+                                        break;
                                 }
                         }
-                        cds_list_move(&tail->cache, &c->cached);
-                        toscan--;
-                } else {
-                        toscan = 0;
+                } while (!done);
+                mutex_unlock(&bucket->lock);
+                scan = (scan + 1) & mask;
+                if (scan == scan0) {
+                        break;
                 }
-                mutex_unlock(&c->guard);
         }
+        cache_sync(mod);
+        mod->cache.scan = scan;
 }
+
 
 enum { MAXWELL_SLEEP = 1 };
 
-static void maxwelld(struct t2 *mod) {
+static void *maxwelld(struct t2 *mod) {
         struct cache *c = &mod->cache;
         while (!mod->shutdown) {
                 struct timeval  cur;
@@ -2388,13 +2445,18 @@ static void maxwelld(struct t2 *mod) {
                 deadline.tv_sec  = cur.tv_sec + MAXWELL_SLEEP;
                 deadline.tv_nsec = 0;
                 mutex_lock(&c->condlock);
-                pthread_cond_timedwait(&c->need, &c->condlock, &deadline);
+                if (c->nr + CACHE_SYNC_THRESHOLD < (1 << c->shift)) {
+                        pthread_cond_timedwait(&c->need, &c->condlock, &deadline);
+                }
                 mutex_unlock(&c->condlock);
-                mscan(mod, FREE_BATCH * 10, FREE_BATCH * 2);
+                mscan(mod, FREE_BATCH * 10, FREE_BATCH * 2, FREE_BATCH * 2);
+                cull(mod);
+                counters_fold();
                 mutex_lock(&c->condlock);
                 pthread_cond_broadcast(&c->got);
                 mutex_unlock(&c->condlock);
         }
+        return NULL;
 }
 
 /* @lib */
@@ -2558,6 +2620,9 @@ static void counters_print() {
         printf("read.bytes:         %10"PRId64"\n", GVAL(read_bytes));
         printf("write:              %10"PRId64"\n", GVAL(write));
         printf("write.bytes:        %10"PRId64"\n", GVAL(write_bytes));
+        printf("scan:               %10"PRId64"\n", GVAL(scan));
+        printf("scan.bucket:        %10"PRId64"\n", GVAL(scan_bucket));
+        printf("throttle.trylock:   %10"PRId64"\n", GVAL(throttle_trylock));
         printf("%15s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
@@ -2579,11 +2644,13 @@ static void counters_print() {
         COUNTER_PRINT(shift);
         COUNTER_PRINT(shift_one);
         COUNTER_PRINT(merge);
-        COUNTER_PRINT(tscan_node);
-        COUNTER_PRINT(tscan_busy);
-        COUNTER_PRINT(tscan_hot);
-        COUNTER_PRINT(tscan_pageout);
-        COUNTER_PRINT(tscan_freed);
+        COUNTER_PRINT(scan_node);
+        COUNTER_PRINT(scan_cached);
+        COUNTER_PRINT(scan_busy);
+        COUNTER_PRINT(scan_hot);
+        COUNTER_PRINT(scan_pageout);
+        COUNTER_PRINT(scan_cold);
+        COUNTER_PRINT(scan_heated);
         COUNTER_VAR_PRINT(nr);
         COUNTER_VAR_PRINT(free);
         COUNTER_VAR_PRINT(modified);
