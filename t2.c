@@ -3808,6 +3808,11 @@ static void ht_ut() {
         utestdone();
 }
 
+enum {
+        HT_SHIFT = 20,
+        CA_SHIFT = 20
+};
+
 static void traverse_ut() {
         taddr_t addr = taddr_make(0x100000, ntype.shift);
         struct node n = {
@@ -3848,7 +3853,7 @@ static void traverse_ut() {
         int result;
         usuite("traverse");
         utest("t2_init");
-        struct t2 *mod = t2_init(ut_storage, 10, 16);
+        struct t2 *mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         t2_node_type_register(mod, &ntype);
         ttype.mod = mod;
         buf_init_str(&key, key0);
@@ -3902,7 +3907,7 @@ static void insert_ut() {
         struct t2_tree t = {
                 .ttype = &ttype
         };
-        struct t2 *mod = t2_init(ut_storage, 10, 16);
+        struct t2 *mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         struct t2_rec r = {
                 .key = &key,
                 .val = &val
@@ -3945,7 +3950,7 @@ static void tree_ut() {
         uint64_t k64;
         uint64_t v64;
         int result;
-        mod = t2_init(ut_storage, 10, 16);
+        mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
@@ -4015,7 +4020,7 @@ static void stress_ut() {
         int     result;
         usuite("stress");
         utest("init");
-        mod = t2_init(ut_storage, 10, 16);
+        mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4108,7 +4113,7 @@ static void delete_ut() {
         int     result;
         usuite("delete");
         utest("init");
-        mod = t2_init(ut_storage, 10, 16);
+        mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4222,7 +4227,7 @@ static void next_ut() {
         };
         usuite("next");
         utest("init");
-        mod = t2_init(ut_storage, 10, 16);
+        mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4357,7 +4362,7 @@ void seq_ut() {
         struct t2_tree *t;
         usuite("seq");
         utest("init");
-        mod = t2_init(ut_storage, 10, 16);
+        mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4501,7 +4506,7 @@ void mt_ut() {
         int     result;
         usuite("mt");
         utest("init");
-        mod = t2_init(ut_storage, 10, 16);
+        mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4574,7 +4579,7 @@ static void open_ut() {
         uint64_t free;
         usuite("open");
         utest("populate");
-        mod = t2_init(ut_storage, 10, 16);
+        mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
@@ -4594,7 +4599,7 @@ static void open_ut() {
         t2_node_type_degister(&ntype);
         t2_fini(mod);
         utest("open");
-        mod = t2_init(ut_storage, 10, 16);
+        mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
