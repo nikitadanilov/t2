@@ -618,6 +618,8 @@ static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
 static void cache_clean(struct t2 *mod);
 static void *maxwelld(struct t2 *mod);
+static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocache);
+static void writeout(struct t2 *mod);
 static void cache_sync(struct t2 *mod);
 static void throttle(struct t2 *mod);
 static void kmod(struct ewma *a, uint32_t t);
@@ -679,6 +681,8 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift) {
         return result != 0 ? EPTR(result) : mod;
 }
 
+enum { BOLT_EPOCH_SHIFT = 16 };
+
 void t2_fini(struct t2 *mod) {
         eclear();
         urcu_memb_barrier();
@@ -688,6 +692,8 @@ void t2_fini(struct t2 *mod) {
         NOFAIL(pthread_cond_signal(&mod->cache.need));
         mutex_unlock(&mod->cache.condlock);
         pthread_join(mod->cache.md, NULL);
+        mod->cache.bolt += (1ull << (BOLT_EPOCH_SHIFT << 1));
+        writeout(mod);
         SCALL(mod, fini);
         cache_clean(mod);
         ht_clean(&mod->ht);
@@ -1031,6 +1037,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
 static void nfini(struct node *n) {
         ASSERT(n->ref == 0);
         ASSERT(cds_list_empty(&n->cache));
+        ASSERT(!(n->flags & DIRTY));
         cookie_invalidate(&n->cookie);
         NOFAIL(pthread_rwlock_destroy(&n->lock));
         mem_free(n->data);
@@ -1124,6 +1131,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
         if (EISOK(addr)) {
                 n = ninit(mod, addr);
                 if (EISOK(n)) {
+                        lock(n, WRITE);
                         *nheader(n) = (struct header) {
                                 .magix  = NODE_MAGIX,
                                 .ntype  = ntype->id,
@@ -1134,6 +1142,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
                         n->flags |= DIRTY;
                         KINC(dirty);
                         simple_make(n);
+                        unlock(n, WRITE);
                 }
         } else {
                 n = EPTR(addr);
@@ -1917,8 +1926,6 @@ static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
         }
 }
 
-enum { BOLT_EPOCH_SHIFT = 16 };
-
 static uint64_t bolt(const struct node *n) {
         return (n->mod->cache.bolt + ci.touched) >> BOLT_EPOCH_SHIFT;
 }
@@ -2424,15 +2431,14 @@ static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocac
                         }
                 } while (!done);
                 mutex_unlock(&bucket->lock);
+                cache_sync(mod);
                 scan = (scan + 1) & mask;
                 if (scan == scan0) {
                         break;
                 }
         }
-        cache_sync(mod);
         mod->cache.scan = scan;
 }
-
 
 enum { MAXWELL_SLEEP = 1 };
 
@@ -2457,6 +2463,20 @@ static void *maxwelld(struct t2 *mod) {
                 mutex_unlock(&c->condlock);
         }
         return NULL;
+}
+
+static void writeout(struct t2 *mod) {
+        int32_t scan = 0;
+        do {
+                struct cds_hlist_head *head = &mod->ht.buckets[scan].chain;
+                struct node           *n;
+                cds_hlist_for_each_entry_2(n, head, hash) {
+                        if (n->flags & DIRTY) {
+                                pageout(n);
+                        }
+                }
+                scan = (scan + 1) & ((1 << mod->ht.shift) - 1);
+        } while (scan != 0);
 }
 
 /* @lib */
