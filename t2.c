@@ -237,6 +237,14 @@ enum {
         __stor->op->method(__stor , ##  __VA_ARGS__);   \
 })
 
+#define NODE_FORMAT simple
+
+#if defined(NODE_FORMAT)
+#define NCALL(n, ...) ((void)(n), simple ## _ ## __VA_ARGS__)
+#else
+#define NCALL(n, ...) ((n)->ntype->ops-> __VA_ARGS__)
+#endif
+
 /* Is Parallel Programming Hard, And, If So, What Can You Do About It? */
 #define ACCESS_ONCE(x)     (*(volatile typeof(x) *)&(x))
 #define READ_ONCE(x)       ({ typeof(x) ___x = ACCESS_ONCE(x); ___x; })
@@ -412,11 +420,26 @@ struct policy {
         int (*exec_delete)(struct path *p, int idx);
 };
 
+struct node_type_ops {
+        int     (*insert)    (struct slot *);
+        void    (*delete)    (struct slot *);
+        void    (*get)       (struct slot *);
+        void    (*make)      (struct node *n);
+        void    (*print)     (struct node *n);
+        bool    (*search)    (struct node *n, struct t2_rec *rec, struct slot *out);
+        bool    (*can_merge) (const struct node *n0, const struct node *n1);
+        int     (*can_insert)(const struct slot *s);
+        int32_t (*nr)        (const struct node *n);
+        int32_t (*free)      (const struct node *n);
+        int32_t (*used)      (const struct node *n);
+};
+
 struct t2_node_type {
-        int16_t     id;
-        const char *name;
-        struct t2  *mod;
-        int         shift;
+        const struct node_type_ops *ops;
+        int                         shift;
+        int16_t                     id;
+        const char                 *name;
+        struct t2                  *mod;
 };
 
 enum {
@@ -566,7 +589,7 @@ static struct node *internal_child(const struct node *n, int32_t pos, bool peek)
 static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s);
 static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn));
 static void *mem_alloc(size_t size);
-static void *mem_alloc_align(size_t size);
+static void *mem_alloc_align(size_t size, int alignment);
 static void  mem_free(void *ptr);
 static int cacheline_size();
 static uint64_t threadid(void);
@@ -879,16 +902,16 @@ void t2_tree_close(struct t2_tree *t) {
 }
 
 static int rec_insert(struct node *n, int32_t idx, struct t2_rec *r) {
-        return simple_insert(&(struct slot) { .node = n, .idx = idx, .rec  = *r });
+        return NCALL(n, insert(&(struct slot) { .node = n, .idx = idx, .rec  = *r }));
 }
 
 static void rec_delete(struct node *n, int32_t idx) {
-        simple_delete(&(struct slot) { .node = n, .idx = idx });
+        NCALL(n, delete(&(struct slot) { .node = n, .idx = idx }));
 }
 
 static void rec_get(struct slot *s, int32_t idx) {
         s->idx = idx;
-        simple_get(s);
+        NCALL(s->node, get(s));
 }
 
 static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node *n, enum optype opt) {
@@ -1028,7 +1051,7 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
 
 static struct node *nalloc(struct t2 *mod, taddr_t addr) {
         struct node *n    = mem_alloc(sizeof *n);
-        void        *data = mem_alloc_align(taddr_ssize(addr));
+        void        *data = mem_alloc_align(taddr_ssize(addr), taddr_ssize(addr));
         int          result;
         CINC(alloc);
         if (LIKELY(n != NULL && data != NULL)) {
@@ -1160,7 +1183,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
                         n->ntype = ntype;
                         n->flags |= DIRTY;
                         KINC(dirty);
-                        simple_make(n);
+                        NCALL(n, make(n));
                         unlock(n, WRITE);
                 }
         } else {
@@ -1231,7 +1254,7 @@ static bool is_leaf(const struct node *n) {
 }
 
 static int32_t nr(const struct node *n) {
-        return simple_nr(n);
+        return NCALL(n, nr(n));
 }
 
 static int32_t nsize(const struct node *n) {
@@ -1400,7 +1423,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 }
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
-                NOFAIL(simple_insert(&s));
+                NOFAIL(NCALL(s.node, insert(&s)));
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node));
                 if (r->flags & ALUSED) {
                         struct t2_buf lkey = {};
@@ -1440,13 +1463,13 @@ static int split_right_plan_delete(struct path *p, int idx) {
 }
 
 static bool can_merge(struct node *n0, struct node *n1) {
-        return simple_can_merge(n0, n1);
+        return NCALL(n0, can_merge(n0, n1));
 }
 
 static void delete_update(struct path *p, int idx, struct slot *s) {
         ASSERT(idx + 1 < p->used);
-        simple_get(s);
-        simple_delete(s);
+        NCALL(s->node, get(s));
+        NCALL(s->node, delete(s));
         if (p->rung[idx + 1].flags & SEPCHG) {
                 struct node  *child = brother(&p->rung[idx + 1], RIGHT)->node;
                 struct t2_buf cptr;
@@ -1460,7 +1483,7 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
                         /* Take the rightmost key in the leaf. */
                         rec_get(&leaf, nr(leaf.node) - 1);
                         prefix_separator(leaf.rec.key, s->rec.key);
-                        NOFAIL(simple_insert(s));
+                        NOFAIL(NCALL(s->node, insert(s)));
                 }
         }
 }
@@ -1683,7 +1706,7 @@ static bool can_insert(const struct node *n, const struct t2_rec *r) {
                 .idx  = -1, /* Unknown position. */
                 .rec  = *r
         };
-        return simple_can_insert(&s);
+        return NCALL(n, can_insert(&s));
 }
 
 static int32_t utmost(const struct node *n, enum dir d) {
@@ -1759,7 +1782,7 @@ static int insert_prep(struct path *p) {
 
 static bool keep(const struct node *n) {
         /* Take level into account? */
-        return simple_free(n) < 3 * nsize(n) / 4;
+        return NCALL(n, free(n)) < 3 * nsize(n) / 4;
 }
 
 static int delete_prep(struct path *p) {
@@ -1846,13 +1869,13 @@ static int root_add(struct path *p) {
         rec_get(&s, 0);
         s.node = p->newroot;
         s.rec.val = ptr_buf(oldroot, &ptr);
-        result = simple_insert(&s);
+        result = NCALL(s.node, insert(&s));
         if (LIKELY(result == 0)) {
                 s.idx = 1;
                 ASSERT(p->rung[0].pd.id == SPLIT_RIGHT); /* For now. */
                 s.rec.key = &p->rung[0].keyout;
                 s.rec.val = &p->rung[0].valout;
-                result = simple_insert(&s);
+                result = NCALL(s.node, insert(&s));
                 if (LIKELY(result == 0)) {
                         p->rung[0].flags |= ALUSED;
                         /* Barrier? */
@@ -1927,7 +1950,7 @@ static int next_complete(struct path *p, struct node *n) {
         int               result = +1;
         SLOT_DEFINE(s, n);
         for (s.idx = r->pos; 0 <= s.idx && s.idx < nr(n); s.idx += c->dir) {
-                simple_get(&s);
+                NCALL(n, get(&s));
                 result = c->op->next(c, &s.rec);
                 if (result <= 0) {
                         break;
@@ -2346,7 +2369,7 @@ static void cache_clean(struct t2 *mod) {
 static void nodescan(struct node *n) {
         uint8_t lev = level(n);
         CMOD(l[lev].nr,          nr(n));
-        CMOD(l[lev].free,        simple_free(n));
+        CMOD(l[lev].free,        NCALL(n, free(n)));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
 }
@@ -2581,9 +2604,9 @@ void *t2_errptr(int errcode) {
         return (void *)(uint64_t)-errcode;
 }
 
-static void *mem_alloc_align(size_t size) {
+static void *mem_alloc_align(size_t size, int alignment) {
         void *out = NULL;
-        int   result = posix_memalign(&out, size, size);
+        int   result = posix_memalign(&out, alignment, size);
         if (result == 0) {
                 memset(out, 0, size);
         }
@@ -2916,7 +2939,7 @@ static uint64_t threadid(void)
 
 static int ht_init(struct ht *ht, int shift) {
         ht->shift = shift;
-        ht->buckets = mem_alloc(sizeof ht->buckets[0] << shift);
+        ht->buckets = mem_alloc_align(sizeof ht->buckets[0] << shift, MAX_CACHELINE);
         if (ht->buckets != NULL) {
                 for (int i = 0; i < (1 << shift); ++i) {
                         NOFAIL(pthread_mutex_init(&ht->buckets[i].lock, NULL));
@@ -3290,7 +3313,7 @@ static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
                 }
                 rec_get(&s, p);
         } else {
-                (void)simple_search(n, r, &s);
+                (void)NCALL(n, search(n, r, &s));
                 if (s.idx < 0) {
                         rec_get(&s, 0);
                 }
@@ -3317,7 +3340,7 @@ static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s) {
         bool found;
         s->rec.key->nr = 1;
         s->rec.val->nr = 1;
-        found = simple_search(n, r, s);
+        found = NCALL(n, search(n, r, s));
         buf_clip_node(s->rec.key, n);
         buf_clip_node(s->rec.val, n);
         return found;
@@ -3524,20 +3547,20 @@ static int shift_one(struct node *d, struct node *s, enum dir dir) {
         rec_get(&src, utmost(s, dir));
         dst.idx = dir == LEFT ? nr(d) : 0;
         CINC(l[level(d)].shift_one);
-        return simple_insert(&dst) ?: (simple_delete(&src), 0);
+        return NCALL(d, insert(&dst)) ?: (NCALL(s, delete(&src)), 0);
 }
 
 static int shift(struct node *d, struct node *s, const struct slot *point, enum dir dir) {
         int result = 0;
         ASSERT(dir == LEFT || dir == RIGHT);
         ASSERT(point->idx >= 0 && point->idx <= nr(s));
-        ASSERT(simple_free(d) > simple_free(s));
+        ASSERT(NCALL(d, free(d)) > NCALL(s, free(s)));
         ASSERT(4 * rec_len(&point->rec) < min_32(nsize(d), nsize(s)));
         CINC(l[level(d)].shift);
         while (LIKELY(result == 0)) {
                 SLOT_DEFINE(slot, s);
                 rec_get(&slot, utmost(s, dir));
-                if (simple_free(d) - simple_free(s) > rec_len(&slot.rec)) {
+                if (NCALL(d, free(d)) - NCALL(s, free(s)) > rec_len(&slot.rec)) {
                         result = shift_one(d, s, dir);
                 } else {
                         break;
@@ -3831,7 +3854,7 @@ static void simple_ut() {
         struct node n = {
                 .ntype = &ntype,
                 .addr  = taddr_make(0x100000, ntype.shift),
-                .data  = mem_alloc_align(1ul << ntype.shift)
+                .data  = mem_alloc_align(1ul << ntype.shift, 1ul << ntype.shift)
         };
         ASSERT(n.data != NULL);
         struct sheader *sh = simple_header(&n);
@@ -3945,7 +3968,7 @@ static void traverse_ut() {
         struct node n = {
                 .ntype = &ntype,
                 .addr  = addr,
-                .data  = mem_alloc_align(1ul << ntype.shift)
+                .data  = mem_alloc_align(1ul << ntype.shift, 1ul << ntype.shift)
         };
         ASSERT(n.data != NULL);
         struct sheader *sh = simple_header(&n);
