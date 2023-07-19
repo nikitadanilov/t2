@@ -29,12 +29,13 @@
 #include "config.h"
 
 enum {
-        MAX_TREE_HEIGHT =      10,
-        MAX_TREE_TYPE   =    1024,
-        MAX_NODE_TYPE   =    1024,
-        MAX_ERR_CODE    =    1024,
-        MAX_ERR_DEPTH   =      16,
-        MAX_CACHELINE   =      64
+        MAX_TREE_HEIGHT   =      10,
+        MAX_TREE_TYPE     =    1024,
+        MAX_NODE_TYPE     =    1024,
+        MAX_ERR_CODE      =    1024,
+        MAX_ERR_DEPTH     =      16,
+        MAX_CACHELINE     =      64,
+        MAX_SEPARATOR_CUT =      10
 };
 
 /* @macro */
@@ -537,6 +538,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var keysize;
                 struct counter_var valsize;
                 struct counter_var repage;
+		struct counter_var sepcut;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -1329,19 +1331,23 @@ static void map_update(struct node *n, int idx, uint64_t seq, enum lock_mode lm)
 
 /* @policy */
 
-#define USE_PREFIX_SEPARATORS (0)
+#define USE_PREFIX_SEPARATORS (1)
 
-static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r) {
+static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r, int level) {
         ASSERT(buf_cmp(l, r) < 0);
         ASSERT(r->nr == 1);
         if (USE_PREFIX_SEPARATORS) {
-                do {
+		int i;
+		for (i = 0; i < MAX_SEPARATOR_CUT; ++i) {
                         r->seg[0].len--;
-                } while (buf_cmp(l, r) < 0);
-                return ++r->seg[0].len;
-        } else {
-                return r->seg[0].len;
-        }
+                        if (buf_cmp(l, r) >= 0) {
+				++r->seg[0].len;
+				break;
+			}
+	        }
+	        CMOD(l[level].sepcut, i);	
+	}
+        return r->seg[0].len;
 }
 
 static void rec_todo(struct path *p, int idx, struct slot *out) {
@@ -1448,7 +1454,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
                         rec_get(&s, 0);
                         rkey = *s.rec.key;
                         if (is_leaf(right)) {
-                                prefix_separator(&lkey, &rkey);
+                                prefix_separator(&lkey, &rkey, level(left));
                         }
                         NOFAIL(buf_alloc(&r->scratch, &rkey));
                         r->keyout = r->scratch;
@@ -1493,7 +1499,7 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
                         *s->rec.val = *ptr_buf(child, &cptr);
                         /* Take the rightmost key in the leaf. */
                         rec_get(&leaf, nr(leaf.node) - 1);
-                        prefix_separator(leaf.rec.key, s->rec.key);
+                        prefix_separator(leaf.rec.key, s->rec.key, level(s->node));
                         NOFAIL(NCALL(s->node, insert(s)));
                 }
         }
@@ -1761,8 +1767,8 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
 }
 
 static bool should_split(const struct node *n) {
-        /* Keep enough free space in internal nodes, to be able to update the delimiting key. */
-        return USE_PREFIX_SEPARATORS ? (level(n) >= 2 && NCALL(n, free(n)) < (nsize(n) >> 4)) : false;
+        /* Keep enough free space in the internal nodes, to be able to update the delimiting key. */
+        return USE_PREFIX_SEPARATORS ? (level(n) >= 2 && NCALL(n, free(n)) < MAX_SEPARATOR_CUT) : false;
 }
 
 static int insert_prep(struct path *p) {
@@ -2801,6 +2807,7 @@ static void counters_print() {
         COUNTER_VAR_PRINT(keysize);
         COUNTER_VAR_PRINT(valsize);
         COUNTER_VAR_PRINT(repage);
+        COUNTER_VAR_PRINT(sepcut);
         DOUBLE_VAR_PRINT(temperature);
 }
 
