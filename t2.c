@@ -237,10 +237,10 @@ enum {
         __stor->op->method(__stor , ##  __VA_ARGS__);   \
 })
 
-#define NODE_FORMAT simple
+#define DEFAULT_FORMAT (1)
 
-#if defined(NODE_FORMAT)
-#define NCALL(n, ...) ((void)(n), simple ## _ ## __VA_ARGS__)
+#if DEFAULT_FORMAT
+#define NCALL(n, ...) ((void)(n), simple_ ## __VA_ARGS__)
 #else
 #define NCALL(n, ...) ((n)->ntype->ops-> __VA_ARGS__)
 #endif
@@ -280,6 +280,23 @@ struct cache {
         int32_t                                scan;
         int                                    shift;
         pthread_t                              md;
+};
+
+struct slot;
+struct node;
+
+struct node_type_ops {
+        int     (*insert)    (struct slot *);
+        void    (*delete)    (struct slot *);
+        void    (*get)       (struct slot *);
+        void    (*make)      (struct node *n);
+        void    (*print)     (struct node *n);
+        bool    (*search)    (struct node *n, struct t2_rec *rec, struct slot *out);
+        bool    (*can_merge) (const struct node *n0, const struct node *n1);
+        int     (*can_insert)(const struct slot *s);
+        int32_t (*nr)        (const struct node *n);
+        int32_t (*free)      (const struct node *n);
+        int32_t (*used)      (const struct node *n);
 };
 
 struct t2 {
@@ -418,20 +435,6 @@ struct policy {
         int (*plan_delete)(struct path *p, int idx);
         int (*exec_insert)(struct path *p, int idx);
         int (*exec_delete)(struct path *p, int idx);
-};
-
-struct node_type_ops {
-        int     (*insert)    (struct slot *);
-        void    (*delete)    (struct slot *);
-        void    (*get)       (struct slot *);
-        void    (*make)      (struct node *n);
-        void    (*print)     (struct node *n);
-        bool    (*search)    (struct node *n, struct t2_rec *rec, struct slot *out);
-        bool    (*can_merge) (const struct node *n0, const struct node *n1);
-        int     (*can_insert)(const struct slot *s);
-        int32_t (*nr)        (const struct node *n);
-        int32_t (*free)      (const struct node *n);
-        int32_t (*used)      (const struct node *n);
 };
 
 struct t2_node_type {
@@ -627,6 +630,7 @@ static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n);
+static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out);
 static int32_t simple_nr(const struct node *n);
 static int32_t simple_free(const struct node *n);
 static int simple_can_insert(const struct slot *s);
@@ -681,6 +685,7 @@ static __thread volatile struct {
 static struct counters __g_counters = {};
 static struct double_counters __G_counters = {};
 static pthread_mutex_t __g_counters_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct node_type_ops simple_ops;
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift) {
         int result;
@@ -795,6 +800,7 @@ struct t2_node_type *t2_node_type_init(int16_t id, const char *name, int shift, 
                 nt->id    = id;
                 nt->name  = name;
                 nt->shift = shift;
+                nt->ops   = &simple_ops;
         }
         return nt;
 }
@@ -1326,7 +1332,6 @@ static void map_update(struct node *n, int idx, uint64_t seq, enum lock_mode lm)
 static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r) {
         ASSERT(buf_cmp(l, r) < 0);
         ASSERT(r->nr == 1);
-        return r->seg[0].len; /* TODO: Cannot handle delete properly. */
         do {
                 r->seg[0].len--;
         } while (buf_cmp(l, r) < 0);
@@ -1749,6 +1754,11 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
         return down;
 }
 
+static bool should_split(const struct node *n) {
+        /* Keep enough free space in internal nodes, to be able to update the delimiting key. */
+        return level(n) >= 2 && NCALL(n, free(n)) < (nsize(n) >> 4);
+}
+
 static int insert_prep(struct path *p) {
         struct t2_rec  irec = {};
         int            idx = p->used - 1;
@@ -1762,7 +1772,7 @@ static int insert_prep(struct path *p) {
         do {
                 struct rung *r = &p->rung[idx];
                 r->lm = WRITE;
-                if (can_insert(r->node, rec)) {
+                if (can_insert(r->node, rec) && !should_split(r->node)) {
                         break;
                 } else {
                         r->pd.id = policy_select(p, idx);
@@ -3578,6 +3588,20 @@ static int merge(struct node *d, struct node *s, enum dir dir) {
         CINC(l[level(d)].merge);
         return result;
 }
+
+static struct node_type_ops simple_ops = {
+        .insert     = &simple_insert,
+        .delete     = &simple_delete,
+        .get        = &simple_get,
+        .make       = &simple_make,
+        .print      = &simple_print,
+        .search     = &simple_search,
+        .can_merge  = &simple_can_merge,
+        .can_insert = &simple_can_insert,
+        .nr         = &simple_nr,
+        .free       = &simple_free,
+        .used       = &simple_used
+};
 
 #if UT || BN
 
