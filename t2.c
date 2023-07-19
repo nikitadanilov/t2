@@ -2353,7 +2353,7 @@ static void nodescan(struct node *n) {
         CMOD(l[lev].nr,          nr(n));
         CMOD(l[lev].free,        simple_free(n));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
-        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT)));
+        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
 }
 
 static bool is_hot(struct node *n, int shift) {
