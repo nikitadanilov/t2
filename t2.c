@@ -538,7 +538,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var keysize;
                 struct counter_var valsize;
                 struct counter_var repage;
-		struct counter_var sepcut;
+                struct counter_var sepcut;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -1337,16 +1337,16 @@ static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r, int le
         ASSERT(buf_cmp(l, r) < 0);
         ASSERT(r->nr == 1);
         if (USE_PREFIX_SEPARATORS) {
-		int i;
-		for (i = 0; i < MAX_SEPARATOR_CUT; ++i) {
+                int i;
+                for (i = 0; i < MAX_SEPARATOR_CUT; ++i) {
                         r->seg[0].len--;
                         if (buf_cmp(l, r) >= 0) {
-				++r->seg[0].len;
-				break;
-			}
-	        }
-	        CMOD(l[level].sepcut, i);	
-	}
+                                ++r->seg[0].len;
+                                break;
+                        }
+                }
+                CMOD(l[level].sepcut, i);
+        }
         return r->seg[0].len;
 }
 
