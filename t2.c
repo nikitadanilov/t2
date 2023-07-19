@@ -424,13 +424,13 @@ enum {
 };
 
 struct header {
+        struct ewma kelvin;
         int8_t      level;
         uint8_t     pad8;
         uint16_t    ntype;
         uint32_t    magix;
         uint32_t    csum;
         uint32_t    treeid;
-        struct ewma kelvin;
 };
 
 struct msg_ctx {
@@ -2054,11 +2054,7 @@ static int traverse(struct path *p) {
                         }
                 }
                 n = peek(mod, p->next);
-                if (EISERR(n)) {
-                        result = ERROR(ERRCODE(n));
-                        rcu_unlock();
-                        break;
-                } else if (n == NULL || rcu_dereference(n->ntype) == NULL) {
+                if (n == NULL || rcu_dereference(n->ntype) == NULL) {
                         rcu_leave(p, NULL);
                         n = get(mod, p->next);
                         if (EISERR(n)) {
@@ -2077,6 +2073,7 @@ static int traverse(struct path *p) {
                                 flags |= PINNED;
                         }
                 } else {
+                        __builtin_prefetch(nheader(n));
                         if (!is_stable(n)) { /* This is racy, but OK. */
                                 rcu_leave(p, n);
                                 lock(n, READ); /* Wait for stabilisation. */
