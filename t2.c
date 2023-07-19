@@ -389,11 +389,12 @@ struct rung {
 };
 
 struct path {
-        struct t2_rec  *rec;
-        enum optype     opt;
         int             used;
+        taddr_t         next;
         struct rung     rung[MAX_TREE_HEIGHT];
         struct t2_tree *tree;
+        struct t2_rec  *rec;
+        enum optype     opt;
         struct node    *newroot;
 };
 
@@ -1523,7 +1524,7 @@ static void path_lock(struct path *p) {
         }
 }
 
-static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
+static void path_fini(struct path *p) {
         while (--p->used >= 0) {
                 struct rung *r = &p->rung[p->used];
                 struct sibling *left  = brother(r, LEFT);
@@ -1548,13 +1549,18 @@ static void path_fini(struct path *p) { /* TODO: path_reset(p, &next). */
                         }
                 }
                 buf_free(&r->scratch);
-                SET0(r);
         }
         p->used = 0;
         if (UNLIKELY(p->newroot != NULL)) {
                 dealloc(p->newroot);
                 p->newroot = NULL;
         }
+}
+
+static void path_reset(struct path *p) {
+        path_fini(p);
+        memset(&p->rung, 0, sizeof p->rung);
+        p->next = p->tree->root;
 }
 
 static void path_pin(struct path *p) {
@@ -1897,7 +1903,7 @@ static bool rcu_try(struct path *p, struct node *extra) {
         result = EXISTS(i, p->used, p->rung[i].node->flags & HEARD_BANSHEE) || (extra != NULL && (extra->flags & HEARD_BANSHEE));
         if (UNLIKELY(result)) {
                 urcu_memb_barrier();
-                path_fini(p);
+                path_reset(p);
                 if (extra != NULL) {
                         put(extra);
                 }
@@ -1945,13 +1951,13 @@ static int traverse_complete(struct path *p, int result) {
                 rcu_lock();
                 return AGAIN;
         } else if (UNLIKELY(result == -ESTALE)) {
-                path_fini(p);
+                path_reset(p);
                 rcu_lock();
                 return AGAIN;
         } else if (UNLIKELY(result != 0)) {
                 return result;
         } else if (UNLIKELY(!path_is_valid(p))) {
-                path_fini(p);
+                path_reset(p);
                 rcu_lock();
                 return AGAIN;
         } else {
@@ -1964,10 +1970,10 @@ static int traverse(struct path *p) {
         struct t2 *mod   = p->tree->ttype->mod;
         int        tries = 0;
         int        result;
-        uint64_t   next = 0;
         ASSERT(p->used == 0);
         ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
         CINC(traverse);
+        p->next = p->tree->root;
         rcu_lock();
         while (true) {
                 struct node *n;
@@ -1982,19 +1988,18 @@ static int traverse(struct path *p) {
                 }
                 if (p->used == 0) {
                         CINC(traverse_start);
-                        next = p->tree->root;
                 }
-                n = peek(mod, next);
+                n = peek(mod, p->next);
                 if (EISERR(n)) {
                         result = ERROR(ERRCODE(n));
                         rcu_unlock();
                         break;
                 } else if (n == NULL || rcu_dereference(n->ntype) == NULL) {
                         rcu_leave(p, NULL);
-                        n = get(mod, next);
+                        n = get(mod, p->next);
                         if (EISERR(n)) {
                                 if (ERRCODE(n) == -ESTALE) {
-                                        path_fini(p);
+                                        path_reset(p);
                                         rcu_lock();
                                         continue;
                                 } else {
@@ -2019,7 +2024,7 @@ static int traverse(struct path *p) {
                         touch(n);
                 }
                 if (UNLIKELY(p->used == ARRAY_SIZE(p->rung))) {
-                        path_fini(p);
+                        path_reset(p);
                         continue;
                 }
                 r = path_add(p, n, flags);
@@ -2027,7 +2032,7 @@ static int traverse(struct path *p) {
                         if (p->opt == LOOKUP) {
                                 result = lookup_complete(p, n);
                                 if (!path_is_valid(p)) {
-                                        path_fini(p);
+                                        path_reset(p);
                                 } else {
                                         rcu_unlock();
                                         break;
@@ -2061,9 +2066,9 @@ static int traverse(struct path *p) {
                                 }
                         }
                 } else {
-                        next = internal_search(n, p->rec, &r->pos);
-                        if (EISERR(next)) {
-                                result = ERROR(ERRCODE(next));
+                        p->next = internal_search(n, p->rec, &r->pos);
+                        if (EISERR(p->next)) {
+                                result = ERROR(ERRCODE(p->next));
                                 rcu_unlock();
                                 break;
                         }
