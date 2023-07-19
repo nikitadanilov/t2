@@ -464,7 +464,12 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t write_bytes;
         int64_t scan;
         int64_t scan_bucket;
-        int64_t throttle_trylock;
+        int64_t throttle_limit;
+        int64_t throttle_wait;
+        int64_t cull_trylock;
+        int64_t cull_limit;
+        int64_t cull_node;
+        int64_t cull_cleaned;
         struct level_counters {
                 int64_t insert_balance;
                 int64_t delete_balance;
@@ -2326,18 +2331,21 @@ static void cull(struct t2 *mod) {
         struct cache *c     = &mod->cache;
         int           shift = c->shift;
         if (c->nr + ci.added >= (1 << c->shift)) {
+                CINC(cull_limit);
                 mutex_lock(&c->guard);
                 for (int i = 0; i < FREE_BATCH && LIKELY(!cds_list_empty(&c->cold)); ++i) {
                         struct node   *tail   = COF(c->cold.prev, struct node, cache);
                         struct bucket *bucket = ht_bucket(&mod->ht, tail->addr);
                         int            try    = pthread_mutex_trylock(&bucket->lock);
                         if (LIKELY(try == 0)) {
+                                CINC(cull_node);
                                 if (nstate(tail, shift) == COLD) {
+                                        CINC(cull_cleaned);
                                         put_final(tail);
                                 }
                                 mutex_unlock(&bucket->lock);
                         } else {
-                                CINC(throttle_trylock);
+                                CINC(cull_trylock);
                                 ASSERT(try == EBUSY);
                                 break;
                         }
@@ -2349,11 +2357,13 @@ static void cull(struct t2 *mod) {
 static void throttle(struct t2 *mod) {
         struct cache *c = &mod->cache;
         if (c->nr + ci.added >= (1 << c->shift)) {
+                CINC(throttle_limit);
                 if (UNLIKELY(cds_list_empty(&c->cold))) {
                         mutex_lock(&c->condlock);
                         pthread_cond_signal(&c->need);
                         while (cds_list_empty(&c->cold)) {
                                 pthread_cond_wait(&c->got, &c->condlock);
+                                CINC(throttle_wait);
                         }
                         mutex_unlock(&c->condlock);
                 }
@@ -2468,6 +2478,7 @@ static void *maxwelld(struct t2 *mod) {
                 mscan(mod, FREE_BATCH * 10, FREE_BATCH * 2, FREE_BATCH * 2);
                 cull(mod);
                 counters_fold();
+                cache_sync(mod);
                 mutex_lock(&c->condlock);
                 pthread_cond_broadcast(&c->got);
                 mutex_unlock(&c->condlock);
@@ -2652,7 +2663,12 @@ static void counters_print() {
         printf("write.bytes:        %10"PRId64"\n", GVAL(write_bytes));
         printf("scan:               %10"PRId64"\n", GVAL(scan));
         printf("scan.bucket:        %10"PRId64"\n", GVAL(scan_bucket));
-        printf("throttle.trylock:   %10"PRId64"\n", GVAL(throttle_trylock));
+        printf("throttle.limit:     %10"PRId64"\n", GVAL(throttle_limit));
+        printf("throttle.wait:      %10"PRId64"\n", GVAL(throttle_wait));
+        printf("cull.trylock:       %10"PRId64"\n", GVAL(cull_trylock));
+        printf("cull.limit:         %10"PRId64"\n", GVAL(cull_limit));
+        printf("cull.node:          %10"PRId64"\n", GVAL(cull_node));
+        printf("cull.cleaned:       %10"PRId64"\n", GVAL(cull_cleaned));
         printf("%15s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
@@ -4706,8 +4722,6 @@ int main(int argc, char **argv) {
  *
  * - "streams" (sequential, random)
  *
- * - cache replacement (arc, clock?)
- *
  * - transaction engine hooks
  *
  * - tools: dump, load, repair
@@ -4759,6 +4773,8 @@ int main(int argc, char **argv) {
  * + simple node functions should be robust in the face of concurrent modifications
  *
  * + decaying node temperature (see bits/avg.c)
+ *
+ * + cache replacement (arc, clock?)
  *
  * References:
  *
