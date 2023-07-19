@@ -1331,7 +1331,7 @@ static void map_update(struct node *n, int idx, uint64_t seq, enum lock_mode lm)
 
 /* @policy */
 
-#define USE_PREFIX_SEPARATORS (1)
+#define USE_PREFIX_SEPARATORS (0)
 
 static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r, int level) {
         ASSERT(buf_cmp(l, r) < 0);
