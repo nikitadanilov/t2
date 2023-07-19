@@ -3227,6 +3227,8 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
                 CINC(l[level(n)].bin_iter);
+                __builtin_prefetch(sat(sh, (l + m) >> 2));
+                __builtin_prefetch(sat(sh, (m + r) >> 2));
                 cmp = skeycmp(sh, m, kaddr, klen, mask);
                 if (cmp > 0) {
                         r = m;
