@@ -710,7 +710,6 @@ void t2_fini(struct t2 *mod) {
         NOFAIL(pthread_cond_signal(&mod->cache.need));
         mutex_unlock(&mod->cache.condlock);
         pthread_join(mod->cache.md, NULL);
-        mod->cache.bolt += (1ull << (BOLT_EPOCH_SHIFT << 1));
         writeout(mod);
         SCALL(mod, fini);
         cache_clean(mod);
@@ -2073,7 +2072,6 @@ static int traverse(struct path *p) {
                                 flags |= PINNED;
                         }
                 } else {
-                        __builtin_prefetch(nheader(n));
                         if (!is_stable(n)) { /* This is racy, but OK. */
                                 rcu_leave(p, n);
                                 lock(n, READ); /* Wait for stabilisation. */
@@ -2972,6 +2970,7 @@ static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
         struct node           *scan;
         cds_hlist_for_each_entry_rcu_2(scan, head, hash) {
                 if (scan->addr == addr && LIKELY((scan->flags & HEARD_BANSHEE) == 0)) {
+                        __builtin_prefetch(scan->data);
                         return scan;
                 }
         }
@@ -4835,8 +4834,6 @@ int main(int argc, char **argv) {
  * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
  *
  * - simple node: store key offsets separately from value offsets
- *
- * - make bolt per-tree
  *
  * Done:
  *
