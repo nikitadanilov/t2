@@ -1263,7 +1263,7 @@ enum { HIGH = 1 };
 
 static void map_update(struct node *n, int idx, uint64_t seq, enum lock_mode lm) {
         struct map *m;
-        if (idx > HIGH || lm != WRITE || is_stable(n)) {
+        if (idx > HIGH || lm != WRITE || is_stable(n) || is_leaf(n)) {
                 return;
         }
         if (LIKELY(n->map != NULL)) {
@@ -3727,6 +3727,14 @@ void bn_file_free_set(struct t2_storage *storage, uint64_t free) {
         fs->free = free;
 }
 
+uint64_t bn_bolt(const struct t2 *mod) {
+        return mod->cache.bolt;
+}
+
+void bn_bolt_set(struct t2 *mod, uint64_t bolt) {
+        mod->cache.bolt = bolt;
+}
+
 void bn_counters_print(void) {
         counters_print();
 }
@@ -4697,6 +4705,7 @@ static void open_ut() {
         int     result;
         taddr_t root;
         uint64_t free;
+        uint64_t bolt;
         usuite("open");
         utest("populate");
         mod = t2_init(ut_storage, HT_SHIFT, CA_SHIFT);
@@ -4714,6 +4723,7 @@ static void open_ut() {
         }
         root = t->root;
         free = file_storage.free;
+        bolt = mod->cache.bolt;
         t2_tree_close(t);
         t2_tree_type_degister(&ttype);
         t2_node_type_degister(&ntype);
@@ -4725,6 +4735,7 @@ static void open_ut() {
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
         file_storage.free = free;
+        mod->cache.bolt = bolt;
         t = t2_tree_open(&ttype, root);
         ASSERT(EISOK(t));
         utest("ops");
@@ -4826,7 +4837,7 @@ int main(int argc, char **argv) {
  *
  * - simple node: store key offsets separately from value offsets
  *
- * - replace cookie with get(), benchmark (sigprocmask is expensive).
+ * - make bolt per-tree
  *
  * Done:
  *
@@ -4849,6 +4860,8 @@ int main(int argc, char **argv) {
  * + decaying node temperature (see bits/avg.c)
  *
  * + cache replacement (arc, clock?)
+ *
+ * + replace cookie with get(), benchmark (sigprocmask is expensive).
  *
  * References:
  *

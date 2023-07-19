@@ -160,6 +160,7 @@ struct kvbenchmark {
                         struct t2      *mod;
                         taddr_t         root;
                         uint64_t        free;
+                        uint64_t        bolt;
                 } t2;
                 struct {
                         rocksdb_t *db;
@@ -229,6 +230,8 @@ extern struct t2_storage *bn_storage;
 extern taddr_t bn_tree_root(const struct t2_tree *t);
 extern uint64_t bn_file_free(struct t2_storage *storage);
 extern void bn_file_free_set(struct t2_storage *storage, uint64_t free);
+extern uint64_t bn_bolt(const struct t2 *mod);
+extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
 extern void bn_counters_print(void);
 
 static struct kv kv[KVNR];
@@ -510,7 +513,7 @@ static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var) {
 }
 
 static int ht_shift = 20;
-static int cache_shift = 16;
+static int cache_shift = 22;
 static int counters_level = 0;
 static int shift_internal = 9;
 static int shift_leaf     = 9;
@@ -755,6 +758,9 @@ static void t_mount(struct benchmark *b) {
         if (b->kv.u.t2.free != 0) {
                 bn_file_free_set(bn_storage, b->kv.u.t2.free);
         }
+        if (b->kv.u.t2.bolt != 0) {
+                bn_bolt_set(b->kv.u.t2.mod, b->kv.u.t2.bolt);
+        }
         if (b->kv.u.t2.root != 0) {
                 b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.root);
         } else {
@@ -764,6 +770,7 @@ static void t_mount(struct benchmark *b) {
 
 static void t_umount(struct benchmark *b) {
         b->kv.u.t2.root = bn_tree_root(b->kv.u.t2.tree);
+        b->kv.u.t2.bolt = bn_bolt(b->kv.u.t2.mod);
         t2_tree_close(b->kv.u.t2.tree);
         t2_node_type_degister(bn_ntype_internal);
         t2_node_type_degister(bn_ntype_leaf);
