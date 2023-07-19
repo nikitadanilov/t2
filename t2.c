@@ -593,7 +593,7 @@ static int32_t nr(const struct node *n);
 static int32_t nsize(const struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
-static void map_update(struct node *n, uint64_t seq, enum lock_mode lm);
+static void map_update(struct node *n, int idx, uint64_t seq, enum lock_mode lm);
 static struct header *nheader(const struct node *n);
 static void rcu_lock();
 static void rcu_unlock();
@@ -1259,11 +1259,11 @@ static void map_free_callback(struct rcu_head *head) {
         mem_free(map);
 }
 
-enum { HIGH = 4 };
+enum { HIGH = 1 };
 
-static void map_update(struct node *n, uint64_t seq, enum lock_mode lm) {
+static void map_update(struct node *n, int idx, uint64_t seq, enum lock_mode lm) {
         struct map *m;
-        if (LIKELY(level(n) < HIGH) || lm != WRITE || is_stable(n)) {
+        if (idx > HIGH || lm != WRITE || is_stable(n)) {
                 return;
         }
         if (LIKELY(n->map != NULL)) {
@@ -1275,24 +1275,24 @@ static void map_update(struct node *n, uint64_t seq, enum lock_mode lm) {
         CINC(l[level(n)].map_updated);
         m = mem_alloc(sizeof *n->map);
         if (m != NULL) {
-                int32_t idx = 0;
+                int32_t off = 0;
                 int32_t i;
                 SLOT_DEFINE(s, n);
                 for (i = 1; i < nr(n); ++i) {
                         uint8_t ch;
                         rec_get(&s, i);
                         ch = ((uint8_t *)s.rec.key->seg[0].addr)[0];
-                        if (idx == ch) { /* Abort. */
+                        if (off == ch) { /* Abort. */
                                 mem_free(m);
                                 CINC(l[level(n)].map_aborted);
                                 return;
                         }
-                        while (idx < ch) {
-                                m->idx[idx++] = i - 1;
+                        while (off < ch) {
+                                m->idx[off++] = i - 1;
                         }
                 }
-                while (idx <= 255) {
-                        m->idx[idx++] = i - 1;
+                while (off <= 255) {
+                        m->idx[off++] = i - 1;
                 }
                 m->seq = seq + 2;
                 rcu_assign_pointer(n->map, m);
@@ -1593,14 +1593,14 @@ static void path_fini(struct path *p) {
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
                 if (UNLIKELY(right->node != NULL)) {
-                        map_update(right->node, right->seq, right->lm);
+                        map_update(right->node, p->used, right->seq, right->lm);
                         unlock(right->node, right->lm);
                         put(right->node);
                 }
-                map_update(r->node, r->seq, r->lm);
+                map_update(r->node, p->used, r->seq, r->lm);
                 unlock(r->node, r->lm);
                 if (UNLIKELY(left->node != NULL)) {
-                        map_update(left->node, left->seq, left->lm);
+                        map_update(left->node, p->used, left->seq, left->lm);
                         unlock(left->node, left->lm);
                         put(left->node);
                 }
