@@ -322,11 +322,11 @@ enum node_flags {
 struct node {
         struct cds_hlist_node      hash;
         taddr_t                    addr;
+        uint64_t                   flags;
         uint64_t                   seq;
         atomic_int                 ref;
         struct cds_list_head       cache;
         const struct t2_node_type *ntype;
-        uint64_t                   flags;
         void                      *data;
         struct t2                 *mod;
         uint64_t                   cookie;
