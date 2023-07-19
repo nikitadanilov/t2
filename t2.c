@@ -2377,6 +2377,59 @@ static void pageout(struct node *n) {
         unlock(n, READ);
 }
 
+static void bucket_scan(struct t2 *mod, int shift, struct bucket *bucket, int32_t *toscan, int32_t *towrite, int32_t *tocache) {
+        bool                   done;
+        struct cds_hlist_head *head = &bucket->chain;
+        CINC(scan_bucket);
+        if (head->next == NULL) {
+                return;
+        }
+        mutex_lock(&bucket->lock);
+        do {
+                struct node *n;
+                done = true;
+                cds_hlist_for_each_entry_2(n, head, hash) {
+                        struct node *tail;
+                        (*toscan)--;
+                        if (!cds_list_empty(&n->cache)) {
+                                CINC(l[level(n)].scan_cached);
+                                continue;
+                        }
+                        switch(nstate(n, shift)) {
+                        case BUSY:
+                        case HOT:
+                                continue;
+                        case UNCLEAN:
+                                ref(n);
+                                mutex_unlock(&bucket->lock);
+                                pageout(n);
+                                (*towrite)--;
+                                mutex_lock(&bucket->lock);
+                                put_locked(n);
+                                done = false;
+                                break;
+                        case COLD:
+                                mutex_lock(&mod->cache.guard);
+                                ASSERT(cds_list_empty(&n->cache));
+                                cds_list_add(&n->cache, &mod->cache.cold);
+                                tail = COF(mod->cache.cold.prev, struct node, cache);
+                                if (nstate(tail, shift) == COLD) {
+                                        cds_list_move(&n->cache, &mod->cache.cold);
+                                        KINC(cached);
+                                } else {
+                                        cds_list_del_init(&tail->cache);
+                                        CINC(l[level(tail)].scan_heated);
+                                }
+                                mutex_unlock(&mod->cache.guard);
+                                (*tocache)--;
+                        }
+                        if (!done) {
+                                break;
+                        }
+                }
+        } while (!done);
+        mutex_unlock(&bucket->lock);
+}
 
 static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocache) {
         int32_t scan0   = mod->cache.scan;
@@ -2387,55 +2440,7 @@ static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocac
         ASSERT((scan0 & mask) == scan0);
         CINC(scan);
         while (toscan > 0 && towrite > 0 && tocache > 0) {
-                struct bucket *bucket = &mod->ht.buckets[scan];
-                bool           done;
-                mutex_lock(&bucket->lock);
-                CINC(scan_bucket);
-                do {
-                        struct cds_hlist_head *head = &bucket->chain;
-                        struct node           *n;
-                        done = true;
-                        cds_hlist_for_each_entry_2(n, head, hash) {
-                                struct node *tail;
-                                toscan--;
-                                if (!cds_list_empty(&n->cache)) {
-                                        CINC(l[level(n)].scan_cached);
-                                        continue;
-                                }
-                                switch(nstate(n, shift)) {
-                                case BUSY:
-                                case HOT:
-                                        continue;
-                                case UNCLEAN:
-                                        ref(n);
-                                        mutex_unlock(&bucket->lock);
-                                        pageout(n);
-                                        towrite--;
-                                        mutex_lock(&bucket->lock);
-                                        put_locked(n);
-                                        done = false;
-                                        break;
-                                case COLD:
-                                        mutex_lock(&mod->cache.guard);
-                                        ASSERT(cds_list_empty(&n->cache));
-                                        cds_list_add(&n->cache, &mod->cache.cold);
-                                        tail = COF(mod->cache.cold.prev, struct node, cache);
-                                        if (nstate(tail, shift) == COLD) {
-                                                cds_list_move(&n->cache, &mod->cache.cold);
-                                                KINC(cached);
-                                        } else {
-                                                cds_list_del_init(&tail->cache);
-                                                CINC(l[level(tail)].scan_heated);
-                                        }
-                                        mutex_unlock(&mod->cache.guard);
-                                        tocache--;
-                                }
-                                if (!done) {
-                                        break;
-                                }
-                        }
-                } while (!done);
-                mutex_unlock(&bucket->lock);
+                bucket_scan(mod, shift, &mod->ht.buckets[scan], &toscan, &towrite, &tocache);
                 cache_sync(mod);
                 scan = (scan + 1) & mask;
                 if (scan == scan0) {
