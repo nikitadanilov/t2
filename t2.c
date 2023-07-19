@@ -313,6 +313,12 @@ struct ewma {
         uint32_t avg;
 };
 
+struct map {
+        uint64_t        seq;
+        int32_t         idx[256];
+        struct rcu_head rcu;
+};
+
 enum node_flags {
         HEARD_BANSHEE = 1ull << 0,
         NOCACHE       = 1ull << 1,
@@ -325,6 +331,7 @@ struct node {
         uint64_t                   flags;
         uint64_t                   seq;
         atomic_int                 ref;
+        struct map                *map;
         struct cds_list_head       cache;
         const struct t2_node_type *ntype;
         void                      *data;
@@ -494,6 +501,10 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t scan_pageout;
                 int64_t scan_cold;
                 int64_t scan_heated;
+                int64_t map_discarded;
+                int64_t map_updated;
+                int64_t map_aborted;
+                int64_t map_used;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
@@ -582,6 +593,7 @@ static int32_t nr(const struct node *n);
 static int32_t nsize(const struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
+static void map_update(struct node *n, uint64_t seq, enum lock_mode lm);
 static struct header *nheader(const struct node *n);
 static void rcu_lock();
 static void rcu_unlock();
@@ -1047,7 +1059,9 @@ static void nfini(struct node *n) {
         cookie_invalidate(&n->cookie);
         NOFAIL(pthread_rwlock_destroy(&n->lock));
         mem_free(n->data);
-        SET0(n);
+        if (n->map != NULL) {
+                mem_free(n->map);
+        }
         mem_free(n);
 }
 
@@ -1240,6 +1254,50 @@ static void rcu_quiescent() {
         urcu_memb_quiescent_state();
 }
 
+static void map_free_callback(struct rcu_head *head) {
+        struct map *map = COF(head, struct map, rcu);
+        mem_free(map);
+}
+
+enum { HIGH = 4 };
+
+static void map_update(struct node *n, uint64_t seq, enum lock_mode lm) {
+        struct map *m;
+        if (LIKELY(level(n) < HIGH) || lm != WRITE || is_stable(n)) {
+                return;
+        }
+        if (LIKELY(n->map != NULL)) {
+                ASSERT(n->map->seq != n->seq);
+                call_rcu_memb(&n->map->rcu, &map_free_callback);
+                rcu_assign_pointer(n->map, NULL);
+                CINC(l[level(n)].map_discarded);
+        }
+        CINC(l[level(n)].map_updated);
+        m = mem_alloc(sizeof *n->map);
+        if (m != NULL) {
+                int32_t idx = 0;
+                int32_t i;
+                SLOT_DEFINE(s, n);
+                for (i = 1; i < nr(n); ++i) {
+                        uint8_t ch;
+                        rec_get(&s, i);
+                        ch = ((uint8_t *)s.rec.key->seg[0].addr)[0];
+                        if (idx == ch) { /* Abort. */
+                                mem_free(m);
+                                CINC(l[level(n)].map_aborted);
+                                return;
+                        }
+                        while (idx < ch) {
+                                m->idx[idx++] = i - 1;
+                        }
+                }
+                while (idx <= 255) {
+                        m->idx[idx++] = i - 1;
+                }
+                m->seq = seq + 2;
+                rcu_assign_pointer(n->map, m);
+        }
+}
 
 /* @policy */
 
@@ -1535,11 +1593,14 @@ static void path_fini(struct path *p) {
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
                 if (UNLIKELY(right->node != NULL)) {
+                        map_update(right->node, right->seq, right->lm);
                         unlock(right->node, right->lm);
                         put(right->node);
                 }
+                map_update(r->node, r->seq, r->lm);
                 unlock(r->node, r->lm);
                 if (UNLIKELY(left->node != NULL)) {
+                        map_update(left->node, left->seq, left->lm);
                         unlock(left->node, left->lm);
                         put(left->node);
                 }
@@ -2696,6 +2757,10 @@ static void counters_print() {
         COUNTER_PRINT(scan_pageout);
         COUNTER_PRINT(scan_cold);
         COUNTER_PRINT(scan_heated);
+        COUNTER_PRINT(map_updated);
+        COUNTER_PRINT(map_discarded);
+        COUNTER_PRINT(map_aborted);
+        COUNTER_PRINT(map_used);
         COUNTER_VAR_PRINT(nr);
         COUNTER_VAR_PRINT(free);
         COUNTER_VAR_PRINT(modified);
@@ -3214,13 +3279,23 @@ static taddr_t internal_addr(const struct slot *s) {
 
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
         SLOT_DEFINE(s, n);
+        ASSERT(CVAL(rcu) > 0);
         SET0(s.rec.key);
         SET0(s.rec.val);
         s.rec.key->nr = 1;
         s.rec.val->nr = 1;
-        (void)simple_search(n, r, &s);
-        if (s.idx < 0) {
-                rec_get(&s, 0);
+        if (n->map != NULL && n->seq == n->map->seq) {
+                int p = n->map->idx[*(uint8_t *)r->key->seg[0].addr];
+                CINC(l[level(n)].map_used);
+                if (p > 0 && skeycmp(simple_header(n), p, r->key->seg[0].addr, r->key->seg[0].len, nsize(n) - 1) > 0) {
+                        p--;
+                }
+                rec_get(&s, p);
+        } else {
+                (void)simple_search(n, r, &s);
+                if (s.idx < 0) {
+                        rec_get(&s, 0);
+                }
         }
         *pos = s.idx;
         return internal_addr(&s);
