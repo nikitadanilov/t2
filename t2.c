@@ -456,7 +456,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t peek;
         int64_t alloc;
         int64_t traverse;
-        int64_t traverse_start;
+        int64_t traverse_restart;
         int64_t traverse_iter;
         int64_t read;
         int64_t read_bytes;
@@ -1566,6 +1566,7 @@ static void path_reset(struct path *p) {
         path_fini(p);
         memset(&p->rung, 0, sizeof p->rung);
         p->next = p->tree->root;
+        CINC(traverse_restart);
 }
 
 static void path_pin(struct path *p) {
@@ -1990,9 +1991,6 @@ static int traverse(struct path *p) {
                         if (false && (tries & (tries - 1)) == 0) {
                                 LOG("Looping: %i.", tries);
                         }
-                }
-                if (p->used == 0) {
-                        CINC(traverse_start);
                 }
                 n = peek(mod, p->next);
                 if (EISERR(n)) {
@@ -2655,7 +2653,7 @@ static void counters_print() {
         printf("peek:               %10"PRId64"\n", GVAL(peek));
         printf("alloc:              %10"PRId64"\n", GVAL(alloc));
         printf("traverse:           %10"PRId64"\n", GVAL(traverse));
-        printf("traverse.start:     %10"PRId64"\n", GVAL(traverse_start));
+        printf("traverse.restart:   %10"PRId64"\n", GVAL(traverse_restart));
         printf("traverse.iter:      %10"PRId64"\n", GVAL(traverse_iter));
         printf("read:               %10"PRId64"\n", GVAL(read));
         printf("read.bytes:         %10"PRId64"\n", GVAL(read_bytes));
