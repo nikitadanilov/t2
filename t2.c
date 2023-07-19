@@ -2015,15 +2015,16 @@ static int traverse(struct path *p) {
                                 }
                                 flags |= PINNED;
                         }
-                } else if (!is_stable(n)) { /* This is racy, but OK. */
-                        rcu_leave(p, n);
-                        lock(n, READ); /* Wait for stabilisation. */
-                        unlock(n, READ);
-                        if (UNLIKELY(rcu_enter(p, n))) {
-                                continue;
-                        }
-                        flags |= PINNED;
                 } else {
+                        if (!is_stable(n)) { /* This is racy, but OK. */
+                                rcu_leave(p, n);
+                                lock(n, READ); /* Wait for stabilisation. */
+                                unlock(n, READ);
+                                if (UNLIKELY(rcu_enter(p, n))) {
+                                        continue;
+                                }
+                                flags |= PINNED;
+                        }
                         touch(n);
                 }
                 if (UNLIKELY(p->used == ARRAY_SIZE(p->rung))) {
