@@ -3398,6 +3398,7 @@ static int simple_insert(struct slot *s) {
         move(sh, end->voff, piv->voff, -vlen);
         for (int32_t i = ++sh->nr; i > s->idx; --i) {
                 struct dir_element *prev = sat(sh, i - 1);
+                __builtin_prefetch(prev - 1);
                 *sat(sh, i) = (struct dir_element){
                         .koff = prev->koff + klen,
                         .voff = prev->voff - vlen
