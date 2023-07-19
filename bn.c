@@ -516,14 +516,16 @@ static int ht_shift = 20;
 static int cache_shift = 22;
 static int counters_level = 0;
 static int shift_internal = 9;
+static int shift_twig     = 9;
 static int shift_leaf     = 9;
 static int report_interval = 10;
 
 static struct t2_node_type *bn_ntype_internal;
+static struct t2_node_type *bn_ntype_twig;
 static struct t2_node_type *bn_ntype_leaf;
 
 static struct t2_node_type *bn_tree_ntype(struct t2_tree *t, int level) {
-        return level == 0 ? bn_ntype_leaf : bn_ntype_internal;
+        return level == 0 ? bn_ntype_leaf : level == 1 ? bn_ntype_twig : bn_ntype_internal;
 }
 
 static struct t2_tree_type bn_ttype = {
@@ -751,8 +753,10 @@ static void brun(struct benchmark *b) {
 static void t_mount(struct benchmark *b) {
         b->kv.u.t2.mod = t2_init(bn_storage, ht_shift, cache_shift);
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
-        bn_ntype_leaf     = t2_node_type_init(1, "simple-bn-leaf",     shift_leaf,     0);
+        bn_ntype_twig     = t2_node_type_init(1, "simple-bn-twig",     shift_twig,     0);
+        bn_ntype_leaf     = t2_node_type_init(0, "simple-bn-leaf",     shift_leaf,     0);
         t2_node_type_register(b->kv.u.t2.mod, bn_ntype_internal);
+        t2_node_type_register(b->kv.u.t2.mod, bn_ntype_twig);
         t2_node_type_register(b->kv.u.t2.mod, bn_ntype_leaf);
         t2_tree_type_register(b->kv.u.t2.mod, &bn_ttype);
         if (b->kv.u.t2.free != 0) {
@@ -773,11 +777,13 @@ static void t_umount(struct benchmark *b) {
         b->kv.u.t2.bolt = bn_bolt(b->kv.u.t2.mod);
         t2_tree_close(b->kv.u.t2.tree);
         t2_node_type_degister(bn_ntype_internal);
+        t2_node_type_degister(bn_ntype_twig);
         t2_node_type_degister(bn_ntype_leaf);
         t2_tree_type_degister(&bn_ttype);
         t2_fini(b->kv.u.t2.mod);
         b->kv.u.t2.free = bn_file_free(bn_storage);
         t2_node_type_fini(bn_ntype_internal);
+        t2_node_type_fini(bn_ntype_twig);
         t2_node_type_fini(bn_ntype_leaf);
 }
 
@@ -909,7 +915,7 @@ int main(int argc, char **argv) {
         char ch;
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        while ((ch = getopt(argc, argv, "vf:r:n:N:h:ck:")) != -1) {
+        while ((ch = getopt(argc, argv, "vr:f:t:n:N:h:ck:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -922,6 +928,9 @@ int main(int argc, char **argv) {
                         break;
                 case 'n':
                         shift_leaf = atoi(optarg);
+                        break;
+                case 't':
+                        shift_twig = atoi(optarg);
                         break;
                 case 'N':
                         shift_internal = atoi(optarg);
