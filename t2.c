@@ -1329,13 +1329,19 @@ static void map_update(struct node *n, int idx, uint64_t seq, enum lock_mode lm)
 
 /* @policy */
 
+#define USE_PREFIX_SEPARATORS (0)
+
 static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r) {
         ASSERT(buf_cmp(l, r) < 0);
         ASSERT(r->nr == 1);
-        do {
-                r->seg[0].len--;
-        } while (buf_cmp(l, r) < 0);
-        return ++r->seg[0].len;
+        if (USE_PREFIX_SEPARATORS) {
+                do {
+                        r->seg[0].len--;
+                } while (buf_cmp(l, r) < 0);
+                return ++r->seg[0].len;
+        } else {
+                return r->seg[0].len;
+        }
 }
 
 static void rec_todo(struct path *p, int idx, struct slot *out) {
@@ -1756,7 +1762,7 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
 
 static bool should_split(const struct node *n) {
         /* Keep enough free space in internal nodes, to be able to update the delimiting key. */
-        return level(n) >= 2 && NCALL(n, free(n)) < (nsize(n) >> 4);
+        return USE_PREFIX_SEPARATORS ? (level(n) >= 2 && NCALL(n, free(n)) < (nsize(n) >> 4)) : false;
 }
 
 static int insert_prep(struct path *p) {
