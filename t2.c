@@ -221,6 +221,9 @@ enum {
 
 #define BUF_VAL(v) (struct t2_buf){ .nr = 1, .seg = { [0] = { .len = SOF(v), .addr = &(v) } } }
 
+#define COUNTERS (0)
+
+#if COUNTERS
 #define CINC(cnt) (++__t_counters.cnt)
 #define CDEC(cnt) (--__t_counters.cnt)
 #define CVAL(cnt) (__t_counters.cnt)
@@ -229,6 +232,19 @@ enum {
 #define CADD(cnt, d) (__t_counters.cnt += (d))
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
 #define DMOD(cnt, d) ({ struct double_var *v = &(__d_counters.cnt); v->sum += (d); v->nr++; })
+#define COUNTERS_ASSERT(expr) ASSERT(expr)
+#else
+#define CINC(cnt)
+#define CDEC(cnt)
+#define CVAL(cnt)
+#define GVAL(cnt)
+#define GDVAL(cnt)
+#define CADD(cnt, d) ((void)(d))
+#define CMOD(cnt, d) ((void)(d))
+#define DMOD(cnt, d) ((void)(d))
+#define COUNTERS_ASSERT(expr)
+#endif /* COUNTERS */
+
 #define KINC(cnt) ({ ci.cnt++; ci.sum++; })
 #define KDEC(cnt) ({ ci.cnt--; ci.sum++; })
 
@@ -472,6 +488,7 @@ enum dir {
         RIGHT = +1
 };
 
+#if COUNTERS
 struct counter_var {
         int64_t sum;
         int64_t nr;
@@ -547,6 +564,7 @@ struct double_counters {
                 struct double_var temperature;
         } l[MAX_TREE_HEIGHT];
 };
+#endif /* COUNTERS */
 
 struct error_descr {
         int                   err;
@@ -675,8 +693,13 @@ static void ref_add(struct node *n);
 static void ref_del(struct node *n);
 static void ref_print(void);
 
+#if COUNTERS
 static __thread struct counters __t_counters = {};
 static __thread struct double_counters __d_counters = {};
+static struct counters __g_counters = {};
+static struct double_counters __G_counters = {};
+static pthread_mutex_t __g_counters_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 static __thread struct error_descr estack[MAX_ERR_DEPTH] = {};
 static __thread int edepth = 0;
 static __thread bool thread_registered = false;
@@ -684,9 +707,6 @@ static __thread struct cacheinfo ci = {};
 static __thread volatile struct {
         volatile jmp_buf *buf;
 } addr_check = {};
-static struct counters __g_counters = {};
-static struct double_counters __G_counters = {};
-static pthread_mutex_t __g_counters_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct node_type_ops simple_ops;
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift) {
@@ -781,6 +801,7 @@ void t2_node_type_register(struct t2 *mod, struct t2_node_type *ntype) {
         ASSERT(IS_IN(ntype->id, mod->ntypes));
         ASSERT(mod->ntypes[ntype->id] == NULL);
         ASSERT(ntype->mod == NULL);
+        ASSERT(ntype->shift <= 32);
         mod->ntypes[ntype->id] = ntype;
         ntype->mod = mod;
         eclear();
@@ -866,7 +887,8 @@ static taddr_t taddr_make(uint64_t addr, int shift) {
         return addr | shift;
 }
 
-static struct t2_buf zero = { .nr = 1 };
+static uint64_t zerodata = 0;
+static struct t2_buf zero = { .nr = 1, .seg = { [0] = { .len = 0, .addr = &zerodata } } };
 
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
         ASSERT(thread_registered);
@@ -1023,7 +1045,7 @@ static bool is_stable(const struct node *n) {
 
 static void lock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
-        ASSERT(CVAL(rcu) == 0);
+        COUNTERS_ASSERT(CVAL(rcu) == 0);
         if (LIKELY(mode == NONE)) {
                 ;
         } else if (mode == WRITE) {
@@ -1143,7 +1165,7 @@ static void ndelete(struct node *n) {
 
 static struct node *get(struct t2 *mod, taddr_t addr) {
         struct node *n = ninit(mod, addr);
-        ASSERT(CVAL(rcu) == 0);
+        COUNTERS_ASSERT(CVAL(rcu) == 0);
         if (EISOK(n)) {
                 lock(n, WRITE);
                 if (LIKELY(n->ntype == NULL)) {
@@ -1177,7 +1199,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
         struct t2_node_type *ntype = t->ttype->ntype(t, level);
         taddr_t              addr  = SCALL(mod, alloc, ntype->shift, ntype->shift);
         struct node      *n;
-        ASSERT(CVAL(rcu) == 0);
+        COUNTERS_ASSERT(CVAL(rcu) == 0);
         if (EISOK(addr)) {
                 n = ninit(mod, addr);
                 if (EISOK(n)) {
@@ -1271,7 +1293,7 @@ static int32_t nsize(const struct node *n) {
 
 static void rcu_lock() {
         urcu_memb_read_lock();
-        ASSERT(CVAL(rcu) == 0);
+        COUNTERS_ASSERT(CVAL(rcu) == 0);
         CINC(rcu);
 }
 
@@ -1331,7 +1353,7 @@ static void map_update(struct node *n, int idx, uint64_t seq, enum lock_mode lm)
 
 /* @policy */
 
-#define USE_PREFIX_SEPARATORS (0)
+#define USE_PREFIX_SEPARATORS (1)
 
 static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r, int level) {
         ASSERT(buf_cmp(l, r) < 0);
@@ -1485,7 +1507,6 @@ static bool can_merge(struct node *n0, struct node *n1) {
 
 static void delete_update(struct path *p, int idx, struct slot *s) {
         ASSERT(idx + 1 < p->used);
-        NCALL(s->node, get(s));
         NCALL(s->node, delete(s));
         if (p->rung[idx + 1].flags & SEPCHG) {
                 struct node  *child = brother(&p->rung[idx + 1], RIGHT)->node;
@@ -1511,7 +1532,7 @@ static int split_right_exec_delete(struct path *p, int idx) {
         struct node *right = brother(r, RIGHT)->node;
         SLOT_DEFINE(s, r->node);
         if (!is_leaf(r->node)) {
-                if (r->pos + RIGHT < nr(r->node)) {
+                if (r->pos + 1 < nr(r->node)) {
                         s.idx = r->pos + 1;
                         delete_update(p, idx, &s);
                 } else {
@@ -2072,7 +2093,9 @@ static int traverse_complete(struct path *p, int result) {
                 rcu_lock();
                 return AGAIN;
         } else {
-                path_dirty(p);
+                if (p->opt != NEXT) {
+                        path_dirty(p);
+                }
                 return DONE;
         }
 }
@@ -2090,7 +2113,7 @@ static int traverse(struct path *p) {
                 struct node *n;
                 struct rung *r;
                 uint64_t     flags = 0;
-                ASSERT(CVAL(rcu) == 1);
+                COUNTERS_ASSERT(CVAL(rcu) == 1);
                 CINC(traverse_iter);
                 if (UNLIKELY(tries++ > 10)) {
                         if (false && (tries & (tries - 1)) == 0) {
@@ -2179,7 +2202,7 @@ static int traverse(struct path *p) {
                         }
                 }
         }
-        ASSERT(CVAL(rcu) == 0);
+        COUNTERS_ASSERT(CVAL(rcu) == 0);
         return result;
 }
 
@@ -2389,7 +2412,7 @@ static void cache_clean(struct t2 *mod) {
 }
 
 static void nodescan(struct node *n) {
-        uint8_t lev = level(n);
+        __attribute__((unused)) uint8_t lev = level(n);
         CMOD(l[lev].nr,          nr(n));
         CMOD(l[lev].free,        NCALL(n, free(n)));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
@@ -2409,7 +2432,7 @@ enum cachestate {
 };
 
 static enum cachestate nstate(struct node *n, int shift) {
-        uint8_t lev = level(n);
+        __attribute__((unused)) uint8_t lev = level(n);
         nodescan(n);
         CINC(l[lev].scan_node);
         if (n->ref > 0) {
@@ -2698,6 +2721,8 @@ static void eprint() {
         }
 }
 
+#if COUNTERS
+
 static void counters_check() {
         if (CVAL(node) != 0) {
                 LOG("Leaked node: %i.", CVAL(node));
@@ -2833,6 +2858,22 @@ static void counters_fold() {
         mutex_unlock(&__g_counters_lock);
         SET0(&__t_counters);
 }
+
+#else /* COUNTERS */
+
+static void counters_check() {
+}
+
+static void counters_print() {
+}
+
+static void counters_clear() {
+}
+
+static void counters_fold() {
+}
+
+#endif /* COUNTERS */
 
 static __thread int insigsegv = 0;
 static struct sigaction osa = {};
@@ -3322,17 +3363,23 @@ static taddr_t internal_addr(const struct slot *s) {
 }
 
 static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
+        struct t2_seg *seg = &r->key->seg[0];
         SLOT_DEFINE(s, n);
-        ASSERT(CVAL(rcu) > 0);
+        COUNTERS_ASSERT(CVAL(rcu) > 0);
         SET0(s.rec.key);
         SET0(s.rec.val);
         s.rec.key->nr = 1;
         s.rec.val->nr = 1;
         if (n->map != NULL && n->seq == n->map->seq) {
-                int p = n->map->idx[*(uint8_t *)r->key->seg[0].addr];
-                CINC(l[level(n)].map_used);
-                if (p > 0 && skeycmp(simple_header(n), p, r->key->seg[0].addr, r->key->seg[0].len, nsize(n) - 1) > 0) {
-                        p--;
+                int p;
+                if (LIKELY(seg->len > 0)) {
+                        p = n->map->idx[*(uint8_t *)seg->addr];
+                        CINC(l[level(n)].map_used);
+                        if (p > 0 && skeycmp(simple_header(n), p, seg->addr, seg->len, nsize(n) - 1) > 0) {
+                                p--;
+                        }
+                } else {
+                        p = 0;
                 }
                 rec_get(&s, p);
         } else {
@@ -3796,6 +3843,10 @@ void bn_bolt_set(struct t2 *mod, uint64_t bolt) {
 
 void bn_counters_print(void) {
         counters_print();
+}
+
+void bn_counters_fold(void) {
+        counters_fold();
 }
 
 #endif /* UT || BN */
@@ -4489,7 +4540,7 @@ static void cookie_ut() {
                 result = addr_is_valid((void *)&t2_init);
                 ASSERT(result);
         }
-        result = addr_is_valid((void *)&__t_counters); /* TLS */
+        result = addr_is_valid((void *)&edepth); /* TLS */
         ASSERT(result);
         result = addr_is_valid((void *)&cit);
         ASSERT(result);

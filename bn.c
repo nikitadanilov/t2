@@ -233,6 +233,7 @@ extern void bn_file_free_set(struct t2_storage *storage, uint64_t free);
 extern uint64_t bn_bolt(const struct t2 *mod);
 extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
 extern void bn_counters_print(void);
+extern void bn_counters_fold(void);
 
 static struct kv kv[KVNR];
 static enum kvtype kvt = T2;
@@ -628,6 +629,7 @@ static void *bworker(void *arg) {
                 var[ch].max  = MAX(var[ch].max, delta);
                 if (end - reported > 1000000) {
                         var_fold(ph, bt, var);
+                        bn_counters_fold();
                         reported = end;
                 }
         }
