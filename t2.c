@@ -314,6 +314,7 @@ struct node_type_ops {
         int32_t (*nr)        (const struct node *n);
         int32_t (*free)      (const struct node *n);
         int32_t (*used)      (const struct node *n);
+        int     (*keycmp)    (const struct node *n, int pos, void *addr, int32_t len, uint64_t mask);
 };
 
 struct t2 {
@@ -658,6 +659,7 @@ static int32_t simple_used(const struct node *n);
 static bool simple_can_merge(const struct node *n0, const struct node *n1);
 static void simple_print(struct node *n);
 static bool simple_invariant(const struct node *n);
+static int simple_keycmp(const struct node *n, int pos, void *addr, int32_t len, uint64_t mask);
 static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 static int shift(struct node *d, struct node *s, const struct slot *insert, enum dir dir);
 static int merge(struct node *d, struct node *s, enum dir dir);
@@ -2102,7 +2104,6 @@ static int traverse_complete(struct path *p, int result) {
 
 static int traverse(struct path *p) {
         struct t2 *mod   = p->tree->ttype->mod;
-        int        tries = 0;
         int        result;
         ASSERT(p->used == 0);
         ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
@@ -2115,11 +2116,6 @@ static int traverse(struct path *p) {
                 uint64_t     flags = 0;
                 COUNTERS_ASSERT(CVAL(rcu) == 1);
                 CINC(traverse_iter);
-                if (UNLIKELY(tries++ > 10)) {
-                        if (false && (tries & (tries - 1)) == 0) {
-                                LOG("Looping: %i.", tries);
-                        }
-                }
                 n = peek(mod, p->next);
                 if (n == NULL || rcu_dereference(n->ntype) == NULL) {
                         rcu_leave(p, NULL);
@@ -3375,7 +3371,7 @@ static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
                 if (LIKELY(seg->len > 0)) {
                         p = n->map->idx[*(uint8_t *)seg->addr];
                         CINC(l[level(n)].map_used);
-                        if (p > 0 && skeycmp(simple_header(n), p, seg->addr, seg->len, nsize(n) - 1) > 0) {
+                        if (p > 0 && NCALL(n, keycmp(n, p, seg->addr, seg->len, nsize(n) - 1)) > 0) {
                                 p--;
                         }
                 } else {
@@ -3649,6 +3645,10 @@ static int merge(struct node *d, struct node *s, enum dir dir) {
         return result;
 }
 
+static int simple_keycmp(const struct node *n, int pos, void *addr, int32_t len, uint64_t mask) {
+        return skeycmp(simple_header(n), pos, addr, len, mask);
+}
+
 static struct node_type_ops simple_ops = {
         .insert     = &simple_insert,
         .delete     = &simple_delete,
@@ -3660,7 +3660,8 @@ static struct node_type_ops simple_ops = {
         .can_insert = &simple_can_insert,
         .nr         = &simple_nr,
         .free       = &simple_free,
-        .used       = &simple_used
+        .used       = &simple_used,
+        .keycmp     = &simple_keycmp
 };
 
 #if UT || BN
