@@ -2676,15 +2676,15 @@ static void llog(const struct msg_ctx *ctx, ...) {
         puts("");
 }
 
-static int32_t min_32(int32_t a, int32_t b) {
-        return a < b ? a : b;
+static int32_t min_32(int32_t a, int32_t b) {  /* Hacker's Delight. */
+        return b + ((a - b) & ((a - b) >> 31));
 }
 
 static int32_t max_32(int32_t a, int32_t b) {
-        return a > b ? a : b;
+        return a - ((a - b) & ((a - b) >> 31));
 }
 
-static int ilog2(uint32_t x) { /* Hacker's Delight. */
+static int ilog2(uint32_t x) {
         x = x | (x >>  1);
         x = x | (x >>  2);
         x = x | (x >>  4);
@@ -3267,6 +3267,7 @@ static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen, uint32_t mask) {
         int32_t ksize;
         int32_t koff = skeyoff(sh, pos, &ksize) & mask;
+        __builtin_prefetch((void *)sh + koff);
         ksize = min_32(ksize & mask, mask + 1 - koff);
         CMOD(l[sh->head.level].keysize, ksize);
         return memcmp((void *)sh + koff, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
