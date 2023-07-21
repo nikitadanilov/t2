@@ -3,8 +3,6 @@
 #define ON_LINUX  (1)
 #define ON_DARWIN (0)
 
-#define DEBUG     (1)
-
 #include <sys/syscall.h>
 #include <sys/time.h>
 
