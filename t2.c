@@ -376,7 +376,6 @@ enum node_flags {
 
 struct node {
         struct cds_hlist_node      hash;
-        struct map                *map;
         taddr_t                    addr;
         uint64_t                   flags;
         uint64_t                   seq;
@@ -385,6 +384,7 @@ struct node {
         const struct t2_node_type *ntype;
         void                      *data;
         struct t2                 *mod;
+        struct map                *map;
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
         struct rcu_head            rcu;
@@ -516,6 +516,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t traverse;
         int64_t traverse_restart;
         int64_t traverse_iter;
+        int64_t cookie_miss;
+        int64_t cookie_hit;
         int64_t read;
         int64_t read_bytes;
         int64_t write;
@@ -560,6 +562,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var valsize;
                 struct counter_var repage;
                 struct counter_var sepcut;
+                struct counter_var map_left;
+                struct counter_var map_right;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -1640,11 +1644,11 @@ static void path_dirty(struct path *p) {
 }
 
 static void path_lock(struct path *p) {
-        /* Bottom to top, left to right. */
+        /* Top to bottom, left to right. */
         if (UNLIKELY(p->newroot != NULL)) {
                 lock(p->newroot, WRITE);
         }
-        for (int i = p->used - 1; i >= 0; --i) {
+        for (int i = 0; i < p->used; ++i) {
                 struct rung *r = &p->rung[i];
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
@@ -1698,6 +1702,7 @@ static void path_fini(struct path *p) {
 static void path_reset(struct path *p) {
         path_fini(p);
         memset(&p->rung, 0, sizeof p->rung);
+        p->newroot = NULL;
         p->next = p->tree->root;
         CINC(traverse_restart);
 }
@@ -2207,7 +2212,10 @@ static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt)
         path_init(&p, t, r, opt);
         result = cookie_try(&p);
         if (result == -ESTALE) {
+                CINC(cookie_miss);
                 result = traverse(&p);
+        } else {
+                CINC(cookie_hit);
         }
         cache_sync(t->ttype->mod);
         path_fini(&p);
@@ -2407,14 +2415,6 @@ static void cache_clean(struct t2 *mod) {
         mutex_unlock(&mod->cache.guard);
 }
 
-static void nodescan(struct node *n) {
-        __attribute__((unused)) uint8_t lev = level(n);
-        CMOD(l[lev].nr,          nr(n));
-        CMOD(l[lev].free,        NCALL(n, free(n)));
-        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
-        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
-}
-
 static bool is_hot(struct node *n, int shift) {
         return (kavg(&nheader(n)->kelvin, bolt(n)) >>
                 ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT) + (shift - BOLT_EPOCH_SHIFT))) != 0;
@@ -2429,7 +2429,6 @@ enum cachestate {
 
 static enum cachestate nstate(struct node *n, int shift) {
         __attribute__((unused)) uint8_t lev = level(n);
-        nodescan(n);
         CINC(l[lev].scan_node);
         if (n->ref > 0) {
                 CINC(l[lev].scan_busy);
@@ -2778,6 +2777,8 @@ static void counters_print() {
         printf("traverse:           %10"PRId64"\n", GVAL(traverse));
         printf("traverse.restart:   %10"PRId64"\n", GVAL(traverse_restart));
         printf("traverse.iter:      %10"PRId64"\n", GVAL(traverse_iter));
+        printf("cookie.miss:        %10"PRId64"\n", GVAL(cookie_miss));
+        printf("cookie.hit:         %10"PRId64"\n", GVAL(cookie_hit));
         printf("read:               %10"PRId64"\n", GVAL(read));
         printf("read.bytes:         %10"PRId64"\n", GVAL(read_bytes));
         printf("write:              %10"PRId64"\n", GVAL(write));
@@ -2819,6 +2820,8 @@ static void counters_print() {
         COUNTER_PRINT(scan_cold);
         COUNTER_PRINT(scan_heated);
         COUNTER_PRINT(map_updated);
+        COUNTER_VAR_PRINT(map_left);
+        COUNTER_VAR_PRINT(map_right);
         COUNTER_VAR_PRINT(nr);
         COUNTER_VAR_PRINT(free);
         COUNTER_VAR_PRINT(modified);
@@ -3289,6 +3292,7 @@ enum { LINEAR = 1 }; /* Effects of switching to linear search seem to be minimal
 static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) {
         ASSERT(rec->key->nr == 1);
         bool            found = false;
+        uint8_t         lev   = level(n);
         struct sheader *sh    = simple_header(n);
         int             l     = -1;
         int             r     = nr(n);
@@ -3300,10 +3304,16 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
-        CINC(l[level(n)].search);
+        CINC(l[lev].search);
+        CMOD(l[lev].nr,          nr(n));
+        CMOD(l[lev].free,        NCALL(n, free(n)));
+        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
+        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
         if (!is_leaf(n)) {
                 l = n->map->idx[ch].l;
                 r = n->map->idx[ch].r;
+                CMOD(l[lev].map_left,  l + 1);
+                CMOD(l[lev].map_right, nr(n) - r);
                 if (UNLIKELY(l < 0)) {
                         goto here;
                 }
@@ -3317,7 +3327,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         }
         while (r - l > LINEAR) {
                 int m = (l + r) >> 1;
-                CINC(l[level(n)].bin_iter);
+                CINC(l[lev].bin_iter);
                 __builtin_prefetch(sat(sh, (l + m) >> 2));
                 __builtin_prefetch(sat(sh, (m + r) >> 2));
                 cmp = skeycmp(sh, m, kaddr, klen, mask);
@@ -3332,7 +3342,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                 }
         }
         while (r - l > 1) {
-                CINC(l[level(n)].lin_iter);
+                CINC(l[lev].lin_iter);
                 cmp = skeycmp(sh, ++l, kaddr, klen, mask);
                 if (cmp >= 0) {
                         if (cmp > 0) {
@@ -3354,8 +3364,8 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                 val->nr = 1;
                 val->seg[0].addr = sval(sh, l, &val->seg[0].len);
                 buf_clip(val, mask, sh);
-                CMOD(l[level(n)].keysize, key->seg[0].len);
-                CMOD(l[level(n)].valsize, key->seg[0].len);
+                CMOD(l[lev].keysize, key->seg[0].len);
+                CMOD(l[lev].valsize, key->seg[0].len);
         }
         return found;
 }
@@ -3938,11 +3948,13 @@ static struct t2_tree_type ttype = {
 };
 
 static void simple_ut() {
+        struct t2 mod = {};
         struct node n = {
                 .ntype = &ntype,
                 .addr  = taddr_make(0x100000, ntype.shift),
                 .data  = mem_alloc_align(1ul << ntype.shift, 1ul << ntype.shift),
-                .seq   = 1
+                .seq   = 1,
+                .mod   = &mod
         };
         ASSERT(n.data != NULL);
         struct sheader *sh = simple_header(&n);
