@@ -68,7 +68,7 @@ enum {
 #if __has_attribute(assume)
 #define ASSERT(expr) (__attribute__((assume(!(expr)))))
 #else
-#define ASSERT(expr)
+#define ASSERT(expr) ((void)(expr))
 #endif
 #endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
