@@ -43,8 +43,8 @@ function run() {
 }
 
 function build() {
-    CFLAGS="-O6 -I/usr/local/include -march=native -g3 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion -fprofile-arcs -ftest-coverage"
-    LDFLAGS="-L/usr/local/lib/ -lurcu -lpthread -rdynamic -lprofiler -lm"
+    CFLAGS="-O0 -I/usr/local/include -march=native -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion"
+    LDFLAGS="-L/usr/local/lib/ -lurcu -lpthread -rdynamic -lprofiler -lm -lrocksdb -lsnappy -lz -lbz2 -lzstd -llz4 -ldl -lstdc++"
     run ut ${CC:-cc} $CFLAGS -DUT=1 -DBN=0 t2.c $LDFLAGS -o ut
     run object ${CC:-cc} $CFLAGS -DUT=0 -DBN=1 -c t2.c
     run bench ${CC:-cc} $CFLAGS bn.c t2.o $LDFLAGS -lrocksdb -o bn

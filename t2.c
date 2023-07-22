@@ -41,6 +41,7 @@ enum {
 /* @macro */
 
 #define DEBUG (1)
+#define COUNTERS (1)
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -222,8 +223,6 @@ enum {
         struct slot s = { .node = n, .rec = { .key = &__key, .val = &__val } }
 
 #define BUF_VAL(v) (struct t2_buf){ .nr = 1, .seg = { [0] = { .len = SOF(v), .addr = &(v) } } }
-
-#define COUNTERS (1)
 
 #if COUNTERS
 #define CINC(cnt) (++__t_counters.cnt)
