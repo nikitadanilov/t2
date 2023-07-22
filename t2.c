@@ -59,7 +59,7 @@ enum {
 #if DEBUG
 #define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
 #else
-#define ASSERT(expr) #define ASSERT(expr) ({ __attribute__((assume(!(expr)))); })
+#define ASSERT(expr) ({ __attribute__((assume(!(expr)))); })
 #endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
 #define SOF(x) ((int32_t)sizeof(x))
@@ -3054,6 +3054,7 @@ static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
         struct cds_hlist_head *head = &ht_bucket(ht, addr)->chain;
         struct node           *scan;
         cds_hlist_for_each_entry_rcu_2(scan, head, hash) {
+                __builtin_prefetch(scan->hash.next);
                 if (scan->addr == addr && LIKELY((scan->flags & HEARD_BANSHEE) == 0)) {
                         __builtin_prefetch(scan->data);
                         return scan;
