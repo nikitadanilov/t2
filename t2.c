@@ -368,7 +368,7 @@ struct ewma {
 
 struct mapel {
         int32_t l;
-        int32_t r;
+        int32_t delta;
 };
 
 struct radixmap {
@@ -1348,7 +1348,7 @@ static void radixmap_update(struct node *n) {
                         return;
                 }
                 for (int16_t ch = -1; ch < ARRAY_SIZE(n->radixmap->idx); ++ch) {
-                        n->radixmap->idx[ch] = (struct mapel){ -1, 0 };
+                        n->radixmap->idx[ch] = (struct mapel){ -1, +1 };
                 }
         }
         m = n->radixmap;
@@ -1364,13 +1364,13 @@ static void radixmap_update(struct node *n) {
                 }
                 if (prev < ch) {
                         for (; prev < ch; ++prev) {
-                                m->idx[prev] = (struct mapel){ pidx, i };
+                                m->idx[prev] = (struct mapel){ pidx, i - pidx };
                         }
                         pidx = i;
                 }
         }
         for (; prev < ARRAY_SIZE(m->idx); ++prev) {
-                m->idx[prev] = (struct mapel){ pidx, i };
+                m->idx[prev] = (struct mapel){ pidx, i - pidx };
         }
 }
 
@@ -2746,7 +2746,7 @@ static void counters_check() {
 }
 
 static void counter_print(int offset, const char *label) {
-        printf("%-15s ", label);
+        printf("%-20s ", label);
         for (int i = 0; i < ARRAY_SIZE(GVAL(l)); ++i) {
                 printf("%10"PRId64" ", *(uint64_t *)(((void *)&GVAL(l[i])) + offset));
         }
@@ -2754,7 +2754,7 @@ static void counter_print(int offset, const char *label) {
 }
 
 static void counter_var_print(int offset, const char *label) {
-        printf("%-15s ", label);
+        printf("%-20s ", label);
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 struct counter_var *v = (((void *)&GVAL(l[i])) + offset);
                 printf("%10.1f ", v->nr ? 1.0 * v->sum / v->nr : 0.0);
@@ -2763,7 +2763,7 @@ static void counter_var_print(int offset, const char *label) {
 }
 
 static void double_var_print(int offset, const char *label) {
-        printf("%-15s ", label);
+        printf("%-20s ", label);
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 struct double_var *v = (((void *)&GDVAL(l[i])) + offset);
                 printf("%10.4f ", v->nr ? 1.0 * v->sum / v->nr : 0.0);
@@ -3334,7 +3334,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         bool            found = false;
         struct sheader *sh    = simple_header(n);
         int             l     = -1;
-        int             r     = nr(n);
+        int             delta = nr(n) + 1;
         void           *kaddr = rec->key->seg[0].addr;
         int32_t         klen  = rec->key->seg[0].len;
         int             cmp   = -1;
@@ -3351,10 +3351,10 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
         if (!is_leaf(n)) {
-                l = n->radixmap->idx[ch].l;
-                r = n->radixmap->idx[ch].r;
+                l     = n->radixmap->idx[ch].l;
+                delta = n->radixmap->idx[ch].delta;
                 CMOD(l[lev].radixmap_left,  l + 1);
-                CMOD(l[lev].radixmap_right, nr(n) - r);
+                CMOD(l[lev].radixmap_right, nr(n) - l - delta);
                 if (UNLIKELY(l < 0)) {
                         goto here;
                 }
@@ -3366,38 +3366,46 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                         goto here;
                 }
         }
-        CMOD(l[lev].search_span, r - l);
-        span = 1 << ilog2(r - l);
+        CMOD(l[lev].search_span, delta);
+        span = 1 << ilog2(delta);
         if (skeycmp(sh, l + span, kaddr, klen, mask) <= 0) {
-                l = r - span;
+                l += delta - span;
         }
-#define RANGE(n)                                                        \
-        case 1 << (n):                                                  \
-                span >>= 1;                                             \
-                __builtin_prefetch(sat(sh, l + span + (span >> 1)));    \
-                __builtin_prefetch(sat(sh, l + span - (span >> 1)));    \
-                cmp = skeycmp(sh, l + span, kaddr, klen, mask);         \
-                if (cmp <= 0) {                                         \
-                        l += span;                                      \
-                        if (cmp == 0) {                                 \
-                                found = true;                           \
-                                goto here;                              \
-                        }                                               \
-                }                                                       \
-        __attribute__((fallthrough));
+#define RANGE(n, prefetchp)                                                  \
+        case 1 << (n):                                                       \
+                span >>= 1;                                                  \
+                if (prefetchp) {                                             \
+                        __builtin_prefetch(sat(sh, l + span + (span >> 1))); \
+                        __builtin_prefetch(sat(sh, l + span - (span >> 1))); \
+                }                                                            \
+                cmp = skeycmp(sh, l + span, kaddr, klen, mask);              \
+                if (cmp <= 0) {                                              \
+                        l += span;                                           \
+                        if (cmp == 0) {                                      \
+                                found = true;                                \
+                                goto here;                                   \
+                        }                                                    \
+                }                                                            \
+                __attribute__((fallthrough));
         switch (span) {
         default:
                 IMMANENTISE("Impossible span: %i.", span);
-                RANGE(10)
-                RANGE( 9)
-                RANGE( 8)
-                RANGE( 7)
-                RANGE( 6)
-                RANGE( 5)
-                RANGE( 4)
-                RANGE( 3)
-                RANGE( 2)
-                RANGE( 1)
+                RANGE(16,  true)
+                RANGE(15,  true)
+                RANGE(14,  true)
+                RANGE(13,  true)
+                RANGE(12,  true)
+                RANGE(11,  true)
+                RANGE(10,  true)
+                RANGE( 9,  true)
+                RANGE( 8,  true)
+                RANGE( 7,  true)
+                RANGE( 6,  true)
+                RANGE( 5,  true)
+                RANGE( 4, false)
+                RANGE( 3, false)
+                RANGE( 2, false)
+                RANGE( 1, false)
         case 1:
                 ;
         }
