@@ -65,7 +65,7 @@ enum {
 #if DEBUG
 #define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
 #else
-#define ASSERT(expr) ({ __attribute__((assume(!(expr)))); })
+#define ASSERT(expr) ({ __attribute__((assume(!(expr)))); (void)0; })
 #endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
 #define SOF(x) ((int32_t)sizeof(x))
@@ -3298,7 +3298,6 @@ static void buf_clip_node(struct t2_buf *b, const struct node *n) {
 static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) {
         ASSERT(rec->key->nr == 1);
         bool            found = false;
-        uint8_t         lev   = level(n);
         struct sheader *sh    = simple_header(n);
         int             l     = -1;
         int             r     = nr(n);
@@ -3308,6 +3307,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         uint32_t        mask  = nsize(n) - 1;
         int16_t         ch    = LIKELY(klen > 0) ? *(uint8_t *)kaddr : -1;
         int32_t         span;
+        uint8_t __attribute__((unused)) lev = level(n);
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));

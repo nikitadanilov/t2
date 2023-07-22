@@ -42,12 +42,18 @@ case "$platform" in ####################### Darwin x86_64 ######################
         ;;
 esac
 
+case "$($CC -v 2>&1)" in
+    *gcc*13.1.0*)
+	CFLAGS="$CFLAGS -Wno-stringop-overflow -Wno-array-bounds"
+esac
+
 function run() {
     echo "$* "
     $*
-    if [ $? != 0 ]
+    rc="$?"
+    if [ $rc != 0 ]
     then
-        log 0 "failed: $* ($?)"
+        echo "failed: $rc"
         exit $?
     fi
 }

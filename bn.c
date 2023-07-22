@@ -472,7 +472,7 @@ static int rnd_between(int lo, int hi, uint64_t seed) {
 
 static int32_t bufgen(void *key, uint64_t seed0, int max, int *rndmax, int delta, struct bspec *sp) {
         uint64_t seed = seed0 + max + delta;
-        int len;
+        int len = 0;
         switch (sp->ord) {
         case EXI:
                 seed = rnd_between(seed0, seed0 + *rndmax, seed) + delta;
