@@ -59,7 +59,7 @@ enum {
 #if DEBUG
 #define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
 #else
-#define ASSERT(expr) ((void)sizeof(expr))
+#define ASSERT(expr) #define ASSERT(expr) ({ __attribute__((assume(!(expr)))); })
 #endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
 #define SOF(x) ((int32_t)sizeof(x))
@@ -564,6 +564,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var sepcut;
                 struct counter_var map_left;
                 struct counter_var map_right;
+                struct counter_var search_span;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -2820,6 +2821,7 @@ static void counters_print() {
         COUNTER_PRINT(scan_cold);
         COUNTER_PRINT(scan_heated);
         COUNTER_PRINT(map_updated);
+        COUNTER_VAR_PRINT(search_span);
         COUNTER_VAR_PRINT(map_left);
         COUNTER_VAR_PRINT(map_right);
         COUNTER_VAR_PRINT(nr);
@@ -3288,8 +3290,6 @@ static void buf_clip_node(struct t2_buf *b, const struct node *n) {
         buf_clip(b, nsize(n) - 1, n->data);
 }
 
-enum { LINEAR = 1 }; /* Effects of switching to linear search seem to be minimal. */
-
 static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) {
         ASSERT(rec->key->nr == 1);
         bool            found = false;
@@ -3302,6 +3302,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         int             cmp   = -1;
         uint32_t        mask  = nsize(n) - 1;
         int16_t         ch    = LIKELY(klen > 0) ? *(uint8_t *)kaddr : -1;
+        int32_t         span;
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
@@ -3326,33 +3327,40 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                         goto here;
                 }
         }
-        while (r - l > LINEAR) {
-                int m = (l + r) >> 1;
-                CINC(l[lev].bin_iter);
-                __builtin_prefetch(sat(sh, (l + m) >> 2));
-                __builtin_prefetch(sat(sh, (m + r) >> 2));
-                cmp = skeycmp(sh, m, kaddr, klen, mask);
-                if (cmp > 0) {
-                        r = m;
-                } else {
-                        l = m;
-                        if (cmp == 0) {
-                                found = true;
-                                goto here;
-                        }
-                }
+        CMOD(l[lev].search_span, r - l);
+        span = 1 << ilog2(r - l);
+        if (skeycmp(sh, l + span, kaddr, klen, mask) <= 0) {
+                l = r - span;
         }
-        while (r - l > 1) {
-                CINC(l[lev].lin_iter);
-                cmp = skeycmp(sh, ++l, kaddr, klen, mask);
-                if (cmp >= 0) {
-                        if (cmp > 0) {
-                                --l;
-                        } else {
-                                found = true;
-                        }
-                        break;
-                }
+#define RANGE(n)                                                        \
+        case 1 << (n):                                                  \
+                span >>= 1;                                             \
+                __builtin_prefetch(sat(sh, l + span + (span >> 1)));    \
+                __builtin_prefetch(sat(sh, l + span - (span >> 1)));    \
+                cmp = skeycmp(sh, l + span, kaddr, klen, mask);         \
+                if (cmp <= 0) {                                         \
+                        l += span;                                      \
+                        if (cmp == 0) {                                 \
+                                found = true;                           \
+                                goto here;                              \
+                        }                                               \
+                }                                                       \
+        __attribute__((fallthrough));
+        switch (span) {
+        default:
+                IMMANENTISE("Impossible span: %i.", span);
+                RANGE(10)
+                RANGE( 9)
+                RANGE( 8)
+                RANGE( 7)
+                RANGE( 6)
+                RANGE( 5)
+                RANGE( 4)
+                RANGE( 3)
+                RANGE( 2)
+                RANGE( 1)
+        case 1:
+                ;
         }
  here:
         out->idx = l;
