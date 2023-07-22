@@ -358,7 +358,6 @@ enum optype {
 
         OP_NR
 };
-
 struct ewma {
         uint32_t count;
         uint32_t cur;
@@ -369,6 +368,12 @@ struct ewma {
 struct mapel {
         int32_t l;
         int32_t delta;
+};
+
+struct num64map {
+        int32_t  used;
+        int32_t  capacity;
+        uint64_t el[0];
 };
 
 struct radixmap {
@@ -392,7 +397,10 @@ struct node {
         const struct t2_node_type *ntype;
         void                      *data;
         struct t2                 *mod;
-        struct radixmap           *radixmap;
+        union {
+                struct radixmap   *radix;
+                struct num64map   *num64;
+        } map;
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
         struct rcu_head            rcu;
@@ -1137,7 +1145,7 @@ static void nfini(struct node *n) {
         ASSERT(!(n->flags & DIRTY));
         cookie_invalidate(&n->cookie);
         NOFAIL(pthread_rwlock_destroy(&n->lock));
-        mem_free(n->radixmap);
+        mem_free(n->map.radix);
         mem_free(n->data);
         mem_free(n);
 }
@@ -1342,16 +1350,16 @@ static void radixmap_update(struct node *n) {
         if (is_stable(n) || is_leaf(n)) {
                 return;
         }
-        if (UNLIKELY(n->radixmap == NULL)) {
-                n->radixmap = mem_alloc(sizeof *n->radixmap);
-                if (UNLIKELY(n->radixmap == NULL)) {
+        if (UNLIKELY(n->map.radix == NULL)) {
+                n->map.radix = mem_alloc(sizeof *n->map.radix);
+                if (UNLIKELY(n->map.radix == NULL)) {
                         return;
                 }
-                for (int16_t ch = -1; ch < ARRAY_SIZE(n->radixmap->idx); ++ch) {
-                        n->radixmap->idx[ch] = (struct mapel){ -1, +1 };
+                for (int16_t ch = -1; ch < ARRAY_SIZE(n->map.radix->idx); ++ch) {
+                        n->map.radix->idx[ch] = (struct mapel){ -1, +1 };
                 }
         }
-        m = n->radixmap;
+        m = n->map.radix;
         CINC(l[level(n)].radixmap_updated);
         for (i = 0; i < nr(n); ++i) {
                 rec_get(&s, i);
@@ -3351,8 +3359,8 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
         if (!is_leaf(n)) {
-                l     = n->radixmap->idx[ch].l;
-                delta = n->radixmap->idx[ch].delta;
+                l     = n->map.radix->idx[ch].l;
+                delta = n->map.radix->idx[ch].delta;
                 CMOD(l[lev].radixmap_left,  l + 1);
                 CMOD(l[lev].radixmap_right, nr(n) - l - delta);
                 if (UNLIKELY(l < 0)) {
