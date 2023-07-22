@@ -13,7 +13,6 @@
 #include <unistd.h>
 #include <sys/time.h>
 
-#include <rocksdb/c.h>
 #include "t2.h"
 
 #define COUNT(var, nr, ...)                             \
@@ -153,6 +152,19 @@ struct bphase {
         bool run;
 };
 
+#if USE_ROCKSDB
+#include <rocksdb/c.h>
+
+struct rocksdb_benchmark {
+        rocksdb_t *db;
+        rocksdb_writeoptions_t *wo;
+        rocksdb_readoptions_t *ro;
+};
+
+#else
+struct rocksdb_benchmark {};
+#endif
+
 struct kvbenchmark {
         union {
                 struct {
@@ -162,11 +174,7 @@ struct kvbenchmark {
                         uint64_t        free;
                         uint64_t        bolt;
                 } t2;
-                struct {
-                        rocksdb_t *db;
-                        rocksdb_writeoptions_t *wo;
-                        rocksdb_readoptions_t *ro;
-                } r;
+                struct rocksdb_benchmark r;
         } u;
 };
 
@@ -831,25 +839,27 @@ static void t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, e
         t2_cursor_fini(&d->u.t2.c);
 }
 
+#if USE_ROCKSDB
+
 static void r_mount(struct benchmark *b) {
-	rocksdb_options_t *opts = rocksdb_options_create();
-	rocksdb_options_set_create_if_missing(opts, 1);
+        rocksdb_options_t *opts = rocksdb_options_create();
+        rocksdb_options_set_create_if_missing(opts, 1);
         rocksdb_options_set_manual_wal_flush(opts, 1);
-	rocksdb_options_set_compression(opts, rocksdb_snappy_compression);
-	char *err = NULL;
-	b->kv.u.r.db = rocksdb_open(opts, "testdb", &err);
-	if (err != NULL) {
-		fprintf(stderr, "database open %s\n", err);
-		abort();
-	}
-	free(err);
-	err = NULL;
-	b->kv.u.r.wo = rocksdb_writeoptions_create();
-	b->kv.u.r.ro = rocksdb_readoptions_create();
+        rocksdb_options_set_compression(opts, rocksdb_snappy_compression);
+        char *err = NULL;
+        b->kv.u.r.db = rocksdb_open(opts, "testdb", &err);
+        if (err != NULL) {
+                fprintf(stderr, "database open %s\n", err);
+                abort();
+        }
+        free(err);
+        err = NULL;
+        b->kv.u.r.wo = rocksdb_writeoptions_create();
+        b->kv.u.r.ro = rocksdb_readoptions_create();
 }
 
 static void r_umount(struct benchmark *b) {
-	rocksdb_close(b->kv.u.r.db);
+        rocksdb_close(b->kv.u.r.db);
 }
 
 static void r_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {
@@ -859,24 +869,24 @@ static void r_worker_fini(struct rthread *rt, struct kvdata *d) {
 }
 
 static void r_tail(const char *label, char *err) {
-	if (err != NULL) {
-		printf("rocksdb error: %s failed with \"%s\"\n", label, err);
+        if (err != NULL) {
+                printf("rocksdb error: %s failed with \"%s\"\n", label, err);
                 abort();
-	}
-	free(err);
+        }
+        free(err);
 }
 
 static void r_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
         char *err = NULL;
         size_t len;
-	char *value = rocksdb_get(d->b->u.r.db, d->b->u.r.ro, key, ksize, &len, &err);
+        char *value = rocksdb_get(d->b->u.r.db, d->b->u.r.ro, key, ksize, &len, &err);
         r_tail("get", err);
         free(value);
 }
 
 static void r_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
         char *err = NULL;
-	rocksdb_put(d->b->u.r.db, d->b->u.r.wo, key, ksize, val, vsize, &err);
+        rocksdb_put(d->b->u.r.db, d->b->u.r.wo, key, ksize, val, vsize, &err);
         r_tail("put", err);
 }
 
@@ -890,6 +900,8 @@ static void r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, e
         assert(false);
 }
 
+#endif
+
 static struct kv kv[] = {
         [T2] = {
                 .mount       = &t_mount,
@@ -901,6 +913,7 @@ static struct kv kv[] = {
                 .delete      = &t_delete,
                 .next        = &t_next
         },
+#if USE_ROCKSDB
         [ROCKSDB] = {
                 .mount       = &r_mount,
                 .umount      = &r_umount,
@@ -911,6 +924,7 @@ static struct kv kv[] = {
                 .delete      = &r_delete,
                 .next        = &r_next
         }
+#endif
 };
 
 int main(int argc, char **argv) {
@@ -946,8 +960,10 @@ int main(int argc, char **argv) {
                 case 'k':
                         if (strcmp(optarg, "t2") == 0) {
                                 kvt = T2;
+#if USE_ROCKSDB
                         } else if (strcmp(optarg, "rocksdb") == 0) {
                                 kvt = ROCKSDB;
+#endif
                         } else {
                                 printf("Unknown kv: %s\n", optarg);
                                 return 1;

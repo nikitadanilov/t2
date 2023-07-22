@@ -59,7 +59,7 @@ function run() {
 }
 
 runut=0
-
+rocksdb=0
 while [ $# != 0 ] ;do
       case "$1" in
           '-o')
@@ -67,6 +67,8 @@ while [ $# != 0 ] ;do
               shift
       ;;  '-u')
 	      runut=1
+      ;;  '-r')
+	      rocksdb=1
       esac
       shift
 done
@@ -95,7 +97,11 @@ done
 
 run $CC $CFLAGS -DUT=1 -BN=0 t2.c $LDFLAGS -o ut
 run $CC $CFLAGS -DUT=0 -DBN=1 -c t2.c
-run $CC $CFLAGS bn.c t2.o $LDFLAGS -lrocksdb $ROCKSDB_LDFLAGS -o bn
+if [ $rocksdb == 1 ] ;then
+   run $CC $CFLAGS -DUSE_ROCKSDB=1 bn.c t2.o $LDFLAGS $ROCKSDB_LDFLAGS -o bn
+else
+   run $CC $CFLAGS -DUSE_ROCKSDB=0 bn.c t2.o $LDFLAGS -o bn
+fi
 if [ $runut == 1 ] ;then
    ./ut
 fi

@@ -524,6 +524,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t traverse;
         int64_t traverse_restart;
         int64_t traverse_iter;
+        int64_t chain;
         int64_t cookie_miss;
         int64_t cookie_hit;
         int64_t read;
@@ -2785,6 +2786,7 @@ static void counters_print() {
         printf("traverse:           %10"PRId64"\n", GVAL(traverse));
         printf("traverse.restart:   %10"PRId64"\n", GVAL(traverse_restart));
         printf("traverse.iter:      %10"PRId64"\n", GVAL(traverse_iter));
+        printf("chain:              %10"PRId64"\n", GVAL(chain));
         printf("cookie.miss:        %10"PRId64"\n", GVAL(cookie_miss));
         printf("cookie.hit:         %10"PRId64"\n", GVAL(cookie_hit));
         printf("read:               %10"PRId64"\n", GVAL(read));
@@ -3028,7 +3030,7 @@ static void debugger_attach(void) {
                 snprintf(pidbuf, sizeof pidbuf, "%i", getppid());
                 execvp(debugger, (void *)argv);
                 abort();
-	}
+        }
 }
 
 /* @ht */
@@ -3091,6 +3093,7 @@ static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
                 __builtin_prefetch(scan->hash.next);
                 if (scan->addr == addr && LIKELY((scan->flags & HEARD_BANSHEE) == 0)) {
                         __builtin_prefetch(scan->data);
+                        CINC(chain);
                         return scan;
                 }
         }
