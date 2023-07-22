@@ -646,7 +646,7 @@ static uint64_t bolt(const struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
-static struct rung *path_add(struct path *p, struct node *n, uint64_t flags);
+static void path_add(struct path *p, struct node *n, uint64_t flags);
 static bool can_insert(const struct node *n, const struct t2_rec *r);
 static bool keep(const struct node *n);
 static int dealloc(struct node *n);
@@ -1749,15 +1749,13 @@ static bool rung_is_valid(const struct path *p, int i) {
         return is_valid;
 }
 
-static struct rung *path_add(struct path *p, struct node *n, uint64_t flags) {
+static void path_add(struct path *p, struct node *n, uint64_t flags) {
+        struct rung *r = &p->rung[p->used];
         ASSERT(IS_IN(p->used, p->rung));
-        p->rung[p->used] = (struct rung) {
-                .node  = n,
-                .seq   = node_seq(n),
-                .flags = flags,
-                .pos   = 0
-        };
-        return &p->rung[p->used++];
+        r->node = n;
+        r->seq  = node_seq(n);
+        r->flags = flags;
+        p->used++;
 }
 
 static bool path_is_valid(const struct path *p) {
@@ -2129,7 +2127,6 @@ static int traverse(struct path *p) {
         rcu_lock();
         while (true) {
                 struct node *n;
-                struct rung *r;
                 uint64_t     flags = 0;
                 COUNTERS_ASSERT(CVAL(rcu) == 1);
                 CINC(traverse_iter);
@@ -2168,7 +2165,7 @@ static int traverse(struct path *p) {
                         path_reset(p);
                         continue;
                 }
-                r = path_add(p, n, flags);
+                path_add(p, n, flags);
                 if (is_leaf(n)) {
                         if (p->opt == LOOKUP) {
                                 result = lookup_complete(p, n);
@@ -2207,7 +2204,7 @@ static int traverse(struct path *p) {
                                 }
                         }
                 } else {
-                        p->next = internal_search(n, p->rec, &r->pos);
+                        p->next = internal_search(n, p->rec, &p->rung[p->used - 1].pos);
                 }
         }
         COUNTERS_ASSERT(CVAL(rcu) == 0);
