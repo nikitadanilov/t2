@@ -40,8 +40,13 @@ enum {
 
 /* @macro */
 
+#if !defined(DEBUG)
 #define DEBUG (1)
+#endif
+
+#if !defined(COUNTERS)
 #define COUNTERS (1)
+#endif
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
