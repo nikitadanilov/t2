@@ -687,9 +687,10 @@ static void counters_print();
 static void counters_clear();
 static void counters_fold();
 static bool is_sorted(struct node *n);
-static int signal_init();
-static void signal_fini();
-static void stacktrace();
+static int signal_init(void);
+static void signal_fini(void);
+static void stacktrace(void);
+static void debugger_attach(void);
 static int lookup(struct t2_tree *t, struct t2_rec *r);
 static int insert(struct t2_tree *t, struct t2_rec *r);
 static int delete(struct t2_tree *t, struct t2_rec *r);
@@ -727,6 +728,7 @@ static __thread volatile struct {
         volatile jmp_buf *buf;
 } addr_check = {};
 static struct node_type_ops simple_ops;
+static char *argv0;
 
 struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift) {
         int result;
@@ -1016,7 +1018,7 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
 static int cookie_try(struct path *p) {
         enum lock_mode mode = p->opt == LOOKUP || p->opt == NEXT ? READ : WRITE;
         struct t2_rec *r    = p->rec;
-        ASSERT(p->used == 0);
+        ASSERT(p->used == -1);
         rcu_lock();
         if (cookie_is_valid(&r->cookie)) {
                 struct node *n = COF(r->cookie.hi, struct node, cookie);
@@ -1392,11 +1394,11 @@ static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r, int le
 }
 
 static void rec_todo(struct path *p, int idx, struct slot *out) {
-        if (idx + 1 == p->used) {
+        if (idx == p->used) {
                 *out->rec.key = *p->rec->key;
                 *out->rec.val = *p->rec->val;
         } else {
-                ASSERT(idx + 1 < p->used);
+                ASSERT(idx < p->used);
                 *out->rec.key = p->rung[idx + 1].keyout;
                 *out->rec.val = p->rung[idx + 1].valout;
         }
@@ -1433,7 +1435,7 @@ static int newnode(struct path *p, int idx) {
                }
        }
        if (idx == 0) { /* Hodie natus est radici frater. */
-               if (LIKELY(p->used < MAX_TREE_HEIGHT)) {
+               if (LIKELY(p->used + 1 < MAX_TREE_HEIGHT)) {
                        p->newroot = alloc(p->tree, level(r->node) + 1);
                        if (EISERR(r->allocated)) {
                                return ERROR(ERRCODE(p->newroot));
@@ -1525,14 +1527,14 @@ static bool can_merge(struct node *n0, struct node *n1) {
 }
 
 static void delete_update(struct path *p, int idx, struct slot *s) {
-        ASSERT(idx + 1 < p->used);
+        ASSERT(idx < p->used);
         NCALL(s->node, delete(s));
         if (p->rung[idx + 1].flags & SEPCHG) {
                 struct node  *child = brother(&p->rung[idx + 1], RIGHT)->node;
                 struct t2_buf cptr;
                 SLOT_DEFINE(sub, child);
                 {       /* A new scope for the second SLOT_DEFINE(). */
-                        SLOT_DEFINE(leaf, p->rung[p->used - 1].node);
+                        SLOT_DEFINE(leaf, p->rung[p->used].node);
                         ASSERT(child != NULL && !is_leaf(child));
                         rec_get(&sub, 0);
                         *s->rec.key = *sub.rec.key;
@@ -1621,8 +1623,8 @@ static enum policy_id policy_select(const struct path *p, int idx) {
 /* @tree */
 
 static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
-        ASSERT(p->used == 0);
         SASSERT(NONE == 0);
+        p->used = -1;
         p->tree = t;
         p->rec  = r;
         p->opt  = opt;
@@ -1640,7 +1642,7 @@ static void dirty(struct node *n, enum lock_mode lm) {
 }
 
 static void path_dirty(struct path *p) {
-        for (int i = p->used - 1; i >= 0; --i) {
+        for (int i = p->used; i >= 0; --i) {
                 struct rung    *r     = &p->rung[i];
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
@@ -1657,7 +1659,7 @@ static void path_lock(struct path *p) {
         if (UNLIKELY(p->newroot != NULL)) {
                 lock(p->newroot, WRITE);
         }
-        for (int i = 0; i < p->used; ++i) {
+        for (int i = 0; i <= p->used; ++i) {
                 struct rung *r = &p->rung[i];
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
@@ -1675,7 +1677,7 @@ static void path_lock(struct path *p) {
 }
 
 static void path_fini(struct path *p) {
-        while (--p->used >= 0) {
+        for (; p->used >= 0; --p->used) {
                 struct rung *r = &p->rung[p->used];
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
@@ -1701,7 +1703,7 @@ static void path_fini(struct path *p) {
                 }
                 buf_free(&r->scratch);
         }
-        p->used = 0;
+        p->used = -1;
         if (UNLIKELY(p->newroot != NULL)) {
                 unlock(p->newroot, WRITE);
                 put(p->newroot);
@@ -1717,7 +1719,7 @@ static void path_reset(struct path *p) {
 }
 
 static void path_pin(struct path *p) {
-        for (int i = p->used - 1; i >= 0; --i) {
+        for (int i = p->used; i >= 0; --i) {
                 struct rung *r = &p->rung[i];
                 if (!(r->flags & PINNED)) {
                         ref(r->node);
@@ -1735,7 +1737,7 @@ static bool rung_validity_invariant(const struct path *p, int i) {
                 (i == 0 ? p->tree->root == n->addr :
                  (prev->lm != WRITE) || (n->addr == internal_get(prev->node, prev->pos) &&
                                          level(prev->node) == level(n) + 1)) &&
-                (i == p->used - 1) == is_leaf(n);
+                (i == p->used) == is_leaf(n);
 }
 
 static bool rung_is_valid(const struct path *p, int i) {
@@ -1750,16 +1752,15 @@ static bool rung_is_valid(const struct path *p, int i) {
 }
 
 static void path_add(struct path *p, struct node *n, uint64_t flags) {
-        struct rung *r = &p->rung[p->used];
-        ASSERT(IS_IN(p->used, p->rung));
+        struct rung *r = &p->rung[++p->used];
+        ASSERT(IS_IN(p->used + 1, p->rung));
         r->node = n;
         r->seq  = node_seq(n);
         r->flags = flags;
-        p->used++;
 }
 
 static bool path_is_valid(const struct path *p) {
-        return p->rung[0].node->addr == p->tree->root && FORALL(i, p->used, rung_is_valid(p, i));
+        return p->rung[0].node->addr == p->tree->root && FORALL(i, p->used + 1, rung_is_valid(p, i));
 }
 
 static bool can_insert(const struct node *n, const struct t2_rec *r) {
@@ -1818,7 +1819,7 @@ static bool should_split(const struct node *n) {
 
 static int insert_prep(struct path *p) {
         struct t2_rec  irec = {};
-        int            idx = p->used - 1;
+        int            idx = p->used;
         struct t2_rec *rec = p->rec;
         int            result = 0;
         SLOT_DEFINE(s, p->rung[idx].node);
@@ -1853,7 +1854,7 @@ static bool keep(const struct node *n) {
 }
 
 static int delete_prep(struct path *p) {
-        int idx    = p->used - 1;
+        int idx    = p->used;
         int result = 0;
         SLOT_DEFINE(s, p->rung[idx].node);
         if (!leaf_search(p->rung[idx].node, p->rec, &s)) {
@@ -1882,7 +1883,7 @@ SASSERT((enum dir)T2_LESS == LEFT && (enum dir)T2_MORE == RIGHT);
 
 static int next_prep(struct path *p) {
         struct node      *sibling;
-        struct rung      *r      = &p->rung[p->used - 1];
+        struct rung      *r      = &p->rung[p->used];
         struct t2_cursor *c      = (void *)p->rec->vcb;
         int               result = 0;
         SLOT_DEFINE(s, r->node);
@@ -1891,7 +1892,7 @@ static int next_prep(struct path *p) {
         }
         r->pos = s.idx;
         r->lm = READ;
-        sibling = neighbour(p, p->used - 1, (enum dir)c->dir, READ);
+        sibling = neighbour(p, p->used, (enum dir)c->dir, READ);
         if (EISERR(sibling)) {
                 result = ERROR(ERRCODE(sibling));
         }
@@ -1950,7 +1951,7 @@ static int root_add(struct path *p) {
 static int insert_balance(struct path *p) {
         int idx;
         int result = 0;
-        for (idx = p->used - 1; idx >= 0; --idx) {
+        for (idx = p->used; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->lm == WRITE);
                 CINC(l[level(r->node)].insert_balance);
@@ -1969,7 +1970,7 @@ static int insert_balance(struct path *p) {
 }
 
 static int insert_complete(struct path *p, struct node *n) {
-        int result = rec_insert(n, p->rung[p->used - 1].pos + 1, p->rec);
+        int result = rec_insert(n, p->rung[p->used].pos + 1, p->rec);
         if (result == -ENOSPC) {
                 result = insert_balance(p);
         }
@@ -1980,7 +1981,7 @@ static int insert_complete(struct path *p, struct node *n) {
 static int delete_balance(struct path *p) {
         int idx;
         int result = 0;
-        for (idx = p->used - 1; idx >= 0; --idx) {
+        for (idx = p->used; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->lm == WRITE);
                 CINC(l[level(r->node)].delete_balance);
@@ -1996,7 +1997,7 @@ static int delete_balance(struct path *p) {
 
 static int delete_complete(struct path *p, struct node *n) {
         int result = 0;
-        rec_delete(n, p->rung[p->used - 1].pos);
+        rec_delete(n, p->rung[p->used].pos);
         if (!keep(n)) {
                 result = delete_balance(p);
         }
@@ -2005,7 +2006,7 @@ static int delete_complete(struct path *p, struct node *n) {
 }
 
 static int next_complete(struct path *p, struct node *n) {
-        struct rung      *r      = &p->rung[p->used - 1];
+        struct rung      *r      = &p->rung[p->used];
         struct t2_cursor *c      = (void *)p->rec->vcb;
         int               result = +1;
         SLOT_DEFINE(s, n);
@@ -2049,7 +2050,7 @@ static void rcu_leave(struct path *p, struct node *extra) {
 
 static bool rcu_try(struct path *p, struct node *extra) {
         bool result;
-        result = EXISTS(i, p->used, p->rung[i].node->flags & HEARD_BANSHEE) || (extra != NULL && (extra->flags & HEARD_BANSHEE));
+        result = EXISTS(i, p->used + 1, p->rung[i].node->flags & HEARD_BANSHEE) || (extra != NULL && (extra->flags & HEARD_BANSHEE));
         if (UNLIKELY(result)) {
                 urcu_memb_barrier();
                 path_reset(p);
@@ -2120,7 +2121,7 @@ static int traverse_complete(struct path *p, int result) {
 static int traverse(struct path *p) {
         struct t2 *mod   = p->tree->ttype->mod;
         int        result;
-        ASSERT(p->used == 0);
+        ASSERT(p->used == -1);
         ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
         CINC(traverse);
         p->next = p->tree->root;
@@ -2161,7 +2162,7 @@ static int traverse(struct path *p) {
                         }
                         touch(n);
                 }
-                if (UNLIKELY(p->used == ARRAY_SIZE(p->rung))) {
+                if (UNLIKELY(p->used + 1 == ARRAY_SIZE(p->rung))) {
                         path_reset(p);
                         continue;
                 }
@@ -2204,7 +2205,7 @@ static int traverse(struct path *p) {
                                 }
                         }
                 } else {
-                        p->next = internal_search(n, p->rec, &p->rung[p->used - 1].pos);
+                        p->next = internal_search(n, p->rec, &p->rung[p->used].pos);
                 }
         }
         COUNTERS_ASSERT(CVAL(rcu) == 0);
@@ -2638,6 +2639,7 @@ __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...
         printf("pid: %lu tid: %lu pthread: %"PRIx64" errno: %i\n",
                (unsigned long)getpid(), (unsigned long)threadid(), (uint64_t)pthread_self(), errno);
         eprint();
+        debugger_attach();
         abort();
 }
 
@@ -2904,6 +2906,7 @@ static void sigsegv(int signo, siginfo_t *si, void *uctx) {
                signo, si->si_errno, si->si_addr, si->si_code, si->si_pid, si->si_uid, uctx);
         stacktrace();
         --insigsegv;
+        debugger_attach();
         if (osa.sa_handler != SIG_DFL && osa.sa_handler != SIG_IGN) {
                 if (osa.sa_flags & SA_SIGINFO) {
                         (*osa.sa_sigaction)(signo, si, uctx);
@@ -3001,6 +3004,32 @@ static uint64_t threadid(void)
         return syscall(SYS_gettid);
 }
 #endif
+
+static void debugger_attach(void) {
+        int result;
+        if (argv0 == NULL) {
+                puts("Quod est nomen meum?");
+                abort();
+        }
+        result = fork();
+        if (result > 0) {
+                pause();
+        } else if (result == 0) {
+                const char *debugger = getenv("DEBUGGER");
+                const char *argv[4];
+                char        pidbuf[16];
+                if (debugger == NULL) {
+                        debugger = "gdb";
+                }
+                argv[0] = debugger;
+                argv[1] = argv0;
+                argv[2] = pidbuf;
+                argv[3] = NULL;
+                snprintf(pidbuf, sizeof pidbuf, "%i", getppid());
+                execvp(debugger, (void *)argv);
+                abort();
+	}
+}
 
 /* @ht */
 
@@ -4145,21 +4174,22 @@ static void traverse_ut() {
         n.seq = 2;
         utest("existing");
         key0[0] = '0';
+        p.used = -1;
         NOFAIL(traverse(&p));
         key0[0] = '2';
-        p.used = 0;
+        p.used = -1;
         NOFAIL(traverse(&p));
         key0[0] = '8';
-        p.used = 0;
+        p.used = -1;
         NOFAIL(traverse(&p));
         utest("too-small");
         key0[0] = ' ';
-        p.used = 0;
+        p.used = -1;
         result = traverse(&p);
         ASSERT(result == -ENOENT);
         utest("non-existent");
         key0[0] = '1';
-        p.used = 0;
+        p.used = -1;
         result = traverse(&p);
         ASSERT(result == -ENOENT);
         ht_delete(&n);
@@ -4904,6 +4934,7 @@ static void open_ut() {
 }
 
 int main(int argc, char **argv) {
+        argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
         insert_ut();
