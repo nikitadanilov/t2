@@ -371,7 +371,7 @@ struct mapel {
         int32_t r;
 };
 
-struct map {
+struct radixmap {
         struct mapel zero_sentinel;
         struct mapel idx[256];
 };
@@ -392,7 +392,7 @@ struct node {
         const struct t2_node_type *ntype;
         void                      *data;
         struct t2                 *mod;
-        struct map                *map;
+        struct radixmap           *radixmap;
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
         struct rcu_head            rcu;
@@ -563,7 +563,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t scan_pageout;
                 int64_t scan_cold;
                 int64_t scan_heated;
-                int64_t map_updated;
+                int64_t radixmap_updated;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
@@ -571,8 +571,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var valsize;
                 struct counter_var repage;
                 struct counter_var sepcut;
-                struct counter_var map_left;
-                struct counter_var map_right;
+                struct counter_var radixmap_left;
+                struct counter_var radixmap_right;
                 struct counter_var search_span;
         } l[MAX_TREE_HEIGHT];
 };
@@ -658,7 +658,7 @@ static int32_t nsize(const struct node *n);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static void dirty(struct node *n, enum lock_mode lm);
-static void map_update(struct node *n);
+static void radixmap_update(struct node *n);
 static struct header *nheader(const struct node *n);
 static void rcu_lock();
 static void rcu_unlock();
@@ -1017,6 +1017,7 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
 }
 
 static int cookie_try(struct path *p) {
+        return -ESTALE; /* Cookies do not seem to be very useful. */
         enum lock_mode mode = p->opt == LOOKUP || p->opt == NEXT ? READ : WRITE;
         struct t2_rec *r    = p->rec;
         ASSERT(p->used == -1);
@@ -1089,7 +1090,7 @@ static void unlock(struct node *n, enum lock_mode mode) {
                 ;
         } else if (mode == WRITE) {
                 if (!is_stable(n)) {
-                        map_update(n);
+                        radixmap_update(n);
                         node_seq_increase(n);
                 }
                 NOFAIL(pthread_rwlock_unlock(&n->lock));
@@ -1136,7 +1137,7 @@ static void nfini(struct node *n) {
         ASSERT(!(n->flags & DIRTY));
         cookie_invalidate(&n->cookie);
         NOFAIL(pthread_rwlock_destroy(&n->lock));
-        mem_free(n->map);
+        mem_free(n->radixmap);
         mem_free(n->data);
         mem_free(n);
 }
@@ -1331,27 +1332,27 @@ static void rcu_quiescent() {
         urcu_memb_quiescent_state();
 }
 
-static void map_update(struct node *n) {
-        struct map *m;
-        int32_t     i;
-        int16_t     ch;
-        int32_t     prev = -1;
-        int32_t     pidx = -1;
+static void radixmap_update(struct node *n) {
+        struct radixmap *m;
+        int32_t          i;
+        int16_t          ch;
+        int32_t          prev = -1;
+        int32_t          pidx = -1;
         SLOT_DEFINE(s, n);
         if (is_stable(n) || is_leaf(n)) {
                 return;
         }
-        if (UNLIKELY(n->map == NULL)) {
-                n->map = mem_alloc(sizeof *n->map);
-                if (UNLIKELY(n->map == NULL)) {
+        if (UNLIKELY(n->radixmap == NULL)) {
+                n->radixmap = mem_alloc(sizeof *n->radixmap);
+                if (UNLIKELY(n->radixmap == NULL)) {
                         return;
                 }
-                for (int16_t ch = -1; ch < ARRAY_SIZE(n->map->idx); ++ch) {
-                        n->map->idx[ch] = (struct mapel){ -1, 0 };
+                for (int16_t ch = -1; ch < ARRAY_SIZE(n->radixmap->idx); ++ch) {
+                        n->radixmap->idx[ch] = (struct mapel){ -1, 0 };
                 }
         }
-        m = n->map;
-        CINC(l[level(n)].map_updated);
+        m = n->radixmap;
+        CINC(l[level(n)].radixmap_updated);
         for (i = 0; i < nr(n); ++i) {
                 rec_get(&s, i);
                 if (LIKELY(s.rec.key->seg[0].len > 0)) {
@@ -2829,10 +2830,10 @@ static void counters_print() {
         COUNTER_PRINT(scan_pageout);
         COUNTER_PRINT(scan_cold);
         COUNTER_PRINT(scan_heated);
-        COUNTER_PRINT(map_updated);
+        COUNTER_PRINT(radixmap_updated);
         COUNTER_VAR_PRINT(search_span);
-        COUNTER_VAR_PRINT(map_left);
-        COUNTER_VAR_PRINT(map_right);
+        COUNTER_VAR_PRINT(radixmap_left);
+        COUNTER_VAR_PRINT(radixmap_right);
         COUNTER_VAR_PRINT(nr);
         COUNTER_VAR_PRINT(free);
         COUNTER_VAR_PRINT(modified);
@@ -3350,10 +3351,10 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
         if (!is_leaf(n)) {
-                l = n->map->idx[ch].l;
-                r = n->map->idx[ch].r;
-                CMOD(l[lev].map_left,  l + 1);
-                CMOD(l[lev].map_right, nr(n) - r);
+                l = n->radixmap->idx[ch].l;
+                r = n->radixmap->idx[ch].r;
+                CMOD(l[lev].radixmap_left,  l + 1);
+                CMOD(l[lev].radixmap_right, nr(n) - r);
                 if (UNLIKELY(l < 0)) {
                         goto here;
                 }
@@ -3936,7 +3937,7 @@ static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         for (int32_t i = 0; simple_free(s->node) >=
                      buf_len(key) + buf_len(val) + SOF(struct dir_element); ++i) {
                 NOFAIL(simple_insert(s));
-                map_update(s->node);
+                radixmap_update(s->node);
                 ASSERT(sh->nr == i + 1);
                 ((char *)key->seg[0].addr)[1]++;
                 ((char *)val->seg[0].addr)[1]++;
@@ -4028,7 +4029,7 @@ static void simple_ut() {
         populate(&s, &key, &val);
         result = simple_insert(&s);
         ASSERT(result == -ENOSPC);
-        map_update(&n);
+        radixmap_update(&n);
         utest("get");
         for (int32_t i = 0; i < sh->nr; ++i) {
                 rec_get(&s, i);
@@ -4039,13 +4040,13 @@ static void simple_ut() {
         for (int32_t i = sh->nr - 1; i >= 0; --i) {
                 s.idx = (s.idx + 7) % sh->nr;
                 simple_delete(&s);
-                map_update(&n);
+                radixmap_update(&n);
                 ASSERT(sh->nr == i);
         }
         s.idx = 0;
         while (nr(&n) > 0) {
                 simple_delete(&s);
-                map_update(&n);
+                radixmap_update(&n);
         }
         utest("search");
         key0[1] = 'a';
@@ -4057,7 +4058,7 @@ static void simple_ut() {
                 key = BUF_VAL(key0);
                 val = BUF_VAL(val0);
                 NOFAIL(simple_insert(&s));
-                map_update(&n);
+                radixmap_update(&n);
                 ASSERT(is_sorted(&n));
                 key0[1] += 251; /* Co-prime with 256. */
                 if (key0[1] == 'a') {
@@ -4171,7 +4172,7 @@ static void traverse_ut() {
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
                 NOFAIL(simple_insert(&s));
-                map_update(&n);
+                radixmap_update(&n);
                 ASSERT(is_sorted(&n));
         }
         n.seq = 2;
