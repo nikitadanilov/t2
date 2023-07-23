@@ -1049,7 +1049,6 @@ static int cookie_try(struct path *p) {
                                 /* TODO: re-check node. */
                                 result = cookie_node_complete(p->tree, r, n, p->opt);
                                 unlock(n, mode);
-                                touch(n);
                                 put(n);
                                 return result;
                         } else {
@@ -1103,6 +1102,7 @@ static void lock(struct node *n, enum lock_mode mode) {
 
 static void unlock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
+        touch(n);
         if (LIKELY(mode == NONE)) {
                 ;
         } else if (mode == WRITE) {
@@ -1181,7 +1181,6 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                         ref(n);
                 }
                 mutex_unlock(bucket);
-                touch(n);
         }
         return n;
 }
@@ -2241,7 +2240,6 @@ static int traverse(struct path *p) {
                                 }
                                 flags |= PINNED;
                         }
-                        touch(n);
                 }
                 if (UNLIKELY(p->used + 1 == ARRAY_SIZE(p->rung))) {
                         path_reset(p);
