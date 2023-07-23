@@ -279,13 +279,17 @@ enum {
 struct node;
 
 struct bucket {
-        alignas(MAX_CACHELINE) struct cds_hlist_head chain;
-        pthread_mutex_t                              lock;
+        struct cds_hlist_head chain;
+};
+
+struct bucketlock {
+        alignas(MAX_CACHELINE) pthread_mutex_t lock;
 };
 
 struct ht {
-        int            shift;
-        struct bucket *buckets;
+        int                shift;
+        struct bucket     *buckets;
+        struct bucketlock *bucketlocks;
 };
 
 struct cache {
@@ -629,9 +633,11 @@ static int32_t rec_len(const struct t2_rec *r);
 static int  ht_init(struct ht *ht, int shift);
 static void ht_fini(struct ht *ht);
 static void ht_clean(struct ht *ht);
-static struct bucket *ht_bucket(struct ht *ht, taddr_t addr);
-static struct node *ht_lookup(struct ht *ht, taddr_t addr);
-static void ht_insert(struct ht *ht, struct node *n);
+static uint32_t ht_bucket(struct ht *ht, taddr_t addr);
+static struct cds_hlist_head *ht_head(struct ht *ht, uint32_t bucket);
+static pthread_mutex_t *ht_lock(struct ht *ht, uint32_t bucket);
+static struct node *ht_lookup(struct ht *ht, taddr_t addr, uint32_t bucket);
+static void ht_insert(struct ht *ht, struct node *n, uint32_t bucket);
 static void ht_delete(struct node *n);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
@@ -1121,7 +1127,7 @@ static void unlock(struct node *n, enum lock_mode mode) {
 
 static struct node *peek(struct t2 *mod, taddr_t addr) {
         CINC(peek);
-        return ht_lookup(&mod->ht, addr);
+        return ht_lookup(&mod->ht, addr, ht_bucket(&mod->ht, addr));
 }
 
 static struct node *nalloc(struct t2 *mod, taddr_t addr) {
@@ -1166,11 +1172,12 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
         n = nalloc(mod, addr);
         if (EISOK(n)) {
                 struct node     *other;
-                pthread_mutex_t *bucket = &ht_bucket(&mod->ht, addr)->lock;
-                mutex_lock(bucket);
-                other = ht_lookup(&mod->ht, addr);
+                uint32_t         bucket = ht_bucket(&mod->ht, addr);
+                pthread_mutex_t *lock   = ht_lock(&mod->ht, bucket);
+                mutex_lock(lock);
+                other = ht_lookup(&mod->ht, addr, bucket);
                 if (LIKELY(other == NULL)) {
-                        ht_insert(&mod->ht, n);
+                        ht_insert(&mod->ht, n, bucket);
                         KINC(added);
                 } else {
                         n->ref = 0;
@@ -1181,7 +1188,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                         n = other;
                         ref(n);
                 }
-                mutex_unlock(bucket);
+                mutex_unlock(lock);
         }
         return n;
 }
@@ -1194,15 +1201,15 @@ static void ref(struct node *n) {
 }
 
 static void ndelete(struct node *n) {
-        struct bucket *bucket = ht_bucket(&n->mod->ht, n->addr);
-        mutex_lock(&bucket->lock);
+        pthread_mutex_t *lock = ht_lock(&n->mod->ht, ht_bucket(&n->mod->ht, n->addr));
+        mutex_lock(lock);
         n->flags |= NOCACHE | HEARD_BANSHEE;
         if (LIKELY(n->flags & DIRTY)) {
                 n->flags &= ~DIRTY;
                 KDEC(dirty);
         }
         put_locked(n);
-        mutex_unlock(&bucket->lock);
+        mutex_unlock(lock);
 }
 
 static struct node *get(struct t2 *mod, taddr_t addr) {
@@ -1299,10 +1306,10 @@ static void put_locked(struct node *n) {
 }
 
 static void put(struct node *n) {
-        struct bucket *bucket = ht_bucket(&n->mod->ht, n->addr);
-        mutex_lock(&bucket->lock);
+        pthread_mutex_t *lock = ht_lock(&n->mod->ht, ht_bucket(&n->mod->ht, n->addr));
+        mutex_lock(lock);
         put_locked(n);
-        mutex_unlock(&bucket->lock);
+        mutex_unlock(lock);
 }
 
 static int dealloc(struct node *n) {
@@ -2544,16 +2551,16 @@ static void cull(struct t2 *mod) {
                 CINC(cull_limit);
                 mutex_lock(&c->guard);
                 for (int i = 0; i < FREE_BATCH && LIKELY(!cds_list_empty(&c->cold)); ++i) {
-                        struct node   *tail   = COF(c->cold.prev, struct node, cache);
-                        struct bucket *bucket = ht_bucket(&mod->ht, tail->addr);
-                        int            try    = pthread_mutex_trylock(&bucket->lock);
+                        struct node     *tail = COF(c->cold.prev, struct node, cache);
+                        pthread_mutex_t *lock = ht_lock(&mod->ht, ht_bucket(&mod->ht, tail->addr));
+                        int              try  = pthread_mutex_trylock(lock);
                         if (LIKELY(try == 0)) {
                                 CINC(cull_node);
                                 if (nstate(tail, shift) == COLD) {
                                         CINC(cull_cleaned);
                                         put_final(tail);
                                 }
-                                mutex_unlock(&bucket->lock);
+                                mutex_unlock(lock);
                         } else {
                                 CINC(cull_trylock);
                                 ASSERT(try == EBUSY);
@@ -2597,14 +2604,15 @@ static void pageout(struct node *n) {
         unlock(n, READ);
 }
 
-static void bucket_scan(struct t2 *mod, int shift, struct bucket *bucket, int32_t *toscan, int32_t *towrite, int32_t *tocache) {
+static void bucket_scan(struct t2 *mod, int shift, int32_t bucket, int32_t *toscan, int32_t *towrite, int32_t *tocache) {
         bool                   done;
-        struct cds_hlist_head *head = &bucket->chain;
+        struct cds_hlist_head *head = ht_head(&mod->ht, bucket);
+        pthread_mutex_t       *lock = ht_lock(&mod->ht, bucket);
         CINC(scan_bucket);
         if (head->next == NULL) {
                 return;
         }
-        mutex_lock(&bucket->lock);
+        mutex_lock(lock);
         do {
                 struct node *n;
                 done = true;
@@ -2621,10 +2629,10 @@ static void bucket_scan(struct t2 *mod, int shift, struct bucket *bucket, int32_
                                 continue;
                         case UNCLEAN:
                                 ref(n);
-                                mutex_unlock(&bucket->lock);
+                                mutex_unlock(lock);
                                 pageout(n);
                                 (*towrite)--;
-                                mutex_lock(&bucket->lock);
+                                mutex_lock(lock);
                                 put_locked(n);
                                 done = false;
                                 break;
@@ -2648,7 +2656,7 @@ static void bucket_scan(struct t2 *mod, int shift, struct bucket *bucket, int32_
                         }
                 }
         } while (!done);
-        mutex_unlock(&bucket->lock);
+        mutex_unlock(lock);
 }
 
 static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocache) {
@@ -2660,7 +2668,7 @@ static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocac
         ASSERT((scan0 & mask) == scan0);
         CINC(scan);
         while (toscan > 0 && towrite > 0 && tocache > 0) {
-                bucket_scan(mod, shift, &mod->ht.buckets[scan], &toscan, &towrite, &tocache);
+                bucket_scan(mod, shift, scan, &toscan, &towrite, &tocache);
                 cache_sync(mod);
                 scan = (scan + 1) & mask;
                 if (scan == scan0) {
@@ -3120,23 +3128,27 @@ static void debugger_attach(void) {
 /* @ht */
 
 static int ht_init(struct ht *ht, int shift) {
-        ht->shift = shift;
-        ht->buckets = mem_alloc_align(sizeof ht->buckets[0] << shift, MAX_CACHELINE);
-        if (ht->buckets != NULL) {
+        ht->shift       = shift;
+        ht->buckets     = mem_alloc_align(sizeof ht->buckets[0]     << shift, MAX_CACHELINE);
+        ht->bucketlocks = mem_alloc_align(sizeof ht->bucketlocks[0] << shift, MAX_CACHELINE);
+        if (ht->buckets != NULL && ht->bucketlocks != NULL) {
                 for (int i = 0; i < (1 << shift); ++i) {
-                        NOFAIL(pthread_mutex_init(&ht->buckets[i].lock, NULL));
+                        NOFAIL(pthread_mutex_init(&ht->bucketlocks[i].lock, NULL));
                 }
                 return 0;
         }
+        mem_free(ht->buckets);
+        mem_free(ht->bucketlocks);
         return ERROR(-ENOMEM);
 }
 
 static void ht_fini(struct ht *ht) {
         for (int i = 0; i < (1 << ht->shift); i++) {
-                NOFAIL(pthread_mutex_destroy(&ht->buckets[i].lock));
+                NOFAIL(pthread_mutex_destroy(&ht->bucketlocks[i].lock));
                 ASSERT(ht->buckets[i].chain.next == NULL);
         }
         mem_free(ht->buckets);
+        mem_free(ht->bucketlocks);
 }
 
 static void ht_clean(struct ht *ht) {
@@ -3144,12 +3156,12 @@ static void ht_clean(struct ht *ht) {
                 struct cds_hlist_head *head = &ht->buckets[i].chain;
                 struct node           *scan;
                 struct node           *next;
-                mutex_lock(&ht->buckets[i].lock);
+                mutex_lock(&ht->bucketlocks[i].lock);
                 cds_hlist_for_each_entry_safe_2(scan, next, head, hash) {
                         ht_delete(scan);
                         nfini(scan);
                 }
-                mutex_unlock(&ht->buckets[i].lock);
+                mutex_unlock(&ht->bucketlocks[i].lock);
         }
 }
 
@@ -3165,13 +3177,20 @@ static uint64_t ht_hash(taddr_t addr) {
         return x;
 }
 
-static struct bucket *ht_bucket(struct ht *ht, taddr_t addr) {
-       uint64_t hash = ht_hash(addr) & ((1 << ht->shift) - 1);
-       return &ht->buckets[hash];
+static uint32_t ht_bucket(struct ht *ht, taddr_t addr) {
+       return ht_hash(addr) & ((1 << ht->shift) - 1);
 }
 
-static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
-        struct cds_hlist_head *head = &ht_bucket(ht, addr)->chain;
+static struct cds_hlist_head *ht_head(struct ht *ht, uint32_t bucket) {
+        return &ht->buckets[bucket].chain;
+}
+
+static pthread_mutex_t *ht_lock(struct ht *ht, uint32_t bucket) {
+        return &ht->bucketlocks[bucket].lock;
+}
+
+static struct node *ht_lookup(struct ht *ht, taddr_t addr, uint32_t bucket) {
+        struct cds_hlist_head *head = ht_head(ht, bucket);
         struct cds_hlist_node *scan = rcu_dereference(head)->next;
         struct node           *n;
 #define CHAINLINK do {                                                    \
@@ -3200,9 +3219,8 @@ static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
 #undef CHAINLINK
 }
 
-static void ht_insert(struct ht *ht, struct node *n) {
-        struct bucket *b = &ht->buckets[ht_hash(n->addr) & ((1 << ht->shift) - 1)];
-        cds_hlist_add_head_rcu(&n->hash, &b->chain);
+static void ht_insert(struct ht *ht, struct node *n, uint32_t bucket) {
+        cds_hlist_add_head_rcu(&n->hash, ht_head(ht, bucket));
 }
 
 static void ht_delete(struct node *n) {
@@ -4278,19 +4296,20 @@ static void ht_ut() {
         ht_init(&mod.ht, 10);
         utest("insert");
         for (uint64_t i = 0; i < N; ++i) {
-                ht_insert(&mod.ht, node_alloc_ut(&mod, ht_hash(i)));
+                struct node *n = node_alloc_ut(&mod, ht_hash(i));
+                ht_insert(&mod.ht, n, ht_bucket(&mod.ht, n->addr));
         }
         utest("lookup");
         for (uint64_t i = 0; i < N; ++i) {
                 taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
-                struct node *n = ht_lookup(&mod.ht, blk);
+                struct node *n = ht_lookup(&mod.ht, blk, ht_bucket(&mod.ht, blk));
                 ASSERT(n != NULL);
                 ASSERT(n->addr == blk);
         }
         utest("delete");
         for (uint64_t i = 0; i < N; ++i) {
                 taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
-                struct node *n = ht_lookup(&mod.ht, blk);
+                struct node *n = ht_lookup(&mod.ht, blk, ht_bucket(&mod.ht, blk));
                 ht_delete(n);
         }
         utest("fini");
@@ -4352,7 +4371,7 @@ static void traverse_ut() {
         n.mod = mod;
         utest("prepare");
         simple_make(&n);
-        ht_insert(&mod->ht, &n);
+        ht_insert(&mod->ht, &n, ht_bucket(&mod->ht, n.addr));
         for (int i = 0; i < 20; ++i, key0[0] += 2) {
                 struct path p = { .rec = &s.rec };
                 result = simple_search(&n, &p, &s);
