@@ -16,8 +16,7 @@ case "$platform" in ####################### Linux #############################
         LDFLAGS="$LDFLAGS -lm"
         cadd '#define ON_LINUX  (1)'
         cadd '#define ON_DARWIN (0)'
-        cadd '#include <sys/syscall.h>'
-        cadd '#include <sys/time.h>'
+        cadd '#include "os-linux.h"'
         ;;
 esac
 
@@ -31,9 +30,7 @@ case "$platform" in ####################### Darwin #############################
         ROCKSDB_LDFLAGS="-lrocksdb"
         cadd '#define ON_LINUX  (0)'
         cadd '#define ON_DARWIN (1)'
-        cadd '#include <sys/uio.h>'
-        cadd '#include <mach/mach.h>'
-        cadd '#include <mach/mach_vm.h>'
+        cadd '#include "os-darwin.h"'
         ;;
 esac
 
