@@ -150,7 +150,7 @@ enum {
  *         return EXISTS(i, ARRAY_SIZE(haystack), haystack[i] == needle);
  * }
  */
-#define EXISTS(var, nr, ...) !FORALL(var, (nr), !(__VA_ARGS__))
+#define EXISTS(var, nr, ...) (!FORALL(var, (nr), !(__VA_ARGS__)))
 
 /*
  * Reduces ("aggregates") given expression over an interval.
@@ -307,6 +307,7 @@ struct cache {
 
 struct slot;
 struct node;
+struct path;
 
 struct node_type_ops {
         int     (*insert)    (struct slot *);
@@ -314,7 +315,7 @@ struct node_type_ops {
         void    (*get)       (struct slot *);
         void    (*make)      (struct node *n);
         void    (*print)     (struct node *n);
-        bool    (*search)    (struct node *n, struct t2_rec *rec, struct slot *out);
+        bool    (*search)    (struct node *n, struct path *p, struct slot *out);
         bool    (*can_merge) (const struct node *n0, const struct node *n1);
         int     (*can_insert)(const struct slot *s);
         int32_t (*nr)        (const struct node *n);
@@ -470,6 +471,7 @@ struct path {
         struct t2_rec  *rec;
         enum optype     opt;
         struct node    *newroot;
+        struct numel    k64;
 };
 
 struct policy {
@@ -634,14 +636,16 @@ static void ht_delete(struct node *n);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
 static void buf_clip_node(struct t2_buf *b, const struct node *n);
-static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos);
+static taddr_t internal_search(struct node *n, struct path *p, int32_t *pos);
 static taddr_t internal_get(const struct node *n, int32_t pos);
 static struct node *internal_child(const struct node *n, int32_t pos, bool peek);
-static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s);
+static int leaf_search(struct node *n, struct path *p, struct slot *s);
 static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn));
 static void *mem_alloc(size_t size);
 static void *mem_alloc_align(size_t size, int alignment);
 static void  mem_free(void *ptr);
+static int32_t max_32(int32_t a, int32_t b);
+static int32_t min_32(int32_t a, int32_t b);
 static int cacheline_size();
 static uint64_t threadid(void);
 static void llog(const struct msg_ctx *ctx, ...);
@@ -682,7 +686,7 @@ static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n);
-static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out);
+static bool simple_search(struct node *n, struct path *p, struct slot *out);
 static int32_t simple_nr(const struct node *n);
 static int32_t simple_free(const struct node *n);
 static int simple_can_insert(const struct slot *s);
@@ -979,10 +983,11 @@ static void rec_get(struct slot *s, int32_t idx) {
         NCALL(s->node, get(s));
 }
 
-static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node *n, enum optype opt) {
+static int cookie_node_complete(struct t2_tree *t, struct path *p, struct node *n, enum optype opt) {
+        struct t2_rec *r = p->rec;
+        int            result;
+        bool           found;
         ASSERT(r->key->nr == 1);
-        int result;
-        bool found;
         SLOT_DEFINE(s, n);
         rec_get(&s, 0);
         if (buf_cmp(s.rec.key, r->key) > 0) {
@@ -992,7 +997,7 @@ static int cookie_node_complete(struct t2_tree *t, struct t2_rec *r, struct node
         if (buf_cmp(s.rec.key, r->key) < 0) {
                 return -ESTALE;
         }
-        found = leaf_search(n, r, &s);
+        found = leaf_search(n, p, &s);
         switch (opt) {
         case LOOKUP:
                 result = found ? val_copy(r, n, &s) : -ENOENT;
@@ -1043,7 +1048,7 @@ static int cookie_try(struct path *p) {
                         lock(n, mode); /* TODO: Lock-less lookup. */
                         if (LIKELY(!rcu_try(p, n))) {
                                 /* TODO: re-check node. */
-                                result = cookie_node_complete(p->tree, r, n, p->opt);
+                                result = cookie_node_complete(p->tree, p, n, p->opt);
                                 unlock(n, mode);
                                 put(n);
                                 return result;
@@ -1253,6 +1258,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
                         n->flags |= DIRTY;
                         KINC(dirty);
                         NCALL(n, make(n));
+                        num64map_build(n);
                         unlock(n, WRITE);
                 }
         } else {
@@ -1387,18 +1393,19 @@ static void radixmap_update(struct node *n) {
         }
 }
 
-static void num64at(struct t2_rec *r, struct numel *el) {
-        int32_t  len = r->key->seg[0].len;
-        uint64_t key = be64toh(*(uint64_t *)r->key->seg[0].addr); /* Safe even if the key is shorter than 8 bytes. */
+static void num64at(struct t2_buf *b, struct numel *el) {
+        uint64_t keycopy = 0;
+        int32_t  len = b->seg[0].len;
         uint64_t mask;
+        memcpy(&keycopy, b->seg[0].addr, min_32(len, sizeof keycopy));
         if (UNLIKELY(len == 0)) {
                 mask = 0;
-        } else if (len < SOF(key)) {
-                mask = ~((1ull << CHAR_BIT * (SOF(key) - len)) - 1);
+        } else if (len < SOF(keycopy)) {
+                mask = ~((1ull << CHAR_BIT * (SOF(keycopy) - len)) - 1);
         } else {
                 mask = ~0ull;
         }
-        el->key  = key & mask;
+        el->key  = be64toh(keycopy) & mask;
         el->mask = mask;
 }
 
@@ -1411,11 +1418,11 @@ static void num64map_build(struct node *n) {
                         SLOT_DEFINE(s, n);
                         for (int32_t i = 0; i < nr(n); ++i) {
                                 rec_get(&s, i);
-                                num64at(&s.rec, &el[i]);
+                                num64at(s.rec.key, &el[i]);
                         }
                         n->map.num64.capacity = nr(n) + 1;
                 }
-                ASSERT(FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
+                ASSERT(nr(n) == 0 || FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
         }
 }
 
@@ -1424,18 +1431,20 @@ static void num64map_insert(struct slot *s) {
         if (is_leaf(n) && LIKELY(n->map.num64.el != NULL)) {
                 struct numel *el;
                 if (n->map.num64.capacity < nr(n)) {
-                        el = mem_alloc((nr(n) + (nr(n) >> 2)) * sizeof el[0]);
+                        int32_t cap = max_32(nr(n) + (nr(n) >> 1), 16);
+                        el = mem_alloc(cap * sizeof el[0]);
                         if (UNLIKELY(el == NULL)) {
                                 return;
                         }
+                        n->map.num64.capacity = cap;
                         memmove(el, n->map.num64.el, s->idx * sizeof el[0]);
                 } else {
                         el = n->map.num64.el;
                 }
                 memmove(el + s->idx + 1, n->map.num64.el + s->idx, (nr(n) - s->idx - 1) * sizeof el[0]);
-                num64at(&s->rec, &el[s->idx]);
+                num64at(s->rec.key, &el[s->idx]);
                 n->map.num64.el = el;
-                ASSERT(FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
+                ASSERT(nr(n) == 0 || FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
         }
 }
 
@@ -1444,7 +1453,7 @@ static void num64map_delete(struct slot *s) {
         if (is_leaf(n) && LIKELY(n->map.num64.el != NULL)) {
                 struct numel *el = n->map.num64.el;
                 memmove(el + s->idx, el + s->idx + 1, (nr(n) - s->idx) * sizeof el[0]);
-                ASSERT(FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
+                ASSERT(nr(n) == 0 || FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
         }
 }
 
@@ -1704,6 +1713,7 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum 
         p->tree = t;
         p->rec  = r;
         p->opt  = opt;
+        num64at(p->rec->key, &p->k64);
 }
 
 static void dirty(struct node *n, enum lock_mode lm) {
@@ -1899,7 +1909,7 @@ static int insert_prep(struct path *p) {
         struct t2_rec *rec = p->rec;
         int            result = 0;
         SLOT_DEFINE(s, p->rung[idx].node);
-        if (leaf_search(p->rung[idx].node, rec, &s)) {
+        if (leaf_search(p->rung[idx].node, p, &s)) {
                 return -EEXIST;
         }
         p->rung[idx].pos = s.idx;
@@ -1933,7 +1943,7 @@ static int delete_prep(struct path *p) {
         int idx    = p->used;
         int result = 0;
         SLOT_DEFINE(s, p->rung[idx].node);
-        if (!leaf_search(p->rung[idx].node, p->rec, &s)) {
+        if (!leaf_search(p->rung[idx].node, p, &s)) {
                 return -ENOENT;
         }
         p->rung[idx].pos = s.idx;
@@ -1963,7 +1973,7 @@ static int next_prep(struct path *p) {
         struct t2_cursor *c      = (void *)p->rec->vcb;
         int               result = 0;
         SLOT_DEFINE(s, r->node);
-        if (!leaf_search(r->node, p->rec, &s) && (enum dir)c->dir == RIGHT) {
+        if (!leaf_search(r->node, p, &s) && (enum dir)c->dir == RIGHT) {
                 s.idx++;
         }
         r->pos = s.idx;
@@ -1978,7 +1988,7 @@ static int next_prep(struct path *p) {
 
 static int lookup_complete(struct path *p, struct node *n) {
         SLOT_DEFINE(s, NULL);
-        return leaf_search(n, p->rec, &s) ? val_copy(p->rec, n, &s) : -ENOENT;
+        return leaf_search(n, p, &s) ? val_copy(p->rec, n, &s) : -ENOENT;
 }
 
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b) {
@@ -2280,7 +2290,7 @@ static int traverse(struct path *p) {
                                 }
                         }
                 } else {
-                        p->next = internal_search(n, p->rec, &p->rung[p->used].pos);
+                        p->next = internal_search(n, p, &p->rung[p->used].pos);
                 }
         }
         COUNTERS_ASSERT(CVAL(rcu) == 0);
@@ -3427,22 +3437,20 @@ static int num64_cmp(struct node *n, int idx, void *kaddr, int32_t klen, uint64_
         return uint64_cmp(e->key & kmask, kmasked & e->mask);
 }
 
-static bool num64_search(struct node *n, struct t2_rec *rec, void *kaddr, int32_t klen, int *ll, int *ddelta) {
-        struct numel k;
-        num64at(rec, &k);
+static bool num64_search(struct node *n, struct path *p, struct t2_rec *rec, void *kaddr, int32_t klen, int *ll, int *ddelta) {
         int      cmp;
         bool     found     = false;
         int      l         = *ll;
         int32_t  delta     = *ddelta;
         int32_t  span      = 1 << ilog2(delta);
-        uint64_t k64       = k.key;
-        uint64_t kmask     = k.mask;
+        uint64_t k64       = p->k64.key;
+        uint64_t kmask     = p->k64.mask;
         uint64_t kmasked   = k64 & kmask;
         uint32_t nmask     = nsize(n) - 1;
         struct sheader *sh = simple_header(n);
         struct numel   *el = n->map.num64.el;
 #define CMP (num64_cmp(n, l + span, kaddr, klen, kmasked, kmask) ?: skeycmp(sh, l + span, kaddr, klen, nmask))
-        if (CMP <= 0) {
+        if (delta != span && CMP <= 0) {
                 l += delta - span;
         }
 #define NUMRANGE(x, prefetchp)                                          \
@@ -3489,8 +3497,8 @@ static bool num64_search(struct node *n, struct t2_rec *rec, void *kaddr, int32_
         return found;
 }
 
-static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) {
-        ASSERT(rec->key->nr == 1);
+static bool simple_search(struct node *n, struct path *p, struct slot *out) {
+        struct t2_rec  *rec   = p->rec;
         bool            found = false;
         struct sheader *sh    = simple_header(n);
         int             l     = -1;
@@ -3502,6 +3510,7 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         int16_t         ch    = LIKELY(klen > 0) ? *(uint8_t *)kaddr : -1;
         int32_t         span;
         uint8_t __attribute__((unused)) lev = level(n);
+        ASSERT(rec->key->nr == 1);
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
@@ -3510,7 +3519,9 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
         CMOD(l[lev].free,        NCALL(n, free(n)));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
-        if (!is_leaf(n)) {
+        if (UNLIKELY(nr(n) == 0)) {
+                goto here;
+        } else if (!is_leaf(n)) {
                 if (n->map.radix != NULL) {
                         l     = n->map.radix->idx[ch].l;
                         delta = n->map.radix->idx[ch].delta;
@@ -3528,12 +3539,12 @@ static bool simple_search(struct node *n, struct t2_rec *rec, struct slot *out) 
                         }
                 }
         } else if (LIKELY(n->map.num64.el != NULL)) {
-                found = num64_search(n, rec, kaddr, klen, &l, &delta);
+                found = num64_search(n, p, rec, kaddr, klen, &l, &delta);
                 goto here;
         }
         CMOD(l[lev].search_span, delta);
         span = 1 << ilog2(delta);
-        if (skeycmp(sh, l + span, kaddr, klen, mask) <= 0) {
+        if (span != delta && skeycmp(sh, l + span, kaddr, klen, mask) <= 0) {
                 l += delta - span;
         }
 #define RANGE(x, prefetchp)                                                  \
@@ -3602,14 +3613,14 @@ static taddr_t internal_addr(const struct slot *s) {
         return taddr_is_valid(addr) ? addr : 0;
 }
 
-static taddr_t internal_search(struct node *n, struct t2_rec *r, int32_t *pos) {
+static taddr_t internal_search(struct node *n, struct path *p, int32_t *pos) {
         SLOT_DEFINE(s, n);
         COUNTERS_ASSERT(CVAL(rcu) > 0);
         SET0(s.rec.key);
         SET0(s.rec.val);
         s.rec.key->nr = 1;
         s.rec.val->nr = 1;
-        (void)NCALL(n, search(n, r, &s));
+        (void)NCALL(n, search(n, p, &s));
         if (s.idx < 0) {
                 rec_get(&s, 0);
         }
@@ -3631,11 +3642,11 @@ static struct node *internal_child(const struct node *n, int32_t pos, bool peekp
         return (peekp ? peek : get)(n->mod, internal_get(n, pos));
 }
 
-static int leaf_search(struct node *n, struct t2_rec *r, struct slot *s) {
+static int leaf_search(struct node *n, struct path *p, struct slot *s) {
         bool found;
         s->rec.key->nr = 1;
         s->rec.val->nr = 1;
-        found = NCALL(n, search(n, r, s));
+        found = NCALL(n, search(n, p, s));
         buf_clip_node(s->rec.key, n);
         buf_clip_node(s->rec.val, n);
         return found;
@@ -4227,7 +4238,8 @@ static void simple_ut() {
         utest("search");
         key0[1] = 'a';
         while (simple_free(&n) > buf_len(&key) + buf_len(&val) + SOF(struct dir_element)) {
-                result = simple_search(&n, &s.rec, &s);
+                struct path p = { .rec = &s.rec };
+                result = simple_search(&n, &p, &s);
                 ASSERT(!result);
                 ASSERT(-1 <= s.idx && s.idx < nr(&n));
                 s.idx++;
@@ -4342,7 +4354,8 @@ static void traverse_ut() {
         simple_make(&n);
         ht_insert(&mod->ht, &n);
         for (int i = 0; i < 20; ++i, key0[0] += 2) {
-                result = simple_search(&n, &s.rec, &s);
+                struct path p = { .rec = &s.rec };
+                result = simple_search(&n, &p, &s);
                 ASSERT(!result);
                 s.idx++;
                 buf_init_str(&key, key0);
