@@ -144,6 +144,7 @@ struct bgroup {
 
 struct bphase {
         int nr;
+        int idx;
         struct bgroup *group;
         pthread_mutex_t lock;
         pthread_cond_t cond;
@@ -686,6 +687,7 @@ static void bphase(struct bphase *ph, int i) {
         NOFAIL(pthread_mutex_init(&ph->lock, NULL));
         NOFAIL(pthread_cond_init(&ph->cond, NULL));
         NOFAIL(pthread_cond_init(&ph->start, NULL));
+        ph->idx = i;
         blog(BINFO, "    Starting phase %2i.\n", i);
         for (int i = 0; i < ph->nr; ++i) {
                 ph->group[i].thread.rt = mem_alloc(ph->group[i].nr * sizeof(struct rthread));
@@ -716,11 +718,19 @@ static void bphase(struct bphase *ph, int i) {
         NOFAIL(pthread_mutex_destroy(&ph->lock));
 }
 
+static const char *bot_name[] = {
+        [BSLEEP]   = " sleep",
+        [BLOOKUP]  = "lookup",
+        [BINSERT]  = "insert",
+        [BDELETE]  = "delete",
+        [BNEXT]    = "  next",
+        [BREMOUNT] = " mount"
+};
+
 static void bphase_report(struct bphase *ph, bool final) {
         int lev = final ? BRESULTS : BPROGRESS;
         for (int i = 0; i < ph->nr; ++i) {
                 struct bthread *bt = &ph->group[i].thread;
-                blog(lev, "        Group %2i:\n", i);
                 for (int k = 0; k < bt->nr; ++k) {
                         const double M = 1000000.0;
                         if (!final) {
@@ -737,10 +747,10 @@ static void bphase_report(struct bphase *ph, bool final) {
                         }
                         if (var.nr != 0) {
                                 double avg = 1.0 * var.sum / var.nr;
-                                blog(lev, "            Option %2i: ops: %10llu sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
-                                     k, var.nr, var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(1.0 * var.ssq / var.nr - avg * avg));
+                                blog(lev, "Phase %2i group %2i option %2i %s: ops: %10llu sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
+                                     ph->idx, i, k, bot_name[bt->choice[k].option.opt], var.nr, var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(1.0 * var.ssq / var.nr - avg * avg));
                         } else {
-                                blog(lev, "            Option %2i: idle.\n", k);
+                                blog(lev, "Phase %2i group %2i option %2i %s: idle.\n", ph->idx, i, k, bot_name[bt->choice[k].option.opt]);
                         }
                 }
         }
