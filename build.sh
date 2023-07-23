@@ -6,6 +6,7 @@ LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -rdynamic"
 CC=${CC:-cc}
 CFLAGS="-I/usr/local/include -march=native -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
 cc="$($CC -v 2>&1)"
+OPTFLAGS="-O6"
 
 function cadd() {
     echo $* >> config.h
@@ -50,6 +51,8 @@ esac
 
 case "$cc" in *clang*)
     cadd '#include "cc-clang.h"'
+    OPTFLAGS="-O3"
+    CFLAGS="$CFLAGS -Wno-assume"
 esac
 
 function run() {
@@ -93,7 +96,7 @@ for o in $options ;do
     ;; *noopt*)
        CFLAGS="$CFLAGS -O0"
     ;; *opt*)
-       CFLAGS="$CFLAGS -O6"
+       CFLAGS="$CFLAGS $OPTFLAGS"
     ;; *)
        echo "Unknown option '$o'"
        exit 1
