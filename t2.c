@@ -3168,17 +3168,32 @@ static struct bucket *ht_bucket(struct ht *ht, taddr_t addr) {
 
 static struct node *ht_lookup(struct ht *ht, taddr_t addr) {
         struct cds_hlist_head *head = &ht_bucket(ht, addr)->chain;
-        struct node           *scan;
-        cds_hlist_for_each_entry_rcu_2(scan, head, hash) {
-                __builtin_prefetch(scan->hash.next);
-                if (scan->addr == addr && LIKELY((scan->flags & HEARD_BANSHEE) == 0)) {
-                        __builtin_prefetch(scan->data);
-                        __builtin_prefetch(scan->map.radix);
-                        CINC(chain);
-                        return scan;
+        struct cds_hlist_node *scan = rcu_dereference(head)->next;
+        struct node           *n;
+#define CHAINLINK do {                                                    \
+        n = COF(scan, struct node, hash);                                 \
+        if (LIKELY(n->addr == addr && (n->flags & HEARD_BANSHEE) == 0)) { \
+                __builtin_prefetch(n->data);                              \
+                CINC(chain);                                              \
+                return n;                                                 \
+        }                                                                 \
+        scan = rcu_dereference(scan->next);                               \
+        if (LIKELY(scan == NULL)) {                                       \
+                return NULL;                                              \
+        }                                                                 \
+} while (0)
+        if (scan != NULL) {
+                CHAINLINK;
+                CHAINLINK;
+                CHAINLINK;
+                CHAINLINK;
+                while (true) {
+                        CHAINLINK;
                 }
+        } else {
+                return NULL;
         }
-        return NULL;
+#undef CHAINLINK
 }
 
 static void ht_insert(struct ht *ht, struct node *n) {
