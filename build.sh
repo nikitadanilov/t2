@@ -5,6 +5,7 @@ platform="$(uname -srm)"
 LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -rdynamic"
 CC=${CC:-cc}
 CFLAGS="-I/usr/local/include -march=native -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
+cc="$($CC -v 2>&1)"
 
 function cadd() {
     echo $* >> config.h
@@ -39,9 +40,16 @@ case "$platform" in ####################### Darwin x86_64 ######################
         ;;
 esac
 
-case "$($CC -v 2>&1)" in
-    *gcc*13.1.0*)
-	CFLAGS="$CFLAGS -Wno-stringop-overflow -Wno-array-bounds"
+case "$cc" in *gcc*13.1.0*)
+    CFLAGS="$CFLAGS -Wno-stringop-overflow -Wno-array-bounds"
+esac
+
+case "$cc" in *gcc*)
+    cadd '#include "cc-gcc.h"'
+esac
+
+case "$cc" in *clang*)
+    cadd '#include "cc-clang.h"'
 esac
 
 function run() {

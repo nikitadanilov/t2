@@ -65,11 +65,7 @@ enum {
 #if DEBUG
 #define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
 #else
-#if __has_attribute(assume)
-#define ASSERT(expr) (__attribute__((assume(!(expr)))))
-#else
-#define ASSERT(expr) ((void)(expr))
-#endif
+#define ASSERT(expr) ASSUME(expr)
 #endif
 #define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
 #define SOF(x) ((int32_t)sizeof(x))
