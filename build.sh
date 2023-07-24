@@ -67,6 +67,7 @@ function run() {
 }
 
 runut=0
+runbn=0
 rocksdb=0
 while [ $# != 0 ] ;do
       case "$1" in
@@ -81,6 +82,8 @@ while [ $# != 0 ] ;do
 	      options="$options nodebug nocounters opt"
       ;;  '-d')
 	      options="$options debug counters noopt profile"
+      ;;  '-b')
+	      runbn=1
       esac
       shift
 done
@@ -116,4 +119,8 @@ else
 fi
 if [ $runut == 1 ] ;then
    ./ut
+fi
+if [ $runbn == 1 ] ;then
+   run rm -fr pages testdb/
+   run ./bn -h15 -n12 -t16 -N16 -kt2 -f '1*10000000*100:insert$rnd1-6/seq0-20;1*10000000*100:lookup$rnd1-6/20;1*10000000*100:delete$rnd1-6'
 fi
