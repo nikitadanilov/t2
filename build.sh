@@ -79,6 +79,8 @@ while [ $# != 0 ] ;do
 	      rocksdb=1
       ;;  '-f')
 	      options="$options nodebug nocounters opt"
+      ;;  '-d')
+	      options="$options debug counters noopt profile"
       esac
       shift
 done
