@@ -561,8 +561,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t delete_balance;
                 int64_t get;
                 int64_t search;
-                int64_t bin_iter;
-                int64_t lin_iter;
                 int64_t nospc;
                 int64_t dirmove;
                 int64_t insert;
@@ -2898,7 +2896,7 @@ static void counters_print() {
         printf("cull.limit:         %10"PRId64"\n", GVAL(cull_limit));
         printf("cull.node:          %10"PRId64"\n", GVAL(cull_node));
         printf("cull.cleaned:       %10"PRId64"\n", GVAL(cull_cleaned));
-        printf("%15s ", "");
+        printf("%20s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
         }
@@ -2909,8 +2907,6 @@ static void counters_print() {
         COUNTER_PRINT(search);
         COUNTER_PRINT(insert);
         COUNTER_PRINT(delete);
-        COUNTER_PRINT(bin_iter);
-        COUNTER_PRINT(lin_iter);
         COUNTER_PRINT(nospc);
         COUNTER_PRINT(dirmove);
         COUNTER_PRINT(recget);
@@ -4116,6 +4112,7 @@ void bn_bolt_set(struct t2 *mod, uint64_t bolt) {
 
 void bn_counters_print(void) {
         counters_print();
+        counters_clear();
 }
 
 void bn_counters_fold(void) {

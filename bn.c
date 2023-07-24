@@ -136,7 +136,7 @@ struct bthread {
 
 struct bgroup {
         int nr;
-        int ops;
+        long long ops;
         struct bthread thread;
         struct bphase *parent;
         int idx;
@@ -315,10 +315,10 @@ static struct span *span_next(const struct span *super, char delim, struct span 
         return sub;
 }
 
-static int bnumber(struct span *s) {
+static long long bnumber(struct span *s) {
         char *end;
         errno = 0;
-        long n = strtol(s->start, &end, 0);
+        long n = strtoll(s->start, &end, 0);
         logspan(s);
         bskip(s);
         assert((n != 0 || errno == 0) && end <= s->end);
@@ -941,7 +941,7 @@ int main(int argc, char **argv) {
         char ch;
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        while ((ch = getopt(argc, argv, "vr:f:t:n:N:h:ck:")) != -1) {
+        while ((ch = getopt(argc, argv, "vr:f:t:n:N:h:ck:C:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -963,6 +963,9 @@ int main(int argc, char **argv) {
                         break;
                 case 'h':
                         ht_shift = atoi(optarg);
+                        break;
+                case 'C':
+                        cache_shift = atoi(optarg);
                         break;
                 case 'c':
                         counters_level++;
