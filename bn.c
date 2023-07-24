@@ -764,7 +764,6 @@ static void brun(struct benchmark *b) {
         }
         blog(BINFO, "Benchmark done.\n");
         for (int i = 0; i < b->nr; ++i) {
-                blog(BRESULTS, "    Phase %2i report:\n", i);
                 bphase_report(&b->phase[i], true);
         }
         kv[kvt].umount(b);
