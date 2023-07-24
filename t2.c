@@ -317,6 +317,7 @@ struct node_type_ops {
         int     (*insert)    (struct slot *);
         void    (*delete)    (struct slot *);
         void    (*get)       (struct slot *);
+        int     (*load)      (struct node *n);
         void    (*make)      (struct node *n);
         void    (*print)     (struct node *n);
         bool    (*search)    (struct node *n, struct path *p, struct slot *out);
@@ -693,6 +694,7 @@ static int simple_insert(struct slot *s);
 static void simple_delete(struct slot *s);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n);
+static int simple_load(struct node *n);
 static bool simple_search(struct node *n, struct path *p, struct slot *out);
 static int32_t simple_nr(const struct node *n);
 static int32_t simple_free(const struct node *n);
@@ -1227,7 +1229,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                         rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                         CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
                                         node_seq_increase(n);
-                                        num64map_build(n);
+                                        NCALL(n, load(n));
                                 } else {
                                         result = ERROR(-ESTALE);
                                 }
@@ -3541,6 +3543,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         CMOD(l[lev].free,        NCALL(n, free(n)));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
+        __builtin_prefetch(n->map.num64.el + ((delta - 1) >> 1));
         if (UNLIKELY(nr(n) == 0)) {
                 goto here;
         } else if (!is_leaf(n)) {
@@ -3807,6 +3810,11 @@ static void simple_make(struct node *n) {
         sh->dir_off = SOF(*sh) + (size - SOF(*sh)) / 2;
         *sat(sh, 0) = (struct dir_element){ .koff = SOF(*sh), .voff = size };
         CINC(l[sh->head.level].make);
+}
+
+static int simple_load(struct node *n) {
+        num64map_build(n);
+        return 0;
 }
 
 static int32_t simple_nr(const struct node *n) {
