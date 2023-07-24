@@ -580,6 +580,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t scan_cold;
                 int64_t scan_heated;
                 int64_t radixmap_updated;
+                int64_t num64map_resize;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
@@ -1435,10 +1436,12 @@ static void num64map_build(struct node *n) {
 
 static void num64map_insert(struct slot *s) {
         struct node *n = s->node;
+        int32_t items = nr(n);
         if (is_leaf(n) && LIKELY(n->map.num64.el != NULL)) {
                 struct numel *el;
                 if (n->map.num64.capacity < nr(n)) {
-                        int32_t cap = max_32(nr(n) + (nr(n) >> 1), 16);
+                        CINC(l[level(n)].num64map_resize);
+                        int32_t cap = max_32(items + (items >> 1), 16);
                         el = mem_alloc(cap * sizeof el[0]);
                         if (UNLIKELY(el == NULL)) {
                                 return;
@@ -1451,7 +1454,7 @@ static void num64map_insert(struct slot *s) {
                 memmove(el + s->idx + 1, n->map.num64.el + s->idx, (nr(n) - s->idx - 1) * sizeof el[0]);
                 num64at(s->rec.key, &el[s->idx]);
                 n->map.num64.el = el;
-                ASSERT(nr(n) == 0 || FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
+                ASSERT(items == 0 || FORALL(i, items - 1, el[i].key <= el[i + 1].key));
         }
 }
 
@@ -2922,6 +2925,7 @@ static void counters_print() {
         COUNTER_PRINT(scan_cold);
         COUNTER_PRINT(scan_heated);
         COUNTER_PRINT(radixmap_updated);
+        COUNTER_PRINT(num64map_resize);
         COUNTER_VAR_PRINT(search_span);
         COUNTER_VAR_PRINT(radixmap_left);
         COUNTER_VAR_PRINT(radixmap_right);
