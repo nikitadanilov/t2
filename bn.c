@@ -74,6 +74,28 @@
         ((unsigned long)(idx)) < ARRAY_SIZE(array);     \
 })
 
+/*
+ * Reduces ("aggregates") given expression over an interval.
+ *
+ * @see http://en.wikipedia.org/wiki/Fold_(higher-order_function)
+ *
+ * Example uses
+ *
+ * sum = REDUCE(i, ARRAY_SIZE(a), 0, + a[i]);
+ * product = REDUCE(i, ARRAY_SIZE(b), 1, * b[i]);
+ */
+#define REDUCE(var, nr, init, exp)              \
+({                                              \
+        unsigned __nr = (nr);                   \
+        unsigned var;                           \
+        typeof(init) __accum = (init);          \
+                                                \
+        for (var = 0; var < __nr; ++var) {      \
+                __accum = __accum exp;          \
+        }                                       \
+        __accum;                                \
+})
+
 struct bvar {
         uint64_t nr;
         uint64_t sum;
@@ -731,7 +753,8 @@ static void bphase_report(struct bphase *ph, bool final) {
         int lev = final ? BRESULTS : BPROGRESS;
         for (int i = 0; i < ph->nr; ++i) {
                 struct bthread *bt = &ph->group[i].thread;
-                uint64_t        total = 0;
+                uint64_t total = REDUCE(i, bt->nr, 0, + bt->choice[i].option.var.nr);
+
                 for (int k = 0; k < bt->nr; ++k) {
                         const double M = 1000000.0;
                         if (!final) {
@@ -742,20 +765,19 @@ static void bphase_report(struct bphase *ph, bool final) {
                         bt->choice[k].option.prev = var;
                         if (!final) {
                                 mutex_unlock(&ph->lock);
-                                total += var.nr;
                                 var.sum -= prev.sum;
                                 var.nr  -= prev.nr;
                                 var.ssq -= prev.ssq;
                         }
                         if (var.nr != 0) {
                                 double avg = 1.0 * var.sum / var.nr;
-                                blog(lev, "Phase %2i group %2i option %2i %s: ops: %10llu sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
-                                     ph->idx, i, k, bot_name[bt->choice[k].option.opt], var.nr, var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(1.0 * var.ssq / var.nr - avg * avg));
+                                blog(lev, "Phase %2i group %2i option %2i %s: ops: %10llu (%4.1f%%) sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
+                                     ph->idx, i, k, bot_name[bt->choice[k].option.opt], var.nr, 100.0 * total / ph->group[i].ops,
+                                     var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(1.0 * var.ssq / var.nr - avg * avg));
                         } else {
                                 blog(lev, "Phase %2i group %2i option %2i %s: idle.\n", ph->idx, i, k, bot_name[bt->choice[k].option.opt]);
                         }
                 }
-                blog(lev, "Phase %2i group %2i:                   %3.1f%% done.\n", ph->idx, i, 100.0 * total / ph->group[i].ops);
         }
 }
 
