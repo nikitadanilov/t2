@@ -731,6 +731,7 @@ static void bphase_report(struct bphase *ph, bool final) {
         int lev = final ? BRESULTS : BPROGRESS;
         for (int i = 0; i < ph->nr; ++i) {
                 struct bthread *bt = &ph->group[i].thread;
+                uint64_t        sum = 0;
                 for (int k = 0; k < bt->nr; ++k) {
                         const double M = 1000000.0;
                         if (!final) {
@@ -741,6 +742,7 @@ static void bphase_report(struct bphase *ph, bool final) {
                         bt->choice[k].option.prev = var;
                         if (!final) {
                                 mutex_unlock(&ph->lock);
+                                sum += var.sum;
                                 var.sum -= prev.sum;
                                 var.nr  -= prev.nr;
                                 var.ssq -= prev.ssq;
@@ -753,6 +755,7 @@ static void bphase_report(struct bphase *ph, bool final) {
                                 blog(lev, "Phase %2i group %2i option %2i %s: idle.\n", ph->idx, i, k, bot_name[bt->choice[k].option.opt]);
                         }
                 }
+                blog(lev, "Phase %2i group %2i:                  %3.1f%% done.\n", ph->idx, i, 100.0 * sum / ph->group[i].ops);
         }
 }
 
