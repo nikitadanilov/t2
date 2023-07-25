@@ -300,9 +300,13 @@ enum {
         TADDR_MIN_SHIFT = 9
 };
 
-struct pool {
+struct freelist {
         alignas(MAX_CACHELINE) pthread_mutex_t lock;
-        struct cds_list_head                   node[TADDR_SIZE_MASK + 1];
+        struct cds_list_head                   head;
+};
+
+struct pool {
+        struct freelist free[TADDR_SIZE_MASK + 1];
 };
 
 struct cache {
@@ -769,9 +773,9 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift) {
                         NOFAIL(pthread_cond_init(&mod->cache.need, NULL));
                         NOFAIL(pthread_cond_init(&mod->cache.got, NULL));
                         CDS_INIT_LIST_HEAD(&mod->cache.cold);
-                        NOFAIL(pthread_mutex_init(&mod->cache.pool.lock, NULL));
-                        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.node); ++i) {
-                                CDS_INIT_LIST_HEAD(&mod->cache.pool.node[i]);
+                        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.free); ++i) {
+                                NOFAIL(pthread_mutex_init(&mod->cache.pool.free[i].lock, NULL));
+                                CDS_INIT_LIST_HEAD(&mod->cache.pool.free[i].head);
                         }
                         mod->stor = storage;
                         result = SCALL(mod, init);
@@ -817,10 +821,10 @@ void t2_fini(struct t2 *mod) {
         mod->stor->op->fini(mod->stor);
         signal_fini();
         pool_clean(mod);
-        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.node); ++i) {
-                ASSERT(cds_list_empty(&mod->cache.pool.node[i]));
+        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.free); ++i) {
+                NOFAIL(pthread_mutex_init(&mod->cache.pool.free[i].lock, NULL));
+                CDS_INIT_LIST_HEAD(&mod->cache.pool.free[i].head);
         }
-        NOFAIL(pthread_mutex_destroy(&mod->cache.pool.lock));
         NOFAIL(pthread_cond_destroy(&mod->cache.got));
         NOFAIL(pthread_cond_destroy(&mod->cache.need));
         NOFAIL(pthread_mutex_destroy(&mod->cache.condlock));
@@ -1131,16 +1135,16 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
 }
 
 static struct node *nalloc(struct t2 *mod, taddr_t addr) {
-        struct cds_list_head *freelist = &mod->cache.pool.node[addr & TADDR_SIZE_MASK];
-        struct node          *n        = NULL;
+        struct freelist *free = &mod->cache.pool.free[addr & TADDR_SIZE_MASK];
+        struct node     *n    = NULL;
         CINC(alloc);
-        mutex_lock(&mod->cache.pool.lock);
-        if (!cds_list_empty(freelist)) {
-                n = COF(freelist->next, struct node, cache);
+        mutex_lock(&free->lock);
+        if (!cds_list_empty(&free->head)) {
+                n = COF(free->head.next, struct node, cache);
                 cds_list_del_init(&n->cache);
                 CINC(alloc_pool);
         }
-        mutex_unlock(&mod->cache.pool.lock);
+        mutex_unlock(&free->lock);
         if (UNLIKELY(n == NULL)) {
                 throttle(mod);
                 void *data = mem_alloc_align(taddr_ssize(addr), taddr_ssize(addr));
@@ -1167,6 +1171,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
 }
 
 static void nfini(struct node *n) {
+        struct freelist *free = &n->mod->cache.pool.free[n->addr & TADDR_SIZE_MASK];
         ASSERT(n->ref == 0);
         ASSERT(cds_list_empty(&n->cache));
         ASSERT(!(n->flags & DIRTY));
@@ -1175,14 +1180,14 @@ static void nfini(struct node *n) {
         n->seq   = 0;
         n->flags = 0;
         n->ntype = NULL;
+        n->addr  = 0;
         cookie_invalidate(&n->cookie);
         if (n->radix != NULL) {
                 SET0(n->radix);
         }
-        mutex_lock(&n->mod->cache.pool.lock);
-        cds_list_add(&n->cache, &n->mod->cache.pool.node[n->addr & TADDR_SIZE_MASK]);
-        n->addr = 0;
-        mutex_unlock(&n->mod->cache.pool.lock);
+        mutex_lock(&free->lock);
+        cds_list_add(&n->cache, &free->head);
+        mutex_unlock(&free->lock);
 }
 
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
@@ -3192,19 +3197,19 @@ static void ht_delete(struct node *n) {
 /* @pool */
 
 static void pool_clean(struct t2 *mod) {
-        mutex_lock(&mod->cache.pool.lock);
-        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.node); ++i) {
-                struct cds_list_head *freelist = &mod->cache.pool.node[i];
-                while (!cds_list_empty(freelist)) {
-                        struct node *n = COF(freelist->next, struct node, cache);
+        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.free); ++i) {
+                struct freelist *free = &mod->cache.pool.free[i];
+                mutex_lock(&free->lock);
+                while (!cds_list_empty(&free->head)) {
+                        struct node *n = COF(free->head.next, struct node, cache);
                         cds_list_del(&n->cache);
                         NOFAIL(pthread_rwlock_destroy(&n->lock));
                         mem_free(n->radix);
                         mem_free(n->data);
                         mem_free(n);
                 }
+                mutex_unlock(&free->lock);
         }
-        mutex_unlock(&mod->cache.pool.lock);
 }
 
 /* @avg */
