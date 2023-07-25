@@ -84,6 +84,9 @@ while [ $# != 0 ] ;do
 	      options="$options debug counters noopt profile"
       ;;  '-b')
 	      runbn=1
+      ;;  *)
+	      echo "Unknown argument $1"
+	      exit 1
       esac
       shift
 done
