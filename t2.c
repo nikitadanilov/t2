@@ -292,6 +292,19 @@ struct ht {
         struct bucketlock *bucketlocks;
 };
 
+enum {
+        TADDR_SIZE_MASK =              0xfull,
+        TADDR_LOW0_MASK =            0x1f0ull,
+        TADDR_ADDR_MASK = 0xfffffffffffe00ull,
+        TADDR_REST_MASK = ~0ull & ~(TADDR_SIZE_MASK | TADDR_LOW0_MASK | TADDR_ADDR_MASK),
+        TADDR_MIN_SHIFT = 9
+};
+
+struct pool {
+        alignas(MAX_CACHELINE) pthread_mutex_t lock;
+        struct cds_list_head                   node[TADDR_SIZE_MASK + 1];
+};
+
 struct cache {
         alignas(MAX_CACHELINE) pthread_mutex_t lock;
         uint64_t                               bolt;
@@ -299,6 +312,7 @@ struct cache {
         int32_t                                busy;
         int32_t                                dirty;
         int32_t                                incache;
+        alignas(MAX_CACHELINE) struct pool     pool;
         alignas(MAX_CACHELINE) pthread_mutex_t guard;
         struct cds_list_head                   cold;
         alignas(MAX_CACHELINE) pthread_mutex_t condlock;
@@ -522,6 +536,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t rcu;
         int64_t peek;
         int64_t alloc;
+        int64_t alloc_pool;
+        int64_t alloc_fresh;
         int64_t traverse;
         int64_t traverse_restart;
         int64_t traverse_iter;
@@ -622,6 +638,7 @@ static pthread_mutex_t *ht_lock(struct ht *ht, uint32_t bucket);
 static struct node *ht_lookup(struct ht *ht, taddr_t addr, uint32_t bucket);
 static void ht_insert(struct ht *ht, struct node *n, uint32_t bucket);
 static void ht_delete(struct node *n);
+static void pool_clean(struct t2 *mod);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
 static void buf_clip_node(struct t2_buf *b, const struct node *n);
@@ -752,6 +769,10 @@ struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift) {
                         NOFAIL(pthread_cond_init(&mod->cache.need, NULL));
                         NOFAIL(pthread_cond_init(&mod->cache.got, NULL));
                         CDS_INIT_LIST_HEAD(&mod->cache.cold);
+                        NOFAIL(pthread_mutex_init(&mod->cache.pool.lock, NULL));
+                        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.node); ++i) {
+                                CDS_INIT_LIST_HEAD(&mod->cache.pool.node[i]);
+                        }
                         mod->stor = storage;
                         result = SCALL(mod, init);
                         if (LIKELY(result == 0)) {
@@ -795,6 +816,11 @@ void t2_fini(struct t2 *mod) {
         ASSERT(cds_list_empty(&mod->cache.cold));
         mod->stor->op->fini(mod->stor);
         signal_fini();
+        pool_clean(mod);
+        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.node); ++i) {
+                ASSERT(cds_list_empty(&mod->cache.pool.node[i]));
+        }
+        NOFAIL(pthread_mutex_destroy(&mod->cache.pool.lock));
         NOFAIL(pthread_cond_destroy(&mod->cache.got));
         NOFAIL(pthread_cond_destroy(&mod->cache.need));
         NOFAIL(pthread_mutex_destroy(&mod->cache.condlock));
@@ -886,14 +912,6 @@ void t2_thread_degister() {
         counters_fold();
         thread_registered = false;
 }
-
-enum {
-        TADDR_SIZE_MASK =              0xfull,
-        TADDR_LOW0_MASK =            0x1f0ull,
-        TADDR_ADDR_MASK = 0xfffffffffffe00ull,
-        TADDR_REST_MASK = ~0ull & ~(TADDR_SIZE_MASK | TADDR_LOW0_MASK | TADDR_ADDR_MASK),
-        TADDR_MIN_SHIFT = 9
-};
 
 static bool taddr_is_valid(taddr_t addr) {
         return (addr & (TADDR_LOW0_MASK | TADDR_LOW0_MASK)) == 0;
@@ -1113,44 +1131,62 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
 }
 
 static struct node *nalloc(struct t2 *mod, taddr_t addr) {
-        struct node *n    = mem_alloc(sizeof *n);
-        void        *data = mem_alloc_align(taddr_ssize(addr), taddr_ssize(addr));
-        int          result;
+        struct cds_list_head *freelist = &mod->cache.pool.node[addr & TADDR_SIZE_MASK];
+        struct node          *n        = NULL;
         CINC(alloc);
-        if (LIKELY(n != NULL && data != NULL)) {
-                NOFAIL(pthread_rwlock_init(&n->lock, NULL));
-                CDS_INIT_LIST_HEAD(&n->cache);
-                n->addr = addr;
-                n->mod = mod;
-                n->data = data;
-                n->ref = 1;
-                cookie_make(&n->cookie);
-                CINC(node);
-                ref_add(n);
-                KINC(busy);
-                return n;
-        } else {
-                result = ERROR(-ENOMEM);
+        mutex_lock(&mod->cache.pool.lock);
+        if (!cds_list_empty(freelist)) {
+                n = COF(freelist->next, struct node, cache);
+                cds_list_del_init(&n->cache);
+                CINC(alloc_pool);
         }
-        mem_free(n);
-        mem_free(data);
-        return EPTR(result);
+        mutex_unlock(&mod->cache.pool.lock);
+        if (UNLIKELY(n == NULL)) {
+                throttle(mod);
+                void *data = mem_alloc_align(taddr_ssize(addr), taddr_ssize(addr));
+                n = mem_alloc(sizeof *n);
+                if (LIKELY(n != NULL && data != NULL)) {
+                        CINC(alloc_fresh);
+                        NOFAIL(pthread_rwlock_init(&n->lock, NULL));
+                        CDS_INIT_LIST_HEAD(&n->cache);
+                        n->data = data;
+                } else {
+                        mem_free(n);
+                        mem_free(data);
+                        return EPTR(-ENOMEM);
+                }
+        }
+        n->addr = addr;
+        n->mod = mod;
+        n->ref = 1;
+        cookie_make(&n->cookie);
+        CINC(node);
+        ref_add(n);
+        KINC(busy);
+        return n;
 }
 
 static void nfini(struct node *n) {
         ASSERT(n->ref == 0);
         ASSERT(cds_list_empty(&n->cache));
         ASSERT(!(n->flags & DIRTY));
+        memset(n->data, 0, taddr_ssize(n->addr));
         cookie_invalidate(&n->cookie);
-        NOFAIL(pthread_rwlock_destroy(&n->lock));
-        mem_free(n->radix);
-        mem_free(n->data);
-        mem_free(n);
+        n->seq   = 0;
+        n->flags = 0;
+        n->ntype = NULL;
+        cookie_invalidate(&n->cookie);
+        if (n->radix != NULL) {
+                SET0(n->radix);
+        }
+        mutex_lock(&n->mod->cache.pool.lock);
+        cds_list_add(&n->cache, &n->mod->cache.pool.node[n->addr & TADDR_SIZE_MASK]);
+        n->addr = 0;
+        mutex_unlock(&n->mod->cache.pool.lock);
 }
 
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
         struct node *n;
-        throttle(mod);
         n = nalloc(mod, addr);
         if (EISOK(n)) {
                 struct node     *other;
@@ -1353,9 +1389,6 @@ static void radixmap_update(struct node *n) {
                 n->radix = mem_alloc(sizeof *n->radix);
                 if (UNLIKELY(n->radix == NULL)) {
                         return;
-                }
-                for (int16_t ch = -1; ch < ARRAY_SIZE(n->radix->idx); ++ch) {
-                        n->radix->idx[ch] = (struct mapel){ -1, +1 };
                 }
         }
         m = n->radix;
@@ -2507,7 +2540,7 @@ static void throttle(struct t2 *mod) {
                 if (UNLIKELY(cds_list_empty(&c->cold))) {
                         mutex_lock(&c->condlock);
                         pthread_cond_signal(&c->need);
-                        while (cds_list_empty(&c->cold)) {
+                        if (cds_list_empty(&c->cold)) {
                                 pthread_cond_wait(&c->got, &c->condlock);
                                 CINC(throttle_wait);
                         }
@@ -2804,6 +2837,8 @@ static void counters_print() {
         counters_fold();
         printf("peek:               %10"PRId64"\n", GVAL(peek));
         printf("alloc:              %10"PRId64"\n", GVAL(alloc));
+        printf("alloc.pool:         %10"PRId64"\n", GVAL(alloc_pool));
+        printf("alloc.fresh:        %10"PRId64"\n", GVAL(alloc_fresh));
         printf("traverse:           %10"PRId64"\n", GVAL(traverse));
         printf("traverse.restart:   %10"PRId64"\n", GVAL(traverse_restart));
         printf("traverse.iter:      %10"PRId64"\n", GVAL(traverse_iter));
@@ -3152,6 +3187,24 @@ static void ht_insert(struct ht *ht, struct node *n, uint32_t bucket) {
 
 static void ht_delete(struct node *n) {
         cds_hlist_del_rcu(&n->hash);
+}
+
+/* @pool */
+
+static void pool_clean(struct t2 *mod) {
+        mutex_lock(&mod->cache.pool.lock);
+        for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.node); ++i) {
+                struct cds_list_head *freelist = &mod->cache.pool.node[i];
+                while (!cds_list_empty(freelist)) {
+                        struct node *n = COF(freelist->next, struct node, cache);
+                        cds_list_del(&n->cache);
+                        NOFAIL(pthread_rwlock_destroy(&n->lock));
+                        mem_free(n->radix);
+                        mem_free(n->data);
+                        mem_free(n);
+                }
+        }
+        mutex_unlock(&mod->cache.pool.lock);
 }
 
 /* @avg */
@@ -5009,11 +5062,11 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        insert_ut();
         lib_ut();
         simple_ut();
         ht_ut();
         traverse_ut();
+        insert_ut();
         tree_ut();
         counters_clear();
         stress_ut();
