@@ -240,11 +240,11 @@ enum {
 #define DMOD(cnt, d) ({ struct double_var *v = &(__d_counters.cnt); v->sum += (d); v->nr++; })
 #define COUNTERS_ASSERT(expr) ASSERT(expr)
 #else
-#define CINC(cnt)
-#define CDEC(cnt)
-#define CVAL(cnt)
-#define GVAL(cnt)
-#define GDVAL(cnt)
+#define CINC(cnt)    ((void)0)
+#define CDEC(cnt)    ((void)0)
+#define CVAL(cnt)    ((void)0)
+#define GVAL(cnt)    ((void)0)
+#define GDVAL(cnt)   ((void)0)
 #define CADD(cnt, d) ((void)(d))
 #define CMOD(cnt, d) ((void)(d))
 #define DMOD(cnt, d) ((void)(d))
@@ -367,16 +367,6 @@ struct ewma {
         uint32_t avg;
 };
 
-struct numel {
-        uint64_t key;
-        uint64_t mask;
-};
-
-struct num64map {
-        struct numel *el;
-        int32_t       capacity;
-};
-
 struct mapel {
         int32_t l;
         int32_t delta;
@@ -403,16 +393,11 @@ struct node {
         const struct t2_node_type *ntype;
         void                      *data;
         struct t2                 *mod;
-        union {
-                struct radixmap   *radix;
-                struct num64map    num64;
-        } map;
+        struct radixmap           *radix;
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
         struct rcu_head            rcu;
 };
-
-SASSERT(offsetof(struct node, map.radix) == offsetof(struct node, map.num64.el));
 
 enum lock_mode {
         NONE,
@@ -476,7 +461,6 @@ struct path {
         struct t2_rec  *rec;
         enum optype     opt;
         struct node    *newroot;
-        struct numel    k64;
 };
 
 struct policy {
@@ -579,7 +563,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t scan_cold;
                 int64_t scan_heated;
                 int64_t radixmap_updated;
-                int64_t num64map_resize;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
@@ -679,9 +662,6 @@ static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static void dirty(struct node *n, enum lock_mode lm);
 static void radixmap_update(struct node *n);
-static void num64map_build(struct node *n);
-static void num64map_insert(struct slot *s);
-static void num64map_delete(struct slot *s);
 static struct header *nheader(const struct node *n);
 static void rcu_lock();
 static void rcu_unlock();
@@ -1162,7 +1142,7 @@ static void nfini(struct node *n) {
         ASSERT(!(n->flags & DIRTY));
         cookie_invalidate(&n->cookie);
         NOFAIL(pthread_rwlock_destroy(&n->lock));
-        mem_free(n->map.radix);
+        mem_free(n->radix);
         mem_free(n->data);
         mem_free(n);
 }
@@ -1266,7 +1246,6 @@ static struct node *alloc(struct t2_tree *t, int8_t level) {
                         n->flags |= DIRTY;
                         KINC(dirty);
                         NCALL(n, make(n));
-                        num64map_build(n);
                         unlock(n, WRITE);
                 }
         } else {
@@ -1369,16 +1348,16 @@ static void radixmap_update(struct node *n) {
         if (is_stable(n) || is_leaf(n)) {
                 return;
         }
-        if (UNLIKELY(n->map.radix == NULL)) {
-                n->map.radix = mem_alloc(sizeof *n->map.radix);
-                if (UNLIKELY(n->map.radix == NULL)) {
+        if (UNLIKELY(n->radix == NULL)) {
+                n->radix = mem_alloc(sizeof *n->radix);
+                if (UNLIKELY(n->radix == NULL)) {
                         return;
                 }
-                for (int16_t ch = -1; ch < ARRAY_SIZE(n->map.radix->idx); ++ch) {
-                        n->map.radix->idx[ch] = (struct mapel){ -1, +1 };
+                for (int16_t ch = -1; ch < ARRAY_SIZE(n->radix->idx); ++ch) {
+                        n->radix->idx[ch] = (struct mapel){ -1, +1 };
                 }
         }
-        m = n->map.radix;
+        m = n->radix;
         CINC(l[level(n)].radixmap_updated);
         for (i = 0; i < nr(n); ++i) {
                 rec_get(&s, i);
@@ -1398,72 +1377,6 @@ static void radixmap_update(struct node *n) {
         }
         for (; prev < ARRAY_SIZE(m->idx); ++prev) {
                 m->idx[prev] = (struct mapel){ pidx, i - pidx };
-        }
-}
-
-static void num64at(struct t2_buf *b, struct numel *el) {
-        uint64_t keycopy = 0;
-        int32_t  len = b->seg[0].len;
-        uint64_t mask;
-        memcpy(&keycopy, b->seg[0].addr, min_32(len, sizeof keycopy));
-        if (UNLIKELY(len == 0)) {
-                mask = 0;
-        } else if (len < SOF(keycopy)) {
-                mask = ~((1ull << CHAR_BIT * (SOF(keycopy) - len)) - 1);
-        } else {
-                mask = ~0ull;
-        }
-        el->key  = be64toh(keycopy) & mask;
-        el->mask = mask;
-}
-
-static void num64map_build(struct node *n) {
-        if (is_leaf(n)) {
-                struct numel *el = mem_alloc((nr(n) + 1) * sizeof el[0]);
-                ASSERT(n->map.num64.el == NULL);
-                n->map.num64.el = el;
-                if (el != NULL) {
-                        SLOT_DEFINE(s, n);
-                        for (int32_t i = 0; i < nr(n); ++i) {
-                                rec_get(&s, i);
-                                num64at(s.rec.key, &el[i]);
-                        }
-                        n->map.num64.capacity = nr(n) + 1;
-                }
-                ASSERT(nr(n) == 0 || FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
-        }
-}
-
-static void num64map_insert(struct slot *s) {
-        struct node *n = s->node;
-        int32_t items = nr(n);
-        if (is_leaf(n) && LIKELY(n->map.num64.el != NULL)) {
-                struct numel *el;
-                if (n->map.num64.capacity < nr(n)) {
-                        CINC(l[level(n)].num64map_resize);
-                        int32_t cap = max_32(items + (items >> 1), 16);
-                        el = mem_alloc(cap * sizeof el[0]);
-                        if (UNLIKELY(el == NULL)) {
-                                return;
-                        }
-                        n->map.num64.capacity = cap;
-                        memmove(el, n->map.num64.el, s->idx * sizeof el[0]);
-                } else {
-                        el = n->map.num64.el;
-                }
-                memmove(el + s->idx + 1, n->map.num64.el + s->idx, (nr(n) - s->idx - 1) * sizeof el[0]);
-                num64at(s->rec.key, &el[s->idx]);
-                n->map.num64.el = el;
-                ASSERT(items == 0 || FORALL(i, items - 1, el[i].key <= el[i + 1].key));
-        }
-}
-
-static void num64map_delete(struct slot *s) {
-        struct node *n = s->node;
-        if (is_leaf(n) && LIKELY(n->map.num64.el != NULL)) {
-                struct numel *el = n->map.num64.el;
-                memmove(el + s->idx, el + s->idx + 1, (nr(n) - s->idx) * sizeof el[0]);
-                ASSERT(nr(n) == 0 || FORALL(i, nr(n) - 1, el[i].key <= el[i + 1].key));
         }
 }
 
@@ -1723,7 +1636,6 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum 
         p->tree = t;
         p->rec  = r;
         p->opt  = opt;
-        num64at(p->rec->key, &p->k64);
 }
 
 static void dirty(struct node *n, enum lock_mode lm) {
@@ -2923,7 +2835,6 @@ static void counters_print() {
         COUNTER_PRINT(scan_cold);
         COUNTER_PRINT(scan_heated);
         COUNTER_PRINT(radixmap_updated);
-        COUNTER_PRINT(num64map_resize);
         COUNTER_VAR_PRINT(search_span);
         COUNTER_VAR_PRINT(radixmap_left);
         COUNTER_VAR_PRINT(radixmap_right);
@@ -3452,71 +3363,6 @@ static int uint64_cmp(uint64_t a, uint64_t b) {
         return a < b ? -1 : a != b;
 }
 
-static int num64_cmp(struct node *n, int idx, void *kaddr, int32_t klen, uint64_t kmasked, uint64_t kmask) {
-        struct numel *e = &n->map.num64.el[idx];
-        return uint64_cmp(e->key & kmask, kmasked & e->mask);
-}
-
-static bool num64_search(struct node *n, struct path *p, struct t2_rec *rec, void *kaddr, int32_t klen, int *ll, int *ddelta) {
-        int      cmp;
-        bool     found     = false;
-        int      l         = *ll;
-        int32_t  delta     = *ddelta;
-        int32_t  span      = 1 << ilog2(delta);
-        uint64_t k64       = p->k64.key;
-        uint64_t kmask     = p->k64.mask;
-        uint64_t kmasked   = k64 & kmask;
-        uint32_t nmask     = nsize(n) - 1;
-        struct sheader *sh = simple_header(n);
-        struct numel   *el = n->map.num64.el;
-#define CMP (num64_cmp(n, l + span, kaddr, klen, kmasked, kmask) ?: skeycmp(sh, l + span, kaddr, klen, nmask))
-        if (delta != span && CMP <= 0) {
-                l += delta - span;
-        }
-#define NUMRANGE(x, prefetchp)                                          \
-        case 1 << (x):                                                  \
-                span >>= 1;                                             \
-                if (prefetchp) {                                        \
-                        __builtin_prefetch(el + l + span + (span >> 1)); \
-                        __builtin_prefetch(el + l + span - (span >> 1)); \
-                }                                                       \
-                cmp = CMP;                                              \
-                if (cmp <= 0) {                                         \
-                        l += span;                                      \
-                        if (cmp == 0) {                                 \
-                                found = true;                           \
-                                break;                                  \
-                        }                                               \
-                }                                                       \
-                __attribute__((fallthrough));
-        switch (span) {
-        default:
-                IMMANENTISE("Impossible span: %i.", span);
-                NUMRANGE(16,  true)
-                NUMRANGE(15,  true)
-                NUMRANGE(14,  true)
-                NUMRANGE(13,  true)
-                NUMRANGE(12,  true)
-                NUMRANGE(11,  true)
-                NUMRANGE(10,  true)
-                NUMRANGE( 9,  true)
-                NUMRANGE( 8,  true)
-                NUMRANGE( 7,  true)
-                NUMRANGE( 6,  true)
-                NUMRANGE( 5,  true)
-                NUMRANGE( 4, false)
-                NUMRANGE( 3, false)
-                NUMRANGE( 2, false)
-                NUMRANGE( 1, false)
-                case 1:
-                        ;
-                }
-#undef NUMRANGE
-#undef CMP
-        *ll = l;
-        return found;
-}
-
 static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         struct t2_rec  *rec   = p->rec;
         bool            found = false;
@@ -3539,29 +3385,23 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         CMOD(l[lev].free,        NCALL(n, free(n)));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
-        __builtin_prefetch(n->map.num64.el + ((delta - 1) >> 1));
         if (UNLIKELY(nr(n) == 0)) {
                 goto here;
-        } else if (!is_leaf(n)) {
-                if (n->map.radix != NULL) {
-                        l     = n->map.radix->idx[ch].l;
-                        delta = n->map.radix->idx[ch].delta;
-                        CMOD(l[lev].radixmap_left,  l + 1);
-                        CMOD(l[lev].radixmap_right, nr(n) - l - delta);
-                        if (UNLIKELY(l < 0)) {
-                                goto here;
-                        }
-                        cmp = skeycmp(sh, l, kaddr, klen, mask);
-                        if (cmp > 0) {
-                                l--;
-                        } else if (cmp == 0) {
-                                found = true;
-                                goto here;
-                        }
+        } else if (LIKELY(!is_leaf(n) && n->radix != NULL)) {
+                l     = n->radix->idx[ch].l;
+                delta = n->radix->idx[ch].delta;
+                CMOD(l[lev].radixmap_left,  l + 1);
+                CMOD(l[lev].radixmap_right, nr(n) - l - delta);
+                if (UNLIKELY(l < 0)) {
+                        goto here;
                 }
-        } else if (LIKELY(n->map.num64.el != NULL)) {
-                found = num64_search(n, p, rec, kaddr, klen, &l, &delta);
-                goto here;
+                cmp = skeycmp(sh, l, kaddr, klen, mask);
+                if (cmp > 0) {
+                        l--;
+                } else if (cmp == 0) {
+                        found = true;
+                        goto here;
+                }
         }
         CMOD(l[lev].search_span, delta);
         span = 1 << ilog2(delta);
@@ -3762,7 +3602,6 @@ static int simple_insert(struct slot *s) {
         ASSERT(buf.seg[0].len == vlen);
         buf_copy(&buf, s->rec.val);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
-        num64map_insert(s);
         return 0;
 }
 
@@ -3787,7 +3626,6 @@ static void simple_delete(struct slot *s) {
         }
         --sh->nr;
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
-        num64map_delete(s);
 }
 
 static void simple_get(struct slot *s) {
@@ -3809,7 +3647,6 @@ static void simple_make(struct node *n) {
 }
 
 static int simple_load(struct node *n) {
-        num64map_build(n);
         return 0;
 }
 
