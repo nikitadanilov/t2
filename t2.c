@@ -658,6 +658,7 @@ static uint8_t level(const struct node *n);
 static bool is_leaf(const struct node *n);
 static int32_t nr(const struct node *n);
 static int32_t nsize(const struct node *n);
+static int32_t utmost(const struct node *n, enum dir d);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static void dirty(struct node *n, enum lock_mode lm);
@@ -1555,13 +1556,21 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
         }
 }
 
+static bool utmost_path(struct path *p, int idx, enum dir d) {
+        return FORALL(i, idx, p->rung[i].lm == WRITE ? p->rung[i].pos == utmost(p->rung[i].node, d) : true);
+}
+
 static int split_right_exec_delete(struct path *p, int idx) {
         int result = 0;
         struct rung *r = &p->rung[idx];
         struct node *right = brother(r, RIGHT)->node;
         SLOT_DEFINE(s, r->node);
         if (!is_leaf(r->node)) {
-                if (r->pos + 1 < nr(r->node)) {
+                if (UNLIKELY(nr(p->rung[idx + 1].node) == 0)) { /* Rightmost in the tree. */
+                        ASSERT(utmost_path(p, idx, RIGHT));
+                        s.idx = r->pos;
+                        NCALL(s.node, delete(&s));
+                } else if (r->pos + 1 < nr(r->node)) {
                         s.idx = r->pos + 1;
                         delete_update(p, idx, &s);
                 } else {
@@ -1574,10 +1583,15 @@ static int split_right_exec_delete(struct path *p, int idx) {
                 }
         }
         if (right != NULL && can_merge(r->node, right)) {
+                ASSERT(nr(right) > 0);
                 NOFAIL(merge(r->node, right, LEFT)); /* TODO: deallocate the empty node. */
+                ASSERT(nr(r->node) > 0);
                 EXPENSIVE_ASSERT(is_sorted(r->node));
                 r->flags &= ~SEPCHG;
                 result = +1;
+        } else if (UNLIKELY(nr(r->node) == 0)) {
+                ASSERT(utmost_path(p, idx, RIGHT));
+                return +1;
         }
         return result;
 }
