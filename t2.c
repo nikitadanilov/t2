@@ -593,6 +593,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var radixmap_left;
                 struct counter_var radixmap_right;
                 struct counter_var search_span;
+                struct counter_var recpos;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -981,6 +982,7 @@ void t2_tree_close(struct t2_tree *t) {
 }
 
 static int rec_insert(struct node *n, int32_t idx, struct t2_rec *r) {
+        CMOD(l[level(n)].recpos, 100 * idx / (nr(n) + 1));
         return NCALL(n, insert(&(struct slot) { .node = n, .idx = idx, .rec  = *r }));
 }
 
@@ -2894,6 +2896,7 @@ static void counters_print() {
         COUNTER_VAR_PRINT(radixmap_right);
         COUNTER_VAR_PRINT(nr);
         COUNTER_VAR_PRINT(free);
+        COUNTER_VAR_PRINT(recpos);
         COUNTER_VAR_PRINT(modified);
         COUNTER_VAR_PRINT(keysize);
         COUNTER_VAR_PRINT(valsize);
