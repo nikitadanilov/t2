@@ -772,7 +772,7 @@ static void bphase_report(struct bphase *ph, bool final) {
                         if (var.nr != 0) {
                                 double avg = 1.0 * var.sum / var.nr;
                                 blog(lev, "Phase %2i group %2i option %2i %s: ops: %10llu (%4.1f%%) sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
-                                     ph->idx, i, k, bot_name[bt->choice[k].option.opt], var.nr, 100.0 * total / ph->group[i].ops,
+                                     ph->idx, i, k, bot_name[bt->choice[k].option.opt], var.nr, 100.0 * total / ph->group[i].ops / ph->group[i].nr,
                                      var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(1.0 * var.ssq / var.nr - avg * avg));
                         } else {
                                 blog(lev, "Phase %2i group %2i option %2i %s: idle.\n", ph->idx, i, k, bot_name[bt->choice[k].option.opt]);
