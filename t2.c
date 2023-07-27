@@ -35,7 +35,8 @@ enum {
         MAX_ERR_CODE      =    1024,
         MAX_ERR_DEPTH     =      16,
         MAX_CACHELINE     =      64,
-        MAX_SEPARATOR_CUT =      10
+        MAX_SEPARATOR_CUT =      10,
+        MAX_PREFIX        =      32
 };
 
 /* @macro */
@@ -391,8 +392,10 @@ struct mapel {
 };
 
 struct radixmap {
-        struct mapel zero_sentinel;
-        struct mapel idx[256];
+        uint8_t       pbuf[MAX_PREFIX];
+        struct t2_buf prefix;
+        struct mapel  zero_sentinel;
+        struct mapel  idx[256];
 };
 
 enum node_flags {
@@ -594,6 +597,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var radixmap_right;
                 struct counter_var search_span;
                 struct counter_var recpos;
+                struct counter_var prefix;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -629,6 +633,7 @@ struct cacheinfo {
 /* @static */
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src);
+static int32_t buf_prefix(const struct t2_buf *dst, const struct t2_buf *src);
 static int32_t buf_len(const struct t2_buf *b);
 static int buf_cmp(const struct t2_buf *dst, const struct t2_buf *src);
 static int buf_alloc(struct t2_buf *dst, struct t2_buf *src);
@@ -823,8 +828,8 @@ void t2_fini(struct t2 *mod) {
         signal_fini();
         pool_clean(mod);
         for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.free); ++i) {
-                NOFAIL(pthread_mutex_init(&mod->cache.pool.free[i].lock, NULL));
-                CDS_INIT_LIST_HEAD(&mod->cache.pool.free[i].head);
+                NOFAIL(pthread_mutex_destroy(&mod->cache.pool.free[i].lock));
+                ASSERT(cds_list_empty(&mod->cache.pool.free[i].head));
         }
         NOFAIL(pthread_cond_destroy(&mod->cache.got));
         NOFAIL(pthread_cond_destroy(&mod->cache.need));
@@ -1136,10 +1141,9 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
         return ht_lookup(&mod->ht, addr, ht_bucket(&mod->ht, addr));
 }
 
-static struct node *nalloc(struct t2 *mod, taddr_t addr) {
+static struct node *pool_get(struct t2 *mod, taddr_t addr) {
         struct freelist *free = &mod->cache.pool.free[addr & TADDR_SIZE_MASK];
         struct node     *n    = NULL;
-        CINC(alloc);
         mutex_lock(&free->lock);
         if (!cds_list_empty(&free->head)) {
                 n = COF(free->head.next, struct node, cache);
@@ -1147,19 +1151,28 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
                 CINC(alloc_pool);
         }
         mutex_unlock(&free->lock);
+        return n;
+}
+
+static struct node *nalloc(struct t2 *mod, taddr_t addr) {
+        struct node *n = pool_get(mod, addr);
+        CINC(alloc);
         if (UNLIKELY(n == NULL)) {
                 throttle(mod);
-                void *data = mem_alloc_align(taddr_ssize(addr), taddr_ssize(addr));
-                n = mem_alloc(sizeof *n);
-                if (LIKELY(n != NULL && data != NULL)) {
-                        CINC(alloc_fresh);
-                        NOFAIL(pthread_rwlock_init(&n->lock, NULL));
-                        CDS_INIT_LIST_HEAD(&n->cache);
-                        n->data = data;
-                } else {
-                        mem_free(n);
-                        mem_free(data);
-                        return EPTR(-ENOMEM);
+                n = pool_get(mod, addr);
+                if (UNLIKELY(n == NULL)) {
+                        void *data = mem_alloc_align(taddr_ssize(addr), taddr_ssize(addr));
+                        n = mem_alloc(sizeof *n);
+                        if (LIKELY(n != NULL && data != NULL)) {
+                                CINC(alloc_fresh);
+                                NOFAIL(pthread_rwlock_init(&n->lock, NULL));
+                                CDS_INIT_LIST_HEAD(&n->cache);
+                                n->data = data;
+                        } else {
+                                mem_free(n);
+                                mem_free(data);
+                                return EPTR(-ENOMEM);
+                        }
                 }
         }
         n->addr = addr;
@@ -1184,9 +1197,6 @@ static void nfini(struct node *n) {
         n->ntype = NULL;
         n->addr  = 0;
         cookie_invalidate(&n->cookie);
-        if (n->radix != NULL) {
-                SET0(n->radix);
-        }
         mutex_lock(&free->lock);
         cds_list_add(&n->cache, &free->head);
         mutex_unlock(&free->lock);
@@ -1388,8 +1398,9 @@ static void radixmap_update(struct node *n) {
         int16_t          ch;
         int32_t          prev = -1;
         int32_t          pidx = -1;
+        int32_t          plen;
         SLOT_DEFINE(s, n);
-        if (is_stable(n) || is_leaf(n)) {
+        if (is_stable(n)) {
                 return;
         }
         if (UNLIKELY(n->radix == NULL)) {
@@ -1397,13 +1408,29 @@ static void radixmap_update(struct node *n) {
                 if (UNLIKELY(n->radix == NULL)) {
                         return;
                 }
+                n->radix->prefix.nr = 1;
+                n->radix->prefix.seg[0].addr = &n->radix->pbuf[0];
         }
         m = n->radix;
         CINC(l[level(n)].radixmap_updated);
+        if (LIKELY(nr(n) > 1)) {
+                struct t2_buf l;
+                struct t2_buf r;
+                rec_get(&s, 0);
+                l = *s.rec.key;
+                rec_get(&s, nr(n) - 1);
+                r = *s.rec.key;
+                plen = min_32(buf_prefix(&l, &r), ARRAY_SIZE(m->pbuf));
+                memcpy(m->prefix.seg[0].addr, l.seg[0].addr, plen);
+                m->prefix.seg[0].len = plen;
+        } else {
+                plen = m->prefix.seg[0].len = 0;
+        }
+        CMOD(l[level(n)].prefix, plen);
         for (i = 0; i < nr(n); ++i) {
                 rec_get(&s, i);
-                if (LIKELY(s.rec.key->seg[0].len > 0)) {
-                        ch = ((uint8_t *)s.rec.key->seg[0].addr)[0];
+                if (LIKELY(s.rec.key->seg[0].len > plen)) {
+                        ch = ((uint8_t *)s.rec.key->seg[0].addr)[plen];
                 } else {
                         ch = -1;
                         pidx = 0;
@@ -2902,6 +2929,7 @@ static void counters_print() {
         COUNTER_VAR_PRINT(valsize);
         COUNTER_VAR_PRINT(repage);
         COUNTER_VAR_PRINT(sepcut);
+        COUNTER_VAR_PRINT(prefix);
         DOUBLE_VAR_PRINT(temperature);
 }
 
@@ -3279,7 +3307,7 @@ static int buf_cmp(const struct t2_buf *b0, const struct t2_buf *b1) {
         ASSERT(b1->nr == 1);
         uint32_t len0 = b0->seg[0].len;
         uint32_t len1 = b1->seg[0].len;
-        return memcmp(b0->seg[0].addr, b1->seg[0].addr, len0 < len1 ? len0 : len1) ?: int32_cmp(len0, len1);
+        return memcmp(b0->seg[0].addr, b1->seg[0].addr, min_32(len0, len1)) ?: int32_cmp(len0, len1);
 }
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
@@ -3302,6 +3330,20 @@ static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
                         soff = 0;
                 }
         }
+}
+
+static int32_t buf_prefix(const struct t2_buf *dst, const struct t2_buf *src) {
+        int32_t i;
+        int32_t len = min_32(dst->nr, src->nr) > 0 ? min_32(dst->seg[0].len, src->seg[0].len) : 0;
+        ASSERT(dst->nr <= 1);
+        ASSERT(src->nr <= 1);
+        for (i = 0; i < len; ++i) {
+                if (((char *)dst->seg[0].addr)[i] != ((char *)src->seg[0].addr)[i]) {
+                        break;
+                }
+        }
+        return i;
+
 }
 
 static int32_t buf_len(const struct t2_buf *b) {
@@ -3448,7 +3490,6 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         int32_t         klen  = rec->key->seg[0].len;
         int             cmp   = -1;
         uint32_t        mask  = nsize(n) - 1;
-        int16_t         ch    = LIKELY(klen > 0) ? *(uint8_t *)kaddr : -1;
         int32_t         span;
         uint8_t __attribute__((unused)) lev = level(n);
         ASSERT(rec->key->nr == 1);
@@ -3462,7 +3503,15 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
         if (UNLIKELY(nr(n) == 0)) {
                 goto here;
-        } else if (LIKELY(!is_leaf(n) && n->radix != NULL)) {
+        } else if (LIKELY(n->radix != NULL)) {
+                int16_t ch;
+                int32_t plen = n->radix->prefix.seg[0].len;
+                cmp = memcmp(n->radix->prefix.seg[0].addr, kaddr, min_32(plen, klen)) ?: klen < plen ? +1 : 0;
+                if (UNLIKELY(cmp != 0)) {
+                        l = cmp > 0 ? -1 : nr(n) - 1;
+                        goto here;
+                }
+                ch = LIKELY(klen > plen) ? ((uint8_t *)kaddr)[plen] : -1;
                 l     = n->radix->idx[ch].l;
                 delta = n->radix->idx[ch].delta;
                 CMOD(l[lev].radixmap_left,  l + 1);
@@ -3477,6 +3526,8 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                         found = true;
                         goto here;
                 }
+                l = max_32(min_32(nr(n) - 1, l), -1);
+                delta = min_32(delta, nr(n) - l);
         }
         CMOD(l[lev].search_span, delta);
         span = 1 << ilog2(delta);
