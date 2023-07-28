@@ -346,7 +346,6 @@ struct node_type_ops {
         int32_t (*nr)        (const struct node *n);
         int32_t (*free)      (const struct node *n);
         int32_t (*used)      (const struct node *n);
-        int     (*keycmp)    (const struct node *n, int pos, void *addr, int32_t len, uint64_t mask);
 };
 
 struct t2 {
@@ -3463,13 +3462,15 @@ static char cmpch(int cmp) {
 
 static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 
-static int skeycmp(struct sheader *sh, int pos, void *key, int32_t klen, uint32_t mask) {
+static int skeycmp(struct sheader *sh, int pos, int32_t prefix, void *key, int32_t klen, uint32_t mask) {
         int32_t ksize;
-        int32_t koff = skeyoff(sh, pos, &ksize) & mask;
+        int32_t koff = (skeyoff(sh, pos, &ksize) + prefix) & mask;
         __builtin_prefetch((void *)sh + koff);
+        ksize -= prefix;
+        klen  -= prefix;
         ksize = min_32(ksize & mask, mask + 1 - koff);
         CMOD(l[sh->head.level].keysize, ksize);
-        return memcmp((void *)sh + koff, key, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
+        return memcmp((void *)sh + koff, key + prefix, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
 }
 
 static struct sheader *simple_header(const struct node *n) {
@@ -3501,6 +3502,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         int32_t         klen  = rec->key->seg[0].len;
         int             cmp   = -1;
         uint32_t        mask  = nsize(n) - 1;
+        int32_t         plen  = 0;
         int32_t         span;
         uint8_t __attribute__((unused)) lev = level(n);
         ASSERT(rec->key->nr == 1);
@@ -3516,7 +3518,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                 goto here;
         } else if (LIKELY(n->radix != NULL)) {
                 int16_t ch;
-                int32_t plen = n->radix->prefix.seg[0].len;
+                plen = n->radix->prefix.seg[0].len;
                 cmp = memcmp(n->radix->prefix.seg[0].addr, kaddr, min_32(plen, klen)) ?: klen < plen ? +1 : 0;
                 if (UNLIKELY(cmp != 0)) {
                         l = cmp > 0 ? -1 : nr(n) - 1;
@@ -3530,7 +3532,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                 if (UNLIKELY(l < 0)) {
                         goto here;
                 }
-                cmp = skeycmp(sh, l, kaddr, klen, mask);
+                cmp = skeycmp(sh, l, plen, kaddr, klen, mask);
                 if (cmp > 0) {
                         l--;
                 } else if (cmp == 0) {
@@ -3542,7 +3544,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         }
         CMOD(l[lev].search_span, delta);
         span = 1 << ilog2(delta);
-        if (span != delta && skeycmp(sh, l + span, kaddr, klen, mask) <= 0) {
+        if (span != delta && skeycmp(sh, l + span, plen, kaddr, klen, mask) <= 0) {
                 l += delta - span;
         }
 #define RANGE(x, prefetchp)                                                  \
@@ -3552,7 +3554,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                         __builtin_prefetch(sat(sh, l + span + (span >> 1))); \
                         __builtin_prefetch(sat(sh, l + span - (span >> 1))); \
                 }                                                            \
-                cmp = skeycmp(sh, l + span, kaddr, klen, mask);              \
+                cmp = skeycmp(sh, l + span, plen, kaddr, klen, mask);        \
                 if (cmp <= 0) {                                              \
                         l += span;                                           \
                         if (cmp == 0) {                                      \
@@ -3897,10 +3899,6 @@ static int merge(struct node *d, struct node *s, enum dir dir) {
         return result;
 }
 
-static int simple_keycmp(const struct node *n, int pos, void *addr, int32_t len, uint64_t mask) {
-        return skeycmp(simple_header(n), pos, addr, len, mask);
-}
-
 static struct node_type_ops simple_ops = {
         .insert     = &simple_insert,
         .delete     = &simple_delete,
@@ -3913,7 +3911,6 @@ static struct node_type_ops simple_ops = {
         .nr         = &simple_nr,
         .free       = &simple_free,
         .used       = &simple_used,
-        .keycmp     = &simple_keycmp
 };
 
 #if UT || BN
@@ -4157,7 +4154,7 @@ static bool is_sorted(struct node *n) {
         for (int32_t i = 0; i < sh->nr; ++i) {
                 rec_get(&ss, i);
                 if (i > 0) {
-                        int cmp = skeycmp(sh, i, keyarea, keysize, nsize(n) - 1);
+                        int cmp = skeycmp(sh, i, 0, keyarea, keysize, nsize(n) - 1);
                         if (cmp <= 0) {
                                 printf("Misordered at %i: ", i);
                                 range_print(keyarea, keysize,
