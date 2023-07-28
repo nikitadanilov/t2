@@ -339,6 +339,7 @@ struct node_type_ops {
         int     (*load)      (struct node *n);
         void    (*make)      (struct node *n);
         void    (*print)     (struct node *n);
+        void    (*fini)      (const struct node *n);
         bool    (*search)    (struct node *n, struct path *p, struct slot *out);
         bool    (*can_merge) (const struct node *n0, const struct node *n1);
         int     (*can_insert)(const struct slot *s);
@@ -392,6 +393,7 @@ struct mapel {
 };
 
 struct radixmap {
+        uint32_t      utmost;
         uint8_t       pbuf[MAX_PREFIX];
         struct t2_buf prefix;
         struct mapel  zero_sentinel;
@@ -707,6 +709,7 @@ static int32_t simple_free(const struct node *n);
 static int simple_can_insert(const struct slot *s);
 static int32_t simple_used(const struct node *n);
 static bool simple_can_merge(const struct node *n0, const struct node *n1);
+static void simple_fini(struct node *n);
 static void simple_print(struct node *n);
 static bool simple_invariant(const struct node *n);
 static int simple_keycmp(const struct node *n, int pos, void *addr, int32_t len, uint64_t mask);
@@ -1190,12 +1193,15 @@ static void nfini(struct node *n) {
         ASSERT(n->ref == 0);
         ASSERT(cds_list_empty(&n->cache));
         ASSERT(!(n->flags & DIRTY));
-        memset(n->data, 0, taddr_ssize(n->addr));
+        NCALL(n, fini(n));
         cookie_invalidate(&n->cookie);
         n->seq   = 0;
         n->flags = 0;
         n->ntype = NULL;
         n->addr  = 0;
+        if (n->radix != NULL) {
+                n->radix->prefix.seg[0].len = -1;
+        }
         cookie_invalidate(&n->cookie);
         mutex_lock(&free->lock);
         cds_list_add(&n->cache, &free->head);
@@ -1414,15 +1420,20 @@ static void radixmap_update(struct node *n) {
         m = n->radix;
         CINC(l[level(n)].radixmap_updated);
         if (LIKELY(nr(n) > 1)) {
-                struct t2_buf l;
-                struct t2_buf r;
-                rec_get(&s, 0);
-                l = *s.rec.key;
-                rec_get(&s, nr(n) - 1);
-                r = *s.rec.key;
-                plen = min_32(buf_prefix(&l, &r), ARRAY_SIZE(m->pbuf));
-                memcpy(m->prefix.seg[0].addr, l.seg[0].addr, plen);
-                m->prefix.seg[0].len = plen;
+                if (m->utmost || m->prefix.seg[0].len == -1) {
+                        struct t2_buf l;
+                        struct t2_buf r;
+                        rec_get(&s, 0);
+                        l = *s.rec.key;
+                        rec_get(&s, nr(n) - 1);
+                        r = *s.rec.key;
+                        plen = min_32(buf_prefix(&l, &r), ARRAY_SIZE(m->pbuf));
+                        memcpy(m->prefix.seg[0].addr, l.seg[0].addr, plen);
+                        m->prefix.seg[0].len = plen;
+                        m->utmost = 0;
+                } else {
+                        plen = m->prefix.seg[0].len;
+                }
         } else {
                 plen = m->prefix.seg[0].len = 0;
         }
@@ -3688,6 +3699,10 @@ static bool simple_can_merge(const struct node *n0, const struct node *n1) {
         return simple_free(n0) >= simple_used(n1) + dirsize(simple_nr(n1));
 }
 
+static void simple_fini(struct node *n) {
+        SET0(simple_header(n));
+}
+
 static int simple_insert(struct slot *s) {
         struct t2_buf       buf;
         struct sheader     *sh   = simple_header(s->node);
@@ -3728,6 +3743,9 @@ static int simple_insert(struct slot *s) {
         ASSERT(buf.seg[0].len == vlen);
         buf_copy(&buf, s->rec.val);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
+        if (LIKELY(s->node->radix != NULL)) {
+                s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node) - 1);
+        }
         return 0;
 }
 
@@ -3752,6 +3770,9 @@ static void simple_delete(struct slot *s) {
         }
         --sh->nr;
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
+        if (LIKELY(s->node->radix != NULL)) {
+                s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node));
+        }
 }
 
 static void simple_get(struct slot *s) {
