@@ -96,6 +96,14 @@
         __accum;                                \
 })
 
+enum {
+        OK,
+        NOENT,
+        EXIST,
+        OTHER,
+        ENR
+};
+
 struct bvar {
         uint64_t nr;
         uint64_t sum;
@@ -142,6 +150,8 @@ struct boption {
         struct bspec val;
         struct bvar  var;
         struct bvar  prev;
+        uint64_t rc[ENR];
+        uint64_t prev_rc[ENR];
 };
 
 struct bchoice {
@@ -173,6 +183,8 @@ struct bphase {
         pthread_cond_t start;
         struct benchmark *parent;
         bool run;
+        uint64_t begin;
+        uint64_t last;
 };
 
 #if USE_ROCKSDB
@@ -251,10 +263,10 @@ struct kv {
         void (*umount)(struct benchmark *b);
         void (*worker_init)(struct rthread *rt, struct kvdata *d, int maxkey, int maxval);
         void (*worker_fini)(struct rthread *rt, struct kvdata *d);
-        void (*lookup)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
-        void (*insert)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
-        void (*delete)(struct rthread *rt, struct kvdata *d, void *key, int ksize);
-        void (*next)  (struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr);
+        int  (*lookup)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
+        int  (*insert)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
+        int  (*delete)(struct rthread *rt, struct kvdata *d, void *key, int ksize);
+        int  (*next)  (struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr);
 };
 
 extern struct t2_storage *bn_storage;
@@ -529,7 +541,7 @@ static uint64_t now(void) {
         return t.tv_sec * 1000000 + t.tv_usec;
 }
 
-static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var) {
+static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var, uint64_t (*rc)[ENR]) {
         mutex_lock(&ph->lock);
         for (int i = 0; i < bt->nr; ++i) {
                 struct bvar *v = &bt->choice[i].option.var;
@@ -539,6 +551,10 @@ static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var) {
                 v->min  = MIN(v->min, var[i].min);
                 v->max  = MAX(v->max, var[i].max);
                 SET0(&var[i]);
+                for (int j = 0; j < ENR; ++j) {
+                        bt->choice[i].option.rc[j] += rc[i][j];
+                        rc[i][j] = 0;
+                }
         }
         mutex_unlock(&ph->lock);
         SET0(var);
@@ -582,8 +598,9 @@ static void *bworker(void *arg) {
         struct bvar *var;
         int i;
         int finger = 0;
-        uint64_t seed0 = ph->parent->seed + g->idx * 100000 + rt->idx;
+        uint64_t seed0 = ph->parent->seed + g->idx * 100000 + brnd(rt->idx);
         uint64_t reported = now() - rt->idx * 10000;
+        uint64_t (*rc)[ENR];
         struct kvdata data = {};
         assert(rt->self == pthread_self());
         blog(BINFO, "        Thread %3i in group %2i started.\n", rt->idx, g->idx);
@@ -601,6 +618,8 @@ static void *bworker(void *arg) {
         val = mem_alloc(maxval);
         cur = mem_alloc(maxkey);
         assert(key != NULL && val != NULL);
+        rc = mem_alloc(bt->nr * sizeof rc[0]);
+        assert(rc != NULL);
         data.b = &b->kv;
         kv[kvt].worker_init(rt, &data, maxkey, maxval);
         mutex_lock(&ph->lock);
@@ -616,6 +635,7 @@ static void *bworker(void *arg) {
                 struct boption *opt = &bt->choice[ch].option;
                 uint64_t start;
                 uint64_t end;
+                int result = 0;
                 if (opt->opt == BSLEEP) {
                         struct timespec sleep = {
                                 .tv_nsec = (brnd(seed + 1) % opt->delay) * 1000
@@ -632,44 +652,47 @@ static void *bworker(void *arg) {
                         int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
                         if (opt->opt == BLOOKUP) {
                                 start = now();
-                                kv[kvt].lookup(rt, &data, key, ksize, val, maxval);
+                                result = kv[kvt].lookup(rt, &data, key, ksize, val, maxval);
                                 end = now();
                         } else if (opt->opt == BINSERT) {
                                 int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val);
                                 start = now();
-                                kv[kvt].insert(rt, &data, key, ksize, val, vsize);
+                                result = kv[kvt].insert(rt, &data, key, ksize, val, vsize);
                                 end = now();
                         } else if (opt->opt == BDELETE) {
                                 start = now();
-                                kv[kvt].delete(rt, &data, key, ksize);
+                                result = kv[kvt].delete(rt, &data, key, ksize);
                                 end = now();
                         } else if (opt->opt == BNEXT) {
                                 start = now();
-                                kv[kvt].next(rt, &data, key, ksize, brnd(seed + 3) % opt->iter,
-                                             (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS);
+                                result = kv[kvt].next(rt, &data, key, ksize, brnd(seed + 3) % opt->iter,
+                                                      (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS);
                                 end = now();
                         } else {
                                 assert(false);
                         }
                 }
                 uint64_t delta = end - start;
+                int rcidx = result == 0 ? OK : result == -ENOENT ? NOENT : result == -EEXIST ? EXIST : OTHER;
+                rc[ch][rcidx]++;
                 var[ch].nr++;
                 var[ch].sum += delta;
                 var[ch].ssq += delta * delta;
                 var[ch].min  = MIN(var[ch].min, delta);
                 var[ch].max  = MAX(var[ch].max, delta);
                 if (end - reported > 1000000) {
-                        var_fold(ph, bt, var);
+                        var_fold(ph, bt, var, rc);
                         bn_counters_fold();
                         reported = end;
                 }
         }
         blog(BINFO, "        Thread %3i in group %2i completed %i operations.\n", rt->idx, bt->parent->idx, i);
-        var_fold(ph, bt, var);
+        var_fold(ph, bt, var, rc);
         mem_free(cur);
         mem_free(key);
         mem_free(val);
         mem_free(var);
+        mem_free(rc);
         kv[kvt].worker_fini(rt, &data);
         return NULL;
 }
@@ -721,6 +744,7 @@ static void bphase(struct bphase *ph, int i) {
         }
         blog(BINFO, "    Threads started. Run!\n");
         mutex_lock(&ph->lock);
+        ph->begin = ph->last = now();
         ph->run = true;
         NOFAIL(pthread_cond_broadcast(&ph->cond));
         mutex_unlock(&ph->lock);
@@ -751,6 +775,7 @@ static const char *bot_name[] = {
 
 static void bphase_report(struct bphase *ph, bool final) {
         int lev = final ? BRESULTS : BPROGRESS;
+        uint64_t duration = now() - (final ? ph->begin : ph->last);
         for (int i = 0; i < ph->nr; ++i) {
                 struct bthread *bt = &ph->group[i].thread;
                 uint64_t total = REDUCE(i, bt->nr, 0, + bt->choice[i].option.var.nr);
@@ -762,23 +787,36 @@ static void bphase_report(struct bphase *ph, bool final) {
                         }
                         struct bvar prev = bt->choice[k].option.prev;
                         struct bvar var = bt->choice[k].option.var;
+                        uint64_t rc[ENR];
+                        uint64_t prev_rc[ENR];
                         bt->choice[k].option.prev = var;
+                        for (int j = 0; j < ARRAY_SIZE(bt->choice[k].option.rc); ++j) {
+                                rc[j] = bt->choice[k].option.rc[j];
+                                prev_rc[j] = bt->choice[k].option.prev_rc[j];
+                                bt->choice[k].option.prev_rc[j] = rc[j];
+                        }
                         if (!final) {
                                 mutex_unlock(&ph->lock);
                                 var.sum -= prev.sum;
                                 var.nr  -= prev.nr;
                                 var.ssq -= prev.ssq;
+                                for (int j = 0; j < ARRAY_SIZE(bt->choice[k].option.rc); ++j) {
+                                        rc[j] -= prev_rc[j];
+                                }
                         }
                         if (var.nr != 0) {
-                                double avg = 1.0 * var.sum / var.nr;
-                                blog(lev, "Phase %2i group %2i option %2i %s: ops: %10llu (%4.1f%%) sec: %10.4f op/sec: %9.1f usec/op: %6.2f min: %3llu max: %7llu dev: %12.4g\n",
+                                blog(lev, " %c %2i %2i %2i %s: ops: %10llu (%5.1f%%) sec: %10.4f op/sec: %9.1f op/wsec: %9.1f "
+                                     "[OK: %8"PRId64" ENOENT: %8"PRId64" EEXIST: %8"PRId64" OTHER: %8"PRId64"]\n",
+                                     final ? '+' : '-',
                                      ph->idx, i, k, bot_name[bt->choice[k].option.opt], var.nr, 100.0 * total / ph->group[i].ops / ph->group[i].nr,
-                                     var.sum / M, M * var.nr / var.sum, avg, var.min, var.max, sqrt(1.0 * var.ssq / var.nr - avg * avg));
+                                     var.sum / M, M * var.nr / var.sum, M * var.nr / duration,
+                                     rc[OK], rc[NOENT], rc[EXIST], rc[OTHER]);
                         } else {
-                                blog(lev, "Phase %2i group %2i option %2i %s: idle.\n", ph->idx, i, k, bot_name[bt->choice[k].option.opt]);
+                                blog(lev, " %c %2i %2i %2i %s: idle.\n", final ? '+' : '-', ph->idx, i, k, bot_name[bt->choice[k].option.opt]);
                         }
                 }
         }
+        ph->last = now();
 }
 
 static void brun(struct benchmark *b) {
@@ -845,22 +883,25 @@ static void t_worker_fini(struct rthread *rt, struct kvdata *d) {
         t2_thread_degister();
 }
 
-static void t_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int t_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
         int result = t2_lookup_ptr(d->u.t2.tree, key, ksize, val, vsize);
         assert(result == 0 || result == -ENOENT || result == -ENAMETOOLONG);
+        return result;
 }
 
-static void t_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int t_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
         int result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize);
         assert(result == 0 || result == -EEXIST);
+        return result;
 }
 
-static void t_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+static int t_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
         int result = t2_delete_ptr(d->u.t2.tree, key, ksize);
         assert(result == 0 || result == -ENOENT);
+        return result;
 }
 
-static void t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
+static int t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
         struct t2_buf nextkey = {
                 .nr = 1,
                 .seg = { [0] = { .addr = key, .len = ksize } }
@@ -871,6 +912,7 @@ static void t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, e
                 ;
         }
         t2_cursor_fini(&d->u.t2.c);
+        return 0;
 }
 
 #if USE_ROCKSDB
@@ -910,28 +952,32 @@ static void r_tail(const char *label, char *err) {
         free(err);
 }
 
-static void r_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int r_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
         char *err = NULL;
         size_t len;
         char *value = rocksdb_get(d->b->u.r.db, d->b->u.r.ro, key, ksize, &len, &err);
         r_tail("get", err);
         free(value);
+        return 0;
 }
 
-static void r_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int r_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
         char *err = NULL;
         rocksdb_put(d->b->u.r.db, d->b->u.r.wo, key, ksize, val, vsize, &err);
         r_tail("put", err);
+        return 0;
 }
 
-static void r_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+static int r_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
         char *err = NULL;
         rocksdb_delete(d->b->u.r.db, d->b->u.r.wo, key, ksize, &err);
         r_tail("delete", err);
+        return 0;
 }
 
-static void r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
+static int r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
         assert(false);
+        return 0;
 }
 
 #endif
