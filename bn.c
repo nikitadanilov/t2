@@ -874,7 +874,7 @@ static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int 
         d->u.t2.cop.next = &bn_next;
         d->u.t2.c.tree = d->u.t2.tree;
         d->u.t2.cur = mem_alloc(maxkey);
-        d->u.t2.c.curkey = (struct t2_buf){ .nr = 1, .seg = { [0] = { .addr = d->u.t2.cur, .len = maxkey } } };
+        d->u.t2.c.curkey = (struct t2_buf){ .addr = d->u.t2.cur, .len = maxkey };
         t2_thread_register();
 }
 
@@ -902,10 +902,7 @@ static int t_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) 
 }
 
 static int t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
-        struct t2_buf nextkey = {
-                .nr = 1,
-                .seg = { [0] = { .addr = key, .len = ksize } }
-        };
+        struct t2_buf nextkey = { .addr = key, .len = ksize };
         d->u.t2.c.dir = dir;
         t2_cursor_init(&d->u.t2.c, &nextkey);
         for (int i = 0; i < nr && t2_cursor_next(&d->u.t2.c) > 0; ++i) {

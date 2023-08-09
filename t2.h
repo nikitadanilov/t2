@@ -69,14 +69,9 @@ struct t2_storage_op {
         int      (*write)(struct t2_storage *storage, taddr_t addr, void *src);
 };
 
-struct t2_seg {
+struct t2_buf {
         int32_t  len;
         void    *addr;
-};
-
-struct t2_buf {
-        int32_t       nr;
-        struct t2_seg seg[1];
 };
 
 struct t2_cookie {
