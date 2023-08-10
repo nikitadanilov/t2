@@ -1033,12 +1033,14 @@ static int cookie_node_complete(struct t2_tree *t, struct path *p, struct node *
                 }
                 break;
         case DELETE:
-                if (!keep(n)) {
-                        result = -ESTALE;
-                } else if (found) {
-                        rec_delete(n, s.idx);
-                        dirty(n, WRITE);
-                        result = 0;
+                if (found) {
+                        if (keep(n)) {
+                                rec_delete(n, s.idx);
+                                dirty(n, WRITE);
+                                result = 0;
+                        } else {
+                                result = -ESTALE;
+                        }
                 } else {
                         result = -ENOENT;
                 }
