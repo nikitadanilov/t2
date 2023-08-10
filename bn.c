@@ -13,7 +13,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 
-#include "t2.h"
+#include "bn.h"
 
 #define COUNT(var, nr, ...)                             \
 ({                                                      \
@@ -95,179 +95,6 @@
         }                                       \
         __accum;                                \
 })
-
-enum {
-        OK,
-        NOENT,
-        EXIST,
-        OTHER,
-        ENR
-};
-
-struct bvar {
-        uint64_t nr;
-        uint64_t sum;
-        uint64_t min;
-        uint64_t max;
-        uint64_t ssq;
-};
-
-struct bthread;
-
-struct rthread {
-        pthread_t self;
-        struct bthread *parent;
-        int idx;
-        bool ready;
-};
-
-enum bop_type {
-        BSLEEP,
-        BLOOKUP,
-        BINSERT,
-        BDELETE,
-        BNEXT,
-        BREMOUNT
-};
-
-enum border {
-        RND,
-        EXI,
-        SEQ
-};
-
-struct bspec {
-        enum border ord;
-        int min;
-        int max;
-};
-
-struct boption {
-        enum bop_type opt;
-        int delay;
-        int iter;
-        struct bspec key;
-        struct bspec val;
-        struct bvar  var;
-        struct bvar  prev;
-        uint64_t rc[ENR];
-        uint64_t prev_rc[ENR];
-};
-
-struct bchoice {
-        int percent;
-        struct boption option;
-};
-
-struct bthread {
-        int nr;
-        struct bchoice *choice;
-        struct bgroup *parent;
-        struct rthread *rt;
-};
-
-struct bgroup {
-        int nr;
-        long long ops;
-        struct bthread thread;
-        struct bphase *parent;
-        int idx;
-};
-
-struct bphase {
-        int nr;
-        int idx;
-        struct bgroup *group;
-        pthread_mutex_t lock;
-        pthread_cond_t cond;
-        pthread_cond_t start;
-        struct benchmark *parent;
-        bool run;
-        uint64_t begin;
-        uint64_t last;
-};
-
-#if USE_ROCKSDB
-#include <rocksdb/c.h>
-
-struct rocksdb_benchmark {
-        rocksdb_t *db;
-        rocksdb_writeoptions_t *wo;
-        rocksdb_readoptions_t *ro;
-};
-
-#else
-struct rocksdb_benchmark {};
-#endif
-
-struct kvbenchmark {
-        union {
-                struct {
-                        struct t2_tree *tree;
-                        struct t2      *mod;
-                        taddr_t         root;
-                        uint64_t        free;
-                        uint64_t        bolt;
-                } t2;
-                struct rocksdb_benchmark r;
-        } u;
-};
-
-struct benchmark {
-        int nr;
-        struct bphase *phase;
-        uint64_t seed;
-        struct kvbenchmark kv;
-};
-
-struct span {
-        const char *start;
-        const char *end;
-};
-
-#define SPAN(s, e) ((const struct span) { .start = (s), .end = (e) })
-
-static const char *total;
-
-enum {
-        BRESULTS,
-        BPROGRESS,
-        BINFO,
-        BTRACE,
-        BDEBUG
-};
-
-enum kvtype {
-        T2,
-        ROCKSDB,
-
-        KVNR
-};
-
-struct kvdata {
-        struct kvbenchmark *b;
-        union {
-                struct {
-                        struct t2_tree      *tree;
-                        struct t2_cursor_op  cop;
-                        struct t2_cursor     c;
-                        void                *cur;
-                } t2;
-                struct {
-                } r;
-        } u;
-};
-
-struct kv {
-        void (*mount)(struct benchmark *b);
-        void (*umount)(struct benchmark *b);
-        void (*worker_init)(struct rthread *rt, struct kvdata *d, int maxkey, int maxval);
-        void (*worker_fini)(struct rthread *rt, struct kvdata *d);
-        int  (*lookup)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
-        int  (*insert)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
-        int  (*delete)(struct rthread *rt, struct kvdata *d, void *key, int ksize);
-        int  (*next)  (struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr);
-};
 
 extern struct t2_storage *bn_storage;
 extern taddr_t bn_tree_root(const struct t2_tree *t);
@@ -661,7 +488,7 @@ static void *bworker(void *arg) {
                                 end = now();
                         } else if (opt->opt == BDELETE) {
                                 start = now();
-                                result = kv[kvt].delete(rt, &data, key, ksize);
+                                result = kv[kvt].del(rt, &data, key, ksize);
                                 end = now();
                         } else if (opt->opt == BNEXT) {
                                 start = now();
@@ -987,7 +814,7 @@ static struct kv kv[] = {
                 .worker_fini = &t_worker_fini,
                 .lookup      = &t_lookup,
                 .insert      = &t_insert,
-                .delete      = &t_delete,
+                .del         = &t_delete,
                 .next        = &t_next
         },
 #if USE_ROCKSDB
@@ -998,16 +825,23 @@ static struct kv kv[] = {
                 .worker_fini = &r_worker_fini,
                 .lookup      = &r_lookup,
                 .insert      = &r_insert,
-                .delete      = &r_delete,
+                .del         = &r_delete,
                 .next        = &r_next
         }
 #endif
 };
 
+#if USE_MAP
+extern struct kv mapkv;
+#endif
+
 int main(int argc, char **argv) {
         char ch;
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+#if USE_MAP
+        kv[MAP] = mapkv;
+#endif
         while ((ch = getopt(argc, argv, "vr:f:t:n:N:h:ck:C:")) != -1) {
                 switch (ch) {
                 case 'v':
@@ -1040,10 +874,10 @@ int main(int argc, char **argv) {
                 case 'k':
                         if (strcmp(optarg, "t2") == 0) {
                                 kvt = T2;
-#if USE_ROCKSDB
-                        } else if (strcmp(optarg, "rocksdb") == 0) {
+                        } else if (USE_ROCKSDB && strcmp(optarg, "rocksdb") == 0) {
                                 kvt = ROCKSDB;
-#endif
+                        } else if (USE_MAP && strcmp(optarg, "map") == 0) {
+                                kvt = MAP;
                         } else {
                                 printf("Unknown kv: %s\n", optarg);
                                 return 1;

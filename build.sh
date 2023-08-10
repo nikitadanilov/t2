@@ -4,6 +4,7 @@ echo > config.h
 platform="$(uname -srm)"
 LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -rdynamic"
 CC=${CC:-cc}
+CPP=${CPP:-c++}
 CFLAGS="-I/usr/local/include -march=native -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
 cc="$($CC -v 2>&1)"
 OPTFLAGS="-O6"
@@ -15,6 +16,7 @@ function cadd() {
 case "$platform" in ####################### Linux #############################
     *Linux*)
         ROCKSDB_LDFLAGS="-lrocksdb -lsnappy -lz -lbz2 -lzstd -llz4 -ldl -lstdc++"
+        MAP_LDFLAGS="-lstdc++"
         LDFLAGS="$LDFLAGS -lm"
         cadd '#define ON_LINUX  (1)'
         cadd '#define ON_DARWIN (0)'
@@ -30,6 +32,7 @@ esac
 case "$platform" in ####################### Darwin #############################
     *Darwin*)
         ROCKSDB_LDFLAGS="-lrocksdb"
+        MAP_LDFLAGS="-lstdc++"
         cadd '#define ON_LINUX  (0)'
         cadd '#define ON_DARWIN (1)'
         cadd '#include "os-darwin.h"'
@@ -53,6 +56,7 @@ case "$cc" in *clang*)
     cadd '#include "cc-clang.h"'
     OPTFLAGS="-O3"
     CFLAGS="$CFLAGS -Wno-assume"
+    MAP_CFLAGS="$MAP_CFLAGS -std=gnu++11"
 esac
 
 function run() {
@@ -69,6 +73,7 @@ function run() {
 runut=0
 runbn=0
 rocksdb=0
+map=0
 while [ $# != 0 ] ;do
       case "$1" in
           '-o')
@@ -78,6 +83,8 @@ while [ $# != 0 ] ;do
 	      runut=1
       ;;  '-r')
 	      rocksdb=1
+      ;;  '-m')
+	      map=1
       ;;  '-f')
 	      options="$options nodebug nocounters opt"
       ;;  '-d')
@@ -116,10 +123,17 @@ done
 run $CC $CFLAGS -DUT=1 -BN=0 t2.c $LDFLAGS -o ut
 run $CC $CFLAGS -DUT=0 -DBN=1 -c t2.c
 if [ $rocksdb == 1 ] ;then
-   run $CC $CFLAGS -DUSE_ROCKSDB=1 bn.c t2.o $LDFLAGS $ROCKSDB_LDFLAGS -o bn
+   BN_CFLAGS="-DUSE_ROCKSDB=1 $ROCKSDB_LDFLAGS"
 else
-   run $CC $CFLAGS -DUSE_ROCKSDB=0 bn.c t2.o $LDFLAGS -o bn
+   BN_CFLAGS="-DUSE_ROCKSDB=0"
 fi
+if [ $map == 1 ] ;then
+   run $CPP $MAP_CFLAGS -c map.cpp -o map.o
+   BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=1 map.o $MAP_LDFLAGS"
+else
+   BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=0"
+fi
+run $CC $CFLAGS $BN_CFLAGS bn.c t2.o $LDFLAGS -o bn
 if [ $runut == 1 ] ;then
    ./ut
 fi
