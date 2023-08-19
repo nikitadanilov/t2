@@ -89,6 +89,9 @@ while [ $# != 0 ] ;do
 	      options="$options nodebug nocounters opt"
       ;;  '-d')
 	      options="$options debug counters noopt profile"
+      ;;  '-D')
+	      CFLAGS="$CFLAGS -D$2"
+	      shift
       ;;  '-b')
 	      runbn=1
       ;;  *)
