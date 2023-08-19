@@ -13,6 +13,8 @@ struct t2_rec;
 struct t2_cookie;
 struct t2_storage;
 struct t2_storage_op;
+struct t2_te;
+struct t2_te_op;
 struct t2_tree_type;
 struct t2_cursor;
 struct t2_cursor_op;
@@ -26,6 +28,13 @@ struct t2_tree_type {
 
 struct t2_storage {
         const struct t2_storage_op *op;
+};
+
+struct t2_te { /* Transaction engine. */
+        const struct t2_te_op *op;
+};
+
+struct t2_tx { /* Transaction. */
 };
 
 /*
@@ -72,6 +81,15 @@ struct t2_storage_op {
 struct t2_buf {
         int32_t  len;
         void    *addr;
+};
+
+struct t2_te_op {
+        void (*begin_r)(struct t2_tx *tx, taddr_t node);
+        void (*begin_w)(struct t2_tx *tx, taddr_t node);
+        void (*touch_r)(struct t2_tx *tx, taddr_t node, uint32_t off, struct t2_buf *part);
+        void (*touch_w)(struct t2_tx *tx, taddr_t node, uint32_t off, struct t2_buf *part);
+        void (*done_r) (struct t2_tx *tx, taddr_t node);
+        void (*done_w) (struct t2_tx *tx, taddr_t node);
 };
 
 struct t2_cookie {
