@@ -14,10 +14,12 @@ struct t2_cookie;
 struct t2_storage;
 struct t2_storage_op;
 struct t2_te;
-struct t2_te_op;
+struct t2_tx;
+struct t2_txrec;
 struct t2_tree_type;
 struct t2_cursor;
 struct t2_cursor_op;
+struct t2_node;
 
 struct t2_tree_type {
         struct t2             *mod;
@@ -30,11 +32,24 @@ struct t2_storage {
         const struct t2_storage_op *op;
 };
 
-struct t2_te { /* Transaction engine. */
-        const struct t2_te_op *op;
+struct t2_tx { /* Transaction. */
 };
 
-struct t2_tx { /* Transaction. */
+typedef uint64_t lsn_t;
+
+struct t2_te { /* Transaction engine. */
+        int           (*ante)   (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
+        void          (*post)   (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
+        struct t2_te *(*init)   (struct t2 *mod);
+        void          (*fini)   (struct t2_te *te);
+        int           (*recover)(struct t2_te *te, int (*func)(struct t2_txrec *, void *), void *arg);
+        struct t2_tx *(*make)   (struct t2_te *te);
+        void          (*stop)   (struct t2_te *te, struct t2_tx *tx);
+        void          (*wait)   (struct t2_te *te, struct t2_tx *tx, bool force);
+        void          (*done)   (struct t2_te *te, struct t2_tx *tx);
+        bool          (*canpage)(struct t2_te *te, struct t2_node *n);
+        void          (*dirty)  (struct t2_te *te, lsn_t lsn);
+        const char     *name;
 };
 
 /*
@@ -83,13 +98,10 @@ struct t2_buf {
         void    *addr;
 };
 
-struct t2_te_op {
-        void (*begin_r)(struct t2_tx *tx, taddr_t node);
-        void (*begin_w)(struct t2_tx *tx, taddr_t node);
-        void (*touch_r)(struct t2_tx *tx, taddr_t node, uint32_t off, struct t2_buf *part);
-        void (*touch_w)(struct t2_tx *tx, taddr_t node, uint32_t off, struct t2_buf *part);
-        void (*done_r) (struct t2_tx *tx, taddr_t node);
-        void (*done_w) (struct t2_tx *tx, taddr_t node);
+struct t2_txrec { /* Transaction log record. */
+        struct t2_node *node;
+        int32_t         off;
+        struct t2_buf   part;
 };
 
 struct t2_cookie {
@@ -130,7 +142,7 @@ enum t2_node_type_flags {
         T2_NT_LEAF     = 1ull << 3
 };
 
-struct t2 *t2_init(struct t2_storage *storage, int hshift, int cshift);
+struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int cshift);
 void       t2_fini(struct t2 *mod);
 
 void t2_thread_register(void);
@@ -143,17 +155,22 @@ void t2_node_type_degister(struct t2_node_type *ntype);
 struct t2_node_type *t2_node_type_init(int16_t id, const char *name, int shift, uint64_t flags);
 void                 t2_node_type_fini(struct t2_node_type *nt);
 
-struct t2_tree *t2_tree_create(struct t2_tree_type *ttype);
+struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx);
 struct t2_tree *t2_tree_open(struct t2_tree_type *ttype, taddr_t root);
 void            t2_tree_close(struct t2_tree *t);
 
 int  t2_lookup(struct t2_tree *t, struct t2_rec *r);
-int  t2_insert(struct t2_tree *t, struct t2_rec *r);
-int  t2_delete(struct t2_tree *t, struct t2_rec *r);
+int  t2_insert(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
+int  t2_delete(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
 
 int  t2_cursor_init(struct t2_cursor *c, struct t2_buf *key);
 void t2_cursor_fini(struct t2_cursor *c);
 int  t2_cursor_next(struct t2_cursor *c);
+
+void    t2_release(struct t2_node *n);
+void    t2_lsnset (struct t2_node *n, lsn_t lsn);
+lsn_t   t2_lsnget (const struct t2_node *n);
+taddr_t t2_addr   (const struct t2_node *n);
 
 int   t2_error(int idx, char *buf, int nob, int *err);
 void  t2_error_print(void);
@@ -162,8 +179,8 @@ int   t2_errcode(void *ptr);
 void *t2_errptr (int errcode);
 
 int t2_lookup_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize);
-int t2_insert_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize);
-int t2_delete_ptr(struct t2_tree *t, void *key, int32_t ksize);
+int t2_insert_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize, struct t2_tx *tx);
+int t2_delete_ptr(struct t2_tree *t, void *key, int32_t ksize, struct t2_tx *tx);
 
 /*
  *  Local variables:

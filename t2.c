@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -47,6 +48,10 @@ enum {
 
 #if !defined(COUNTERS)
 #define COUNTERS (1)
+#endif
+
+#if !defined(TRANSACTIONS)
+#define TRANSACTIONS (1)
 #endif
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -269,6 +274,21 @@ enum {
 #define NCALL(n, ...) ((n)->ntype->ops-> __VA_ARGS__)
 #endif
 
+#define DEFAULT_TE (1)
+
+#define TXDO(te, val) ((te) != NULL ? (val) : ((typeof(val))0))
+
+#if TRANSACTIONS
+#if DEFAULT_TE
+#define TXCALL(te, ...) TXDO(te, wal_ ## __VA_ARGS__)
+#else
+#define TXCALL(te, ...) TXDO(te, (te)-> __VA_ARGS__)
+#endif
+#else
+#define TXCALL(te, ...) TXDO(NULL, (te)-> __VA_ARGS__)
+#endif
+
+
 /* Is Parallel Programming Hard, And, If So, What Can You Do About It? */
 #define ACCESS_ONCE(x)     (*(volatile typeof(x) *)&(x))
 #define READ_ONCE(x)       ({ typeof(x) ___x = ACCESS_ONCE(x); ___x; })
@@ -354,6 +374,7 @@ struct t2 {
         const struct t2_tree_type               *ttypes[MAX_TREE_TYPE];
         const struct t2_node_type               *ntypes[MAX_NODE_TYPE];
         struct t2_storage                       *stor;
+        struct t2_te                            *te;
         bool                                     shutdown;
 };
 
@@ -416,6 +437,7 @@ struct node {
         void                      *data;
         struct t2                 *mod;
         struct radixmap           *radix;
+        lsn_t                      lsn;
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
         struct rcu_head            rcu;
@@ -482,6 +504,7 @@ struct path {
         struct t2_tree *tree;
         struct t2_rec  *rec;
         enum optype     opt;
+        struct t2_tx   *tx;
         struct node    *newroot;
 };
 
@@ -717,6 +740,8 @@ static int shift(struct node *d, struct node *s, const struct slot *insert, enum
 static int merge(struct node *d, struct node *s, enum dir dir);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
+static void txadd(struct node *n, enum lock_mode lm, struct path *p);
+static void wal_add(struct t2_tx *tx, struct t2_txrec *txr);
 static void counters_check();
 static void counters_print();
 static void counters_clear();
@@ -727,8 +752,8 @@ static void signal_fini(void);
 static void stacktrace(void);
 static void debugger_attach(void);
 static int lookup(struct t2_tree *t, struct t2_rec *r);
-static int insert(struct t2_tree *t, struct t2_rec *r);
-static int delete(struct t2_tree *t, struct t2_rec *r);
+static int insert(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
+static int delete(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
 static bool cookie_is_valid(const struct t2_cookie *k);
 static void cookie_invalidate(uint64_t *addr);
 static void cookie_make(uint64_t *addr);
@@ -947,7 +972,7 @@ static taddr_t taddr_make(uint64_t addr, int shift) {
 static uint64_t zerodata = 0;
 static struct t2_buf zero = { .len = 0, .addr = &zerodata };
 
-struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
+struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx) {
         ASSERT(thread_registered);
         eclear();
         struct t2_tree *t = mem_alloc(sizeof *t);
@@ -958,7 +983,7 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype) {
                         int result;
                         t->root = root->addr;
                         put(root); /* Release earlier to keep counters happy. */
-                        result = insert(t, &(struct t2_rec) { .key = &zero, .val = &zero });
+                        result = insert(t, &(struct t2_rec) { .key = &zero, .val = &zero }, tx);
                         if (result != 0) {
                                 t = EPTR(result);
                         }
@@ -1025,8 +1050,6 @@ static int cookie_node_complete(struct t2_tree *t, struct path *p, struct node *
                         result = rec_insert(n, s.idx + 1, r);
                         if (result == -ENOSPC) {
                                 result = -ESTALE;
-                        } else if (result == 0) {
-                                dirty(n, WRITE);
                         }
                 } else {
                         result = -EEXIST;
@@ -1036,7 +1059,6 @@ static int cookie_node_complete(struct t2_tree *t, struct path *p, struct node *
                 if (found) {
                         if (keep(n)) {
                                 rec_delete(n, s.idx);
-                                dirty(n, WRITE);
                                 result = 0;
                         } else {
                                 result = -ESTALE;
@@ -1067,8 +1089,12 @@ static int cookie_try(struct path *p) {
                         rcu_leave(p, n);
                         lock(n, mode); /* TODO: Lock-less lookup. */
                         if (LIKELY(!rcu_try(p, n))) {
-                                /* TODO: re-check node. */
+                                /* TODO: Re-check node. */
                                 result = cookie_node_complete(p->tree, p, n, p->opt);
+                                if (result == 0) {
+                                        dirty(n, mode);
+                                        txadd(n, mode, p);
+                                }
                                 unlock(n, mode);
                                 put(n);
                                 return result;
@@ -1720,11 +1746,12 @@ static enum policy_id policy_select(const struct path *p, int idx) {
 
 /* @tree */
 
-static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, enum optype opt) {
+static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx, enum optype opt) {
         SASSERT(NONE == 0);
         p->used = -1;
         p->tree = t;
         p->rec  = r;
+        p->tx   = tx;
         p->opt  = opt;
 }
 
@@ -1823,6 +1850,28 @@ static void path_pin(struct path *p) {
                         ref(r->node);
                         r->flags |= PINNED;
                 }
+        }
+}
+
+static void txadd(struct node *n, enum lock_mode lm, struct path *p) {
+        if (lm == WRITE) {
+                struct t2_txrec whole = {
+                        .node = (void *)n,
+                        .off  = 0,
+                        .part = { .len  = nsize(n), .addr = n->data }
+                };
+                TXCALL(n->mod->te, add(p->tx, &whole));
+        }
+}
+
+static void path_txadd(struct path *p) {
+        for (int i = 0; i <= p->used; ++i) {
+                struct rung *r = &p->rung[p->used];
+                struct sibling *left  = brother(r, LEFT);
+                struct sibling *right = brother(r, RIGHT);
+                txadd(left->node,  left->lm,  p);
+                txadd(r->node,     r->lm,     p);
+                txadd(right->node, right->lm, p);
         }
 }
 
@@ -2073,6 +2122,7 @@ static int insert_complete(struct path *p, struct node *n) {
                 result = insert_balance(p);
         }
         cookie_complete(p, n);
+        path_txadd(p);
         return result;
 }
 
@@ -2100,6 +2150,7 @@ static int delete_complete(struct path *p, struct node *n) {
                 result = delete_balance(p);
         }
         cookie_complete(p, n);
+        path_txadd(p);
         return result;
 }
 
@@ -2309,11 +2360,11 @@ static int traverse(struct path *p) {
         return result;
 }
 
-static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt) {
+static int traverse_result(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx, enum optype opt) {
         int         result;
         struct path p = {};
         counters_check();
-        path_init(&p, t, r, opt);
+        path_init(&p, t, r, tx, opt);
         result = cookie_try(&p);
         if (result == -ESTALE) {
                 CINC(cookie_miss);
@@ -2328,15 +2379,15 @@ static int traverse_result(struct t2_tree *t, struct t2_rec *r, enum optype opt)
 }
 
 static int lookup(struct t2_tree *t, struct t2_rec *r) {
-        return traverse_result(t, r, LOOKUP);
+        return traverse_result(t, r, NULL, LOOKUP);
 }
 
-static int insert(struct t2_tree *t, struct t2_rec *r) {
-        return traverse_result(t, r, INSERT);
+static int insert(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx) {
+        return traverse_result(t, r, tx, INSERT);
 }
 
-static int delete(struct t2_tree *t, struct t2_rec *r) {
-        return traverse_result(t, r, DELETE);
+static int delete(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx) {
+        return traverse_result(t, r, tx, DELETE);
 }
 
 static int next(struct t2_cursor *c) {
@@ -2355,18 +2406,18 @@ int t2_lookup(struct t2_tree *t, struct t2_rec *r) {
         return lookup(t, r);
 }
 
-int t2_delete(struct t2_tree *t, struct t2_rec *r) {
+int t2_delete(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx) {
         ASSERT(thread_registered);
         ASSERT(buf_len(r->key) > 0);
         eclear();
-        return delete(t, r);
+        return delete(t, r, tx);
 }
 
-int t2_insert(struct t2_tree *t, struct t2_rec *r) {
+int t2_insert(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx) {
         ASSERT(thread_registered);
         ASSERT(buf_len(r->key) > 0);
         eclear();
-        return insert(t, r);
+        return insert(t, r, tx);
 }
 
 int t2_cursor_init(struct t2_cursor *c, struct t2_buf *key) {
@@ -2760,12 +2811,10 @@ static void *mem_alloc_align(size_t size, int alignment) {
 
 static void *mem_alloc(size_t size) {
         void *out = malloc(size);
-        if (out != NULL) {
+        if (LIKELY(out != NULL)) {
                 memset(out, 0, size);
-                return out;
-        } else {
-                return EPTR(-ENOMEM);
         }
+        return out;
 }
 
 static void mem_free(void *ptr) {
@@ -3868,6 +3917,444 @@ static struct node_type_ops simple_ops = {
         .free       = &simple_free,
         .used       = &simple_used,
 };
+
+/* @wal */
+
+enum rec_type {
+        HEADER = 1,
+        FOOTER,
+        UPDATE,
+        OPEN,
+        CLOSE
+};
+
+enum {
+        LOG_MAGIX = 0x6429ae111111bf37ull,
+        REC_MAGIX = 0xa50d4e3333337221ull
+};
+
+struct wal_superblock {
+        int64_t magix;
+};
+
+struct wal_rec {
+        int64_t magix;
+        int32_t rtype;
+        int32_t idx;
+        lsn_t   lsn;
+        int32_t len;
+        union {
+                struct {
+                        lsn_t   tx;
+                        int32_t off;
+                        taddr_t node;
+                } update;
+                struct {
+                        lsn_t   tx;
+                } close;
+                struct {
+                        int32_t nr;
+                        lsn_t   log_start;
+                        lsn_t   max_synced;
+                } header;
+                struct {
+                } footer;
+        } u;
+        uint8_t data[0];
+};
+
+struct wal_tx {
+        struct t2_tx base;
+        int          epoch;
+        lsn_t        begin;
+        lsn_t        end;
+};
+
+enum { WAL_MAX_BUF_SEG = 1 << 15 };
+
+struct wal_buf {
+        int32_t              used;
+        int32_t              nob;
+        int32_t              idx;
+        lsn_t                start;
+        struct cds_list_head link;
+        struct iovec         header;
+        struct iovec         seg[WAL_MAX_BUF_SEG];
+        struct iovec         footer;
+};
+
+struct wal_epoch {
+        int64_t open;
+        lsn_t   last;
+};
+
+enum {
+        EPOCHS     = 1 << 4,
+        EPOCH_MASK = EPOCHS - 1
+};
+
+struct wal_te {
+        struct t2_te          base;
+        lsn_t                 lsn;
+        pthread_mutex_t       lock;
+        int                   cur_epoch;
+        struct wal_epoch      epoch[EPOCHS];
+        pthread_cond_t        logwait;
+        pthread_cond_t        bufwait;
+        pthread_cond_t        bufwrite;
+        lsn_t                 max_persistent;
+        lsn_t                 max_synced;
+        lsn_t                 max_written;
+        lsn_t                 log_start;
+        lsn_t                 min_dirty;
+        bool                  recovered;
+        int                   fd;
+        int                   nr_bufs;
+        int                   buf_size;
+        struct wal_buf       *cur;
+        struct cds_list_head  ready;
+        struct cds_list_head  busy;
+};
+
+static bool wal_autostop(const struct wal_tx *tx) {
+        return tx == NULL;
+}
+
+static void *wal_buf(struct wal_te *en, int nr, int32_t nob, int32_t *out) {
+        int32_t size = nob + nr * sizeof(struct wal_rec);
+        void   *buf  = mem_alloc(size);
+        if (LIKELY(buf != NULL)) {
+                *out = size;
+        }
+        return buf;
+}
+
+static void wal_buf_release(struct wal_buf *buf) {
+        for (int i = 0; i < buf->used; ++i) {
+                mem_free(buf->seg[i].iov_base);
+        }
+}
+
+static int wal_buf_alloc(struct wal_te *en) {
+        struct wal_buf *buf = mem_alloc(sizeof *buf);
+        if (LIKELY(buf != NULL)) {
+                cds_list_add(&buf->link, &en->ready);
+                return 0;
+        } else {
+                return ERROR(-ENOMEM);
+        }
+}
+
+static void wal_buf_fini(struct wal_buf *buf) {
+        cds_list_del_init(&buf->link);
+        wal_buf_release(buf);
+        mem_free(buf);
+}
+
+static bool wal_should_fsync(const struct wal_te *en) {
+        return en->busy.next->next == &en->busy; /* 0 or 1 busy buffers. */
+}
+
+static int wal_write(struct wal_te *en, struct wal_buf *buf) {
+        int            result;
+        struct wal_rec header = {
+                .magix = REC_MAGIX,
+                .rtype = HEADER,
+                .idx   = 0,
+                .lsn   = buf->start,
+                .len   = 0,
+                .u     = {
+                        .header = {
+                                .nr         = buf->idx + 1,
+                                .log_start  = en->log_start,
+                                .max_synced = en->max_synced
+                        }
+                }
+        };
+        struct wal_rec footer = {
+                .magix = REC_MAGIX,
+                .rtype = FOOTER,
+                .idx   = buf->idx,
+                .lsn   = buf->nob - sizeof(footer),
+                .len   = en->buf_size - buf->nob
+        };
+        ASSERT(buf->start != 0);
+        buf->header = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
+        buf->footer = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
+        mutex_unlock(&en->lock);
+        result = pwritev(en->fd, &buf->header, buf->used + 2, buf->start);
+        mutex_lock(&en->lock);
+        if (LIKELY(result == buf->nob)) {
+                ASSERT(buf->start + en->buf_size - 1 > en->max_written);
+                en->max_written = buf->start + en->buf_size - 1;
+                wal_buf_release(buf);
+                if (en->cur == NULL) {
+                        en->cur = buf;
+                } else {
+                        cds_list_add(&buf->link, &en->ready);
+                }
+                NOFAIL(pthread_cond_signal(&en->bufwait));
+                if (wal_should_fsync(en)) {
+                        mutex_unlock(&en->lock);
+                        result = fdatasync(en->fd); /* TODO: Darwin: use fcnt(F_FULLFSYNC). */
+                        mutex_lock(&en->lock);
+                        if (LIKELY(result == 0)) { /* Assume single log writer. */
+                                en->max_persistent = en->max_synced;
+                                en->max_synced = en->max_written;
+                        } else {
+                                result = ERROR(-errno);
+                        }
+                } else {
+                        result = 0;
+                }
+        } else {
+                result = ERROR(result < 0 ? -errno : -EIO);
+        }
+        return result;
+}
+
+static bool wal_fits(struct wal_te *en, struct wal_buf *buf, int32_t size) {
+        return buf->nob + size <= en->buf_size && buf->used < ARRAY_SIZE(buf->seg) - 1;
+}
+
+static void wal_buf_start(struct wal_te *en) {
+        struct wal_buf *buf = en->cur = COF(en->ready.next, struct wal_buf, link);
+        cds_list_del_init(&buf->link);
+        buf->start = en->lsn;
+        buf->used = 0;
+        buf->idx = 1;
+        buf->nob = 2 * sizeof(struct wal_rec);
+}
+
+static void wal_buf_end(struct wal_te *en) {
+        cds_list_add(&en->cur->link, &en->busy);
+        en->cur = NULL;
+        en->lsn = en->cur->start + en->buf_size;
+        NOFAIL(pthread_cond_signal(&en->bufwrite));
+}
+
+static void wal_tx_begin(struct wal_te *en, struct wal_tx *tx) {
+        tx->begin = en->lsn;
+        tx->epoch = en->cur_epoch;
+        en->epoch[en->cur_epoch & EPOCH_MASK].open++;
+}
+
+static void wal_tx_close(struct wal_te *en, struct wal_tx *tx) {
+        int dist = MAX(en->cur_epoch - tx->epoch, EPOCHS - 1);
+        int idx  = (en->cur_epoch - dist) & EPOCH_MASK;
+        ASSERT(en->epoch[idx].open > 0);
+        ASSERT(en->epoch[idx].last < en->lsn);
+        --en->epoch[idx].open;
+        en->epoch[idx].last = tx->end = en->lsn;
+}
+
+static lsn_t wal_attach(struct wal_te *en, int32_t size, void *data) {
+        lsn_t lsn;
+        while (true) {
+                while (UNLIKELY(en->cur == NULL)) {
+                        if (!cds_list_empty(&en->ready)) {
+                                wal_buf_start(en);
+                                ASSERT(wal_fits(en, en->cur, size));
+                                break;
+                        } else {
+                                NOFAIL(pthread_cond_wait(&en->bufwait, &en->lock));
+                        }
+                }
+                if (LIKELY(wal_fits(en, en->cur, size))) {
+                        break;
+                }
+                wal_buf_end(en);
+        }
+        lsn = en->lsn;
+        en->lsn += size;
+        en->cur->seg[en->cur->used++] = (struct iovec){ .iov_base = data, .iov_len = size };
+        return lsn;
+}
+
+static struct wal_rec *wal_next(struct wal_rec *rec) {
+        return (void *)&rec->data[rec->len];
+}
+
+static int wal_ante(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr) {
+        struct wal_te  *en  = COF(engine, struct wal_te, base);
+        struct wal_tx  *tx  = COF(trax, struct wal_tx, base);
+        int             tot = nr + (tx->begin == 0) + !!wal_autostop(tx);
+        lsn_t           lsn;
+        struct wal_rec *rec;
+        int32_t         size;
+        ASSERT(en->recovered);
+        ASSERT(tx->end == 0);
+        ASSERT(wal_autostop(tx)); /* TODO: Support generic transactions. */
+        rec = wal_buf(en, tot, nob, &size);
+        if (UNLIKELY(rec == NULL)) {
+                return ERROR(-ENOMEM);
+        }
+        if (tx->begin == 0) {
+                rec->rtype = OPEN;
+                rec = wal_next(rec);
+        }
+        for (int i = 0; i < nr; ++i) {
+                *rec = (struct wal_rec) {
+                        .magix = REC_MAGIX,
+                        .rtype = UPDATE,
+                        .len   = txr[i].part.len,
+                        .u = {
+                                .update = {
+                                        .off  = txr[i].off,
+                                        .node = t2_addr(txr[i].node)
+                                }
+                        }
+                };
+                memcpy(rec->data, txr[i].part.addr, rec->len);
+                rec = wal_next(rec);
+        }
+        if (wal_autostop(tx)) {
+                rec->rtype = CLOSE;
+        }
+        mutex_lock(&en->lock);
+        lsn = wal_attach(en, size, rec);
+        if (tx->begin == 0) {
+                wal_tx_begin(en, tx);
+        }
+        for (int i = 0, n = 0; i < tot; ++i) {
+                rec->lsn = lsn;
+                rec->idx = en->cur->idx++;
+                if (rec->rtype == UPDATE) {
+                        rec->u.update.tx = tx->begin;
+                        t2_lsnset(txr[n++].node, lsn);
+                }
+                if (rec->rtype == CLOSE) {
+                        rec->u.close.tx = tx->begin;
+                }
+                rec = wal_next(rec);
+        }
+        mutex_unlock(&en->lock);
+        if (wal_autostop(tx)) {
+                wal_tx_close(en, tx);
+        }
+}
+
+static void wal_post(struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr) {
+}
+
+static struct t2_te *wal_init(struct t2 *mod) {
+        struct wal_te *en = mem_alloc(sizeof *en);
+        if (en != NULL) {
+                NOFAIL(pthread_mutex_init(&en->lock, NULL));
+                NOFAIL(pthread_cond_init(&en->logwait, NULL));
+                NOFAIL(pthread_cond_init(&en->bufwait, NULL));
+                NOFAIL(pthread_cond_init(&en->bufwrite, NULL));
+                return &en->base;
+        } else {
+                return EPTR(NULL);
+        }
+}
+
+static void wal_fini(struct t2_te *engine) {
+        struct wal_te *en = COF(engine, struct wal_te, base);
+        NOFAIL(pthread_cond_destroy(&en->bufwrite));
+        NOFAIL(pthread_cond_destroy(&en->bufwait));
+        NOFAIL(pthread_cond_destroy(&en->logwait));
+        NOFAIL(pthread_mutex_destroy(&en->lock));
+        mem_free(en);
+}
+
+static bool wal_buf_is_valid(struct wal_te *en, struct wal_rec *rec) {
+        return true;
+}
+
+static int wal_recover_log(struct wal_te *en, lsn_t start, lsn_t end, int (*func)(struct t2_txrec *, void *), void *arg) {
+        return 0;
+}
+
+static int wal_recover(struct t2_te *engine, int (*func)(struct t2_txrec *, void *), void *arg) {
+        struct wal_te  *en = COF(engine, struct wal_te, base);
+        void           *buf;
+        struct wal_rec *rec;
+        struct stat     st;
+        int             result;
+        int64_t         lastbuf;
+        result = fstat(en->fd, &st);
+        if (result != 0) {
+                return ERROR(-errno);
+        }
+        if (st.st_size == en->buf_size) {
+                return 0;
+        }
+        lastbuf = st.st_size / en->buf_size - 1;
+        if (lastbuf < 1) {
+                return ERROR(-EIO);
+        }
+        rec = buf = mem_alloc(en->buf_size);
+        if (UNLIKELY(buf == NULL)) {
+                return ERROR(-ENOMEM);
+        }
+        result = pread(en->fd, buf, en->buf_size, lastbuf * en->buf_size);
+        if (result == lastbuf * en->buf_size) {
+                if (wal_buf_is_valid(en, rec)) {
+                        result = wal_recover_log(en, rec->u.header.log_start, lastbuf * (en->buf_size + 1), func, arg);
+                }
+        } else {
+                result = ERROR(result < 0 ? -errno : -EIO);
+        }
+        mem_free(buf);
+        return 0;
+}
+
+static struct t2_tx *wal_make(struct t2_te *te) {
+        return mem_alloc(sizeof(struct t2_tx));
+}
+
+static void wal_stop(struct t2_te *engine, struct t2_tx *trax) {
+        struct wal_tx  *tx = COF(trax, struct wal_tx, base);
+        struct wal_te  *en = COF(engine, struct wal_te, base);
+        lsn_t           lsn;
+        struct wal_rec *rec;
+        int32_t         size;
+        ASSERT(!wal_autostop(tx));
+        ASSERT(tx->end == 0);
+        ASSERT(en->recovered);
+        if (LIKELY(tx->begin != 0)) {
+                rec = wal_buf(en, 1, 0, &size);
+                rec->magix = REC_MAGIX;
+                rec->rtype = CLOSE;
+                mutex_lock(&en->lock);
+                lsn = wal_attach(en, size, rec);
+                rec->idx = en->cur->idx++;
+                rec->lsn = lsn;
+                rec->u.close.tx = tx->begin;
+                wal_tx_close(en, tx);
+                mutex_unlock(&en->lock);
+        }
+}
+
+static void wal_wait(struct t2_te *engine, struct t2_tx *trax, bool force) {
+        struct wal_te *en = COF(engine, struct wal_te, base);
+        struct wal_tx *tx = COF(trax, struct wal_tx, base);
+        ASSERT(tx->end != 0);
+        mutex_lock(&en->lock);
+        if (force && en->cur != NULL && en->cur->start <= tx->begin) {
+                wal_buf_end(en);
+        }
+        while (en->log_start <= tx->end) {
+                NOFAIL(pthread_cond_wait(&en->logwait, &en->lock));
+        }
+        mutex_unlock(&en->lock);
+}
+
+static void wal_done(struct t2_te *te, struct t2_tx *trax) {
+        mem_free(COF(trax, struct wal_tx, base));
+}
+
+static bool wal_canpage(struct t2_te *engine, struct t2_node *n) {
+        struct wal_te *en = COF(engine, struct wal_te, base);
+        return t2_lsnget(n) <= en->max_persistent;
+}
+
+static void wal_dirty(struct t2_te *engine, lsn_t lsn) {
+        struct wal_te *en = COF(engine, struct wal_te, base);
+        en->min_dirty = lsn;
+}
 
 #if UT || BN
 
@@ -5201,6 +5688,12 @@ int main(int argc, char **argv) {
  *   techniques: a personal account (https://dl.acm.org/doi/pdf/10.1145/603867.603878)
  *
  * - R. Bayer, K. Unterauer, Prefix B-Trees (https://dl.acm.org/doi/abs/10.1145/320521.320530)
+ *
+ * - C. Mohan et al., ARIES: a transaction recovery method supporting
+ *   fine-granularity locking and partial rollbacks using write-ahead logging
+ *   (https://dl.acm.org/doi/10.1145/128765.128770)
+ *
+ * - J. Gray, A. Reuter, Transaction Processing: Concepts and Techniques
  */
 
 /*
