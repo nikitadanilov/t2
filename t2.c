@@ -5819,14 +5819,14 @@ static void wal_ut() {
         lsnset_nr = 0;
         ut_lsnset = &wal_ut_lsnset;
         utest("init");
-        result = wal_prep("log", 5, 4 << 20, &engine);
+        result = wal_prep("log", 5, 1 << 22, &engine);
         ASSERT(result == 0);
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         utest("fini-init");
         t2_fini(mod);
         utest("add");
-        result = wal_prep("log", 5, 4 << 20, &engine);
+        result = wal_prep("log", 5, 1 << 22, &engine);
         ASSERT(result == 0);
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
