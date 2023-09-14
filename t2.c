@@ -3989,9 +3989,9 @@ int t2_apply(struct t2 *mod, struct t2_txrec *txr) {
 }
 
 enum rec_type {
-        HEADER = 1,
-        FOOTER,
-        UPDATE
+        HEADER = 'H',
+        FOOTER = 'F',
+        UPDATE = 'U'
 };
 
 static const int64_t REC_MAGIX = 0xa50d4e3333337221ll;
@@ -4025,7 +4025,7 @@ struct wal_tx {
         lsn_t        id;
 };
 
-enum { WAL_MAX_BUF_SEG = 1 << 15 };
+enum { WAL_MAX_BUF_SEG = 1024 }; /* __IOV_MAX on Linux and UIO_MAXIOV on Darwin are both 1024. */
 
 struct wal_buf {
         int32_t              used;
@@ -5799,6 +5799,8 @@ enum {
         SIZE       = NODE_SIZE / 3
 };
 
+static const char logname[] = "log";
+
 static void wal_ut() {
         struct t2 *mod;
         struct t2_te *engine;
@@ -5819,21 +5821,39 @@ static void wal_ut() {
         lsnset_nr = 0;
         ut_lsnset = &wal_ut_lsnset;
         utest("init");
-        result = wal_prep("log", 5, 1 << 22, &engine);
+        result = unlink(logname);
+        ASSERT(result == 0);
+        result = wal_prep(logname, 5, 1 << 22, &engine);
         ASSERT(result == 0);
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         utest("fini-init");
         t2_fini(mod);
         utest("add");
-        result = wal_prep("log", 5, 1 << 22, &engine);
+        result = unlink(logname);
+        ASSERT(result == 0);
+        result = wal_prep(logname, 5, 1 << 22, &engine);
         ASSERT(result == 0);
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
         trax = wal_make(engine);
         result = wal_post(engine, trax, txr.part.len, 1, &txr);
         ASSERT(result == 0);
-        utest("fini");
+        utest("fini-add");
+        t2_fini(mod);
+        utest("add-many");
+        result = unlink(logname);
+        ASSERT(result == 0);
+        result = wal_prep(logname, 5, 1 << 22, &engine);
+        ASSERT(result == 0);
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        ASSERT(EISOK(mod));
+        trax = wal_make(engine);
+        for (int i = 0; i < 100000; ++i) {
+                result = wal_post(engine, trax, txr.part.len, 1, &txr);
+                ASSERT(result == 0);
+        }
+        utest("fini-many");
         t2_fini(mod);
         utestdone();
         ut_lsnset = NULL;
