@@ -21,6 +21,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -4251,6 +4252,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 memcpy(rec->data, txr[i].part.addr, rec->len);
                 rec = wal_next(rec);
         }
+	rec = space;
         mutex_lock(&en->lock);
         ASSERT(wal_invariant(en));
         tx->id = wal_attach(en, size, space);
@@ -4470,7 +4472,12 @@ static int wal_recover(struct wal_te  *en) {
 }
 
 static struct t2_tx *wal_make(struct t2_te *te) {
-        return mem_alloc(sizeof(struct t2_tx));
+	struct wal_tx *tx = mem_alloc(sizeof *tx);
+	if (LIKELY(tx != NULL)) {
+		return &tx->base;
+	} else {
+		return NULL;
+	}
 }
 
 static int wal_wait(struct t2_te *engine, struct t2_tx *trax, const struct timespec *deadline, bool force) {
