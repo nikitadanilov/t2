@@ -16,6 +16,7 @@ function cadd() {
 case "$platform" in ####################### Linux #############################
     *Linux*)
         ROCKSDB_LDFLAGS="-lrocksdb -lsnappy -lz -lbz2 -lzstd -llz4 -ldl -lstdc++"
+        LMDB_LDFLAGS="-L/usr/local/lib -llmdb"
         MAP_LDFLAGS="-lstdc++"
         LDFLAGS="$LDFLAGS -lm"
         cadd '#define ON_LINUX  (1)'
@@ -32,6 +33,7 @@ esac
 case "$platform" in ####################### Darwin #############################
     *Darwin*)
         ROCKSDB_LDFLAGS="-lrocksdb"
+        LMDB_LDFLAGS="-L/usr/local/lib -llmdb"
         MAP_LDFLAGS="-lstdc++"
         cadd '#define ON_LINUX  (0)'
         cadd '#define ON_DARWIN (1)'
@@ -73,6 +75,7 @@ function run() {
 runut=0
 runbn=0
 rocksdb=0
+lmdb=0
 map=0
 while [ $# != 0 ] ;do
       case "$1" in
@@ -83,6 +86,8 @@ while [ $# != 0 ] ;do
 	      runut=1
       ;;  '-r')
 	      rocksdb=1
+      ;;  '-l')
+	      lmdb=1
       ;;  '-m')
 	      map=1
       ;;  '-f')
@@ -129,6 +134,11 @@ if [ $rocksdb == 1 ] ;then
    BN_CFLAGS="-DUSE_ROCKSDB=1 $ROCKSDB_LDFLAGS"
 else
    BN_CFLAGS="-DUSE_ROCKSDB=0"
+fi
+if [ $lmdb == 1 ] ;then
+   BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=1 $LMDB_LDFLAGS"
+else
+   BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=0"
 fi
 if [ $map == 1 ] ;then
    run $CPP $MAP_CFLAGS -c map.cpp -o map.o

@@ -660,7 +660,7 @@ static void brun(struct benchmark *b) {
 }
 
 static void t_mount(struct benchmark *b) {
-        b->kv.u.t2.mod = t2_init(bn_storage, ht_shift, cache_shift);
+        b->kv.u.t2.mod = t2_init(bn_storage, NULL, ht_shift, cache_shift);
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
         bn_ntype_twig     = t2_node_type_init(1, "simple-bn-twig",     shift_twig,     0);
         bn_ntype_leaf     = t2_node_type_init(0, "simple-bn-leaf",     shift_leaf,     0);
@@ -677,7 +677,7 @@ static void t_mount(struct benchmark *b) {
         if (b->kv.u.t2.root != 0) {
                 b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.root);
         } else {
-                b->kv.u.t2.tree = t2_tree_create(&bn_ttype);
+                b->kv.u.t2.tree = t2_tree_create(&bn_ttype, NULL);
         }
 }
 
@@ -717,13 +717,13 @@ static int t_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, 
 }
 
 static int t_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
-        int result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize);
+        int result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize, NULL);
         assert(result == 0 || result == -EEXIST);
         return result;
 }
 
 static int t_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
-        int result = t2_delete_ptr(d->u.t2.tree, key, ksize);
+        int result = t2_delete_ptr(d->u.t2.tree, key, ksize, NULL);
         assert(result == 0 || result == -ENOENT);
         return result;
 }
@@ -806,6 +806,83 @@ static int r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, en
 
 #endif
 
+#if USE_LMDB
+
+#include <sys/stat.h>
+
+static void l_mount(struct benchmark *b) {
+        NOFAIL(mdb_env_create(&b->kv.u.l.env));
+        NOFAIL(mdb_env_set_maxreaders(b->kv.u.l.env, 1 << 16));
+        NOFAIL(mdb_env_set_mapsize(b->kv.u.l.env, 10485760));
+        mkdir("./lmdb", 0777);
+        NOFAIL(mdb_env_open(b->kv.u.l.env, "./lmdb", MDB_FIXEDMAP | MDB_WRITEMAP | MDB_NOMETASYNC | MDB_NOSYNC, 0664));
+}
+
+static void l_umount(struct benchmark *b) {
+        mdb_env_close(b->kv.u.l.env);
+}
+
+static void l_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {
+}
+
+static void l_worker_fini(struct rthread *rt, struct kvdata *d) {
+}
+
+static int l_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+        MDB_val mkey = { .mv_size = ksize, .mv_data = key };
+        MDB_val mval = {};
+        MDB_txn *txn;
+	MDB_dbi dbi;
+        int rc;
+        NOFAIL(mdb_txn_begin(d->b->u.l.env, NULL, MDB_RDONLY, &txn));
+        NOFAIL(mdb_dbi_open(txn, NULL, 0, &dbi));
+        rc = mdb_get(txn, dbi, &mkey, &mval);
+        if (rc == 0) {
+                if ((int)mval.mv_size <= vsize) {
+                        memcpy(val, mval.mv_data, mval.mv_size);
+                } else {
+                        rc = -ENAMETOOLONG;
+                }
+        }
+        mdb_txn_abort(txn);
+        mdb_dbi_close(d->b->u.l.env, dbi);
+        return rc == 0 ? 0 : rc == MDB_NOTFOUND ? -ENOENT : rc;
+}
+
+static int l_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+        MDB_val mkey = { .mv_size = ksize, .mv_data = key };
+        MDB_val mval = { .mv_size = vsize, .mv_data = val };
+        MDB_txn *txn;
+	MDB_dbi dbi;
+        int rc;
+        NOFAIL(mdb_txn_begin(d->b->u.l.env, NULL, 0, &txn));
+        NOFAIL(mdb_dbi_open(txn, NULL, 0, &dbi));
+        rc = mdb_put(txn, dbi, &mkey, &mval, MDB_NOOVERWRITE);
+        mdb_txn_commit(txn);
+        mdb_dbi_close(d->b->u.l.env, dbi);
+        return rc == 0 ? 0 : rc == MDB_KEYEXIST ? -EEXIST : rc;
+}
+
+static int l_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+        MDB_val mkey = { .mv_size = ksize, .mv_data = key };
+        MDB_txn *txn;
+	MDB_dbi dbi;
+        int rc;
+        NOFAIL(mdb_txn_begin(d->b->u.l.env, NULL, 0, &txn));
+        NOFAIL(mdb_dbi_open(txn, NULL, 0, &dbi));
+        rc = mdb_del(txn, dbi, &mkey, NULL);
+        mdb_txn_commit(txn);
+        mdb_dbi_close(d->b->u.l.env, dbi);
+        return rc == 0 ? 0 : rc == MDB_NOTFOUND ? -ENOENT : rc;
+}
+
+static int l_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
+        assert(false);
+        return 0;
+}
+
+#endif
+
 static struct kv kv[] = {
         [T2] = {
                 .mount       = &t_mount,
@@ -827,6 +904,18 @@ static struct kv kv[] = {
                 .insert      = &r_insert,
                 .del         = &r_delete,
                 .next        = &r_next
+        },
+#endif
+#if USE_LMDB
+        [LMDB] = {
+                .mount       = &l_mount,
+                .umount      = &l_umount,
+                .worker_init = &l_worker_init,
+                .worker_fini = &l_worker_fini,
+                .lookup      = &l_lookup,
+                .insert      = &l_insert,
+                .del         = &l_delete,
+                .next        = &l_next
         }
 #endif
 };
@@ -878,6 +967,8 @@ int main(int argc, char **argv) {
                                 kvt = ROCKSDB;
                         } else if (USE_MAP && strcmp(optarg, "map") == 0) {
                                 kvt = MAP;
+                        } else if (USE_LMDB && strcmp(optarg, "lmdb") == 0) {
+                                kvt = LMDB;
                         } else {
                                 printf("Unknown kv: %s\n", optarg);
                                 return 1;

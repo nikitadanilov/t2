@@ -108,6 +108,18 @@ struct rocksdb_benchmark {
 struct rocksdb_benchmark { char x; };
 #endif
 
+#if USE_LMDB
+#include <lmdb.h>
+
+struct lmdb_benchmark {
+	MDB_env *env;
+	MDB_dbi dbi;
+};
+
+#else
+struct lmdb_benchmark { char x; };
+#endif
+
 struct kvbenchmark {
         union {
                 struct {
@@ -118,6 +130,7 @@ struct kvbenchmark {
                         uint64_t        bolt;
                 } t2;
                 struct rocksdb_benchmark r;
+                struct lmdb_benchmark l;
                 struct {
                         void *m;
                         void *l;
@@ -153,6 +166,7 @@ enum kvtype {
         T2,
         ROCKSDB,
         MAP,
+        LMDB,
 
         KVNR
 };
