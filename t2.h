@@ -35,17 +35,15 @@ struct t2_storage {
 struct t2_tx { /* Transaction. */
 };
 
-typedef uint64_t lsn_t;
+typedef int64_t lsn_t;
 
 struct t2_te { /* Transaction engine. */
         int           (*ante)   (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
-        void          (*post)   (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
-        struct t2_te *(*init)   (struct t2 *mod);
+        int           (*post)   (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
+        int           (*init)   (struct t2_te *te, struct t2 *mod);
         void          (*fini)   (struct t2_te *te);
-        int           (*recover)(struct t2_te *te, int (*func)(struct t2_txrec *, void *), void *arg);
         struct t2_tx *(*make)   (struct t2_te *te);
-        void          (*stop)   (struct t2_te *te, struct t2_tx *tx);
-        void          (*wait)   (struct t2_te *te, struct t2_tx *tx, bool force);
+        int           (*wait)   (struct t2_te *te, struct t2_tx *tx, const struct timespec *deadline, bool force);
         void          (*done)   (struct t2_te *te, struct t2_tx *tx);
         bool          (*canpage)(struct t2_te *te, struct t2_node *n);
         void          (*dirty)  (struct t2_te *te, lsn_t lsn);
@@ -100,6 +98,7 @@ struct t2_buf {
 
 struct t2_txrec { /* Transaction log record. */
         struct t2_node *node;
+        taddr_t         addr;
         int32_t         off;
         struct t2_buf   part;
 };
@@ -171,6 +170,7 @@ void    t2_release(struct t2_node *n);
 void    t2_lsnset (struct t2_node *n, lsn_t lsn);
 lsn_t   t2_lsnget (const struct t2_node *n);
 taddr_t t2_addr   (const struct t2_node *n);
+int     t2_apply  (struct t2 *mod, struct t2_txrec *txr);
 
 int   t2_error(int idx, char *buf, int nob, int *err);
 void  t2_error_print(void);
