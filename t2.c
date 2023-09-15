@@ -988,8 +988,12 @@ static uint64_t taddr_saddr(taddr_t addr) {
         return addr & TADDR_ADDR_MASK;
 }
 
+static int taddr_sshift(taddr_t addr) {
+        return (addr & TADDR_SIZE_MASK) + TADDR_MIN_SHIFT;
+}
+
 static int taddr_ssize(taddr_t addr) {
-        return 1 << ((addr & TADDR_SIZE_MASK) + TADDR_MIN_SHIFT);
+        return 1 << taddr_sshift(addr);
 }
 
 static taddr_t taddr_make(uint64_t addr, int shift) {
@@ -1319,7 +1323,8 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                         if (LIKELY(result == 0)) {
                                 struct header *h = nheader(n);
                                 /* TODO: check node. */
-                                if (LIKELY(IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL)) {
+                                if (LIKELY(IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL &&
+                                           n->mod->ntypes[h->ntype]->shift == taddr_sshift(addr))) {
                                         rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                         CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
                                         node_seq_increase(n);
