@@ -2602,7 +2602,7 @@ int t2_tx_open(struct t2 *mod, struct t2_tx *tx) {
 }
 
 void t2_tx_close(struct t2 *mod, struct t2_tx *tx) {
-        return TXCALL(mod->te, close(mod->te, tx));
+        TXCALL(mod->te, close(mod->te, tx));
 }
 
 int t2_tx_wait (struct t2 *mod, struct t2_tx *tx, const struct timespec *deadline, bool force) {
@@ -3925,7 +3925,9 @@ static void move(struct node *n, void *sh, int32_t start, int32_t end, int delta
         ASSERT(start <= end);
         memmove(sh + start + delta, sh + start, end - start);
         CADD(l[((struct sheader *)sh)->head.level].moves, end - start);
-        ext_merge(&n->range.ext[id], start + delta, end - start);
+        if (TRANSACTIONS) {
+                ext_merge(&n->range.ext[id], start + delta, end - start);
+        }
 }
 
 static void sdirmove(struct node *n, struct sheader *sh, int32_t nsize,

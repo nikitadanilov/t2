@@ -47,7 +47,7 @@ struct t2_te { /* Transaction engine. */
         void          (*fini)   (struct t2_te *te);
         struct t2_tx *(*make)   (struct t2_te *te);
         int           (*open)   (struct t2_te *te, struct t2_tx *tx);
-        int           (*close)  (struct t2_te *te, struct t2_tx *tx);
+        void          (*close)  (struct t2_te *te, struct t2_tx *tx);
         int           (*wait)   (struct t2_te *te, struct t2_tx *tx, const struct timespec *deadline, bool force);
         void          (*done)   (struct t2_te *te, struct t2_tx *tx);
         bool          (*canpage)(struct t2_te *te, struct t2_node *n);
