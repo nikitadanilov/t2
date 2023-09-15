@@ -1,6 +1,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <string.h>
 
 extern "C" {
 #include "bn.h"
