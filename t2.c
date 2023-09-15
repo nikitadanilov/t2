@@ -4433,7 +4433,7 @@ static void wal_fini(struct t2_te *engine) {
         mem_free(en);
 }
 
-static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags) {
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags) {
         struct wal_te *en     = mem_alloc(sizeof *en);
         int            result = 0;
         ASSERT(nr_bufs > 0);

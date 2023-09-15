@@ -104,6 +104,7 @@ extern uint64_t bn_bolt(const struct t2 *mod);
 extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
 extern void bn_counters_print(void);
 extern void bn_counters_fold(void);
+extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags);
 
 static struct kv kv[KVNR];
 static enum kvtype kvt = T2;
@@ -659,8 +660,25 @@ static void brun(struct benchmark *b) {
         kv[kvt].umount(b);
 }
 
+enum {
+        NR_BUFS    = 20,
+        BUF_SIZE   = 1 << 22,
+        FLAGS      = 0 /* noforce-nosteal == redo only. */
+};
+
+enum {
+        STEAL = 1 << 0, /* Undo needed. */
+        FORCE = 1 << 1, /* Redo not needed. */
+        MAKE  = 1 << 2, /* Delete existing log. */
+        KEEP  = 1 << 3  /* Do not truncate the log on finalisation. */
+};
+
+static const char logname[] = "log";
+static bool transactions = false;
+
 static void t_mount(struct benchmark *b) {
-        b->kv.u.t2.mod = t2_init(bn_storage, NULL, ht_shift, cache_shift);
+        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE) : NULL;
+        b->kv.u.t2.mod = t2_init(bn_storage, engine, ht_shift, cache_shift);
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
         bn_ntype_twig     = t2_node_type_init(1, "simple-bn-twig",     shift_twig,     0);
         bn_ntype_leaf     = t2_node_type_init(0, "simple-bn-leaf",     shift_leaf,     0);
@@ -677,7 +695,11 @@ static void t_mount(struct benchmark *b) {
         if (b->kv.u.t2.root != 0) {
                 b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.root);
         } else {
-                b->kv.u.t2.tree = t2_tree_create(&bn_ttype, NULL);
+                struct t2_tx *tx = transactions ? t2_tx_make(b->kv.u.t2.mod) : NULL;
+                b->kv.u.t2.tree = t2_tree_create(&bn_ttype, tx);
+                if (transactions) {
+                        t2_tx_done(b->kv.u.t2.mod, tx);
+                }
         }
 }
 
@@ -717,13 +739,21 @@ static int t_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, 
 }
 
 static int t_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
-        int result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize, NULL);
+        struct t2_tx *tx = transactions ? t2_tx_make(d->b->u.t2.mod) : NULL;
+        int result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize, tx);
+        if (transactions) {
+                t2_tx_done(d->b->u.t2.mod, tx);
+        }
         assert(result == 0 || result == -EEXIST);
         return result;
 }
 
 static int t_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
-        int result = t2_delete_ptr(d->u.t2.tree, key, ksize, NULL);
+        struct t2_tx *tx = transactions ? t2_tx_make(d->b->u.t2.mod) : NULL;
+        int result = t2_delete_ptr(d->u.t2.tree, key, ksize, tx);
+        if (transactions) {
+                t2_tx_done(d->b->u.t2.mod, tx);
+        }
         assert(result == 0 || result == -ENOENT);
         return result;
 }
@@ -931,7 +961,7 @@ int main(int argc, char **argv) {
 #if USE_MAP
         kv[MAP] = mapkv;
 #endif
-        while ((ch = getopt(argc, argv, "vr:f:t:n:N:h:ck:C:")) != -1) {
+        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:C:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -947,6 +977,9 @@ int main(int argc, char **argv) {
                         break;
                 case 't':
                         shift_twig = atoi(optarg);
+                        break;
+                case 'T':
+                        transactions = true;
                         break;
                 case 'N':
                         shift_internal = atoi(optarg);
