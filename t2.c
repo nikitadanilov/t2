@@ -428,6 +428,24 @@ enum node_flags {
         DIRTY         = 1ull << 2
 };
 
+enum ext_id {
+        HDR,
+        KEY,
+        VAL,
+        DIR,
+
+        M_NR
+};
+
+struct ext {
+        int32_t off;
+        int32_t len;
+};
+
+struct mod {
+        struct ext ext[M_NR];
+};
+
 struct node {
         struct cds_hlist_node      hash;
         taddr_t                    addr;
@@ -442,6 +460,7 @@ struct node {
         lsn_t                      lsn;
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
+        struct mod                 range;
         struct rcu_head            rcu;
 };
 
@@ -753,7 +772,6 @@ static int shift(struct node *d, struct node *s, const struct slot *insert, enum
 static int merge(struct node *d, struct node *s, enum dir dir);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
-static int txadd(struct node *n, enum lock_mode lm, struct t2_txrec *txr, int32_t *nob);
 static struct t2_tx *wal_make(struct t2_te *te);
 static int  wal_init   (struct t2_te *engine, struct t2 *mod);
 static void wal_fini   (struct t2_te *engine);
@@ -1890,22 +1908,43 @@ static void path_pin(struct path *p) {
         }
 }
 
-static int txadd(struct node *n, enum lock_mode lm, struct t2_txrec *txr, int32_t *nob) {
+static int txadd(struct node *n, enum lock_mode lm, struct t2_txrec *txr, int32_t *nob, struct mod *mod) {
+        int pos = 0;
         if (n != NULL && lm == WRITE) {
-                *txr = (struct t2_txrec) {
-                        .node = (void *)n,
-                        .off  = 0,
-                        .part = { .len  = nsize(n), .addr = n->data }
-                };
-                *nob += txr->part.len;
-                return 1;
-        } else {
-                return 0;
+                if (mod != NULL) {
+                        for (int i = 0; i < ARRAY_SIZE(mod->ext); ++i) {
+                                if (mod->ext[i].len > 0) {
+                                        txr[pos] = (struct t2_txrec) {
+                                                .node = (void *)n,
+                                                .off  = mod->ext[i].off,
+                                                .part = {
+                                                        .len  = mod->ext[i].len,
+                                                        .addr = n->data + mod->ext[i].off
+                                                }
+                                        };
+                                        *nob += txr->part.len;
+                                        pos++;
+                                }
+                        }
+                        SET0(mod);
+                } else {
+                        txr[0] = (struct t2_txrec) {
+                                .node = (void *)n,
+                                .off  = 0,
+                                .part = {
+                                        .len  = nsize(n),
+                                        .addr = n->data
+                                }
+                        };
+                        *nob += txr->part.len;
+                        pos++;
+                }
         }
+        return pos;
 }
 
 static void path_txadd(struct path *p) {
-        struct t2_txrec txr[(p->used + 1) * 4 + 1]; /* VLA. */
+        struct t2_txrec txr[((p->used + 1) * 4 + 1) * M_NR]; /* VLA. */
         struct t2_te   *te  = p->tree->ttype->mod->te;
         int             pos = 0;
         int32_t         nob = 0;
@@ -1913,11 +1952,11 @@ static void path_txadd(struct path *p) {
                 struct rung *r = &p->rung[p->used];
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
-                pos += txadd(left->node,   left->lm,  &txr[pos], &nob);
-                pos += txadd(r->node,      r->lm,     &txr[pos], &nob);
-                pos += txadd(right->node,  right->lm, &txr[pos], &nob);
+                pos += txadd(left->node,   left->lm,  &txr[pos], &nob, &left->node->range);
+                pos += txadd(r->node,      r->lm,     &txr[pos], &nob, &r->node->range);
+                pos += txadd(right->node,  right->lm, &txr[pos], &nob, &right->node->range);
                 if (r->flags & ALUSED) {
-                        pos += txadd(r->allocated, WRITE, &txr[pos], &nob);
+                        pos += txadd(r->allocated, WRITE, &txr[pos], &nob, NULL);
                 }
         }
         TXCALL(te, post(te, p->tx, nob, pos, txr));
@@ -3777,13 +3816,25 @@ static int32_t simple_free(const struct node *n) {
         return end->voff - end->koff - sdirsize(sh);
 }
 
-static void move(void *sh, int32_t start, int32_t end, int delta) {
+static void ext_merge(struct ext *ext, int32_t off, int32_t len) {
+        if (ext->len > 0) {
+                int32_t moff = min_32(ext->off, off);
+                ext->len = max_32(ext->off + ext->len, off + len) - off;
+                ext->off = moff;
+        } else {
+                ext->off = off;
+                ext->len = len;
+        }
+}
+
+static void move(struct node *n, void *sh, int32_t start, int32_t end, int delta, enum ext_id id) {
         ASSERT(start <= end);
         memmove(sh + start + delta, sh + start, end - start);
         CADD(l[((struct sheader *)sh)->head.level].moves, end - start);
+        ext_merge(&n->range.ext[id], start + delta, end - start);
 }
 
-static void sdirmove(struct sheader *sh, int32_t nsize,
+static void sdirmove(struct node *n, struct sheader *sh, int32_t nsize,
                      int32_t knob, int32_t vnob, int32_t nr) {
         int32_t dir_off = (knob * (nsize - SOF(*sh))) / (knob + vnob) -
                 dirsize(nr + 1) / 2 + SOF(*sh);
@@ -3791,7 +3842,7 @@ static void sdirmove(struct sheader *sh, int32_t nsize,
                          nsize - vnob - dirsize(nr + 1));
         ASSERT(knob + SOF(*sh) <= dir_off);
         ASSERT(dir_off + dirsize(nr + 1) + vnob <= nsize);
-        move(sh, sh->dir_off, sdirend(sh), dir_off - sh->dir_off);
+        move(n, sh, sh->dir_off, sdirend(sh), dir_off - sh->dir_off, DIR);
         sh->dir_off = dir_off;
 }
 
@@ -3830,14 +3881,14 @@ static int simple_insert(struct slot *s) {
         }
         if (sfreekey(s->node) < klen || sfreeval(s->node) < vlen + SOF(*end)) {
                 struct dir_element *beg = sat(sh, 0);
-                sdirmove(sh, beg->voff, end->koff - beg->koff + klen,
+                sdirmove(s->node, sh, beg->voff, end->koff - beg->koff + klen,
                          beg->voff - end->voff + vlen, sh->nr + 1);
                 end = sat(sh, sh->nr);
                 CINC(l[sh->head.level].dirmove);
         }
         piv = sat(sh, s->idx);
-        move(sh, piv->koff, end->koff, +klen);
-        move(sh, end->voff, piv->voff, -vlen);
+        move(s->node, sh, piv->koff, end->koff, +klen, KEY);
+        move(s->node, sh, end->voff, piv->voff, -vlen, VAL);
         for (int32_t i = ++sh->nr; i > s->idx; --i) {
                 struct dir_element *prev = sat(sh, i - 1);
                 __builtin_prefetch(prev - 1);
@@ -3856,6 +3907,7 @@ static int simple_insert(struct slot *s) {
         if (LIKELY(s->node->radix != NULL)) {
                 s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node) - 1);
         }
+        ext_merge(&s->node->range.ext[HDR], 0, sizeof *sh);
         return 0;
 }
 
@@ -3869,8 +3921,8 @@ static void simple_delete(struct slot *s) {
         ASSERT(s->idx < sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         CINC(l[sh->head.level].delete);
-        move(sh, inn->koff, end->koff, -klen);
-        move(sh, end->voff, inn->voff, +vlen);
+        move(s->node, sh, inn->koff, end->koff, -klen, KEY);
+        move(s->node, sh, end->voff, inn->voff, +vlen, VAL);
         for (int32_t i = s->idx; i < sh->nr; ++i) {
                 struct dir_element *next = sat(sh, i + 1);
                 *sat(sh, i) = (struct dir_element){
@@ -3883,6 +3935,7 @@ static void simple_delete(struct slot *s) {
         if (LIKELY(s->node->radix != NULL)) {
                 s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node));
         }
+        ext_merge(&s->node->range.ext[HDR], 0, sizeof *sh);
 }
 
 static void simple_get(struct slot *s) {
