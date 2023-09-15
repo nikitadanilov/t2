@@ -5,6 +5,9 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <endian.h>
+#include <linux/falloc.h>
+
+extern int fallocate(int fd, int mode, off_t offset, off_t len); /* Hmm... */
 
 /*
  *  Local variables:
