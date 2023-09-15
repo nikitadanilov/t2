@@ -661,8 +661,8 @@ static void brun(struct benchmark *b) {
 }
 
 enum {
-        NR_BUFS    = 20,
-        BUF_SIZE   = 1 << 22,
+        NR_BUFS    = 200,
+        BUF_SIZE   = 1 << 20,
         FLAGS      = 0 /* noforce-nosteal == redo only. */
 };
 
