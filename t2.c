@@ -750,6 +750,7 @@ static int32_t nsize(const struct node *n);
 static int32_t utmost(const struct node *n, enum dir d);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
+static void touch_unlock(struct node *n, enum lock_mode mode);
 static void dirty(struct node *n, enum lock_mode lm);
 static void radixmap_update(struct node *n);
 static struct header *nheader(const struct node *n);
@@ -1155,11 +1156,11 @@ static int cookie_try(struct path *p) {
                                         dirty(n, mode);
                                         /* TODO: Add to the transaction. */
                                 }
-                                unlock(n, mode);
+                                touch_unlock(n, mode);
                                 put(n);
                                 return result;
                         } else {
-                                unlock(n, mode);
+                                touch_unlock(n, mode);
                                 return -ESTALE;
                         }
                 }
@@ -1209,7 +1210,6 @@ static void lock(struct node *n, enum lock_mode mode) {
 
 static void unlock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
-        touch(n);
         if (LIKELY(mode == NONE)) {
                 ;
         } else if (mode == WRITE) {
@@ -1223,6 +1223,11 @@ static void unlock(struct node *n, enum lock_mode mode) {
                 NOFAIL(pthread_rwlock_unlock(&n->lock));
                 CDEC(rlock);
         }
+}
+
+static void touch_unlock(struct node *n, enum lock_mode mode) {
+        touch(n);
+        unlock(n, mode);
 }
 
 static struct node *peek(struct t2 *mod, taddr_t addr) {
@@ -1882,19 +1887,19 @@ static void path_fini(struct path *p) {
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
                 if (UNLIKELY(right->node != NULL)) {
-                        unlock(right->node, right->lm);
+                        touch_unlock(right->node, right->lm);
                         put(right->node);
                 }
-                unlock(r->node, r->lm);
+                touch_unlock(r->node, r->lm);
                 if (UNLIKELY(left->node != NULL)) {
-                        unlock(left->node, left->lm);
+                        touch_unlock(left->node, left->lm);
                         put(left->node);
                 }
                 if (r->flags & PINNED) {
                         put(r->node);
                 }
                 if (UNLIKELY(r->allocated != NULL)) {
-                        unlock(r->allocated, WRITE);
+                        touch_unlock(r->allocated, WRITE);
                         if (LIKELY(r->flags & ALUSED)) {
                                 put(r->allocated);
                         } else {
@@ -1905,7 +1910,7 @@ static void path_fini(struct path *p) {
         }
         p->used = -1;
         if (UNLIKELY(p->newroot != NULL)) {
-                unlock(p->newroot, WRITE);
+                touch_unlock(p->newroot, WRITE);
                 put(p->newroot);
         }
 }
@@ -2778,6 +2783,10 @@ static void node_iovec(struct node *n, struct iovec *v) {
         v->iov_len  = nsize(n);
 }
 
+static bool pageable(const struct node *n) {
+        return (n->flags & DIRTY) && n->ref <= 1;
+}
+
 enum {
         MAX_CLUSTER = 256
 };
@@ -2790,18 +2799,18 @@ static void pageout(struct node *n) {
         taddr_t       next;
         taddr_t       whole;
         int           result;
-        int           shift = n->mod->cache.shift;
+        int           shift;
         lock(n, READ);
-        if (LIKELY(nstate(n, shift) == UNCLEAN)) {
+        if (LIKELY(pageable(n))) {
                 node_iovec(n, &vec[0]);
-                for (cur = n->addr, nr = 0; nr < ARRAY_SIZE(cluster); ++nr, cur = next) {
+                for (cur = n->addr, nr = 1; nr < ARRAY_SIZE(cluster); ++nr, cur = next) {
                         struct node *right;
                         next = taddr_make(taddr_saddr(cur) + taddr_ssize(cur), taddr_sshift(cur));
                         right = look(n->mod, next);
                         if (right != NULL) {
                                 lock(right, READ);
-                                if (nstate(right, shift) == UNCLEAN) {
-                                        cluster[nr++] = right;
+                                if (pageable(right)) {
+                                        cluster[nr] = right;
                                         node_iovec(right, &vec[nr]);
                                 } else {
                                         unlock(right, READ);
@@ -2812,24 +2821,29 @@ static void pageout(struct node *n) {
                                 break;
                         }
                 }
-                whole = taddr_make(taddr_saddr(n->addr), (1 << ilog2(nr + 1)) * taddr_ssize(n->addr));
-                result = SCALL(n->mod, write, whole, nr + 1, vec);
+                shift = ilog2(nr);
+                for (int i = 1 << shift; i < nr; ++i) {
+                        unlock(cluster[i], READ);
+                        put(cluster[i]);
+                }
+                whole = taddr_make(taddr_saddr(n->addr), shift + taddr_sshift(n->addr));
+                result = SCALL(n->mod, write, whole, 1 << shift, vec);
                 CMOD(l[level(n)].pageout_cluster, nr);
                 if (LIKELY(result == 0)) {
                         CINC(write);
                         CADD(write_bytes, taddr_ssize(whole));
                         n->flags &= ~DIRTY;
                         KDEC(dirty);
-                        for (int i = 0; i < nr; ++i) {
+                        for (int i = 1; i < (1 << shift); ++i) {
                                 cluster[i]->flags &= ~DIRTY;
                                 KDEC(dirty);
                         }
                 } else {
                         LOG("Pageout failure: %"PRIx64": %i/%i.\n", n->addr, result, errno);
                 }
-                while (--nr >= 0) {
-                        unlock(cluster[nr], READ);
-                        put(cluster[nr]);
+                for (int i = 1; i < 1 << shift; ++i) {
+                        unlock(cluster[i], READ);
+                        put(cluster[i]);
                 }
         }
         unlock(n, READ);
@@ -2953,6 +2967,7 @@ static void writeout(struct t2 *mod) {
                         if (n->flags & DIRTY) {
                                 pageout(n);
                         }
+                        ASSERT(!(n->flags & DIRTY));
                 }
                 scan = (scan + 1) & ((1 << mod->ht.shift) - 1);
         } while (scan != 0);
@@ -4421,6 +4436,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                         result = 0;
                 }
         } else { /* TODO: Handle list linkage. */
+                LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.\n", en->logname, buf->start, buf->nob, result, errno);
                 result = ERROR(result < 0 ? -errno : -EIO);
         }
         ASSERT(wal_invariant(en));
