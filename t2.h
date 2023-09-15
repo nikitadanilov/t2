@@ -43,6 +43,8 @@ struct t2_te { /* Transaction engine. */
         int           (*init)   (struct t2_te *te, struct t2 *mod);
         void          (*fini)   (struct t2_te *te);
         struct t2_tx *(*make)   (struct t2_te *te);
+        int           (*open)   (struct t2_te *te, struct t2_tx *tx);
+        int           (*close)  (struct t2_te *te, struct t2_tx *tx);
         int           (*wait)   (struct t2_te *te, struct t2_tx *tx, const struct timespec *deadline, bool force);
         void          (*done)   (struct t2_te *te, struct t2_tx *tx);
         bool          (*canpage)(struct t2_te *te, struct t2_node *n);
@@ -165,6 +167,12 @@ int  t2_delete(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
 int  t2_cursor_init(struct t2_cursor *c, struct t2_buf *key);
 void t2_cursor_fini(struct t2_cursor *c);
 int  t2_cursor_next(struct t2_cursor *c);
+
+struct t2_tx *t2_tx_make (struct t2 *mod);
+int           t2_tx_open (struct t2 *mod, struct t2_tx *tx);
+void          t2_tx_close(struct t2 *mod, struct t2_tx *tx);
+int           t2_tx_wait (struct t2 *mod, struct t2_tx *tx, const struct timespec *deadline, bool force);
+void          t2_tx_done (struct t2 *mod, struct t2_tx *tx);
 
 void    t2_release(struct t2_node *n);
 void    t2_lsnset (struct t2_node *n, lsn_t lsn);

@@ -753,13 +753,15 @@ static int shift(struct node *d, struct node *s, const struct slot *insert, enum
 static int merge(struct node *d, struct node *s, enum dir dir);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
-static void txadd(struct node *n, enum lock_mode lm, struct path *p);
+static int txadd(struct node *n, enum lock_mode lm, struct t2_txrec *txr, int32_t *nob);
 static struct t2_tx *wal_make(struct t2_te *te);
 static int  wal_init   (struct t2_te *engine, struct t2 *mod);
 static void wal_fini   (struct t2_te *engine);
 static int  wal_diff   (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype);
 static int  wal_ante   (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr);
 static int  wal_post   (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr);
+static int  wal_open   (struct t2_te *engine, struct t2_tx *trax);
+static void wal_close  (struct t2_te *engine, struct t2_tx *trax);
 static int  wal_wait   (struct t2_te *engine, struct t2_tx *trax, const struct timespec *deadline, bool force);
 static void wal_done   (struct t2_te *engine, struct t2_tx *trax);
 static bool wal_canpage(struct t2_te *engine, struct t2_node *n);
@@ -1127,7 +1129,7 @@ static int cookie_try(struct path *p) {
                                 result = cookie_node_complete(p->tree, p, n, p->opt);
                                 if (result == 0) {
                                         dirty(n, mode);
-                                        txadd(n, mode, p);
+                                        /* TODO: Add to the transaction. */
                                 }
                                 unlock(n, mode);
                                 put(n);
@@ -1888,26 +1890,37 @@ static void path_pin(struct path *p) {
         }
 }
 
-static void txadd(struct node *n, enum lock_mode lm, struct path *p) {
-        if (lm == WRITE) {
-                struct t2_txrec whole = {
+static int txadd(struct node *n, enum lock_mode lm, struct t2_txrec *txr, int32_t *nob) {
+        if (n != NULL && lm == WRITE) {
+                *txr = (struct t2_txrec) {
                         .node = (void *)n,
                         .off  = 0,
                         .part = { .len  = nsize(n), .addr = n->data }
                 };
-                TXCALL(n->mod->te, post(n->mod->te, p->tx, nsize(n), 1, &whole));
+                *nob += txr->part.len;
+                return 1;
+        } else {
+                return 0;
         }
 }
 
 static void path_txadd(struct path *p) {
+        struct t2_txrec txr[(p->used + 1) * 4 + 1]; /* VLA. */
+        struct t2_te   *te  = p->tree->ttype->mod->te;
+        int             pos = 0;
+        int32_t         nob = 0;
         for (int i = 0; i <= p->used; ++i) {
                 struct rung *r = &p->rung[p->used];
                 struct sibling *left  = brother(r, LEFT);
                 struct sibling *right = brother(r, RIGHT);
-                txadd(left->node,  left->lm,  p);
-                txadd(r->node,     r->lm,     p);
-                txadd(right->node, right->lm, p);
+                pos += txadd(left->node,   left->lm,  &txr[pos], &nob);
+                pos += txadd(r->node,      r->lm,     &txr[pos], &nob);
+                pos += txadd(right->node,  right->lm, &txr[pos], &nob);
+                if (r->flags & ALUSED) {
+                        pos += txadd(r->allocated, WRITE, &txr[pos], &nob);
+                }
         }
+        TXCALL(te, post(te, p->tx, nob, pos, txr));
 }
 
 static bool rung_validity_invariant(const struct path *p, int i) {
@@ -2512,6 +2525,25 @@ int t2_delete_ptr(struct t2_tree *t, void *key, int32_t ksize, struct t2_tx *tx)
         return delete(t, &r, tx);
 }
 
+struct t2_tx *t2_tx_make(struct t2 *mod) {
+        return TXCALL(mod->te, make(mod->te));
+}
+
+int t2_tx_open(struct t2 *mod, struct t2_tx *tx) {
+        return TXCALL(mod->te, open(mod->te, tx));
+}
+
+void t2_tx_close(struct t2 *mod, struct t2_tx *tx) {
+        return TXCALL(mod->te, close(mod->te, tx));
+}
+
+int t2_tx_wait (struct t2 *mod, struct t2_tx *tx, const struct timespec *deadline, bool force) {
+        return TXCALL(mod->te, wait(mod->te, tx, deadline, force));
+}
+
+void t2_tx_done (struct t2 *mod, struct t2_tx *tx) {
+        return TXCALL(mod->te, done(mod->te, tx));
+}
 
 /* @cookie */
 
@@ -4603,6 +4635,13 @@ static int wal_wait(struct t2_te *engine, struct t2_tx *trax, const struct times
         return result;
 }
 
+static int  wal_open(struct t2_te *engine, struct t2_tx *trax) {
+        return 0;
+}
+
+static void wal_close(struct t2_te *engine, struct t2_tx *trax) {
+}
+
 static void wal_done(struct t2_te *te, struct t2_tx *trax) {
         mem_free(COF(trax, struct wal_tx, base));
 }
@@ -5938,6 +5977,7 @@ static void wal_ut() {
                         .len  = SIZE
                 }
         };
+        struct t2_tree *t;
         int result;
         memset(fake_data, '#', SOF(fake_data));
         usuite("wal");
@@ -5955,16 +5995,19 @@ static void wal_ut() {
         ASSERT(EISOK(engine));
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
-        trax = wal_make(engine);
+        trax = t2_tx_make(mod);
+        ASSERT(EISOK(trax));
         result = wal_post(engine, trax, txr.part.len, 1, &txr);
         ASSERT(result == 0);
+        t2_tx_done(mod, trax);
         t2_fini(mod);
         utest("add-many");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
         ASSERT(EISOK(engine));
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
-        trax = wal_make(engine);
+        trax = t2_tx_make(mod);
+        ASSERT(EISOK(trax));
         for (int i = 0; i < 100000; ++i) {
                 txr.off = rand() % (NODE_SIZE - 10);
                 txr.part.addr = fake_data + txr.off;
@@ -5972,6 +6015,7 @@ static void wal_ut() {
                 result = wal_post(engine, trax, txr.part.len, 1, &txr);
                 ASSERT(result == 0);
         }
+        t2_tx_done(mod, trax);
         t2_fini(mod);
         utest("replay");
         fdata = fake_data;
@@ -5979,7 +6023,8 @@ static void wal_ut() {
         ASSERT(EISOK(engine));
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
-        trax = wal_make(engine);
+        trax = t2_tx_make(mod);
+        ASSERT(EISOK(trax));
         for (int i = 0; i < 100000; ++i) {
                 txr.off = rand() % (NODE_SIZE - 10);
                 txr.part.addr = fake_data + txr.off;
@@ -5988,6 +6033,7 @@ static void wal_ut() {
                 result = wal_post(engine, trax, txr.part.len, 1, &txr);
                 ASSERT(result == 0);
         }
+        t2_tx_done(mod, trax);
         t2_fini(mod);
         memcpy(copy, fake_data, SOF(copy));
         memset(fake_data, '#', SOF(fake_data));
@@ -5999,9 +6045,26 @@ static void wal_ut() {
         ASSERT(memcmp(copy, fake_data, SOF(copy)) == 0);
         ASSERT(apply_nr == 100000);
         t2_fini(mod);
-        utestdone();
         ut_lsnset = NULL;
         ut_apply = NULL;
+        utest("tree-create");
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
+        ASSERT(EISOK(engine));
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        ASSERT(EISOK(mod));
+        ttype.mod = NULL;
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        trax = t2_tx_make(mod);
+        ASSERT(EISOK(trax));
+        t = t2_tree_create(&ttype, trax);
+        ASSERT(EISOK(t));
+        t2_tree_close(t);
+        t2_tx_done(mod, trax);
+        t2_tree_type_degister(&ttype);
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utestdone();
 }
 
 int main(int argc, char **argv) {
