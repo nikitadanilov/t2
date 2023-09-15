@@ -656,6 +656,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var search_span;
                 struct counter_var recpos;
                 struct counter_var prefix;
+                struct counter_var pageout_cluster;
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -721,6 +722,7 @@ static void  mem_free(void *ptr);
 static uint64_t now(void);
 static int32_t max_32(int32_t a, int32_t b);
 static int32_t min_32(int32_t a, int32_t b);
+static int ilog2(uint32_t x);
 static int cacheline_size();
 static uint64_t threadid(void);
 static void llog(const struct msg_ctx *ctx, ...);
@@ -734,6 +736,7 @@ static void touch(struct node *n);
 static uint64_t temperature(struct node *n);
 static uint64_t bolt(const struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
+static struct node *look(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level);
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
 static void path_add(struct path *p, struct node *n, uint64_t flags);
@@ -1227,6 +1230,19 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
         return ht_lookup(&mod->ht, addr, ht_bucket(&mod->ht, addr));
 }
 
+static struct node *look(struct t2 *mod, taddr_t addr) {
+        uint32_t         bucket = ht_bucket(&mod->ht, addr);
+        pthread_mutex_t *lock   = ht_lock(&mod->ht, bucket);
+        struct node     *n;
+        mutex_lock(lock);
+        n = ht_lookup(&mod->ht, addr, bucket);
+        if (n != NULL) {
+                ref(n);
+        }
+        mutex_unlock(lock);
+        return n;
+}
+
 static struct node *pool_get(struct t2 *mod, taddr_t addr) {
         struct freelist *free = &mod->cache.pool.free[addr & TADDR_SIZE_MASK];
         struct node     *n    = NULL;
@@ -1342,7 +1358,8 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
         if (EISOK(n)) {
                 lock(n, WRITE);
                 if (LIKELY(n->ntype == NULL)) {
-                        int result = SCALL(n->mod, read, n->addr, n->data);
+                        struct iovec io     = { .iov_base = n->data, .iov_len = taddr_ssize(addr) };
+                        int          result = SCALL(n->mod, read, n->addr, 1, &io);
                         if (LIKELY(result == 0)) {
                                 struct header *h = nheader(n);
                                 /* TODO: check node. */
@@ -2756,17 +2773,63 @@ static void throttle(struct t2 *mod) {
         }
 }
 
+static void node_iovec(struct node *n, struct iovec *v) {
+        v->iov_base = n->data;
+        v->iov_len  = nsize(n);
+}
+
+enum {
+        MAX_CLUSTER = 256
+};
+
 static void pageout(struct node *n) {
-        lock(n, READ); /* TODO: Re-check that the node is not busy. */
-        if (LIKELY(n->flags & DIRTY)) {
-                int result = SCALL(n->mod, write, n->addr, n->data);
+        struct node  *cluster[MAX_CLUSTER];
+        struct iovec  vec[MAX_CLUSTER + 1];
+        int           nr;
+        taddr_t       cur;
+        taddr_t       next;
+        taddr_t       whole;
+        int           result;
+        int           shift = n->mod->cache.shift;
+        lock(n, READ);
+        if (LIKELY(nstate(n, shift) == UNCLEAN)) {
+                node_iovec(n, &vec[0]);
+                for (cur = n->addr, nr = 0; nr < ARRAY_SIZE(cluster); ++nr, cur = next) {
+                        struct node *right;
+                        next = taddr_make(taddr_saddr(cur) + taddr_ssize(cur), taddr_sshift(cur));
+                        right = look(n->mod, next);
+                        if (right != NULL) {
+                                lock(right, READ);
+                                if (nstate(right, shift) == UNCLEAN) {
+                                        cluster[nr++] = right;
+                                        node_iovec(right, &vec[nr]);
+                                } else {
+                                        unlock(right, READ);
+                                        put(right);
+                                        break;
+                                }
+                        } else {
+                                break;
+                        }
+                }
+                whole = taddr_make(taddr_saddr(n->addr), (1 << ilog2(nr + 1)) * taddr_ssize(n->addr));
+                result = SCALL(n->mod, write, whole, nr + 1, vec);
+                CMOD(l[level(n)].pageout_cluster, nr);
                 if (LIKELY(result == 0)) {
                         CINC(write);
-                        CADD(write_bytes, taddr_ssize(n->addr));
+                        CADD(write_bytes, taddr_ssize(whole));
                         n->flags &= ~DIRTY;
                         KDEC(dirty);
+                        for (int i = 0; i < nr; ++i) {
+                                cluster[i]->flags &= ~DIRTY;
+                                KDEC(dirty);
+                        }
                 } else {
                         LOG("Pageout failure: %"PRIx64": %i/%i.\n", n->addr, result, errno);
+                }
+                while (--nr >= 0) {
+                        unlock(cluster[nr], READ);
+                        put(cluster[nr]);
                 }
         }
         unlock(n, READ);
@@ -3141,6 +3204,7 @@ static void counters_print() {
         COUNTER_VAR_PRINT(repage);
         COUNTER_VAR_PRINT(sepcut);
         COUNTER_VAR_PRINT(prefix);
+        COUNTER_VAR_PRINT(pageout_cluster);
         DOUBLE_VAR_PRINT(temperature);
 }
 
@@ -4817,17 +4881,27 @@ static void mso_free(struct t2_storage *storage, taddr_t addr) {
         free((void *)taddr_saddr(addr));
 }
 
-static int mso_read(struct t2_storage *storage, taddr_t addr, void *dst) {
+static int mso_read(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst) {
+        void *src = (void *)taddr_saddr(addr);
+        ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + dst[i].iov_len));
         if (taddr_ssize(addr) <= 4096 && FORALL(i, taddr_ssize(addr) / 8, addr_is_valid((void *)taddr_saddr(addr) + 8 * i))) {
-                memcpy(dst, (void *)taddr_saddr(addr), taddr_ssize(addr));
+                for (int i = 0; i < nr; ++i) {
+                        memcpy(dst[i].iov_base, src, dst[i].iov_len);
+                        src += dst[i].iov_len;
+                }
                 return 0;
         } else {
                 return -ESTALE;
         }
 }
 
-static int mso_write(struct t2_storage *storage, taddr_t addr, void *src) {
-        memcpy((void *)taddr_saddr(addr), src, taddr_ssize(addr));
+static int mso_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src) {
+        void *dst = (void *)taddr_saddr(addr);
+        ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
+        for (int i = 0; i < nr; ++i) {
+                memcpy(dst, src[i].iov_base, src[i].iov_len);
+                dst += src[i].iov_len;
+        }
         return 0;
 }
 
@@ -4888,16 +4962,16 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
 static void file_free(struct t2_storage *storage, taddr_t addr) {
 }
 
-static int file_read(struct t2_storage *storage, taddr_t addr, void *dst) {
+static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst) {
         struct file_storage *fs    = COF(storage, struct file_storage, gen);
         uint64_t             off   = taddr_saddr(addr);
-        int                  count = taddr_ssize(addr);
         int                  result;
+        ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + dst[i].iov_len));
         if (UNLIKELY(off >= fs->free)) {
                 return -ESTALE;
         }
-        result = pread(fs->fd, dst, count, off);
-        if (LIKELY(result == count)) {
+        result = preadv(fs->fd, dst, nr, off);
+        if (LIKELY(result == taddr_ssize(addr))) {
                 return 0;
         } else if (result < 0) {
                 return ERROR(result);
@@ -4906,16 +4980,16 @@ static int file_read(struct t2_storage *storage, taddr_t addr, void *dst) {
         }
 }
 
-static int file_write(struct t2_storage *storage, taddr_t addr, void *src) {
+static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src) {
         struct file_storage *fs    = COF(storage, struct file_storage, gen);
         uint64_t             off   = taddr_saddr(addr);
-        int                  count = taddr_ssize(addr);
         int                  result;
+        ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
         if (UNLIKELY(off >= fs->free)) {
                 return -ESTALE;
         }
-        result = pwrite(fs->fd, src, count, off);
-        if (LIKELY(result == count)) {
+        result = pwritev(fs->fd, src, nr, off);
+        if (LIKELY(result == taddr_ssize(addr))) {
                 return 0;
         } else if (result < 0) {
                 return ERROR(result);
@@ -6144,8 +6218,6 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        wal_ut();
-        counters_print();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -6165,6 +6237,8 @@ int main(int argc, char **argv) {
         mt_ut();
         counters_print();
         open_ut();
+        counters_print();
+        wal_ut();
         counters_print();
         return 0;
 }

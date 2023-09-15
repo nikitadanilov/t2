@@ -6,6 +6,9 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+struct timespec;
+struct iovec;
+
 struct t2;
 struct t2_tree;
 struct t2_buf;
@@ -89,8 +92,8 @@ struct t2_storage_op {
         void     (*fini) (struct t2_storage *storage);
         taddr_t  (*alloc)(struct t2_storage *storage, int shift_min, int shift_max);
         void     (*free) (struct t2_storage *storage, taddr_t addr);
-        int      (*read) (struct t2_storage *storage, taddr_t addr, void *dst);
-        int      (*write)(struct t2_storage *storage, taddr_t addr, void *src);
+        int      (*read) (struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst);
+        int      (*write)(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src);
 };
 
 struct t2_buf {
