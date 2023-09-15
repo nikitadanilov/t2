@@ -4749,7 +4749,7 @@ static void *wal_writer(void *arg) {
                 while (!cds_list_empty(&en->busy)) {
                         wal_write(en, COF(en->busy.prev, struct wal_buf, link)); /* TODO: Handle errors. */
                         wal_report(en);
-                        if ((++writes & (1 << WAL_MAX_WRITES)) == 0) {
+                        if ((++writes & ((1 << WAL_MAX_WRITES) - 1)) == 0) {
                                 wal_writer_chores(en);
                         }
                 }
