@@ -611,6 +611,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_space;
         int64_t wal_write;
         int64_t wal_write_fsync;
+        int64_t wal_cur_aged;
         int64_t wal_get_ready;
         int64_t wal_get_wait;
         struct counter_var wal_space_nr;
@@ -1916,13 +1917,14 @@ static int txadd(struct node *n, enum lock_mode lm, struct t2_txrec *txr, int32_
                                 if (mod->ext[i].len > 0) {
                                         txr[pos] = (struct t2_txrec) {
                                                 .node = (void *)n,
+                                                .addr = n->addr,
                                                 .off  = mod->ext[i].off,
                                                 .part = {
                                                         .len  = mod->ext[i].len,
                                                         .addr = n->data + mod->ext[i].off
                                                 }
                                         };
-                                        *nob += txr->part.len;
+                                        *nob += txr[pos].part.len;
                                         pos++;
                                 }
                         }
@@ -1930,13 +1932,14 @@ static int txadd(struct node *n, enum lock_mode lm, struct t2_txrec *txr, int32_
                 } else {
                         txr[0] = (struct t2_txrec) {
                                 .node = (void *)n,
+                                .addr = n->addr,
                                 .off  = 0,
                                 .part = {
                                         .len  = nsize(n),
                                         .addr = n->data
                                 }
                         };
-                        *nob += txr->part.len;
+                        *nob += txr[0].part.len;
                         pos++;
                 }
         }
@@ -3083,6 +3086,7 @@ static void counters_print() {
         printf("wal.write_fsync:    %10"PRId64"\n", GVAL(wal_write_fsync));
         counter_var_print1(&GVAL(wal_write_seg), "wal.write_seg");
         counter_var_print1(&GVAL(wal_write_nob), "wal.write_nob");
+        printf("wal.cur_aged:       %10"PRId64"\n", GVAL(wal_cur_aged));
         printf("wal.get_ready:      %10"PRId64"\n", GVAL(wal_get_ready));
         printf("wal.get_wait:       %10"PRId64"\n", GVAL(wal_get_wait));
         counter_var_print1(&GVAL(wal_busy),      "wal.busy");
@@ -4354,7 +4358,7 @@ static void wal_buf_start(struct wal_te *en) {
         buf->used = 1;
         buf->idx = 1;
         buf->nob = 2 * sizeof(struct wal_rec);
-        en->cur_age = 0;
+        en->cur_age = time(NULL);
 }
 
 static void wal_buf_end(struct wal_te *en) {
@@ -4414,6 +4418,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 return ERROR(-ENOMEM);
         }
         for (int i = 0; i < nr; ++i) {
+                ASSERT((void *)rec + sizeof *rec + txr[i].part.len <= space + size);
                 *rec = (struct wal_rec) {
                         .magix = REC_MAGIX,
                         .rtype = rtype,
@@ -4716,8 +4721,21 @@ static void wal_dirty(struct t2_te *engine, lsn_t lsn) {
 enum {
         WAL_SLEEP_SEC  = 1,
         WAL_SLEEP_NSEC = 0,
-        WAL_AGE_LIMIT  = 2
+        WAL_AGE_LIMIT  = 2,
+        WAL_MAX_WRITES = 7 /* Shift. */
 };
+
+static void wal_writer_chores(struct wal_te *en) {
+        counters_fold();
+        if (en->cur != NULL && time(NULL) - en->cur_age > WAL_AGE_LIMIT) {
+                wal_buf_end(en);
+                CINC(wal_cur_aged);
+        }
+        if (en->log_start_persistent > en->log_pruned) {
+                wal_log_prune(en);
+                en->log_pruned = en->log_start_persistent;
+        }
+}
 
 static void *wal_writer(void *arg) {
         struct wal_te *en = arg;
@@ -4726,19 +4744,16 @@ static void *wal_writer(void *arg) {
         while (true) {
                 struct timeval  cur;
                 struct timespec deadline;
+                int writes = 0;
                 ASSERT(wal_invariant(en));
-                if (en->cur != NULL && en->cur_age++ > WAL_AGE_LIMIT) {
-                        wal_buf_end(en);
-                }
                 while (!cds_list_empty(&en->busy)) {
                         wal_write(en, COF(en->busy.prev, struct wal_buf, link)); /* TODO: Handle errors. */
                         wal_report(en);
+                        if ((++writes & (1 << WAL_MAX_WRITES)) == 0) {
+                                wal_writer_chores(en);
+                        }
                 }
-                if (en->log_start_persistent > en->log_pruned) {
-                        wal_log_prune(en);
-                        en->log_pruned = en->log_start_persistent;
-                }
-                counters_fold();
+                wal_writer_chores(en);
                 if (en->shutdown) {
                         break;
                 }
