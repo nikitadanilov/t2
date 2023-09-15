@@ -131,22 +131,25 @@ done
 run $CC $CFLAGS -DUT=1 -BN=0 t2.c $LDFLAGS -o ut
 run $CC $CFLAGS -DUT=0 -DBN=1 -c t2.c
 if [ $rocksdb == 1 ] ;then
-   BN_CFLAGS="-DUSE_ROCKSDB=1 $ROCKSDB_LDFLAGS"
+   BN_CFLAGS="-DUSE_ROCKSDB=1"
+   BN_LDFLAGS="$ROCKSDB_LDFLAGS"
 else
    BN_CFLAGS="-DUSE_ROCKSDB=0"
 fi
 if [ $lmdb == 1 ] ;then
-   BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=1 $LMDB_LDFLAGS"
+   BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=1"
+   BN_LDFLAGS="$BN_LDFLAGS $LMDB_LDFLAGS"
 else
    BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=0"
 fi
 if [ $map == 1 ] ;then
    run $CPP $MAP_CFLAGS -c map.cpp -o map.o
-   BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=1 map.o $MAP_LDFLAGS"
+   BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=1"
+   BN_LDFLAGS="$BN_LDFLAGS map.o $MAP_LDFLAGS"
 else
    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=0"
 fi
-run $CC $CFLAGS $BN_CFLAGS bn.c t2.o $LDFLAGS -o bn
+run $CC $CFLAGS $BN_CFLAGS bn.c t2.o $BN_LDFLAGS $LDFLAGS -o bn
 if [ $runut == 1 ] ;then
    ./ut
 fi
