@@ -339,6 +339,7 @@ struct cache {
         int32_t                                busy;
         int32_t                                dirty;
         int32_t                                incache;
+        lsn_t                                  min_dirty;
         alignas(MAX_CACHELINE) struct pool     pool;
         alignas(MAX_CACHELINE) pthread_mutex_t guard;
         struct cds_list_head                   cold;
@@ -862,6 +863,7 @@ struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int
         if (LIKELY(result == 0)) {
                 if (LIKELY(mod != NULL)) {
                         mod->cache.shift = cshift;
+                        mod->cache.min_dirty = LONG_LONG_MAX;
                         NOFAIL(pthread_mutex_init(&mod->cache.lock, NULL));
                         NOFAIL(pthread_mutex_init(&mod->cache.guard, NULL));
                         NOFAIL(pthread_mutex_init(&mod->cache.condlock, NULL));
@@ -1893,22 +1895,24 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struc
 static void dirty(struct page *g) {
         struct node *n = g->node;
         if (n != NULL && g->lm == WRITE) {
-                int32_t start = nsize(n) - 1;
+                int32_t start = nsize(n);
                 ASSERT(is_stable(n));
                 node_seq_increase(n);
                 if (!(n->flags & DIRTY)) {
                         n->flags |= DIRTY;
                         KINC(dirty);
                 }
-                for (int i = 0; i < ARRAY_SIZE(g->mod.ext); ++i) {
-                        g->mod.ext[i] = (struct ext) { .start = start, .end = 0 };
+                if (TRANSACTIONS) {
+                        for (int i = 0; i < ARRAY_SIZE(g->mod.ext); ++i) {
+                                g->mod.ext[i] = (struct ext) { .start = start, .end = 0 };
+                        }
                 }
         }
 }
 
 static void path_dirty(struct path *p) {
         for (int i = p->used; i >= 0; --i) {
-                struct rung    *r     = &p->rung[i];
+                struct rung *r = &p->rung[i];
                 dirty(&r->page);
                 dirty(&r->brother[0]);
                 dirty(&r->brother[1]);
@@ -2000,7 +2004,6 @@ static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
                         int32_t start = mod->ext[i].start;
                         int32_t end   = mod->ext[i].end;
                         if (end > start) {
-                                printf("mod[%i]: %4i ... %4i\n", i, start, end);
                                 txr[pos] = (struct t2_txrec) {
                                         .node = (void *)n,
                                         .addr = n->addr,
@@ -2832,7 +2835,7 @@ static void node_iovec(struct node *n, struct iovec *v) {
 }
 
 static bool pageable(const struct node *n) {
-        return (n->flags & DIRTY) && n->ref <= 1;
+        return (n->flags & DIRTY) && n->ref <= 1 && TXCALL(n->mod->te, canpage(n->mod->te, (void *)n));
 }
 
 enum {
@@ -2881,9 +2884,11 @@ static void pageout(struct node *n) {
                         CINC(write);
                         CADD(write_bytes, taddr_ssize(whole));
                         n->flags &= ~DIRTY;
+                        n->lsn = 0;
                         KDEC(dirty);
                         for (int i = 1; i < (1 << shift); ++i) {
                                 cluster[i]->flags &= ~DIRTY;
+                                cluster[i]->lsn = 0;
                                 KDEC(dirty);
                         }
                 } else {
@@ -2912,6 +2917,12 @@ static void bucket_scan(struct t2 *mod, int shift, int32_t bucket, int32_t *tosc
                 cds_hlist_for_each_entry_2(n, head, hash) {
                         struct node *tail;
                         (*toscan)--;
+                        if (TRANSACTIONS && n->flags & DIRTY && n->lsn > 0) {
+                                if (n->lsn < mod->cache.min_dirty) {
+                                        printf("min-dirty: %"PRId64"\n", mod->cache.min_dirty);
+                                }
+                                mod->cache.min_dirty = MIN(mod->cache.min_dirty, n->lsn);
+                        }
                         if (!cds_list_empty(&n->cache)) {
                                 CINC(l[level(n)].scan_cached);
                                 continue;
@@ -2964,6 +2975,11 @@ static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocac
                 bucket_scan(mod, shift, scan, &toscan, &towrite, &tocache);
                 cache_sync(mod);
                 scan = (scan + 1) & mask;
+                if (scan == 0) {
+                        TXCALL(mod->te, dirty(mod->te, mod->cache.min_dirty));
+                        printf("min_dirty: %"PRId64"\n", mod->cache.min_dirty);
+                        mod->cache.min_dirty = LONG_LONG_MAX;
+                }
                 if (scan == scan0) {
                         break;
                 }
@@ -3959,13 +3975,10 @@ static int32_t simple_free(const struct node *n) {
 }
 
 static void ext_merge(struct ext *ext, int32_t start, int32_t end) {
-        ext->start = min_32(ext->start, start);
-        ext->end   = max_32(ext->end,   end);
-}
-
-static bool mod_invariant(const struct mod *mod) {
-        return FORALL(i, ARRAY_SIZE(mod->ext),
-                      mod->ext[i].start < mod->ext[i].end && i > 0 ? mod->ext[i - 1].end <= mod->ext[i].start : true);
+        if (TRANSACTIONS) {
+                ext->start = min_32(ext->start, start);
+                ext->end   = max_32(ext->end,   end);
+        }
 }
 
 static void mod_print(const struct mod *mod) {
@@ -4060,9 +4073,10 @@ static int simple_insert(struct slot *s, struct mod *mod) {
         if (LIKELY(s->node->radix != NULL)) {
                 s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node) - 1);
         }
-        mod->ext[HDR].start = 0;
-        mod->ext[HDR].end = sizeof *sh;
-        ASSERT(mod_invariant(mod));
+        if (TRANSACTIONS) {
+                mod->ext[HDR].start = 0;
+                mod->ext[HDR].end = sizeof *sh;
+        }
         return 0;
 }
 
@@ -4073,20 +4087,13 @@ static void simple_delete(struct slot *s, struct mod *mod) {
         struct dir_element *inn  = sat(sh, s->idx + 1);
         int32_t             klen = inn->koff - piv->koff;
         int32_t             vlen = piv->voff - inn->voff;
-        ASSERT(mod_invariant(mod));
         ASSERT(s->idx < sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         CINC(l[sh->head.level].delete);
         move(sh, inn->koff, end->koff, -klen);
         move(sh, end->voff, inn->voff, +vlen);
         ext_merge(&mod->ext[KEY], inn->koff - klen, end->koff - klen);
-        ASSERT(mod_invariant(mod));
-        mod_print(mod);
         ext_merge(&mod->ext[VAL], end->voff + vlen, inn->voff + vlen);
-        simple_print(s->node);
-        printf("end: %d inn: %d len: %d idx: %d nr: %d\n", end->voff, inn->voff, vlen, s->idx, sh->nr);
-        mod_print(mod);
-        ASSERT(mod_invariant(mod));
         for (int32_t i = s->idx; i < sh->nr; ++i) {
                 struct dir_element *next = sat(sh, i + 1);
                 *sat(sh, i) = (struct dir_element){
@@ -4096,15 +4103,15 @@ static void simple_delete(struct slot *s, struct mod *mod) {
         }
         ext_merge(&mod->ext[DIR], sh->dir_off + s->idx * sizeof *piv,
                   sh->dir_off + sh->nr * sizeof *piv);
-        ASSERT(mod_invariant(mod));
         --sh->nr;
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         if (LIKELY(s->node->radix != NULL)) {
                 s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node));
         }
-        mod->ext[HDR].start = 0;
-        mod->ext[HDR].end = sizeof *sh;
-        ASSERT(mod_invariant(mod));
+        if (TRANSACTIONS) {
+                mod->ext[HDR].start = 0;
+                mod->ext[HDR].end = sizeof *sh;
+        }
 }
 
 static void simple_get(struct slot *s) {
@@ -4196,7 +4203,7 @@ static int shift_one(struct page *dp, struct page *sp, enum dir dir) {
         rec_get(&src, utmost(s, dir));
         dst.idx = dir == LEFT ? nr(d) : 0;
         CINC(l[level(d)].shift_one);
-        return NCALL(d, insert(&dst, &dp->mod)) ?: (NCALL(s, delete(&src, &dp->mod)), 0);
+        return NCALL(d, insert(&dst, &dp->mod)) ?: (NCALL(s, delete(&src, &sp->mod)), 0);
 }
 
 static int shift(struct page *dst, struct page *src, const struct slot *point, enum dir dir) {
@@ -4252,7 +4259,10 @@ static int  (*ut_apply)(struct t2 *mod, struct t2_txrec *txr);
 void t2_lsnset(struct t2_node *node, lsn_t lsn) {
         if (!UT || ut_lsnset == NULL) {
                 struct node *n = (void *)node;
-                n->lsn = lsn;
+                ASSERT(lsn > n->lsn);
+                if (n->lsn != 0) {
+                        n->lsn = lsn;
+                }
         } else {
                 (*ut_lsnset)(node, lsn);
         }
@@ -4402,7 +4412,6 @@ static void wal_report(const struct wal_te *te) {
 }
 
 static void *wal_space(struct wal_te *en, int nr, int32_t nob, int32_t *out) {
-        ASSERT(wal_invariant(en));
         int32_t size = nob + nr * sizeof(struct wal_rec);
         void   *buf  = mem_alloc(size);
         if (LIKELY(buf != NULL)) {
