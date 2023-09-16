@@ -353,10 +353,11 @@ struct cache {
 struct slot;
 struct node;
 struct path;
+struct mod;
 
 struct node_type_ops {
-        int     (*insert)    (struct slot *);
-        void    (*delete)    (struct slot *);
+        int     (*insert)    (struct slot *, struct mod *);
+        void    (*delete)    (struct slot *, struct mod *);
         void    (*get)       (struct slot *);
         int     (*load)      (struct node *n);
         void    (*make)      (struct node *n);
@@ -387,6 +388,8 @@ struct t2_tree {
         taddr_t              root;
         uint32_t             id;
 };
+
+struct page;
 
 struct slot {
         struct node   *node;
@@ -437,15 +440,6 @@ enum ext_id {
         M_NR
 };
 
-struct ext {
-        int32_t off;
-        int32_t len;
-};
-
-struct mod {
-        struct ext ext[M_NR];
-};
-
 struct node {
         struct cds_hlist_node      hash;
         taddr_t                    addr;
@@ -460,7 +454,6 @@ struct node {
         lsn_t                      lsn;
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
-        struct mod                 range;
         struct rcu_head            rcu;
 };
 
@@ -468,6 +461,22 @@ enum lock_mode {
         NONE,
         READ,
         WRITE
+};
+
+struct ext {
+        int32_t start;
+        int32_t end;
+};
+
+struct mod {
+        struct ext ext[M_NR];
+};
+
+struct page {
+        struct node    *node;
+        uint64_t        seq;
+        enum lock_mode  lm;
+        struct mod      mod;
 };
 
 enum rung_flags {
@@ -501,17 +510,14 @@ struct pstate {
 struct sibling {
         struct node   *node;
         enum lock_mode lm;
-        uint64_t       seq;
 };
 
 struct rung {
-        struct node   *node;
-        uint64_t       seq;
+        struct page    page;
         uint64_t       flags;
-        enum lock_mode lm;
         int32_t        pos;
-        struct node   *allocated;
-        struct sibling brother[2];
+        struct page    allocated;
+        struct page    brother[2];
         struct t2_buf  keyout;
         struct t2_buf  valout;
         struct pstate  pd;
@@ -526,7 +532,7 @@ struct path {
         struct t2_rec  *rec;
         enum optype     opt;
         struct t2_tx   *tx;
-        struct node    *newroot;
+        struct page     newroot;
 };
 
 struct policy {
@@ -751,7 +757,7 @@ static int32_t utmost(const struct node *n, enum dir d);
 static void lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static void touch_unlock(struct node *n, enum lock_mode mode);
-static void dirty(struct node *n, enum lock_mode lm);
+static void dirty(struct page *g);
 static void radixmap_update(struct node *n);
 static struct header *nheader(const struct node *n);
 static void rcu_lock();
@@ -759,8 +765,8 @@ static void rcu_unlock();
 static void rcu_leave(struct path *p, struct node *extra);
 static bool rcu_try(struct path *p, struct node *extra);
 static bool rcu_enter(struct path *p, struct node *extra);
-static int simple_insert(struct slot *s);
-static void simple_delete(struct slot *s);
+static int simple_insert(struct slot *s, struct mod *mod);
+static void simple_delete(struct slot *s, struct mod *mod);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n);
 static int simple_load(struct node *n);
@@ -775,8 +781,8 @@ static void simple_print(struct node *n);
 static bool simple_invariant(const struct node *n);
 static int simple_keycmp(const struct node *n, int pos, void *addr, int32_t len, uint64_t mask);
 static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
-static int shift(struct node *d, struct node *s, const struct slot *insert, enum dir dir);
-static int merge(struct node *d, struct node *s, enum dir dir);
+static int shift(struct page *d, struct page *s, const struct slot *insert, enum dir dir);
+static int merge(struct page *d, struct page *s, enum dir dir);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
 static struct t2_tx *wal_make(struct t2_te *te);
@@ -1074,13 +1080,13 @@ void t2_tree_close(struct t2_tree *t) {
         mem_free(t);
 }
 
-static int rec_insert(struct node *n, int32_t idx, struct t2_rec *r) {
+static int rec_insert(struct node *n, int32_t idx, struct t2_rec *r, struct mod *mod) {
         CMOD(l[level(n)].recpos, 100 * idx / (nr(n) + 1));
-        return NCALL(n, insert(&(struct slot) { .node = n, .idx = idx, .rec  = *r }));
+        return NCALL(n, insert(&(struct slot) { .node = n, .idx = idx, .rec  = *r }, mod));
 }
 
-static void rec_delete(struct node *n, int32_t idx) {
-        NCALL(n, delete(&(struct slot) { .node = n, .idx = idx }));
+static void rec_delete(struct node *n, int32_t idx, struct mod *mod) {
+        NCALL(n, delete(&(struct slot) { .node = n, .idx = idx }, mod));
 }
 
 static void rec_get(struct slot *s, int32_t idx) {
@@ -1108,7 +1114,7 @@ static int cookie_node_complete(struct t2_tree *t, struct path *p, struct node *
                 break;
         case INSERT:
                 if (!found) {
-                        result = rec_insert(n, s.idx + 1, r);
+                        result = rec_insert(n, s.idx + 1, r, NULL); /* TODO: Update modification tracking. */
                         if (result == -ENOSPC) {
                                 result = -ESTALE;
                         }
@@ -1119,7 +1125,7 @@ static int cookie_node_complete(struct t2_tree *t, struct path *p, struct node *
         case DELETE:
                 if (found) {
                         if (keep(n)) {
-                                rec_delete(n, s.idx);
+                                rec_delete(n, s.idx, NULL);
                                 result = 0;
                         } else {
                                 result = -ESTALE;
@@ -1153,7 +1159,7 @@ static int cookie_try(struct path *p) {
                                 /* TODO: Re-check node. */
                                 result = cookie_node_complete(p->tree, p, n, p->opt);
                                 if (result == 0) {
-                                        dirty(n, mode);
+                                        dirty(NULL); /* TODO: Modification tracking. */
                                         /* TODO: Add to the transaction. */
                                 }
                                 touch_unlock(n, mode);
@@ -1597,40 +1603,42 @@ static void rec_todo(struct path *p, int idx, struct slot *out) {
 
 static void internal_parent_rec(struct path *p, int idx) {
         struct rung  *r = &p->rung[idx];
-        SLOT_DEFINE(s, r->node);
+        SLOT_DEFINE(s, r->page.node);
         int32_t       maxlen;
         int32_t       keylen;
-        ASSERT(nr(r->node) > 0);
-        ASSERT(r->allocated != NULL);
+        ASSERT(nr(r->page.node) > 0);
+        ASSERT(r->allocated.node != NULL);
         rec_todo(p, idx, &s);
         maxlen = buf_len(s.rec.key);
         r->keyout = *s.rec.key;
-        for (int32_t i = 0; i < nr(r->node); ++i) {
+        for (int32_t i = 0; i < nr(r->page.node); ++i) {
                 rec_get(&s, i);
-                buf_clip_node(s.rec.key, r->node);
+                buf_clip_node(s.rec.key, r->page.node);
                 keylen = buf_len(s.rec.key);
                 if (keylen > maxlen) {
                         maxlen = keylen;
                         r->keyout = *s.rec.key;
                 }
         }
-        ptr_buf(r->allocated, &r->valout);
+        ptr_buf(r->allocated.node, &r->valout);
 }
 
 static int newnode(struct path *p, int idx) {
        struct rung *r = &p->rung[idx];
-       if (r->allocated == NULL) {
-               r->allocated = alloc(p->tree, level(r->node));
-               if (EISERR(r->allocated)) {
-                       return ERROR(ERRCODE(r->allocated));
+       if (r->allocated.node == NULL) {
+               r->allocated.node = alloc(p->tree, level(r->page.node));
+               if (EISERR(r->allocated.node)) {
+                       return ERROR(ERRCODE(r->allocated.node));
                }
+               r->allocated.lm = WRITE;
        }
        if (idx == 0) { /* Hodie natus est radici frater. */
                if (LIKELY(p->used + 1 < MAX_TREE_HEIGHT)) {
-                       p->newroot = alloc(p->tree, level(r->node) + 1);
-                       if (EISERR(r->allocated)) {
-                               return ERROR(ERRCODE(p->newroot));
+                       p->newroot.node = alloc(p->tree, level(r->page.node) + 1);
+                       if (EISERR(r->allocated.node)) {
+                               return ERROR(ERRCODE(p->newroot.node));
                        } else {
+                               p->newroot.lm = WRITE;
                                return +1; /* Done. */
                        }
                } else {
@@ -1650,31 +1658,34 @@ static int split_right_plan_insert(struct path *p, int idx) {
 
 static int split_right_exec_insert(struct path *p, int idx) {
         struct rung *r = &p->rung[idx];
-        struct node *left = r->node;
-        struct node *right = r->allocated;
+        struct node *left = r->page.node;
+        struct node *right = r->allocated.node;
         SLOT_DEFINE(s, NULL);
         int result = 0;
         rec_todo(p, idx, &s);
         /* Maybe ->plan() overestimated keysize and shift is not needed. */
         if (right != NULL && !can_insert(left, &s.rec)) {
                 s.idx = r->pos + 1;
-                result = shift(right, left, &s, RIGHT);
+                result = shift(&r->allocated, &r->page, &s, RIGHT);
                 ASSERT(nr(left) > 0);
                 ASSERT(nr(right) > 0);
                 r->flags |= ALUSED;
         }
         if (LIKELY(result == 0)) {
+                struct page *p;
                 if (r->pos < nr(left)) {
                         s.node = left;
                         s.idx  = r->pos;
+                        p = &r->page;
                 } else {
                         ASSERT(right != NULL);
                         s.node = right;
                         s.idx  = r->pos - nr(left);
+                        p = &r->allocated;
                 }
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
-                NOFAIL(NCALL(s.node, insert(&s)));
+                NOFAIL(NCALL(s.node, insert(&s, &p->mod)));
                 EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node));
                 if (r->flags & ALUSED) {
                         struct t2_buf lkey = {};
@@ -1699,7 +1710,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
         return result;
 }
 
-static struct sibling *brother(struct rung *r, enum dir d) {
+static struct page *brother(struct rung *r, enum dir d) {
         ASSERT(d == LEFT || d == RIGHT);
         return &r->brother[d > 0];
 }
@@ -1717,15 +1728,16 @@ static bool can_merge(struct node *n0, struct node *n1) {
         return NCALL(n0, can_merge(n0, n1));
 }
 
-static void delete_update(struct path *p, int idx, struct slot *s) {
+static void delete_update(struct path *p, int idx, struct slot *s, struct page *g) {
         ASSERT(idx < p->used);
-        NCALL(s->node, delete(s));
+        ASSERT(g->node == s->node);
+        NCALL(s->node, delete(s, &g->mod));
         if (p->rung[idx + 1].flags & SEPCHG) {
                 struct node  *child = brother(&p->rung[idx + 1], RIGHT)->node;
                 struct t2_buf cptr;
                 SLOT_DEFINE(sub, child);
                 {       /* A new scope for the second SLOT_DEFINE(). */
-                        SLOT_DEFINE(leaf, p->rung[p->used].node);
+                        SLOT_DEFINE(leaf, p->rung[p->used].page.node);
                         ASSERT(child != NULL && !is_leaf(child));
                         rec_get(&sub, 0);
                         *s->rec.key = *sub.rec.key;
@@ -1733,45 +1745,45 @@ static void delete_update(struct path *p, int idx, struct slot *s) {
                         /* Take the rightmost key in the leaf. */
                         rec_get(&leaf, nr(leaf.node) - 1);
                         prefix_separator(leaf.rec.key, s->rec.key, level(s->node));
-                        NOFAIL(NCALL(s->node, insert(s)));
+                        NOFAIL(NCALL(s->node, insert(s, &g->mod)));
                 }
         }
 }
 
 static bool utmost_path(struct path *p, int idx, enum dir d) {
-        return FORALL(i, idx, p->rung[i].lm == WRITE ? p->rung[i].pos == utmost(p->rung[i].node, d) : true);
+        return FORALL(i, idx, p->rung[i].page.lm == WRITE ? p->rung[i].pos == utmost(p->rung[i].page.node, d) : true);
 }
 
 static int split_right_exec_delete(struct path *p, int idx) {
         int result = 0;
         struct rung *r = &p->rung[idx];
         struct node *right = brother(r, RIGHT)->node;
-        SLOT_DEFINE(s, r->node);
-        if (!is_leaf(r->node)) {
-                if (UNLIKELY(nr(p->rung[idx + 1].node) == 0)) { /* Rightmost in the tree. */
+        SLOT_DEFINE(s, r->page.node);
+        if (!is_leaf(r->page.node)) {
+                if (UNLIKELY(nr(p->rung[idx + 1].page.node) == 0)) { /* Rightmost in the tree. */
                         ASSERT(utmost_path(p, idx, RIGHT));
                         s.idx = r->pos;
-                        NCALL(s.node, delete(&s));
-                } else if (r->pos + 1 < nr(r->node)) {
+                        NCALL(s.node, delete(&s, &r->page.mod));
+                } else if (r->pos + 1 < nr(r->page.node)) {
                         s.idx = r->pos + 1;
-                        delete_update(p, idx, &s);
+                        delete_update(p, idx, &s, &r->page);
                 } else {
                         ASSERT(right != NULL);
                         s.node = right;
                         s.idx = 0;
-                        delete_update(p, idx, &s);
+                        delete_update(p, idx, &s, brother(r, RIGHT));
                         r->flags |= SEPCHG;
                         result = +1;
                 }
         }
-        if (right != NULL && can_merge(r->node, right)) {
+        if (right != NULL && can_merge(r->page.node, right)) {
                 ASSERT(nr(right) > 0);
-                NOFAIL(merge(r->node, right, LEFT)); /* TODO: deallocate the empty node. */
-                ASSERT(nr(r->node) > 0);
-                EXPENSIVE_ASSERT(is_sorted(r->node));
+                NOFAIL(merge(&r->page, brother(r, RIGHT), LEFT)); /* TODO: deallocate the empty node. */
+                ASSERT(nr(r->page.node) > 0);
+                EXPENSIVE_ASSERT(is_sorted(r->page.node));
                 r->flags &= ~SEPCHG;
                 result = +1;
-        } else if (UNLIKELY(nr(r->node) == 0)) {
+        } else if (UNLIKELY(nr(r->page.node) == 0)) {
                 ASSERT(utmost_path(p, idx, RIGHT));
                 return +1;
         }
@@ -1788,7 +1800,7 @@ static int shift_plan_insert(struct path *p, int idx) {
         struct node *left  = neighbour(p, idx,  LEFT, WRITE);
         struct node *right = neighbour(p, idx, RIGHT, WRITE);
         if (UNLIKELY(EISOK(left) && EISOK(right))) {
-                if (can_fit(left, r->node, right, NULL)) {
+                if (can_fit(left, r->page.node, right, NULL)) {
                         return 0;
                 }
                 result = newnode(p, idx);
@@ -1835,8 +1847,9 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struc
         p->opt  = opt;
 }
 
-static void dirty(struct node *n, enum lock_mode lm) {
-        if (n != NULL && lm == WRITE) {
+static void dirty(struct page *g) {
+        struct node *n = g->node;
+        if (n != NULL && g->lm == WRITE) {
                 ASSERT(is_stable(n));
                 node_seq_increase(n);
                 if (!(n->flags & DIRTY)) {
@@ -1849,34 +1862,32 @@ static void dirty(struct node *n, enum lock_mode lm) {
 static void path_dirty(struct path *p) {
         for (int i = p->used; i >= 0; --i) {
                 struct rung    *r     = &p->rung[i];
-                struct sibling *left  = brother(r, LEFT);
-                struct sibling *right = brother(r, RIGHT);
-                dirty(r->node, r->lm);
-                dirty(left->node, left->lm);
-                dirty(right->node, right->lm);
-                dirty(r->allocated, WRITE);
+                dirty(&r->page);
+                dirty(&r->brother[0]);
+                dirty(&r->brother[1]);
+                dirty(&r->allocated);
         }
-        dirty(p->newroot, WRITE);
+        dirty(&p->newroot);
 }
 
 static void path_lock(struct path *p) {
         /* Top to bottom, left to right. */
-        if (UNLIKELY(p->newroot != NULL)) {
-                lock(p->newroot, WRITE);
+        if (UNLIKELY(p->newroot.node != NULL)) {
+                lock(p->newroot.node, WRITE);
         }
         for (int i = 0; i <= p->used; ++i) {
                 struct rung *r = &p->rung[i];
-                struct sibling *left  = brother(r, LEFT);
-                struct sibling *right = brother(r, RIGHT);
+                struct page *left  = brother(r, LEFT);
+                struct page *right = brother(r, RIGHT);
                 if (left->node != NULL) {
                         lock(left->node, left->lm);
                 }
-                lock(r->node, r->lm);
+                lock(r->page.node, r->page.lm);
                 if (right->node != NULL) {
                         lock(right->node, right->lm);
                 }
-                if (r->allocated != NULL) {
-                        lock(r->allocated, WRITE);
+                if (r->allocated.node != NULL) {
+                        lock(r->allocated.node, WRITE);
                 }
         }
 }
@@ -1884,41 +1895,41 @@ static void path_lock(struct path *p) {
 static void path_fini(struct path *p) {
         for (; p->used >= 0; --p->used) {
                 struct rung *r = &p->rung[p->used];
-                struct sibling *left  = brother(r, LEFT);
-                struct sibling *right = brother(r, RIGHT);
+                struct page *left  = brother(r, LEFT);
+                struct page *right = brother(r, RIGHT);
                 if (UNLIKELY(right->node != NULL)) {
                         touch_unlock(right->node, right->lm);
                         put(right->node);
                 }
-                touch_unlock(r->node, r->lm);
+                touch_unlock(r->page.node, r->page.lm);
                 if (UNLIKELY(left->node != NULL)) {
                         touch_unlock(left->node, left->lm);
                         put(left->node);
                 }
                 if (r->flags & PINNED) {
-                        put(r->node);
+                        put(r->page.node);
                 }
-                if (UNLIKELY(r->allocated != NULL)) {
-                        touch_unlock(r->allocated, WRITE);
+                if (UNLIKELY(r->allocated.node != NULL)) {
+                        touch_unlock(r->allocated.node, WRITE);
                         if (LIKELY(r->flags & ALUSED)) {
-                                put(r->allocated);
+                                put(r->allocated.node);
                         } else {
-                                dealloc(r->allocated);
+                                dealloc(r->allocated.node);
                         }
                 }
                 buf_free(&r->scratch);
         }
         p->used = -1;
-        if (UNLIKELY(p->newroot != NULL)) {
-                touch_unlock(p->newroot, WRITE);
-                put(p->newroot);
+        if (UNLIKELY(p->newroot.node != NULL)) {
+                touch_unlock(p->newroot.node, WRITE);
+                put(p->newroot.node);
         }
 }
 
 static void path_reset(struct path *p) {
         path_fini(p);
         memset(&p->rung, 0, sizeof p->rung);
-        p->newroot = NULL;
+        SET0(&p->newroot.node);
         p->next = p->tree->root;
         CINC(traverse_restart);
 }
@@ -1927,44 +1938,31 @@ static void path_pin(struct path *p) {
         for (int i = p->used; i >= 0; --i) {
                 struct rung *r = &p->rung[i];
                 if (!(r->flags & PINNED)) {
-                        ref(r->node);
+                        ref(r->page.node);
                         r->flags |= PINNED;
                 }
         }
 }
 
-static int txadd(struct node *n, enum lock_mode lm, struct t2_txrec *txr, int32_t *nob, struct mod *mod) {
-        int pos = 0;
-        if (n != NULL && lm == WRITE) {
-                if (mod != NULL) {
-                        for (int i = 0; i < ARRAY_SIZE(mod->ext); ++i) {
-                                if (mod->ext[i].len > 0) {
-                                        txr[pos] = (struct t2_txrec) {
-                                                .node = (void *)n,
-                                                .addr = n->addr,
-                                                .off  = mod->ext[i].off,
-                                                .part = {
-                                                        .len  = mod->ext[i].len,
-                                                        .addr = n->data + mod->ext[i].off
-                                                }
-                                        };
-                                        *nob += txr[pos].part.len;
-                                        pos++;
-                                }
+static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
+        struct node *n   = g->node;
+        struct mod  *mod = &g->mod;
+        int          pos = 0;
+        if (n != NULL && g->lm == WRITE) {
+                for (int i = 0; i < ARRAY_SIZE(mod->ext); ++i) {
+                        if (mod->ext[i].end > mod->ext[i].start) {
+                                txr[pos] = (struct t2_txrec) {
+                                        .node = (void *)n,
+                                        .addr = n->addr,
+                                        .off  = mod->ext[i].start,
+                                        .part = {
+                                                .len  = mod->ext[i].end - mod->ext[i].start,
+                                                .addr = n->data + mod->ext[i].start
+                                        }
+                                };
+                                *nob += txr[pos].part.len;
+                                pos++;
                         }
-                        SET0(mod);
-                } else {
-                        txr[0] = (struct t2_txrec) {
-                                .node = (void *)n,
-                                .addr = n->addr,
-                                .off  = 0,
-                                .part = {
-                                        .len  = nsize(n),
-                                        .addr = n->data
-                                }
-                        };
-                        *nob += txr[0].part.len;
-                        pos++;
                 }
         }
         return pos;
@@ -1978,52 +1976,51 @@ static void path_txadd(struct path *p) {
                 int32_t         nob = 0;
                 for (int i = 0; i <= p->used; ++i) {
                         struct rung *r = &p->rung[p->used];
-                        struct sibling *left  = brother(r, LEFT);
-                        struct sibling *right = brother(r, RIGHT);
-                        pos += txadd(left->node,   left->lm,  &txr[pos], &nob, &left->node->range);
-                        pos += txadd(r->node,      r->lm,     &txr[pos], &nob, &r->node->range);
-                        pos += txadd(right->node,  right->lm, &txr[pos], &nob, &right->node->range);
+                        pos += txadd(brother(r, LEFT),  &txr[pos], &nob);
+                        pos += txadd(&r->page,          &txr[pos], &nob);
+                        pos += txadd(brother(r, RIGHT), &txr[pos], &nob);
                         if (r->flags & ALUSED) {
-                                pos += txadd(r->allocated, WRITE, &txr[pos], &nob, &r->allocated->range);
+                                pos += txadd(&r->allocated, &txr[pos], &nob);
                         }
                 }
+                pos += txadd(&p->newroot, &txr[pos], &nob);
                 TXCALL(te, post(te, p->tx, nob, pos, txr));
         }
 }
 
 static bool rung_validity_invariant(const struct path *p, int i) {
         const struct rung *r    = &p->rung[i];
-        const struct node *n    = r->node;
+        const struct node *n    = r->page.node;
         const struct rung *prev = &p->rung[i - 1];
         return is_stable(n) &&
                 (!is_leaf(n) ? r->pos < nr(n) : true) &&
                 (i == 0 ? p->tree->root == n->addr :
-                 (prev->lm != WRITE) || (n->addr == internal_get(prev->node, prev->pos) &&
-                                         level(prev->node) == level(n) + 1)) &&
+                 (prev->page.lm != WRITE) || (n->addr == internal_get(prev->page.node, prev->pos) &&
+                                         level(prev->page.node) == level(n) + 1)) &&
                 (i == p->used) == is_leaf(n);
 }
 
 static bool rung_is_valid(const struct path *p, int i) {
         const struct rung *r        = &p->rung[i];
-        struct sibling    *left     = brother((struct rung *)r, LEFT);
-        struct sibling    *right    = brother((struct rung *)r, RIGHT);
-        bool               is_valid = node_seq_is_valid(r->node, r->seq) &&
+        struct page       *left     = brother((struct rung *)r, LEFT);
+        struct page       *right    = brother((struct rung *)r, RIGHT);
+        bool               is_valid = node_seq_is_valid(r->page.node, r->page.seq) &&
                 (left->node  != NULL ? node_seq_is_valid(left->node,  left->seq)  : true) &&
                 (right->node != NULL ? node_seq_is_valid(right->node, right->seq) : true);
-        ASSERT(is_valid && r->lm == WRITE ? rung_validity_invariant(p, i) : true);
+        ASSERT(is_valid && r->page.lm == WRITE ? rung_validity_invariant(p, i) : true);
         return is_valid;
 }
 
 static void path_add(struct path *p, struct node *n, uint64_t flags) {
         struct rung *r = &p->rung[++p->used];
         ASSERT(IS_IN(p->used + 1, p->rung));
-        r->node = n;
-        r->seq  = node_seq(n);
-        r->flags = flags;
+        r->page.node = n;
+        r->page.seq  = node_seq(n);
+        r->flags     = flags;
 }
 
 static bool path_is_valid(const struct path *p) {
-        return p->rung[0].node->addr == p->tree->root && FORALL(i, p->used + 1, rung_is_valid(p, i));
+        return p->rung[0].page.node->addr == p->tree->root && FORALL(i, p->used + 1, rung_is_valid(p, i));
 }
 
 static bool can_insert(const struct node *n, const struct t2_rec *r) {
@@ -2042,7 +2039,7 @@ static int32_t utmost(const struct node *n, enum dir d) {
 static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode) {
         struct node    *down = NULL;
         struct rung    *r    = &p->rung[idx];
-        struct sibling *br   = brother(r, d);
+        struct page    *br   = brother(r, d);
         int             i;
         if (br->node != NULL) {
                 ASSERT(br->lm == mode);
@@ -2051,21 +2048,21 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
         for (i = idx - 1; i >= 0; --i) {
                 r = &p->rung[i];
                 ASSERT(brother(r, d)->node == NULL);
-                if (r->pos != utmost(r->node, d)) {
+                if (r->pos != utmost(r->page.node, d)) {
                         break;
                 }
         }
         if (i < 0) {
                 return NULL;
         }
-        ASSERT(r->lm == NONE || r->lm == mode);
-        r->lm = mode;
-        down = internal_child(r->node, r->pos + d, false);
+        ASSERT(r->page.lm == NONE || r->page.lm == mode);
+        r->page.lm = mode;
+        down = internal_child(r->page.node, r->pos + d, false);
         while (down != NULL && EISOK(down)) {
                 r = &p->rung[++i];
-                ASSERT(r->lm == NONE || r->lm == mode);
-                r->lm = mode;
-                *brother(r, d) = (struct sibling) { .node = down, .lm = mode, .seq = node_seq(down) };
+                ASSERT(r->page.lm == NONE || r->page.lm == mode);
+                r->page.lm = mode;
+                *brother(r, d) = (struct page) { .node = down, .lm = mode, .seq = node_seq(down) };
                 if (i == idx) {
                         break;
                 }
@@ -2085,15 +2082,15 @@ static int insert_prep(struct path *p) {
         int            idx = p->used;
         struct t2_rec *rec = p->rec;
         int            result = 0;
-        SLOT_DEFINE(s, p->rung[idx].node);
-        if (leaf_search(p->rung[idx].node, p, &s)) {
+        SLOT_DEFINE(s, p->rung[idx].page.node);
+        if (leaf_search(p->rung[idx].page.node, p, &s)) {
                 return -EEXIST;
         }
         p->rung[idx].pos = s.idx;
         do {
                 struct rung *r = &p->rung[idx];
-                r->lm = WRITE;
-                if (can_insert(r->node, rec) && !should_split(r->node)) {
+                r->page.lm = WRITE;
+                if (can_insert(r->page.node, rec) && !should_split(r->page.node)) {
                         break;
                 } else {
                         r->pd.id = policy_select(p, idx);
@@ -2119,15 +2116,15 @@ static bool keep(const struct node *n) {
 static int delete_prep(struct path *p) {
         int idx    = p->used;
         int result = 0;
-        SLOT_DEFINE(s, p->rung[idx].node);
-        if (!leaf_search(p->rung[idx].node, p, &s)) {
+        SLOT_DEFINE(s, p->rung[idx].page.node);
+        if (!leaf_search(p->rung[idx].page.node, p, &s)) {
                 return -ENOENT;
         }
         p->rung[idx].pos = s.idx;
         do {
                 struct rung *r = &p->rung[idx];
-                r->lm = WRITE;
-                if (keep(r->node)) {
+                r->page.lm = WRITE;
+                if (keep(r->page.node)) {
                         break;
                 } else {
                         r->pd.id = policy_select(p, idx);
@@ -2149,12 +2146,12 @@ static int next_prep(struct path *p) {
         struct rung      *r      = &p->rung[p->used];
         struct t2_cursor *c      = (void *)p->rec->vcb;
         int               result = 0;
-        SLOT_DEFINE(s, r->node);
-        if (!leaf_search(r->node, p, &s) && (enum dir)c->dir == RIGHT) {
+        SLOT_DEFINE(s, r->page.node);
+        if (!leaf_search(r->page.node, p, &s) && (enum dir)c->dir == RIGHT) {
                 s.idx++;
         }
         r->pos = s.idx;
-        r->lm = READ;
+        r->page.lm = READ;
         sibling = neighbour(p, p->used, (enum dir)c->dir, READ);
         if (EISERR(sibling)) {
                 result = ERROR(ERRCODE(sibling));
@@ -2190,24 +2187,24 @@ static int root_add(struct path *p) {
          * latter 2 nodes the only children of the old root. Then increase the
          * old root's level.
          */
-        struct node  *oldroot = p->rung[0].node;
+        struct node  *oldroot = p->rung[0].page.node;
         struct t2_buf ptr;
         SLOT_DEFINE(s, oldroot);
         if (UNLIKELY(buf_len(&p->rung[0].keyout) == 0 && buf_len(&p->rung[0].valout) == 0)) {
                 return 0; /* Nothing to do. */
         }
         rec_get(&s, 0);
-        s.node = p->newroot;
+        s.node = p->newroot.node;
         s.rec.val = ptr_buf(oldroot, &ptr);
-        NOFAIL(NCALL(s.node, insert(&s)));
+        NOFAIL(NCALL(s.node, insert(&s, &p->newroot.mod)));
         s.idx = 1;
         ASSERT(p->rung[0].pd.id == SPLIT_RIGHT); /* For now. */
         s.rec.key = &p->rung[0].keyout;
         s.rec.val = &p->rung[0].valout;
-        NOFAIL(NCALL(s.node, insert(&s)));
+        NOFAIL(NCALL(s.node, insert(&s, &p->newroot.mod)));
         p->rung[0].flags |= ALUSED;
         /* Barrier? */
-        p->tree->root = p->newroot->addr;
+        p->tree->root = p->newroot.node->addr;
         return 0;
 }
 
@@ -2216,8 +2213,8 @@ static int insert_balance(struct path *p) {
         int result = 0;
         for (idx = p->used; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
-                ASSERT(r->lm == WRITE);
-                CINC(l[level(r->node)].insert_balance);
+                ASSERT(r->page.lm == WRITE);
+                CINC(l[level(r->page.node)].insert_balance);
                 result = dispatch[r->pd.id].exec_insert(p, idx);
                 if (result <= 0) {
                         break;
@@ -2225,7 +2222,7 @@ static int insert_balance(struct path *p) {
                 result = 0;
         }
         if (UNLIKELY(idx < 0 && LIKELY(result == 0))) {
-                if (p->newroot != NULL) {
+                if (p->newroot.node != NULL) {
                         result = root_add(p); /* Move this to policy? */
                 }
         }
@@ -2233,7 +2230,8 @@ static int insert_balance(struct path *p) {
 }
 
 static int insert_complete(struct path *p, struct node *n) {
-        int result = rec_insert(n, p->rung[p->used].pos + 1, p->rec);
+        struct rung *r = &p->rung[p->used];
+        int result = rec_insert(n, r->pos + 1, p->rec, &r->page.mod);
         if (result == -ENOSPC) {
                 result = insert_balance(p);
         }
@@ -2247,8 +2245,8 @@ static int delete_balance(struct path *p) {
         int result = 0;
         for (idx = p->used; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
-                ASSERT(r->lm == WRITE);
-                CINC(l[level(r->node)].delete_balance);
+                ASSERT(r->page.lm == WRITE);
+                CINC(l[level(r->page.node)].delete_balance);
                 result = dispatch[r->pd.id].exec_delete(p, idx);
                 if (result <= 0) {
                         break;
@@ -2261,7 +2259,7 @@ static int delete_balance(struct path *p) {
 
 static int delete_complete(struct path *p, struct node *n) {
         int result = 0;
-        rec_delete(n, p->rung[p->used].pos);
+        rec_delete(n, p->rung[p->used].pos, &p->rung[p->used].page.mod);
         if (!keep(n)) {
                 result = delete_balance(p);
         }
@@ -2315,7 +2313,7 @@ static void rcu_leave(struct path *p, struct node *extra) {
 
 static bool rcu_try(struct path *p, struct node *extra) {
         bool result;
-        result = EXISTS(i, p->used + 1, p->rung[i].node->flags & HEARD_BANSHEE) || (extra != NULL && (extra->flags & HEARD_BANSHEE));
+        result = EXISTS(i, p->used + 1, p->rung[i].page.node->flags & HEARD_BANSHEE) || (extra != NULL && (extra->flags & HEARD_BANSHEE));
         if (UNLIKELY(result)) {
                 urcu_memb_barrier();
                 path_reset(p);
@@ -3910,35 +3908,28 @@ static int32_t simple_free(const struct node *n) {
         return end->voff - end->koff - sdirsize(sh);
 }
 
-static void ext_merge(struct ext *ext, int32_t off, int32_t len) {
-        if (ext->len > 0) {
-                int32_t moff = min_32(ext->off, off);
-                ext->len = max_32(ext->off + ext->len, off + len) - off;
-                ext->off = moff;
-        } else {
-                ext->off = off;
-                ext->len = len;
-        }
+static void ext_merge(struct ext *ext, int32_t start, int32_t end) {
+        ext->start = min_32(ext->start, start);
+        ext->end   = max_32(ext->end,   end);
 }
 
-static void move(struct node *n, void *sh, int32_t start, int32_t end, int delta, enum ext_id id) {
+static void move(void *sh, int32_t start, int32_t end, int delta) {
         ASSERT(start <= end);
         memmove(sh + start + delta, sh + start, end - start);
         CADD(l[((struct sheader *)sh)->head.level].moves, end - start);
-        if (TRANSACTIONS) {
-                ext_merge(&n->range.ext[id], start + delta, end - start);
-        }
 }
 
-static void sdirmove(struct node *n, struct sheader *sh, int32_t nsize,
-                     int32_t knob, int32_t vnob, int32_t nr) {
+static void sdirmove(struct sheader *sh, int32_t nsize, int32_t knob, int32_t vnob, int32_t nr, struct mod *mod) {
         int32_t dir_off = (knob * (nsize - SOF(*sh))) / (knob + vnob) -
                 dirsize(nr + 1) / 2 + SOF(*sh);
+        int32_t delta;
         dir_off = min_32(max_32(dir_off, knob + SOF(*sh)),
                          nsize - vnob - dirsize(nr + 1));
         ASSERT(knob + SOF(*sh) <= dir_off);
         ASSERT(dir_off + dirsize(nr + 1) + vnob <= nsize);
-        move(n, sh, sh->dir_off, sdirend(sh), dir_off - sh->dir_off, DIR);
+        delta = dir_off - sh->dir_off;
+        move(sh, sh->dir_off, sdirend(sh), delta);
+        ext_merge(&mod->ext[DIR], sh->dir_off + delta, sdirend(sh) + delta);
         sh->dir_off = dir_off;
 }
 
@@ -3961,7 +3952,7 @@ static void simple_fini(struct node *n) {
         SET0(simple_header(n));
 }
 
-static int simple_insert(struct slot *s) {
+static int simple_insert(struct slot *s, struct mod *mod) {
         struct t2_buf       buf;
         struct sheader     *sh   = simple_header(s->node);
         struct dir_element *end  = sat(sh, sh->nr);
@@ -3977,14 +3968,16 @@ static int simple_insert(struct slot *s) {
         }
         if (sfreekey(s->node) < klen || sfreeval(s->node) < vlen + SOF(*end)) {
                 struct dir_element *beg = sat(sh, 0);
-                sdirmove(s->node, sh, beg->voff, end->koff - beg->koff + klen,
-                         beg->voff - end->voff + vlen, sh->nr + 1);
+                sdirmove(sh, beg->voff, end->koff - beg->koff + klen,
+                         beg->voff - end->voff + vlen, sh->nr + 1, mod);
                 end = sat(sh, sh->nr);
                 CINC(l[sh->head.level].dirmove);
         }
         piv = sat(sh, s->idx);
-        move(s->node, sh, piv->koff, end->koff, +klen, KEY);
-        move(s->node, sh, end->voff, piv->voff, -vlen, VAL);
+        move(sh, piv->koff, end->koff, +klen);
+        move(sh, end->voff, piv->voff, -vlen);
+        ext_merge(&mod->ext[KEY], piv->koff, end->koff + klen); /* Captures buf_copy() below. */
+        ext_merge(&mod->ext[VAL], end->voff - vlen, piv->voff);
         for (int32_t i = ++sh->nr; i > s->idx; --i) {
                 struct dir_element *prev = sat(sh, i - 1);
                 __builtin_prefetch(prev - 1);
@@ -3993,6 +3986,8 @@ static int simple_insert(struct slot *s) {
                         .voff = prev->voff - vlen
                 };
         }
+        ext_merge(&mod->ext[DIR], sh->dir_off + (s->idx + 1) * sizeof *piv,
+                  sh->dir_off + (sh->nr + 1) * sizeof *piv);
         buf.addr = skey(sh, s->idx, &buf.len);
         ASSERT(buf.len == klen);
         buf_copy(&buf, s->rec.key);
@@ -4003,12 +3998,12 @@ static int simple_insert(struct slot *s) {
         if (LIKELY(s->node->radix != NULL)) {
                 s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node) - 1);
         }
-        ASSERT(s->node->range.ext[HDR].off == 0);
-        s->node->range.ext[HDR].len = sizeof *sh;
+        ASSERT(mod->ext[HDR].start == 0);
+        mod->ext[HDR].end = sizeof *sh;
         return 0;
 }
 
-static void simple_delete(struct slot *s) {
+static void simple_delete(struct slot *s, struct mod *mod) {
         struct sheader     *sh   = simple_header(s->node);
         struct dir_element *end  = sat(sh, sh->nr);
         struct dir_element *piv  = sat(sh, s->idx);
@@ -4018,8 +4013,10 @@ static void simple_delete(struct slot *s) {
         ASSERT(s->idx < sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         CINC(l[sh->head.level].delete);
-        move(s->node, sh, inn->koff, end->koff, -klen, KEY);
-        move(s->node, sh, end->voff, inn->voff, +vlen, VAL);
+        move(sh, inn->koff, end->koff, -klen);
+        move(sh, end->voff, inn->voff, +vlen);
+        ext_merge(&mod->ext[KEY], inn->koff - klen, end->koff - klen);
+        ext_merge(&mod->ext[VAL], end->voff + vlen, inn->voff + vlen);
         for (int32_t i = s->idx; i < sh->nr; ++i) {
                 struct dir_element *next = sat(sh, i + 1);
                 *sat(sh, i) = (struct dir_element){
@@ -4027,13 +4024,15 @@ static void simple_delete(struct slot *s) {
                         .voff = next->voff + vlen
                 };
         }
+        ext_merge(&mod->ext[DIR], sh->dir_off + s->idx * sizeof *piv,
+                  sh->dir_off + sh->nr * sizeof *piv);
         --sh->nr;
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         if (LIKELY(s->node->radix != NULL)) {
                 s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node));
         }
-        ASSERT(s->node->range.ext[HDR].off == 0);
-        s->node->range.ext[HDR].len = sizeof *sh;
+        ASSERT(mod->ext[HDR].start == 0);
+        mod->ext[HDR].end = sizeof *sh;
 }
 
 static void simple_get(struct slot *s) {
@@ -4114,7 +4113,9 @@ static void rec_print(const struct t2_rec *r) {
         buf_print(r->val);
 }
 
-static int shift_one(struct node *d, struct node *s, enum dir dir) {
+static int shift_one(struct page *dp, struct page *sp, enum dir dir) {
+        struct node  *d   = dp->node;
+        struct node  *s   = sp->node;
         struct t2_buf key = {};
         struct t2_buf val = {};
         struct slot   dst = { .node = d, .rec = { .key = &key, .val = &val } };
@@ -4123,10 +4124,12 @@ static int shift_one(struct node *d, struct node *s, enum dir dir) {
         rec_get(&src, utmost(s, dir));
         dst.idx = dir == LEFT ? nr(d) : 0;
         CINC(l[level(d)].shift_one);
-        return NCALL(d, insert(&dst)) ?: (NCALL(s, delete(&src)), 0);
+        return NCALL(d, insert(&dst, &dp->mod)) ?: (NCALL(s, delete(&src, &dp->mod)), 0);
 }
 
-static int shift(struct node *d, struct node *s, const struct slot *point, enum dir dir) {
+static int shift(struct page *dst, struct page *src, const struct slot *point, enum dir dir) {
+        struct node *d = dst->node;
+        struct node *s = src->node;
         int result = 0;
         ASSERT(dir == LEFT || dir == RIGHT);
         ASSERT(point->idx >= 0 && point->idx <= nr(s));
@@ -4137,7 +4140,7 @@ static int shift(struct node *d, struct node *s, const struct slot *point, enum 
                 SLOT_DEFINE(slot, s);
                 rec_get(&slot, utmost(s, dir));
                 if (NCALL(d, free(d)) - NCALL(s, free(s)) > rec_len(&slot.rec)) {
-                        result = shift_one(d, s, dir);
+                        result = shift_one(dst, src, dir);
                 } else {
                         break;
                 }
@@ -4146,12 +4149,12 @@ static int shift(struct node *d, struct node *s, const struct slot *point, enum 
         return result;
 }
 
-static int merge(struct node *d, struct node *s, enum dir dir) {
+static int merge(struct page *dst, struct page *src, enum dir dir) {
         int result = 0;
-        while (LIKELY(result == 0) && nr(s) > 0) {
-                result = shift_one(d, s, dir);
+        while (LIKELY(result == 0) && nr(src->node) > 0) {
+                result = shift_one(dst, src, dir);
         }
-        CINC(l[level(d)].merge);
+        CINC(l[level(dst->node)].merge);
         return result;
 }
 
@@ -5091,10 +5094,11 @@ static void utest(const char *t) {
 }
 
 static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
+        struct mod mod = {};
         struct sheader *sh = simple_header(s->node);
         for (int32_t i = 0; simple_free(s->node) >=
                      buf_len(key) + buf_len(val) + SOF(struct dir_element); ++i) {
-                NOFAIL(simple_insert(s));
+                NOFAIL(simple_insert(s, &mod));
                 radixmap_update(s->node);
                 ASSERT(sh->nr == i + 1);
                 ((char *)key->addr)[1]++;
@@ -5175,6 +5179,7 @@ static void simple_ut() {
                         .val = &val
                 }
         };
+        struct mod m = {};
         int result;
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
@@ -5184,7 +5189,7 @@ static void simple_ut() {
         ASSERT(sh->nr == 0);
         utest("insert");
         populate(&s, &key, &val);
-        result = simple_insert(&s);
+        result = simple_insert(&s, &m);
         ASSERT(result == -ENOSPC);
         radixmap_update(&n);
         utest("get");
@@ -5196,13 +5201,13 @@ static void simple_ut() {
         utest("delete");
         for (int32_t i = sh->nr - 1; i >= 0; --i) {
                 s.idx = (s.idx + 7) % sh->nr;
-                simple_delete(&s);
+                simple_delete(&s, &m);
                 radixmap_update(&n);
                 ASSERT(sh->nr == i);
         }
         s.idx = 0;
         while (nr(&n) > 0) {
-                simple_delete(&s);
+                simple_delete(&s, &m);
                 radixmap_update(&n);
         }
         utest("search");
@@ -5215,7 +5220,7 @@ static void simple_ut() {
                 s.idx++;
                 key = BUF_VAL(key0);
                 val = BUF_VAL(val0);
-                NOFAIL(simple_insert(&s));
+                NOFAIL(simple_insert(&s, &m));
                 radixmap_update(&n);
                 ASSERT(is_sorted(&n));
                 key0[1] += 251; /* Co-prime with 256. */
@@ -5312,6 +5317,7 @@ static void traverse_ut() {
                 .opt  = LOOKUP,
                 .rec  = &s.rec
         };
+        struct mod m = {};
         int result;
         usuite("traverse");
         utest("t2_init");
@@ -5331,7 +5337,7 @@ static void traverse_ut() {
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
-                NOFAIL(simple_insert(&s));
+                NOFAIL(simple_insert(&s, &m));
                 radixmap_update(&n);
                 ASSERT(is_sorted(&n));
         }
