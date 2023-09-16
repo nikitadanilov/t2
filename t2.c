@@ -434,8 +434,8 @@ enum node_flags {
 enum ext_id {
         HDR,
         KEY,
-        VAL,
         DIR,
+        VAL,
 
         M_NR
 };
@@ -1893,11 +1893,15 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struc
 static void dirty(struct page *g) {
         struct node *n = g->node;
         if (n != NULL && g->lm == WRITE) {
+                int32_t start = nsize(n) - 1;
                 ASSERT(is_stable(n));
                 node_seq_increase(n);
                 if (!(n->flags & DIRTY)) {
                         n->flags |= DIRTY;
                         KINC(dirty);
+                }
+                for (int i = 0; i < ARRAY_SIZE(g->mod.ext); ++i) {
+                        g->mod.ext[i] = (struct ext) { .start = start, .end = 0 };
                 }
         }
 }
@@ -1993,14 +1997,17 @@ static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
         int          pos = 0;
         if (n != NULL && g->lm == WRITE) {
                 for (int i = 0; i < ARRAY_SIZE(mod->ext); ++i) {
-                        if (mod->ext[i].end > mod->ext[i].start) {
+                        int32_t start = mod->ext[i].start;
+                        int32_t end   = mod->ext[i].end;
+                        if (end > start) {
+                                printf("mod[%i]: %4i ... %4i\n", i, start, end);
                                 txr[pos] = (struct t2_txrec) {
                                         .node = (void *)n,
                                         .addr = n->addr,
-                                        .off  = mod->ext[i].start,
+                                        .off  = start,
                                         .part = {
-                                                .len  = mod->ext[i].end - mod->ext[i].start,
-                                                .addr = n->data + mod->ext[i].start
+                                                .len  = end - start,
+                                                .addr = n->data + start
                                         }
                                 };
                                 *nob += txr[pos].part.len;
@@ -3956,6 +3963,18 @@ static void ext_merge(struct ext *ext, int32_t start, int32_t end) {
         ext->end   = max_32(ext->end,   end);
 }
 
+static bool mod_invariant(const struct mod *mod) {
+        return FORALL(i, ARRAY_SIZE(mod->ext),
+                      mod->ext[i].start < mod->ext[i].end && i > 0 ? mod->ext[i - 1].end <= mod->ext[i].start : true);
+}
+
+static void mod_print(const struct mod *mod) {
+        for (int i = 0; i < ARRAY_SIZE(mod->ext); ++i) {
+                printf("[%4i ... %4i] ", mod->ext[i].start, mod->ext[i].end);
+        }
+        puts("");
+}
+
 static void move(void *sh, int32_t start, int32_t end, int delta) {
         ASSERT(start <= end);
         memmove(sh + start + delta, sh + start, end - start);
@@ -4041,8 +4060,9 @@ static int simple_insert(struct slot *s, struct mod *mod) {
         if (LIKELY(s->node->radix != NULL)) {
                 s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node) - 1);
         }
-        ASSERT(mod->ext[HDR].start == 0);
+        mod->ext[HDR].start = 0;
         mod->ext[HDR].end = sizeof *sh;
+        ASSERT(mod_invariant(mod));
         return 0;
 }
 
@@ -4053,13 +4073,20 @@ static void simple_delete(struct slot *s, struct mod *mod) {
         struct dir_element *inn  = sat(sh, s->idx + 1);
         int32_t             klen = inn->koff - piv->koff;
         int32_t             vlen = piv->voff - inn->voff;
+        ASSERT(mod_invariant(mod));
         ASSERT(s->idx < sh->nr);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         CINC(l[sh->head.level].delete);
         move(sh, inn->koff, end->koff, -klen);
         move(sh, end->voff, inn->voff, +vlen);
         ext_merge(&mod->ext[KEY], inn->koff - klen, end->koff - klen);
+        ASSERT(mod_invariant(mod));
+        mod_print(mod);
         ext_merge(&mod->ext[VAL], end->voff + vlen, inn->voff + vlen);
+        simple_print(s->node);
+        printf("end: %d inn: %d len: %d idx: %d nr: %d\n", end->voff, inn->voff, vlen, s->idx, sh->nr);
+        mod_print(mod);
+        ASSERT(mod_invariant(mod));
         for (int32_t i = s->idx; i < sh->nr; ++i) {
                 struct dir_element *next = sat(sh, i + 1);
                 *sat(sh, i) = (struct dir_element){
@@ -4069,13 +4096,15 @@ static void simple_delete(struct slot *s, struct mod *mod) {
         }
         ext_merge(&mod->ext[DIR], sh->dir_off + s->idx * sizeof *piv,
                   sh->dir_off + sh->nr * sizeof *piv);
+        ASSERT(mod_invariant(mod));
         --sh->nr;
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         if (LIKELY(s->node->radix != NULL)) {
                 s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node));
         }
-        ASSERT(mod->ext[HDR].start == 0);
+        mod->ext[HDR].start = 0;
         mod->ext[HDR].end = sizeof *sh;
+        ASSERT(mod_invariant(mod));
 }
 
 static void simple_get(struct slot *s) {
