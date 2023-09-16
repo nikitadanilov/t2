@@ -1969,7 +1969,7 @@ static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
 }
 
 static void path_txadd(struct path *p) {
-        if (TRANSACTIONS && p->tx != NULL) {
+        if (TRANSACTIONS && p->tx != NULL) { /* TODO: Log node allocations and de-allocations. */
                 struct t2_txrec txr[((p->used + 1) * 4 + 1) * M_NR]; /* VLA. */
                 struct t2_te   *te  = p->tree->ttype->mod->te;
                 int             pos = 0;
@@ -6128,15 +6128,53 @@ enum {
         SIZE       = NODE_SIZE / 3,
         NR_BUFS    = 200,
         BUF_SIZE   = 1 << 20,
-        FLAGS      = 0 /* noforce-nosteal == redo only. */
+        FLAGS      = 0, /* noforce-nosteal == redo only. */
+        NOPS       = 10
 };
 
 static const char logname[] = "log";
 
+static uint64_t prev_key;
+static uint64_t keys;
+
+static int wal_cnext(struct t2_cursor *c, const struct t2_rec *rec) {
+        uint64_t key = *(uint64_t *)rec->key->addr;
+        uint64_t val = *(uint64_t *)rec->val->addr;
+        ASSERT(rec->key->len == sizeof key);
+        ASSERT(rec->val->len == sizeof val);
+        ASSERT(prev_key == 0 || key == prev_key + 2);
+        ++keys;
+        prev_key = key;
+        return +1;
+}
+
+static void wal_verify(struct t2_tree *t) {
+        uint64_t key;
+        uint64_t start = 0;
+        struct t2_buf startkey = BUF_VAL(start);
+        struct t2_cursor_op cop = {
+                .next = &wal_cnext
+        };
+        struct t2_cursor c = {
+                .curkey = BUF_VAL(key),
+                .tree   = t,
+                .dir    = T2_MORE,
+                .op     = &cop
+        };
+        keys = 0;
+        prev_key = 0;
+        t2_cursor_init(&c, &startkey);
+        while (t2_cursor_next(&c) > 0) {
+                        ;
+        }
+        ASSERT(keys == NOPS / 2);
+        t2_cursor_fini(&c);
+}
+
 static void wal_ut() {
         struct t2 *mod;
         struct t2_te *engine;
-        struct t2_tx *trax;
+        struct t2_tx *tx;
         char fake_data[NODE_SIZE];
         char copy[NODE_SIZE];
         struct t2_txrec txr = {
@@ -6166,27 +6204,27 @@ static void wal_ut() {
         ASSERT(EISOK(engine));
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
-        trax = t2_tx_make(mod);
-        ASSERT(EISOK(trax));
-        result = wal_post(engine, trax, txr.part.len, 1, &txr);
+        tx = t2_tx_make(mod);
+        ASSERT(EISOK(tx));
+        result = wal_post(engine, tx, txr.part.len, 1, &txr);
         ASSERT(result == 0);
-        t2_tx_done(mod, trax);
+        t2_tx_done(mod, tx);
         t2_fini(mod);
         utest("add-many");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
         ASSERT(EISOK(engine));
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
-        trax = t2_tx_make(mod);
-        ASSERT(EISOK(trax));
+        tx = t2_tx_make(mod);
+        ASSERT(EISOK(tx));
         for (int i = 0; i < 100000; ++i) {
                 txr.off = rand() % (NODE_SIZE - 10);
                 txr.part.addr = fake_data + txr.off;
                 txr.part.len  = rand() % (NODE_SIZE - txr.off - 1);
-                result = wal_post(engine, trax, txr.part.len, 1, &txr);
+                result = wal_post(engine, tx, txr.part.len, 1, &txr);
                 ASSERT(result == 0);
         }
-        t2_tx_done(mod, trax);
+        t2_tx_done(mod, tx);
         t2_fini(mod);
         utest("replay");
         fdata = fake_data;
@@ -6194,17 +6232,17 @@ static void wal_ut() {
         ASSERT(EISOK(engine));
         mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
         ASSERT(EISOK(mod));
-        trax = t2_tx_make(mod);
-        ASSERT(EISOK(trax));
+        tx = t2_tx_make(mod);
+        ASSERT(EISOK(tx));
         for (int i = 0; i < 100000; ++i) {
                 txr.off = rand() % (NODE_SIZE - 10);
                 txr.part.addr = fake_data + txr.off;
                 txr.part.len  = rand() % (NODE_SIZE - txr.off - 1);
                 memset(txr.part.addr, 'A' + rand() % ('Z' - 'A' + 1), txr.part.len);
-                result = wal_post(engine, trax, txr.part.len, 1, &txr);
+                result = wal_post(engine, tx, txr.part.len, 1, &txr);
                 ASSERT(result == 0);
         }
-        t2_tx_done(mod, trax);
+        t2_tx_done(mod, tx);
         t2_fini(mod);
         memcpy(copy, fake_data, SOF(copy));
         memset(fake_data, '#', SOF(fake_data));
@@ -6226,12 +6264,46 @@ static void wal_ut() {
         ttype.mod = NULL;
         t2_tree_type_register(mod, &ttype);
         t2_node_type_register(mod, &ntype);
-        trax = t2_tx_make(mod);
-        ASSERT(EISOK(trax));
-        t = t2_tree_create(&ttype, trax);
+        tx = t2_tx_make(mod);
+        ASSERT(EISOK(tx));
+        t = t2_tree_create(&ttype, tx);
         ASSERT(EISOK(t));
         t2_tree_close(t);
-        t2_tx_done(mod, trax);
+        t2_tx_done(mod, tx);
+        t2_tree_type_degister(&ttype);
+        t2_node_type_degister(&ntype);
+        t2_fini(mod);
+        utest("replay-ops");
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP);
+        ASSERT(EISOK(engine));
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        ASSERT(EISOK(mod));
+        ttype.mod = NULL;
+        t2_tree_type_register(mod, &ttype);
+        t2_node_type_register(mod, &ntype);
+        tx = t2_tx_make(mod);
+        ASSERT(EISOK(tx));
+        result = t2_tx_open(mod, tx);
+        ASSERT(result == 0);
+        t = t2_tree_create(&ttype, tx);
+        ASSERT(EISOK(t));
+        t2_tree_close(t);
+        for (uint64_t k = 0; k < NOPS; ++k) {
+                result = t2_tx_open(mod, tx);
+                ASSERT(result == 0);
+                result = t2_insert_ptr(t, &k, SOF(k), &k, SOF(k), tx);
+                ASSERT(result == 0);
+                t2_tx_close(mod, tx);
+        }
+        for (uint64_t k = 0; k < NOPS; k += 2) {
+                result = t2_tx_open(mod, tx);
+                ASSERT(result == 0);
+                result = t2_delete_ptr(t, &k, SOF(k), tx);
+                ASSERT(result == 0);
+                t2_tx_close(mod, tx);
+        }
+        t2_tx_done(mod, tx);
+        wal_verify(t);
         t2_tree_type_degister(&ttype);
         t2_node_type_degister(&ntype);
         t2_fini(mod);
@@ -6242,6 +6314,7 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        wal_ut();
         lib_ut();
         simple_ut();
         ht_ut();
