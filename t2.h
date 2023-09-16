@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 struct timespec;
 struct iovec;
@@ -104,6 +105,7 @@ struct t2_buf {
 struct t2_txrec { /* Transaction log record. */
         struct t2_node *node;
         taddr_t         addr;
+        int16_t         ntype;
         int32_t         off;
         struct t2_buf   part;
 };
@@ -146,15 +148,12 @@ enum t2_node_type_flags {
         T2_NT_LEAF     = 1ull << 3
 };
 
-struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int cshift);
+struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int cshift,
+                   struct t2_tree_type **ttypes, struct t2_node_type **ntypes);
 void       t2_fini(struct t2 *mod);
 
 void t2_thread_register(void);
 void t2_thread_degister(void);
-void t2_tree_type_register(struct t2 *mod, struct t2_tree_type *ttype);
-void t2_tree_type_degister(struct t2_tree_type *ttype);
-void t2_node_type_register(struct t2 *mod, struct t2_node_type *ntype);
-void t2_node_type_degister(struct t2_node_type *ntype);
 
 struct t2_node_type *t2_node_type_init(int16_t id, const char *name, int shift, uint64_t flags);
 void                 t2_node_type_fini(struct t2_node_type *nt);

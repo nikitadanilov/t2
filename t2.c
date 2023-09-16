@@ -372,13 +372,13 @@ struct node_type_ops {
 };
 
 struct t2 {
-        alignas(MAX_CACHELINE) struct ht         ht;
-        alignas(MAX_CACHELINE) struct cache      cache;
-        const struct t2_tree_type               *ttypes[MAX_TREE_TYPE];
-        const struct t2_node_type               *ntypes[MAX_NODE_TYPE];
-        struct t2_storage                       *stor;
-        struct t2_te                            *te;
-        bool                                     shutdown;
+        alignas(MAX_CACHELINE) struct ht     ht;
+        alignas(MAX_CACHELINE) struct cache  cache;
+        struct t2_tree_type                 *ttypes[MAX_TREE_TYPE];
+        struct t2_node_type                 *ntypes[MAX_NODE_TYPE];
+        struct t2_storage                   *stor;
+        struct t2_te                        *te;
+        bool                                 shutdown;
 };
 
 SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
@@ -543,8 +543,8 @@ struct policy {
 };
 
 struct t2_node_type {
-        const struct node_type_ops *ops;
         int                         shift;
+        const struct node_type_ops *ops;
         int16_t                     id;
         const char                 *name;
         struct t2                  *mod;
@@ -783,6 +783,10 @@ static int simple_keycmp(const struct node *n, int pos, void *addr, int32_t len,
 static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 static int shift(struct page *d, struct page *s, const struct slot *insert, enum dir dir);
 static int merge(struct page *d, struct page *s, enum dir dir);
+static void tree_type_register(struct t2 *mod, struct t2_tree_type *ttype);
+static void tree_type_degister(struct t2_tree_type *ttype);
+static void node_type_register(struct t2 *mod, struct t2_node_type *ntype);
+static void node_type_degister(struct t2_node_type *ntype);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
 static struct t2_tx *wal_make(struct t2_te *te);
@@ -847,7 +851,8 @@ static __thread volatile struct {
 static struct node_type_ops simple_ops;
 static char *argv0;
 
-struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int cshift) {
+struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int cshift,
+                   struct t2_tree_type **ttypes, struct t2_node_type **ntypes) {
         int result;
         struct t2 *mod = mem_alloc(sizeof *mod);
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
@@ -866,6 +871,12 @@ struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int
                         for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.free); ++i) {
                                 NOFAIL(pthread_mutex_init(&mod->cache.pool.free[i].lock, NULL));
                                 CDS_INIT_LIST_HEAD(&mod->cache.pool.free[i].head);
+                        }
+                        for (; *ttypes != NULL; ++ttypes) {
+                                tree_type_register(mod, *ttypes);
+                        }
+                        for (; *ntypes != NULL; ++ntypes) {
+                                node_type_register(mod, *ntypes);
                         }
                         mod->stor = storage;
                         result = SCALL(mod, init);
@@ -921,6 +932,16 @@ void t2_fini(struct t2 *mod) {
                 NOFAIL(pthread_mutex_destroy(&mod->cache.pool.free[i].lock));
                 ASSERT(cds_list_empty(&mod->cache.pool.free[i].head));
         }
+        for (int i = 0; i < ARRAY_SIZE(mod->ttypes); ++i) {
+                if (mod->ttypes[i] != NULL) {
+                        tree_type_degister(mod->ttypes[i]);
+                }
+        }
+        for (int i = 0; i < ARRAY_SIZE(mod->ntypes); ++i) {
+                if (mod->ntypes[i] != NULL) {
+                        node_type_degister(mod->ntypes[i]);
+                }
+        }
         NOFAIL(pthread_cond_destroy(&mod->cache.got));
         NOFAIL(pthread_cond_destroy(&mod->cache.need));
         NOFAIL(pthread_mutex_destroy(&mod->cache.condlock));
@@ -931,7 +952,7 @@ void t2_fini(struct t2 *mod) {
 }
 
 
-void t2_tree_type_register(struct t2 *mod, struct t2_tree_type *ttype) {
+static void tree_type_register(struct t2 *mod, struct t2_tree_type *ttype) {
         ASSERT(IS_IN(ttype->id, mod->ttypes));
         ASSERT(mod->ttypes[ttype->id] == NULL);
         ASSERT(ttype->mod == NULL);
@@ -941,7 +962,7 @@ void t2_tree_type_register(struct t2 *mod, struct t2_tree_type *ttype) {
 }
 
 
-void t2_tree_type_degister(struct t2_tree_type *ttype)
+static void tree_type_degister(struct t2_tree_type *ttype)
 {
         ASSERT(IS_IN(ttype->id, ttype->mod->ttypes));
         ASSERT(ttype->mod->ttypes[ttype->id] == ttype);
@@ -950,7 +971,7 @@ void t2_tree_type_degister(struct t2_tree_type *ttype)
         eclear();
 }
 
-void t2_node_type_register(struct t2 *mod, struct t2_node_type *ntype) {
+static void node_type_register(struct t2 *mod, struct t2_node_type *ntype) {
         ASSERT(IS_IN(ntype->id, mod->ntypes));
         ASSERT(mod->ntypes[ntype->id] == NULL);
         ASSERT(ntype->mod == NULL);
@@ -961,7 +982,7 @@ void t2_node_type_register(struct t2 *mod, struct t2_node_type *ntype) {
 }
 
 
-void t2_node_type_degister(struct t2_node_type *ntype)
+static void node_type_degister(struct t2_node_type *ntype)
 {
         ASSERT(IS_IN(ntype->id, ntype->mod->ntypes));
         ASSERT(ntype->mod->ntypes[ntype->id] == ntype);
@@ -1363,14 +1384,36 @@ static void ndelete(struct node *n) {
         mutex_unlock(lock);
 }
 
+static int readdata(struct node *n) {
+        struct iovec io = { .iov_base = n->data, .iov_len = taddr_ssize(n->addr) };
+        return SCALL(n->mod, read, n->addr, 1, &io);
+}
+
+static struct node *take(struct t2 *mod, taddr_t addr, struct t2_node_type *ntype) {
+        struct node *n = look(mod, addr);
+        ASSERT(taddr_sshift(addr) == ntype->shift);
+        if (n == NULL) {
+                n = ninit(mod, addr);
+                if (EISOK(n)) {
+                        int result = readdata(n);
+                        if (result == 0) {
+                                n->ntype = ntype;
+                        } else {
+                                n = EPTR(result);
+                        }
+                }
+        }
+        ASSERT(EISOK(n) ? n->ntype == ntype : true);
+        return n;
+}
+
 static struct node *get(struct t2 *mod, taddr_t addr) {
         struct node *n = ninit(mod, addr);
         COUNTERS_ASSERT(CVAL(rcu) == 0);
         if (EISOK(n)) {
                 lock(n, WRITE);
                 if (LIKELY(n->ntype == NULL)) {
-                        struct iovec io     = { .iov_base = n->data, .iov_len = taddr_ssize(addr) };
-                        int          result = SCALL(n->mod, read, n->addr, 1, &io);
+                        int result = readdata(n);
                         if (LIKELY(result == 0)) {
                                 struct header *h = nheader(n);
                                 /* TODO: check node. */
@@ -1975,7 +2018,7 @@ static void path_txadd(struct path *p) {
                 int             pos = 0;
                 int32_t         nob = 0;
                 for (int i = 0; i <= p->used; ++i) {
-                        struct rung *r = &p->rung[p->used];
+                        struct rung *r = &p->rung[i];
                         pos += txadd(brother(r, LEFT),  &txr[pos], &nob);
                         pos += txadd(&r->page,          &txr[pos], &nob);
                         pos += txadd(brother(r, RIGHT), &txr[pos], &nob);
@@ -4198,13 +4241,18 @@ taddr_t t2_addr(const struct t2_node *node) {
 
 int t2_apply(struct t2 *mod, struct t2_txrec *txr) {
         if (!UT || ut_apply == NULL) {
-                struct node *n = get(mod, txr->addr);
-                if (EISOK(n)) {
-                        memcpy(n->data + txr->off, txr->part.addr, txr->part.len);
-                        n->flags |= DIRTY;
-                        return 0;
+                if (IS_IN(txr->ntype, mod->ntypes) && mod->ntypes[txr->ntype] != NULL) {
+                        struct node *n = take(mod, txr->addr, mod->ntypes[txr->ntype]);
+                        if (EISOK(n)) {
+                                memcpy(n->data + txr->off, txr->part.addr, txr->part.len);
+                                n->flags |= DIRTY;
+                                put(n);
+                                return 0;
+                        } else {
+                                return ERRCODE(n);
+                        }
                 } else {
-                        return ERRCODE(n);
+                        return ERROR(-EIO);
                 }
         } else {
                 return (*ut_apply)(mod, txr);
@@ -4212,10 +4260,12 @@ int t2_apply(struct t2 *mod, struct t2_txrec *txr) {
 }
 
 enum rec_type {
-        HEADER = 'H',
-        FOOTER = 'F',
+        HEADER = '<',
+        FOOTER = '>',
         UNDO   = 'U',
-        REDO   = 'R'
+        REDO   = 'R',
+        ALLOC  = 'A',
+        FREE   = 'F'
 };
 
 static const int64_t REC_MAGIX = 0xa50d4e3333337221ll;
@@ -4232,6 +4282,7 @@ struct wal_rec {
                 struct {
                         taddr_t node;
                         int32_t off;
+                        int16_t ntype;
                 } update;
                 struct {
                         lsn_t   log_start;
@@ -4530,8 +4581,9 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                         .len   = txr[i].part.len,
                         .u = {
                                 .update = {
-                                        .off  = txr[i].off,
-                                        .node = txr[i].addr
+                                        .off   = txr[i].off,
+                                        .node  = txr[i].addr,
+                                        .ntype = ((struct node *)txr[i].node)->ntype->id
                                 }
                         }
                 };
@@ -4649,7 +4701,8 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
 
 static bool wal_rec_invariant(const struct wal_rec *rec, lsn_t lsn) {
         return  rec->magix == REC_MAGIX &&
-                (rec->rtype == HEADER || rec->rtype == FOOTER || rec->rtype == UNDO || rec->rtype == REDO) &&
+                (rec->rtype == HEADER || rec->rtype == FOOTER || rec->rtype == UNDO ||
+                 rec->rtype == REDO || rec->rtype == ALLOC || rec->rtype == FREE) &&
                 rec->rtype == HEADER ? (rec->len == 0 &&
                                         rec->u.header.log_start > 0 && rec->u.header.log_start <= lsn &&
                                         rec->u.header.max_synced > 0 && rec->u.header.max_synced <= lsn &&
@@ -4669,9 +4722,10 @@ static int wal_replay(struct wal_te *en, void *space, lsn_t start, lsn_t end) {
                         result = ERROR(-EIO);
                 } else if (rec->rtype == REDO) {
                         struct t2_txrec txr = {
-                                .addr = rec->u.update.node,
-                                .off  = rec->u.update.off,
-                                .part = {
+                                .addr  = rec->u.update.node,
+                                .off   = rec->u.update.off,
+                                .ntype = rec->u.update.ntype,
+                                .part  = {
                                         .len  = rec->len,
                                         .addr = &rec->data
                                 }
@@ -4950,11 +5004,13 @@ struct file_storage {
         uint64_t          free;
 };
 
+static int64_t free0 = 512;
+
 static int file_init(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         fs->fd = open(fs->filename, O_RDWR | O_CREAT, 0777);
         if (fs->fd > 0) {
-                fs->free = 512;
+                fs->free = free0;
                 return pthread_mutex_init(&fs->lock, NULL);
         } else {
                 return ERROR(-errno);
@@ -5279,6 +5335,16 @@ enum {
         CA_SHIFT = 20
 };
 
+static struct t2_node_type *ntypes[] = {
+        &ntype,
+        NULL
+};
+
+static struct t2_tree_type *ttypes[] = {
+        &ttype,
+        NULL
+};
+
 static void traverse_ut() {
         taddr_t addr = taddr_make(0x100000, ntype.shift);
         struct node n = {
@@ -5321,8 +5387,7 @@ static void traverse_ut() {
         int result;
         usuite("traverse");
         utest("t2_init");
-        struct t2 *mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
-        t2_node_type_register(mod, &ntype);
+        struct t2 *mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ttype.mod = mod;
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
@@ -5364,7 +5429,6 @@ static void traverse_ut() {
         ASSERT(result == -ENOENT);
         ht_delete(&n);
         utest("t2_fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
@@ -5379,15 +5443,13 @@ static void insert_ut() {
         struct t2_tree t = {
                 .ttype = &ttype
         };
-        struct t2 *mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        struct t2 *mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         struct t2_rec r = {
                 .key = &key,
                 .val = &val
         };
         int result;
         ASSERT(EISOK(mod));
-        t2_node_type_register(mod, &ntype);
-        ttype.mod = mod;
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         struct node *n = alloc(&t, 0);
@@ -5400,7 +5462,6 @@ static void insert_ut() {
         result = t2_insert(&t, &r, NULL);
         ASSERT(result == -EEXIST);
         utest("fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
@@ -5421,11 +5482,8 @@ static void tree_ut() {
         uint64_t k64;
         uint64_t v64;
         int result;
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         buf_init_str(&key, key0);
@@ -5463,7 +5521,6 @@ static void tree_ut() {
                 ASSERT(v64 == ht_hash(i + 1));
         }
         utest("fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
@@ -5492,11 +5549,8 @@ static void stress_ut() {
         int     result;
         usuite("stress");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         utest("probe");
@@ -5561,7 +5615,6 @@ static void stress_ut() {
                 }
         }
         utest("fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
@@ -5585,11 +5638,8 @@ static void delete_ut() {
         int     result;
         usuite("delete");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         utest("1K*1K");
@@ -5675,7 +5725,6 @@ static void delete_ut() {
                 }
         }
         utest("fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
@@ -5699,11 +5748,8 @@ static void next_ut() {
         };
         usuite("next");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         struct t2_cursor_op cop = {
@@ -5747,7 +5793,6 @@ static void next_ut() {
                 ASSERT(cit == U - i);
         }
         utest("fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
@@ -5834,11 +5879,8 @@ void seq_ut() {
         struct t2_tree *t;
         usuite("seq");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         utest("populate");
@@ -5852,7 +5894,6 @@ void seq_ut() {
                 inc(key, (sizeof key) - 1);
         }
         utest("fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
@@ -5978,11 +6019,8 @@ void mt_ut() {
         int     result;
         usuite("mt");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         utest("populate");
@@ -6033,7 +6071,6 @@ void mt_ut() {
                 pthread_join(tid[i], NULL);
         }
         utest("fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
@@ -6052,11 +6089,8 @@ static void open_ut() {
         uint64_t bolt;
         usuite("open");
         utest("populate");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         for (long i = 0; i < 4*OPS; ++i) {
@@ -6069,15 +6103,10 @@ static void open_ut() {
         free = file_storage.free;
         bolt = mod->cache.bolt;
         t2_tree_close(t);
-        t2_tree_type_degister(&ttype);
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utest("open");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         file_storage.free = free;
         mod->cache.bolt = bolt;
         t = t2_tree_open(&ttype, root);
@@ -6099,18 +6128,19 @@ static void open_ut() {
                 pthread_join(tid[i], NULL);
         }
         utest("fini");
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utestdone();
 }
 
-static struct t2_node *fake_node = (void*)&open_ut;
 static int lsnset_nr;
 static int apply_nr;
 static void *fdata;
+static struct node fake_node = {
+        .ntype = &ntype
+};
 
 static void wal_ut_lsnset(struct t2_node *node, lsn_t lsn) {
-        ASSERT(node == fake_node && lsn > 0);
+        ASSERT(node == (void *)&fake_node && lsn > 0);
         ++lsnset_nr;
 }
 
@@ -6129,7 +6159,7 @@ enum {
         NR_BUFS    = 200,
         BUF_SIZE   = 1 << 20,
         FLAGS      = 0, /* noforce-nosteal == redo only. */
-        NOPS       = 10
+        NOPS       = 500000
 };
 
 static const char logname[] = "log";
@@ -6138,17 +6168,18 @@ static uint64_t prev_key;
 static uint64_t keys;
 
 static int wal_cnext(struct t2_cursor *c, const struct t2_rec *rec) {
-        uint64_t key = *(uint64_t *)rec->key->addr;
+        uint64_t key = be64toh(*(uint64_t *)rec->key->addr);
         uint64_t val = *(uint64_t *)rec->val->addr;
         ASSERT(rec->key->len == sizeof key);
         ASSERT(rec->val->len == sizeof val);
         ASSERT(prev_key == 0 || key == prev_key + 2);
+        ASSERT(key == val);
         ++keys;
         prev_key = key;
         return +1;
 }
 
-static void wal_verify(struct t2_tree *t) {
+static void wal_ut_verify(struct t2_tree *t) {
         uint64_t key;
         uint64_t start = 0;
         struct t2_buf startkey = BUF_VAL(start);
@@ -6178,7 +6209,7 @@ static void wal_ut() {
         char fake_data[NODE_SIZE];
         char copy[NODE_SIZE];
         struct t2_txrec txr = {
-                .node = fake_node,
+                .node = (void *)&fake_node,
                 .addr = taddr_make(0x100000, NODE_SHIFT),
                 .off  = OFF,
                 .part = {
@@ -6187,6 +6218,9 @@ static void wal_ut() {
                 }
         };
         struct t2_tree *t;
+        taddr_t root;
+        int64_t free;
+        int64_t bolt;
         int result;
         memset(fake_data, '#', SOF(fake_data));
         usuite("wal");
@@ -6196,13 +6230,13 @@ static void wal_ut() {
         utest("init");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t2_fini(mod);
         utest("add");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
@@ -6213,7 +6247,7 @@ static void wal_ut() {
         utest("add-many");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
@@ -6230,7 +6264,7 @@ static void wal_ut() {
         fdata = fake_data;
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
@@ -6249,7 +6283,7 @@ static void wal_ut() {
         apply_nr = 0;
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         ASSERT(memcmp(copy, fake_data, SOF(copy)) == 0);
         ASSERT(apply_nr == 100000);
@@ -6259,54 +6293,65 @@ static void wal_ut() {
         utest("tree-create");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
         t = t2_tree_create(&ttype, tx);
         ASSERT(EISOK(t));
         t2_tree_close(t);
         t2_tx_done(mod, tx);
-        t2_tree_type_degister(&ttype);
-        t2_node_type_degister(&ntype);
         t2_fini(mod);
         utest("replay-ops");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT);
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        ttype.mod = NULL;
-        t2_tree_type_register(mod, &ttype);
-        t2_node_type_register(mod, &ntype);
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
         result = t2_tx_open(mod, tx);
         ASSERT(result == 0);
         t = t2_tree_create(&ttype, tx);
         ASSERT(EISOK(t));
-        t2_tree_close(t);
         for (uint64_t k = 0; k < NOPS; ++k) {
+                uint64_t bek = htobe64(k);
                 result = t2_tx_open(mod, tx);
                 ASSERT(result == 0);
-                result = t2_insert_ptr(t, &k, SOF(k), &k, SOF(k), tx);
+                result = t2_insert_ptr(t, &bek, SOF(bek), &k, SOF(k), tx);
                 ASSERT(result == 0);
                 t2_tx_close(mod, tx);
         }
         for (uint64_t k = 0; k < NOPS; k += 2) {
+                uint64_t bek = htobe64(k);
                 result = t2_tx_open(mod, tx);
                 ASSERT(result == 0);
-                result = t2_delete_ptr(t, &k, SOF(k), tx);
+                result = t2_delete_ptr(t, &bek, SOF(bek), tx);
                 ASSERT(result == 0);
                 t2_tx_close(mod, tx);
         }
         t2_tx_done(mod, tx);
-        wal_verify(t);
-        t2_tree_type_degister(&ttype);
-        t2_node_type_degister(&ntype);
+        wal_ut_verify(t);
+        root = t->root;
+        free = file_storage.free;
+        bolt = mod->cache.bolt;
+        t2_tree_close(t);
         t2_fini(mod);
+        result = truncate(file_storage.filename, 0);
+        ASSERT(result == 0);
+        result = truncate(file_storage.filename, free + (1 << 20));
+        ASSERT(result == 0);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS);
+        ASSERT(EISOK(engine));
+        free0 = free;
+        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        ASSERT(EISOK(mod));
+        mod->cache.bolt = bolt;
+        t = t2_tree_open(&ttype, root);
+        ASSERT(EISOK(t));
+        wal_ut_verify(t);
+        t2_tree_close(t);
+        t2_fini(mod);
+        free0 = 512;
         utestdone();
 }
 
@@ -6314,7 +6359,6 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        wal_ut();
         lib_ut();
         simple_ut();
         ht_ut();

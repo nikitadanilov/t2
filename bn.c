@@ -678,14 +678,20 @@ static bool transactions = false;
 
 static void t_mount(struct benchmark *b) {
         struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE) : NULL;
-        b->kv.u.t2.mod = t2_init(bn_storage, engine, ht_shift, cache_shift);
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
         bn_ntype_twig     = t2_node_type_init(1, "simple-bn-twig",     shift_twig,     0);
         bn_ntype_leaf     = t2_node_type_init(0, "simple-bn-leaf",     shift_leaf,     0);
-        t2_node_type_register(b->kv.u.t2.mod, bn_ntype_internal);
-        t2_node_type_register(b->kv.u.t2.mod, bn_ntype_twig);
-        t2_node_type_register(b->kv.u.t2.mod, bn_ntype_leaf);
-        t2_tree_type_register(b->kv.u.t2.mod, &bn_ttype);
+        struct t2_node_type *ntypes[] = {
+                bn_ntype_internal,
+                bn_ntype_twig,
+                bn_ntype_leaf,
+                NULL
+        };
+        struct t2_tree_type *ttypes[] = {
+                &bn_ttype,
+                NULL
+        };
+        b->kv.u.t2.mod = t2_init(bn_storage, engine, ht_shift, cache_shift, ttypes, ntypes);
         if (b->kv.u.t2.free != 0) {
                 bn_file_free_set(bn_storage, b->kv.u.t2.free);
         }
@@ -707,10 +713,6 @@ static void t_umount(struct benchmark *b) {
         b->kv.u.t2.root = bn_tree_root(b->kv.u.t2.tree);
         b->kv.u.t2.bolt = bn_bolt(b->kv.u.t2.mod);
         t2_tree_close(b->kv.u.t2.tree);
-        t2_node_type_degister(bn_ntype_internal);
-        t2_node_type_degister(bn_ntype_twig);
-        t2_node_type_degister(bn_ntype_leaf);
-        t2_tree_type_degister(&bn_ttype);
         t2_fini(b->kv.u.t2.mod);
         b->kv.u.t2.free = bn_file_free(bn_storage);
         t2_node_type_fini(bn_ntype_internal);
