@@ -46,12 +46,14 @@ struct t2_te { /* Transaction engine. */
         int           (*post)   (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
         int           (*init)   (struct t2_te *te, struct t2 *mod);
         void          (*fini)   (struct t2_te *te);
+        void          (*quiesce)(struct t2_te *te);
         struct t2_tx *(*make)   (struct t2_te *te);
         int           (*open)   (struct t2_te *te, struct t2_tx *tx);
         void          (*close)  (struct t2_te *te, struct t2_tx *tx);
         int           (*wait)   (struct t2_te *te, struct t2_tx *tx, const struct timespec *deadline, bool force);
         void          (*done)   (struct t2_te *te, struct t2_tx *tx);
-        bool          (*canpage)(struct t2_te *te, struct t2_node *n);
+        bool          (*pinned) (struct t2_te *te, struct t2_node *n);
+        bool          (*wantout)(struct t2_te *te, struct t2_node *n);
         void          (*dirty)  (struct t2_te *te, lsn_t lsn);
         const char     *name;
 };

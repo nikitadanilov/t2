@@ -628,6 +628,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_write_nob;
         struct counter_var wal_busy;
         struct counter_var wal_ready;
+        struct counter_var chain_depth;
+        struct counter_var chain_restart;
         struct level_counters {
                 int64_t insert_balance;
                 int64_t delete_balance;
@@ -646,7 +648,9 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t scan_node;
                 int64_t scan_cached;
                 int64_t scan_busy;
+                int64_t scan_tx_busy;
                 int64_t scan_hot;
+                int64_t scan_tx_want;
                 int64_t scan_pageout;
                 int64_t scan_cold;
                 int64_t scan_heated;
@@ -792,6 +796,7 @@ static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
 static struct t2_tx *wal_make(struct t2_te *te);
 static int  wal_init   (struct t2_te *engine, struct t2 *mod);
+static void wal_quiesce(struct t2_te *engine);
 static void wal_fini   (struct t2_te *engine);
 static int  wal_diff   (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype);
 static int  wal_ante   (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr);
@@ -800,7 +805,8 @@ static int  wal_open   (struct t2_te *engine, struct t2_tx *trax);
 static void wal_close  (struct t2_te *engine, struct t2_tx *trax);
 static int  wal_wait   (struct t2_te *engine, struct t2_tx *trax, const struct timespec *deadline, bool force);
 static void wal_done   (struct t2_te *engine, struct t2_tx *trax);
-static bool wal_canpage(struct t2_te *engine, struct t2_node *n);
+static bool wal_pinned (struct t2_te *engine, struct t2_node *n);
+static bool wal_wantout(struct t2_te *engine, struct t2_node *n);
 static void wal_dirty  (struct t2_te *engine, lsn_t lsn);
 static void counters_check();
 static void counters_print();
@@ -918,6 +924,7 @@ void t2_fini(struct t2 *mod) {
         eclear();
         urcu_memb_barrier();
         SET0(&ci);
+        TXCALL(mod->te, quiesce(mod->te));
         cache_fini(mod);
         SCALL(mod, fini);
         cache_clean(mod);
@@ -925,9 +932,7 @@ void t2_fini(struct t2 *mod) {
         ht_fini(&mod->ht);
         ASSERT(cds_list_empty(&mod->cache.cold));
         mod->stor->op->fini(mod->stor);
-        if (mod->te != NULL) {
-                TXCALL(mod->te, fini(mod->te));
-        }
+        TXCALL(mod->te, fini(mod->te));
         signal_fini();
         pool_clean(mod);
         for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.free); ++i) {
@@ -1380,6 +1385,7 @@ static void ndelete(struct node *n) {
         n->flags |= NOCACHE | HEARD_BANSHEE;
         if (LIKELY(n->flags & DIRTY)) {
                 n->flags &= ~DIRTY;
+                n->lsn = 0;
                 KDEC(dirty);
         }
         put_locked(n);
@@ -2760,17 +2766,31 @@ static bool is_hot(struct node *n, int shift) {
                 ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT) + (shift - BOLT_EPOCH_SHIFT))) != 0;
 }
 
+static bool pinned(const struct node *n) {
+        return TXCALL(n->mod->te, pinned(n->mod->te, (void *)n));
+}
+
+static bool wantout(const struct node *n) {
+        return TXCALL(n->mod->te, wantout(n->mod->te, (void *)n));
+}
+
 enum cachestate {
         BUSY,
         HOT,
-        UNCLEAN,
+        PAGE,
         COLD
 };
 
-static enum cachestate nstate(struct node *n, int shift) {
+static enum cachestate nstate(struct node *n, int shift, int baseref) {
         __attribute__((unused)) uint8_t lev = level(n);
         CINC(l[lev].scan_node);
-        if (n->ref > 0) {
+        if (TRANSACTIONS && pinned(n)) {
+                CINC(l[lev].scan_tx_busy);
+                return BUSY;
+        } else if (TRANSACTIONS && wantout(n)) {
+                CINC(l[lev].scan_tx_want);
+                return PAGE;
+        } else if (n->ref > baseref) {
                 CINC(l[lev].scan_busy);
                 return BUSY;
         } else if (is_hot(n, shift)) {
@@ -2778,7 +2798,7 @@ static enum cachestate nstate(struct node *n, int shift) {
                 return HOT;
         } else if (n->flags & DIRTY) {
                 CINC(l[lev].scan_pageout);
-                return UNCLEAN;
+                return PAGE;
         } else {
                 CINC(l[lev].scan_cold);
                 return COLD;
@@ -2797,7 +2817,7 @@ static void cull(struct t2 *mod) {
                         int              try  = pthread_mutex_trylock(lock);
                         if (LIKELY(try == 0)) {
                                 CINC(cull_node);
-                                if (nstate(tail, shift) == COLD) {
+                                if (nstate(tail, shift, 0) == COLD) {
                                         CINC(cull_cleaned);
                                         put_final(tail);
                                 }
@@ -2834,15 +2854,12 @@ static void node_iovec(struct node *n, struct iovec *v) {
         v->iov_len  = nsize(n);
 }
 
-static bool pageable(const struct node *n) {
-        return (n->flags & DIRTY) && n->ref <= 1 && TXCALL(n->mod->te, canpage(n->mod->te, (void *)n));
-}
-
 enum {
         MAX_CLUSTER = 256
 };
 
-static void pageout(struct node *n) {
+static int pageout(struct node *n) {
+        struct t2    *mod = n->mod;
         struct node  *cluster[MAX_CLUSTER];
         struct iovec  vec[MAX_CLUSTER + 1];
         int           nr;
@@ -2851,16 +2868,17 @@ static void pageout(struct node *n) {
         taddr_t       whole;
         int           result;
         int           shift;
+        int           bshift = taddr_sshift(n->addr);
         lock(n, READ);
-        if (LIKELY(pageable(n))) {
+        if (LIKELY(nstate(n, mod->cache.shift, 1) == PAGE)) {
                 node_iovec(n, &vec[0]);
                 for (cur = n->addr, nr = 1; nr < ARRAY_SIZE(cluster); ++nr, cur = next) {
-                        struct node *right;
-                        next = taddr_make(taddr_saddr(cur) + taddr_ssize(cur), taddr_sshift(cur));
-                        right = look(n->mod, next);
-                        if (right != NULL) {
+                        struct node *right; /* This makes a lot of assumptions about taddr_t semantics. */
+                        next = taddr_make(taddr_saddr(cur) + taddr_ssize(cur), bshift);
+                        right = look(mod, next);
+                        if (right != NULL) { /* TODO: Can continue here. */
                                 lock(right, READ);
-                                if (pageable(right)) {
+                                if (nstate(right, mod->cache.shift, 1) == PAGE) {
                                         cluster[nr] = right;
                                         node_iovec(right, &vec[nr]);
                                 } else {
@@ -2877,8 +2895,8 @@ static void pageout(struct node *n) {
                         unlock(cluster[i], READ);
                         put(cluster[i]);
                 }
-                whole = taddr_make(taddr_saddr(n->addr), shift + taddr_sshift(n->addr));
-                result = SCALL(n->mod, write, whole, 1 << shift, vec);
+                whole = taddr_make(taddr_saddr(n->addr), shift + bshift);
+                result = SCALL(mod, write, whole, 1 << shift, vec);
                 CMOD(l[level(n)].pageout_cluster, nr);
                 if (LIKELY(result == 0)) {
                         CINC(write);
@@ -2898,14 +2916,19 @@ static void pageout(struct node *n) {
                         unlock(cluster[i], READ);
                         put(cluster[i]);
                 }
+        } else {
+                result = +1;
         }
         unlock(n, READ);
+        return result;
 }
 
 static void bucket_scan(struct t2 *mod, int shift, int32_t bucket, int32_t *toscan, int32_t *towrite, int32_t *tocache) {
         bool                   done;
         struct cds_hlist_head *head = ht_head(&mod->ht, bucket);
         pthread_mutex_t       *lock = ht_lock(&mod->ht, bucket);
+        int                    restart = 0;
+        int                    result;
         CINC(scan_bucket);
         if (head->next == NULL) {
                 return;
@@ -2913,39 +2936,43 @@ static void bucket_scan(struct t2 *mod, int shift, int32_t bucket, int32_t *tosc
         mutex_lock(lock);
         do {
                 struct node *n;
+                int depth = 0;
                 done = true;
                 cds_hlist_for_each_entry_2(n, head, hash) {
                         struct node *tail;
+                        ++depth;
                         (*toscan)--;
-                        if (TRANSACTIONS && n->flags & DIRTY && n->lsn > 0) {
-                                if (n->lsn < mod->cache.min_dirty) {
-                                        printf("min-dirty: %"PRId64"\n", mod->cache.min_dirty);
-                                }
+                        if (TRANSACTIONS && (n->flags & DIRTY) && n->lsn > 0) {
                                 mod->cache.min_dirty = MIN(mod->cache.min_dirty, n->lsn);
                         }
                         if (!cds_list_empty(&n->cache)) {
                                 CINC(l[level(n)].scan_cached);
                                 continue;
                         }
-                        switch(nstate(n, shift)) {
+                        switch(nstate(n, shift, 0)) {
                         case BUSY:
                         case HOT:
                                 continue;
-                        case UNCLEAN:
+                        case PAGE:
                                 ref(n);
                                 mutex_unlock(lock);
-                                pageout(n);
+                                result = pageout(n);
                                 (*towrite)--;
                                 mutex_lock(lock);
                                 put_locked(n);
-                                done = false;
-                                break;
+                                if (result == 0) {
+                                        done = false;
+                                        restart++;
+                                        break;
+                                } else {
+                                        continue;
+                                }
                         case COLD:
                                 mutex_lock(&mod->cache.guard);
                                 ASSERT(cds_list_empty(&n->cache));
                                 cds_list_add(&n->cache, &mod->cache.cold);
                                 tail = COF(mod->cache.cold.prev, struct node, cache);
-                                if (nstate(tail, shift) == COLD) {
+                                if (nstate(tail, shift, 0) == COLD) {
                                         cds_list_move(&n->cache, &mod->cache.cold);
                                         KINC(cached);
                                 } else {
@@ -2959,7 +2986,9 @@ static void bucket_scan(struct t2 *mod, int shift, int32_t bucket, int32_t *tosc
                                 break;
                         }
                 }
+                CMOD(chain_depth, depth);
         } while (!done);
+        CMOD(chain_restart, restart);
         mutex_unlock(lock);
 }
 
@@ -2976,9 +3005,10 @@ static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocac
                 cache_sync(mod);
                 scan = (scan + 1) & mask;
                 if (scan == 0) {
-                        TXCALL(mod->te, dirty(mod->te, mod->cache.min_dirty));
-                        printf("min_dirty: %"PRId64"\n", mod->cache.min_dirty);
-                        mod->cache.min_dirty = LONG_LONG_MAX;
+                        if (mod->cache.min_dirty != LONG_LONG_MAX) {
+                                TXCALL(mod->te, dirty(mod->te, mod->cache.min_dirty));
+                                mod->cache.min_dirty = LONG_LONG_MAX;
+                        }
                 }
                 if (scan == scan0) {
                         break;
@@ -2987,7 +3017,10 @@ static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocac
         mod->cache.scan = scan;
 }
 
-enum { MAXWELL_SLEEP = 1 };
+enum {
+        MAXWELL_SLEEP = 1,
+        SCAN_STEP     = 1024
+};
 
 static void *maxwelld(struct t2 *mod) {
         struct cache *c = &mod->cache;
@@ -3002,7 +3035,7 @@ static void *maxwelld(struct t2 *mod) {
                         pthread_cond_timedwait(&c->need, &c->condlock, &deadline);
                 }
                 mutex_unlock(&c->condlock);
-                mscan(mod, FREE_BATCH * 10, FREE_BATCH * 2, FREE_BATCH * 2);
+                mscan(mod, SCAN_STEP * 10, SCAN_STEP * 2, SCAN_STEP * 2);
                 cull(mod);
                 counters_fold();
                 cache_sync(mod);
@@ -3024,6 +3057,8 @@ static void cache_fini(struct t2 *mod) {
 
 static void writeout(struct t2 *mod) {
         int32_t scan = 0;
+        uint64_t bolt = mod->cache.bolt;
+        mod->cache.bolt = ~0ULL >> 1; /* Cool everything. */
         do {
                 struct cds_hlist_head *head = &mod->ht.buckets[scan].chain;
                 struct node           *n;
@@ -3035,6 +3070,7 @@ static void writeout(struct t2 *mod) {
                 }
                 scan = (scan + 1) & ((1 << mod->ht.shift) - 1);
         } while (scan != 0);
+        mod->cache.bolt = bolt;
 }
 
 /* @lib */
@@ -3225,6 +3261,8 @@ static void counters_print() {
         printf("write.bytes:        %10"PRId64"\n", GVAL(write_bytes));
         printf("scan:               %10"PRId64"\n", GVAL(scan));
         printf("scan.bucket:        %10"PRId64"\n", GVAL(scan_bucket));
+        counter_var_print1(&GVAL(chain_depth),   "chain_depth");
+        counter_var_print1(&GVAL(chain_restart), "chain_restart");
         printf("throttle.limit:     %10"PRId64"\n", GVAL(throttle_limit));
         printf("throttle.wait:      %10"PRId64"\n", GVAL(throttle_wait));
         printf("cull.trylock:       %10"PRId64"\n", GVAL(cull_trylock));
@@ -3266,7 +3304,9 @@ static void counters_print() {
         COUNTER_PRINT(scan_node);
         COUNTER_PRINT(scan_cached);
         COUNTER_PRINT(scan_busy);
+        COUNTER_PRINT(scan_tx_busy);
         COUNTER_PRINT(scan_hot);
+        COUNTER_PRINT(scan_tx_want);
         COUNTER_PRINT(scan_pageout);
         COUNTER_PRINT(scan_cold);
         COUNTER_PRINT(scan_heated);
@@ -3615,7 +3655,7 @@ static void kmod(struct ewma *a, uint32_t t) {
 }
 
 static uint64_t kavg(struct ewma *a, uint32_t t) { /* Typical unit: quarter of nano-Kelvin (of nabi-Kelvin, technically). */
-        return ((uint64_t)kval(a) << (63 - BOLT_EPOCH_SHIFT)) >> (t - a->cur);
+        return ((uint64_t)kval(a) << (63 - BOLT_EPOCH_SHIFT)) >> MIN(t - a->cur, 63);
 }
 
 /* @buf */
@@ -4160,9 +4200,9 @@ static void simple_print(struct node *n) {
         if (n == NULL) {
                 printf("nil node");
         }
-        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u dir_off: %u dir_end: %u (%p)\n",
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u dir_off: %u dir_end: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64"\n",
                n->addr, sh->head.treeid, sh->head.level, sh->head.ntype,
-               sh->nr, size, sh->dir_off, sdirend(sh), n);
+               sh->nr, size, sh->dir_off, sdirend(sh), n, n->ref, n->flags, n->lsn);
         for (int32_t i = 0; i <= sh->nr; ++i) {
                 struct dir_element *del = sat(sh, i);
                 printf("        %4u %4u %4u: ", i, del->koff, del->voff);
@@ -4259,8 +4299,8 @@ static int  (*ut_apply)(struct t2 *mod, struct t2_txrec *txr);
 void t2_lsnset(struct t2_node *node, lsn_t lsn) {
         if (!UT || ut_lsnset == NULL) {
                 struct node *n = (void *)node;
-                ASSERT(lsn > n->lsn);
-                if (n->lsn != 0) {
+                ASSERT(lsn >= n->lsn);
+                if (n->lsn == 0) {
                         n->lsn = lsn;
                 }
         } else {
@@ -4324,7 +4364,7 @@ struct wal_rec {
                         int16_t ntype;
                 } update;
                 struct {
-                        lsn_t   log_start;
+                        lsn_t   start;
                         lsn_t   max_synced;
                 } header;
         } u;
@@ -4366,9 +4406,11 @@ struct wal_te {
         lsn_t                 max_persistent;
         lsn_t                 max_synced;
         lsn_t                 max_written;
-        lsn_t                 log_start;
-        lsn_t                 log_start_persistent;
+        lsn_t                 start;
+        lsn_t                 start_persistent;
         lsn_t                 log_pruned;
+        lsn_t                 max_wait;
+        lsn_t                 min_want;
         time_t                last_sync;
         int                   fd;
         int                   buf_size;
@@ -4388,26 +4430,29 @@ enum {
         WAL_AGE_LIMIT  = 2,
         WAL_MAX_WRITES = 7, /* Shift. */
         WAL_SYNC_NOB   = 1 << 27,
-        WAL_SYNC_AGE   = 1
+        WAL_SYNC_AGE   = 1,
+        WAL_MAX_LOG    = WAL_SYNC_NOB << 3 /* TODO: Make this a parameter. */
 };
 
 static bool wal_invariant(const struct wal_te *en) {
         return
                 cds_list_length(&en->busy) + cds_list_length(&en->ready) + (en->cur != NULL) == en->nr_bufs &&
+                ((en->buf_size - 1) & en->buf_size) == 0 &&
                 (en->flags & ~(STEAL|FORCE|MAKE|KEEP)) == 0 &&
-                en->log_start_persistent <= en->log_start &&
-                en->log_start <= en->max_persistent &&
+                en->start_persistent <= en->start &&
+                en->start <= en->max_persistent &&
                 en->max_persistent <= en->max_synced &&
                 en->max_synced <= en->max_written &&
                 en->max_written <= en->lsn &&
-                ((en->log_start_persistent | en->log_start | en->max_persistent | en->max_synced | en->max_written) & (en->buf_size - 1)) == 0 &&
+                en->min_want + WAL_MAX_LOG == en->max_persistent &&
+                ((en->start_persistent | en->start | en->max_persistent | en->max_synced | en->max_written) & (en->buf_size - 1)) == 0 &&
                 en->cur != NULL ? cds_list_empty(&en->cur->link) : true;
 }
 
 static void wal_report(const struct wal_te *te) {
         return;
         printf("lsp: %14"PRId64" ls: %14"PRId64" %mp: %14"PRId64" %ms: %14"PRId64" mw: %14"PRId64" lsn: %14"PRId64" ready: %2d busy: %2d\n",
-               te->log_start_persistent, te->log_start, te->max_persistent, te->max_synced, te->max_written,
+               te->start_persistent, te->start, te->max_persistent, te->max_synced, te->max_written,
                te->lsn, cds_list_length(&te->ready), cds_list_length(&te->busy));
 }
 
@@ -4460,7 +4505,7 @@ static int wal_sync(int fd) {
 static void wal_log_prune(struct wal_te *en) {
         struct fpunchhole hole = {
                 .fp_offset = en->buf_size,
-                .fp_length = en->log_start_persistent - en->buf_size
+                .fp_length = en->start_persistent - en->buf_size
         };
         fcntl(en->fd, F_PUNCHHOLE, &hole);
 }
@@ -4471,7 +4516,7 @@ static int wal_sync(int fd) {
 }
 
 static void wal_log_prune(struct wal_te *en) {
-        fallocate(en->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, en->buf_size, en->log_start_persistent - en->buf_size);
+        fallocate(en->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, en->buf_size, en->start_persistent - en->buf_size);
 }
 
 #endif
@@ -4484,7 +4529,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 .len   = 0,
                 .u     = {
                         .header = {
-                                .log_start  = en->log_start,
+                                .start      = en->start,
                                 .max_synced = en->max_synced
                         }
                 }
@@ -4521,7 +4566,8 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                         if (LIKELY(result == 0)) { /* Assume single log writer. */
                                 en->max_persistent = en->max_synced;
                                 en->max_synced = en->max_written;
-                                en->log_start_persistent = en->log_start;
+                                en->start_persistent = en->start;
+                                en->min_want = en->max_persistent - WAL_MAX_LOG;
                                 en->last_sync = time(NULL);
                         } else {
                                 result = ERROR(-errno);
@@ -4644,7 +4690,7 @@ static int wal_post(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         return wal_diff(engine, trax, nob, nr, txr, REDO);
 }
 
-static void wal_fini(struct t2_te *engine) {
+static void wal_quiesce(struct t2_te *engine) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         mutex_lock(&en->lock);
         ASSERT(wal_invariant(en));
@@ -4653,23 +4699,33 @@ static void wal_fini(struct t2_te *engine) {
         }
         wal_get(en, 0);
         wal_buf_end(en);
+        while (cds_list_length(&en->ready) + (en->cur != NULL) != en->nr_bufs) {
+                NOFAIL(pthread_cond_wait(&en->bufwait, &en->lock));
+        }
+        ASSERT(wal_invariant(en));
+        ASSERT(cds_list_empty(&en->busy));
+        mutex_unlock(&en->lock);
+        if (en->fd >= 0) {
+                wal_sync(en->fd);
+                close(en->fd);
+        }
+}
+
+static void wal_fini(struct t2_te *engine) {
+        struct wal_te *en = COF(engine, struct wal_te, base);
+        mutex_lock(&en->lock);
         en->shutdown = true;
         NOFAIL(pthread_cond_signal(&en->bufwrite));
         mutex_unlock(&en->lock);
         pthread_join(en->writer, NULL);
-        ASSERT(cds_list_empty(&en->busy));
-        if (en->fd >= 0) {
-                wal_sync(en->fd);
-                close(en->fd);
-                if (!(en->flags & KEEP)) {
-                        unlink(en->logname);
-                }
-        }
         if (en->cur != NULL) {
                 wal_buf_fini(en->cur);
         }
         while (!cds_list_empty(&en->ready)) {
                 wal_buf_fini(COF(en->ready.next, struct wal_buf, link));
+        }
+        if (!(en->flags & KEEP)) {
+                unlink(en->logname);
         }
         ASSERT(cds_list_empty(&en->ready));
         NOFAIL(pthread_cond_destroy(&en->bufwrite));
@@ -4687,11 +4743,13 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                 en->base.ante    = &wal_ante;
                 en->base.init    = &wal_init;
                 en->base.post    = &wal_post;
+                en->base.quiesce = &wal_quiesce;
                 en->base.fini    = &wal_fini;
                 en->base.make    = &wal_make;
                 en->base.wait    = &wal_wait;
                 en->base.done    = &wal_done;
-                en->base.canpage = &wal_canpage;
+                en->base.pinned  = &wal_pinned;
+                en->base.wantout = &wal_wantout;
                 en->base.dirty   = &wal_dirty;
                 en->base.name    = "wal";
 
@@ -4742,9 +4800,9 @@ static bool wal_rec_invariant(const struct wal_rec *rec, lsn_t lsn) {
                 (rec->rtype == HEADER || rec->rtype == FOOTER || rec->rtype == UNDO ||
                  rec->rtype == REDO || rec->rtype == ALLOC || rec->rtype == FREE) &&
                 rec->rtype == HEADER ? (rec->len == 0 &&
-                                        rec->u.header.log_start > 0 && rec->u.header.log_start <= lsn &&
+                                        rec->u.header.start > 0 && rec->u.header.start <= lsn &&
                                         rec->u.header.max_synced > 0 && rec->u.header.max_synced <= lsn &&
-                                        rec->u.header.log_start <= rec->u.header.max_synced) : true;
+                                        rec->u.header.start <= rec->u.header.max_synced) : true;
 }
 
 static bool wal_buf_is_valid(struct wal_te *en, struct wal_rec *rec, lsn_t lsn) {
@@ -4793,8 +4851,9 @@ static int wal_recover_log(struct wal_te *en, lsn_t start, lsn_t end) {
 }
 
 static void wal_recovery_done(struct wal_te  *en, lsn_t start, lsn_t end) {
-        en->lsn = en->max_persistent = en->max_synced = en->max_written = end;
-        en->log_pruned = en->log_start_persistent = en->log_start = start;
+        en->lsn = en->max_persistent = en->max_synced = en->max_written = en->max_wait = end;
+        en->log_pruned = en->start_persistent = en->start = start;
+        en->min_want = en->max_persistent - WAL_MAX_LOG;
         en->recovered = true;
 }
 
@@ -4832,12 +4891,12 @@ static int wal_recover(struct wal_te  *en) {
         }
         if (result == 0) {
                 if (lastbuf >= 1) {
-                        result = wal_recover_log(en, rec->u.header.log_start, rec->u.header.max_synced);
+                        result = wal_recover_log(en, rec->u.header.start, rec->u.header.max_synced);
                         if (result == 0) {
-                                wal_recovery_done(en, rec->u.header.log_start, rec->u.header.max_synced);
+                                wal_recovery_done(en, rec->u.header.start, rec->u.header.max_synced);
                                 en->recovered = true;
                                 en->lsn = en->max_persistent = en->max_synced = en->max_written = rec->u.header.max_synced;
-                                en->log_start = rec->u.header.log_start;
+                                en->start = rec->u.header.start;
                         }
                 } else {
                         return ERROR(-EIO);
@@ -4857,7 +4916,7 @@ static struct t2_tx *wal_make(struct t2_te *te) {
 }
 
 static bool wal_tx_stable(struct wal_te *en, lsn_t tx) {
-        return ((en->flags & FORCE) ? en->log_start_persistent : en->max_persistent) > tx;
+        return ((en->flags & FORCE) ? en->start_persistent : en->max_persistent) > tx;
 }
 
 static int wal_wait(struct t2_te *engine, struct t2_tx *trax, const struct timespec *deadline, bool force) {
@@ -4870,6 +4929,7 @@ static int wal_wait(struct t2_te *engine, struct t2_tx *trax, const struct times
         if (force && en->cur != NULL && en->cur->start <= tx->id) {
                 wal_buf_end(en);
         }
+        en->max_wait = MAX(en->max_wait, tx->id);
         while (!wal_tx_stable(en, tx->id)) {
                 result = -pthread_cond_timedwait(&en->logwait, &en->lock, deadline);
                 ASSERT(result == 0 || result == -ETIMEDOUT);
@@ -4893,16 +4953,22 @@ static void wal_done(struct t2_te *te, struct t2_tx *trax) {
         mem_free(COF(trax, struct wal_tx, base));
 }
 
-static bool wal_canpage(struct t2_te *engine, struct t2_node *n) {
+static bool wal_pinned(struct t2_te *engine, struct t2_node *n) {
         struct wal_te *en = COF(engine, struct wal_te, base);
-        return t2_lsnget(n) < en->max_persistent;
+        return t2_lsnget(n) >= en->max_persistent;
+}
+
+static bool wal_wantout(struct t2_te *engine, struct t2_node *n) {
+        struct wal_te *en = COF(engine, struct wal_te, base);
+        lsn_t lsn = t2_lsnget(n);
+        return lsn != 0 && lsn < en->min_want;
 }
 
 static void wal_dirty(struct t2_te *engine, lsn_t lsn) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         mutex_lock(&en->lock);
         ASSERT(wal_invariant(en));
-        en->log_start = lsn;
+        en->start = lsn & ~(en->buf_size - 1);
         ASSERT(wal_invariant(en));
         mutex_unlock(&en->lock);
 }
@@ -4913,10 +4979,11 @@ static void wal_writer_chores(struct wal_te *en) {
                 wal_buf_end(en);
                 CINC(wal_cur_aged);
         }
-        if (en->log_start_persistent > en->log_pruned) {
+        if (en->start_persistent > en->log_pruned) {
                 wal_log_prune(en);
-                en->log_pruned = en->log_start_persistent;
+                en->log_pruned = en->start_persistent;
         }
+        /* TODO: force cache write-out if the log is too large. */
 }
 
 static void *wal_writer(void *arg) {
