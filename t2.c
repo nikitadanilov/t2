@@ -5243,8 +5243,11 @@ void bn_bolt_set(struct t2 *mod, uint64_t bolt) {
 }
 
 void bn_counters_print(struct t2 *mod) {
-        t2_stats_print(mod);
-        counters_print();
+        if (mod != NULL) {
+                t2_stats_print(mod);
+        } else {
+                counters_print();
+        }
         counters_clear();
 }
 
