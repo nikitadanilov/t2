@@ -3147,9 +3147,9 @@ static void mem_free(void *ptr) {
 }
 
 static uint64_t now(void) {
-        struct timeval t;
-        NOFAIL(gettimeofday(&t, NULL));
-        return t.tv_sec * 1000000 + t.tv_usec;
+        struct timespec t;
+        NOFAIL(clock_gettime(CLOCK_MONOTONIC, &t));
+        return t.tv_sec * 1000000000ULL + t.tv_nsec;
 }
 
 static void llog(const struct msg_ctx *ctx, ...) {
@@ -4557,8 +4557,6 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 .rtype = FOOTER,
                 .len   = en->buf_size - buf->nob
         };
-        ASSERT(wal_invariant(en));
-        mutex_unlock(&en->lock);
         ASSERT(buf->start != 0);
         buf->seg[0]         = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
         buf->seg[buf->used] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
@@ -4566,21 +4564,20 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         CINC(wal_write);
         CMOD(wal_write_seg, buf->used + 1);
         CMOD(wal_write_nob, buf->nob);
-        mutex_lock(&en->lock);
         if (LIKELY(result == buf->nob)) {
                 cds_list_del(&buf->link);
                 CMOD(wal_busy, cds_list_length(&en->busy));
                 ASSERT(buf->start + en->buf_size > en->max_written);
                 en->max_written = buf->start + en->buf_size;
                 wal_buf_release(buf);
+                mutex_lock(&en->lock);
                 cds_list_add(&buf->link, &en->ready);
                 NOFAIL(pthread_cond_signal(&en->bufwait));
+                mutex_unlock(&en->lock);
                 CMOD(wal_ready, cds_list_length(&en->ready));
                 if (wal_should_fsync(en)) {
-                        mutex_unlock(&en->lock);
                         result = wal_sync(en->fd);
                         CINC(wal_write_sync);
-                        mutex_lock(&en->lock);
                         if (LIKELY(result == 0)) { /* Assume single log writer. */
                                 en->max_persistent = en->max_synced;
                                 en->max_synced = en->max_written;
@@ -4597,7 +4594,6 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.", en->logname, buf->start, buf->nob, result, errno);
                 result = ERROR(result < 0 ? -errno : -EIO);
         }
-        ASSERT(wal_invariant(en));
         return result;
 }
 
@@ -4692,7 +4688,6 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 memcpy(rec->data, txr[i].part.addr, rec->len);
                 rec = wal_next(rec);
         }
-        rec = space;
         tx->id = wal_attach(en, size, space);
         for (int i = 0; i < nr; ++i) {
                 t2_lsnset(txr[i].node, tx->id);
@@ -5000,8 +4995,10 @@ static void wal_print(struct t2_te *engine) {
 
 static void wal_writer_chores(struct wal_te *en) {
         counters_fold();
-        if (en->cur != NULL && time(NULL) - en->cur_age > WAL_AGE_LIMIT) {
+        if (UNLIKELY(en->cur != NULL && time(NULL) - en->cur_age > WAL_AGE_LIMIT)) {
+                mutex_lock(&en->lock);
                 wal_buf_end(en);
+                mutex_unlock(&en->lock);
                 CINC(wal_cur_aged);
         }
         if (en->start_persistent > en->pruned) {
@@ -5014,16 +5011,25 @@ static void wal_writer_chores(struct wal_te *en) {
 static void *wal_writer(void *arg) {
         struct wal_te *en = arg;
         int            result;
-        mutex_lock(&en->lock);
         while (true) {
                 struct timeval  cur;
                 struct timespec deadline;
                 int writes = 0;
-                ASSERT(wal_invariant(en));
-                while (!cds_list_empty(&en->busy)) {
-                        wal_write(en, COF(en->busy.prev, struct wal_buf, link)); /* TODO: Handle errors. */
-                        if ((++writes & ((1 << WAL_MAX_WRITES) - 1)) == 0) {
-                                wal_writer_chores(en);
+                while (true) {
+                        struct wal_buf *buf = NULL;
+                        mutex_lock(&en->lock);
+                        ASSERT(wal_invariant(en));
+                        if (LIKELY(!cds_list_empty(&en->busy))) {
+                                buf = COF(en->busy.prev, struct wal_buf, link);
+                        }
+                        mutex_unlock(&en->lock);
+                        if (buf != NULL) {
+                                wal_write(en, buf); /* TODO: Handle errors. */
+                                if ((++writes & ((1 << WAL_MAX_WRITES) - 1)) == 0) {
+                                        wal_writer_chores(en);
+                                }
+                        } else {
+                                break;
                         }
                 }
                 wal_writer_chores(en);
@@ -5033,10 +5039,11 @@ static void *wal_writer(void *arg) {
                 gettimeofday(&cur, NULL);
                 deadline.tv_sec  = cur.tv_sec + WAL_SLEEP_SEC;
                 deadline.tv_nsec = WAL_SLEEP_NSEC;
+                mutex_lock(&en->lock);
                 result = pthread_cond_timedwait(&en->bufwrite, &en->lock, &deadline);
+                mutex_unlock(&en->lock);
                 ASSERT(result == 0 || result == ETIMEDOUT);
         }
-        mutex_unlock(&en->lock);
         return NULL;
 }
 
