@@ -4594,7 +4594,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                         result = 0;
                 }
         } else { /* TODO: Handle list linkage. */
-                LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.\n", en->logname, buf->start, buf->nob, result, errno);
+                LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.", en->logname, buf->start, buf->nob, result, errno);
                 result = ERROR(result < 0 ? -errno : -EIO);
         }
         ASSERT(wal_invariant(en));
