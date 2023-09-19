@@ -55,6 +55,7 @@ struct t2_te { /* Transaction engine. */
         bool          (*pinned) (struct t2_te *te, struct t2_node *n);
         bool          (*wantout)(struct t2_te *te, struct t2_node *n);
         void          (*dirty)  (struct t2_te *te, lsn_t lsn);
+        void          (*print)  (struct t2_te *te);
         const char     *name;
 };
 

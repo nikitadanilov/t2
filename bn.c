@@ -102,12 +102,13 @@ extern uint64_t bn_file_free(struct t2_storage *storage);
 extern void bn_file_free_set(struct t2_storage *storage, uint64_t free);
 extern uint64_t bn_bolt(const struct t2 *mod);
 extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
-extern void bn_counters_print(void);
+extern void bn_counters_print(struct t2 *mod);
 extern void bn_counters_fold(void);
 extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags);
 
 static struct kv kv[KVNR];
 static enum kvtype kvt = T2;
+struct t2 *mod = NULL;
 
 static void *mem_alloc(size_t size) {
         void *out = malloc(size);
@@ -549,7 +550,7 @@ static void *breport_thread(void *arg) {
                 sleep(report_interval);
                 bphase_report(ph, false);
                 if (counters_level > 1) {
-                        bn_counters_print();
+                        bn_counters_print(mod);
                 }
                 pthread_testcancel();
         }
@@ -584,7 +585,7 @@ static void bphase(struct bphase *ph, int i) {
         }
         blog(BINFO, "    Phase %2i done.\n", i);
         if (counters_level > 0) {
-                bn_counters_print();
+                bn_counters_print(mod);
         }
         NOFAIL(pthread_cancel(reporter));
         NOFAIL(pthread_cond_destroy(&ph->start));
@@ -691,7 +692,7 @@ static void t_mount(struct benchmark *b) {
                 &bn_ttype,
                 NULL
         };
-        b->kv.u.t2.mod = t2_init(bn_storage, engine, ht_shift, cache_shift, ttypes, ntypes);
+        mod = b->kv.u.t2.mod = t2_init(bn_storage, engine, ht_shift, cache_shift, ttypes, ntypes);
         if (b->kv.u.t2.free != 0) {
                 bn_file_free_set(bn_storage, b->kv.u.t2.free);
         }
@@ -718,6 +719,7 @@ static void t_umount(struct benchmark *b) {
         t2_node_type_fini(bn_ntype_internal);
         t2_node_type_fini(bn_ntype_twig);
         t2_node_type_fini(bn_ntype_leaf);
+        mod = NULL;
 }
 
 static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {
