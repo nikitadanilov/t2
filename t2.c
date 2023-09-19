@@ -870,7 +870,7 @@ struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int
         if (LIKELY(result == 0)) {
                 if (LIKELY(mod != NULL)) {
                         mod->cache.shift = cshift;
-                        mod->cache.min_dirty = LONG_LONG_MAX;
+                        mod->cache.min_dirty = LLONG_MAX;
                         NOFAIL(pthread_mutex_init(&mod->cache.lock, NULL));
                         NOFAIL(pthread_mutex_init(&mod->cache.guard, NULL));
                         NOFAIL(pthread_mutex_init(&mod->cache.condlock, NULL));
@@ -3030,9 +3030,9 @@ static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocac
                 cache_sync(mod);
                 scan = (scan + 1) & mask;
                 if (scan == 0) {
-                        if (mod->cache.min_dirty != LONG_LONG_MAX) {
+                        if (mod->cache.min_dirty != LLONG_MAX) {
                                 TXCALL(mod->te, dirty(mod->te, mod->cache.min_dirty));
-                                mod->cache.min_dirty = LONG_LONG_MAX;
+                                mod->cache.min_dirty = LLONG_MAX;
                         }
                 }
                 if (scan == scan0) {
