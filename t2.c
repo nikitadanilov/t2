@@ -4720,7 +4720,6 @@ static void wal_quiesce(struct t2_te *engine) {
         mutex_unlock(&en->lock);
         if (en->fd >= 0) {
                 wal_sync(en->fd);
-                close(en->fd);
         }
 }
 
@@ -4736,6 +4735,9 @@ static void wal_fini(struct t2_te *engine) {
         }
         while (!cds_list_empty(&en->ready)) {
                 wal_buf_fini(COF(en->ready.next, struct wal_buf, link));
+        }
+        if (en->fd >= 0) {
+                close(en->fd);
         }
         if (!(en->flags & KEEP)) {
                 unlink(en->logname);
