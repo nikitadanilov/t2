@@ -365,9 +365,9 @@ static int32_t bufgen(void *key, uint64_t seed0, int max, int *rndmax, int delta
 }
 
 static uint64_t now(void) {
-        struct timeval t;
-        NOFAIL(gettimeofday(&t, NULL));
-        return t.tv_sec * 1000000 + t.tv_usec;
+        struct timespec t;
+        NOFAIL(clock_gettime(CLOCK_MONOTONIC, &t));
+        return t.tv_sec * 1000000ULL + t.tv_nsec / 1000;
 }
 
 static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var, uint64_t (*rc)[ENR]) {
