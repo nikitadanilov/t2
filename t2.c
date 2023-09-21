@@ -668,6 +668,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var recpos;
                 struct counter_var prefix;
                 struct counter_var pageout_cluster;
+                struct counter_var tx_add[M_NR];
         } l[MAX_TREE_HEIGHT];
 };
 
@@ -809,6 +810,7 @@ static bool wal_pinned (struct t2_te *engine, struct t2_node *n);
 static bool wal_wantout(struct t2_te *engine, struct t2_node *n);
 static void wal_dirty  (struct t2_te *engine, lsn_t lsn);
 static void wal_print  (struct t2_te *engine);
+static void mod_print(const struct mod *mod);
 static void counters_check();
 static void counters_print();
 static void counters_clear();
@@ -978,7 +980,6 @@ void t2_stats_print(struct t2 *mod) {
         mutex_unlock(&mod->cache.guard);
         mutex_unlock(&mod->cache.lock);
         if (TRANSACTIONS && mod->te != NULL) {
-                printf("%15s", "tx-engine: ");
                 TXCALL(mod->te, print(mod->te));
         }
         counters_print();
@@ -2047,6 +2048,11 @@ static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
                                 *nob += txr[pos].part.len;
                                 pos++;
                         }
+                        CMOD(l[level(n)].tx_add[i], max_32(end - start, 0));
+                }
+        } else if (n != NULL) {
+                for (int i = 0; i < ARRAY_SIZE(mod->ext); ++i) {
+                        CMOD(l[level(n)].tx_add[i], 0);
                 }
         }
         return pos;
@@ -3349,6 +3355,10 @@ static void counters_print() {
         COUNTER_VAR_PRINT(sepcut);
         COUNTER_VAR_PRINT(prefix);
         COUNTER_VAR_PRINT(pageout_cluster);
+        COUNTER_VAR_PRINT(tx_add[HDR]);
+        COUNTER_VAR_PRINT(tx_add[KEY]);
+        COUNTER_VAR_PRINT(tx_add[DIR]);
+        COUNTER_VAR_PRINT(tx_add[VAL]);
         DOUBLE_VAR_PRINT(temperature);
 }
 
@@ -4048,7 +4058,7 @@ static void ext_merge(struct ext *ext, int32_t start, int32_t end) {
 
 static void mod_print(const struct mod *mod) {
         for (int i = 0; i < ARRAY_SIZE(mod->ext); ++i) {
-                printf("[%4i ... %4i] ", mod->ext[i].start, mod->ext[i].end);
+                printf("[%4i: %4i ... %4i] ", mod->ext[i].end - mod->ext[i].start, mod->ext[i].start, mod->ext[i].end);
         }
         puts("");
 }
@@ -4439,6 +4449,7 @@ struct wal_te {
         time_t                last_sync;
         int                   fd;
         int                   buf_size;
+        int64_t               log_size;
         struct wal_buf       *cur;
         struct cds_list_head  ready;
         struct cds_list_head  busy;
@@ -4463,6 +4474,7 @@ static bool wal_invariant(const struct wal_te *en) {
         return
                 cds_list_length(&en->busy) + cds_list_length(&en->ready) + (en->cur != NULL) == en->nr_bufs &&
                 ((en->buf_size - 1) & en->buf_size) == 0 &&
+                ((en->log_size - 1) & en->log_size) == 0 &&
                 (en->flags & ~(STEAL|FORCE|MAKE|KEEP)) == 0 &&
                 en->start_persistent <= en->start &&
                 en->start <= en->max_persistent &&
@@ -4565,16 +4577,15 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         CMOD(wal_write_seg, buf->used + 1);
         CMOD(wal_write_nob, buf->nob);
         if (LIKELY(result == buf->nob)) {
-                cds_list_del(&buf->link);
-                CMOD(wal_busy, cds_list_length(&en->busy));
                 ASSERT(buf->start + en->buf_size > en->max_written);
                 en->max_written = buf->start + en->buf_size;
                 wal_buf_release(buf);
                 mutex_lock(&en->lock);
-                cds_list_add(&buf->link, &en->ready);
+                cds_list_move(&buf->link, &en->ready);
                 NOFAIL(pthread_cond_signal(&en->bufwait));
-                mutex_unlock(&en->lock);
+                CMOD(wal_busy,  cds_list_length(&en->busy));
                 CMOD(wal_ready, cds_list_length(&en->ready));
+                mutex_unlock(&en->lock);
                 if (wal_should_fsync(en)) {
                         result = wal_sync(en->fd);
                         CINC(wal_write_sync);
@@ -4991,8 +5002,10 @@ static void wal_dirty(struct t2_te *engine, lsn_t lsn) {
 
 static void wal_print(struct t2_te *engine) {
         struct wal_te *en = COF(engine, struct wal_te, base);
-        printf("pruned: %010"PRIx64" start-persistent: %010"PRIx64" start: %010"PRIx64" min-want: %010"PRIx64" max-persistent: %010"PRIx64" max-synced: %010"PRIx64" max-written: %010"PRIx64" max-wait: %010"PRIx64" lsn: %010"PRIx64"\n",
-               en->pruned, en->start_persistent, en->start, en->min_want, en->max_persistent, en->max_synced, en->max_written, en->max_wait, en->lsn);
+        printf("pruned:         %010"PRIx64" start-persistent: %010"PRIx64" start:       %010"PRIx64" min-want: %010"PRIx64" min-dirty: %010"PRIx64"\n"
+               "max-persistent: %010"PRIx64" max-synced:       %010"PRIx64" max-written: %010"PRIx64" max-wait: %010"PRIx64" lsn:       %010"PRIx64"\n",
+               en->pruned, en->start_persistent, en->start, en->min_want, en->mod->cache.min_dirty,
+               en->max_persistent, en->max_synced, en->max_written, en->max_wait, en->lsn);
 }
 
 static void wal_writer_chores(struct wal_te *en) {
