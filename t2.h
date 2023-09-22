@@ -54,7 +54,7 @@ struct t2_te { /* Transaction engine. */
         void          (*done)   (struct t2_te *te, struct t2_tx *tx);
         bool          (*pinned) (struct t2_te *te, struct t2_node *n);
         bool          (*wantout)(struct t2_te *te, struct t2_node *n);
-        void          (*dirty)  (struct t2_te *te, lsn_t lsn);
+        void          (*clean)  (struct t2_te *te, struct t2_node **nodes, int nr);
         void          (*print)  (struct t2_te *te);
         const char     *name;
 };
@@ -183,7 +183,7 @@ void    t2_release(struct t2_node *n);
 void    t2_lsnset (struct t2_node *n, lsn_t lsn);
 lsn_t   t2_lsnget (const struct t2_node *n);
 taddr_t t2_addr   (const struct t2_node *n);
-int     t2_apply  (struct t2 *mod, struct t2_txrec *txr);
+struct t2_node *t2_apply(struct t2 *mod, struct t2_txrec *txr);
 
 int   t2_error(int idx, char *buf, int nob, int *err);
 void  t2_error_print(void);

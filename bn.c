@@ -702,10 +702,14 @@ static void t_mount(struct benchmark *b) {
         if (b->kv.u.t2.root != 0) {
                 b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.root);
         } else {
-                struct t2_tx *tx = transactions ? t2_tx_make(b->kv.u.t2.mod) : NULL;
-                b->kv.u.t2.tree = t2_tree_create(&bn_ttype, tx);
                 if (transactions) {
+                        struct t2_tx *tx = t2_tx_make(b->kv.u.t2.mod);
+                        t2_tx_open(b->kv.u.t2.mod, tx);
+                        b->kv.u.t2.tree = t2_tree_create(&bn_ttype, tx);
+                        t2_tx_close(b->kv.u.t2.mod, tx);
                         t2_tx_done(b->kv.u.t2.mod, tx);
+                } else {
+                        b->kv.u.t2.tree = t2_tree_create(&bn_ttype, NULL);
                 }
         }
 }
@@ -729,9 +733,14 @@ static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int 
         d->u.t2.cur = mem_alloc(maxkey);
         d->u.t2.c.curkey = (struct t2_buf){ .addr = d->u.t2.cur, .len = maxkey };
         t2_thread_register();
+        if (transactions) {
+                d->u.t2.tx = t2_tx_make(d->b->u.t2.mod);
+                assert(d->u.t2.tx != NULL);
+        }
 }
 
 static void t_worker_fini(struct rthread *rt, struct kvdata *d) {
+        t2_tx_done(d->b->u.t2.mod, d->u.t2.tx);
         mem_free(d->u.t2.cur);
         t2_thread_degister();
 }
@@ -743,20 +752,28 @@ static int t_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, 
 }
 
 static int t_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
-        struct t2_tx *tx = transactions ? t2_tx_make(d->b->u.t2.mod) : NULL;
-        int result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize, tx);
+        int result;
         if (transactions) {
-                t2_tx_done(d->b->u.t2.mod, tx);
+                result = t2_tx_open(d->b->u.t2.mod, d->u.t2.tx);
+                assert(result == 0);
+        }
+        result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize, d->u.t2.tx);
+        if (transactions) {
+                t2_tx_close(d->b->u.t2.mod, d->u.t2.tx);
         }
         assert(result == 0 || result == -EEXIST);
         return result;
 }
 
 static int t_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
-        struct t2_tx *tx = transactions ? t2_tx_make(d->b->u.t2.mod) : NULL;
-        int result = t2_delete_ptr(d->u.t2.tree, key, ksize, tx);
+        int result;
         if (transactions) {
-                t2_tx_done(d->b->u.t2.mod, tx);
+                result = t2_tx_open(d->b->u.t2.mod, d->u.t2.tx);
+                assert(result == 0);
+        }
+        result = t2_delete_ptr(d->u.t2.tree, key, ksize, d->u.t2.tx);
+        if (transactions) {
+                t2_tx_close(d->b->u.t2.mod, d->u.t2.tx);
         }
         assert(result == 0 || result == -ENOENT);
         return result;

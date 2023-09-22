@@ -179,6 +179,7 @@ struct kvdata {
                         struct t2_cursor_op  cop;
                         struct t2_cursor     c;
                         void                *cur;
+                        struct t2_tx        *tx;
                 } t2;
         } u;
 };
