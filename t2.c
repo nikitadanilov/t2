@@ -5100,12 +5100,10 @@ static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
         struct wal_tx *tx = COF(trax, struct wal_tx, base);
         tx->reserved = 1;
         wal_lock(en);
-        uint64_t start = now();
         en->reserved += 1;
         while (wal_log_free(en) < wal_log_need(en)) {
                 wal_cond_wait(en, &en->logwait);
         }
-        CMOD(wal_open_wait_time, now() - start);
         wal_unlock(en);
         return 0;
 }
