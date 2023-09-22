@@ -932,13 +932,12 @@ void t2_fini(struct t2 *mod) {
         SET0(&ci);
         TXCALL(mod->te, quiesce(mod->te));
         cache_fini(mod);
+        TXCALL(mod->te, fini(mod->te));
         SCALL(mod, fini);
         cache_clean(mod);
         ht_clean(&mod->ht);
         ht_fini(&mod->ht);
         ASSERT(cds_list_empty(&mod->cache.cold));
-        mod->stor->op->fini(mod->stor);
-        TXCALL(mod->te, fini(mod->te));
         signal_fini();
         pool_clean(mod);
         for (int i = 0; i < ARRAY_SIZE(mod->cache.pool.free); ++i) {
@@ -5225,9 +5224,7 @@ static void *wal_cache_writer(void *arg) {
                         mutex_lock(&en->laundry_lock);
                         if (UNLIKELY(cds_list_empty(&en->laundry))) {
                                 mutex_unlock(&en->laundry_lock);
-                                LOG("Not enough log space.");
-                                wal_print(&en->base);
-                                continue;
+                                break;
                         }
                         n = COF(en->laundry.prev, struct node, dirty);
                         tail = n->lsn;
