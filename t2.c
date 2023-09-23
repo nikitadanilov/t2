@@ -4431,7 +4431,7 @@ enum { WAL_MAX_BUF_SEG = 1024 }; /* __IOV_MAX on Linux and UIO_MAXIOV on Darwin 
 struct wal_buf {
         int32_t              used;
         int32_t              nob;
-        lsn_t                start;
+        lsn_t                lsn;
         struct cds_list_head link;
         struct iovec         seg[WAL_MAX_BUF_SEG];
 };
@@ -4496,7 +4496,7 @@ enum {
         WAL_MAX_WRITES       = 7,          /* Shift. */
         WAL_SYNC_NOB         = 1ULL << 5,  /* Measured in buffers. */
         WAL_SYNC_AGE         = 1000000000, /* Nanoseconds. */
-        WAL_MAX_LOG          = 1ULL << 10, /* Measured in buffers. TODO: Make this a parameter. */
+        WAL_MAX_LOG          = 2ULL << 10, /* Measured in buffers. TODO: Make this a parameter. */
         WAL_RESERVE_QUANTUM  = 10
 };
 
@@ -4518,7 +4518,7 @@ static bool wal_invariant(const struct wal_te *en) {
                 en->max_written <= en->lsn &&
                 en->min_want + en->log_size == en->max_persistent &&
                 en->cur != NULL ? (cds_list_empty(&en->cur->link) &&
-                                   en->lsn == en->cur->start) : true &&
+                                   en->lsn == en->cur->lsn) : true &&
                 wal_log_need(en) <= en->log_size;
 }
 
@@ -4669,7 +4669,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 .len   = 0,
                 .u     = {
                         .header = {
-                                .lsn   = buf->start,
+                                .lsn   = buf->lsn,
                                 .start = en->start,
                                 .end   = en->max_synced
                         }
@@ -4680,19 +4680,19 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 .rtype = FOOTER,
                 .len   = en->buf_size - buf->nob
         };
-        ASSERT(buf->start != 0);
+        ASSERT(buf->lsn != 0);
         buf->seg[0]         = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
         buf->seg[buf->used] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
         ASSERT(wal_log_free(en) > 0);
-        result = pwritev(en->fd, buf->seg, buf->used + 1, (buf->start & (en->log_size - 1)) << en->buf_size_shift);
+        result = pwritev(en->fd, buf->seg, buf->used + 1, (buf->lsn & (en->log_size - 1)) << en->buf_size_shift);
         CINC(wal_write);
         CMOD(wal_write_seg, buf->used + 1);
         CMOD(wal_write_nob, buf->nob);
         if (LIKELY(result == buf->nob)) {
-                ASSERT(buf->start + 1 > en->max_written);
+                ASSERT(buf->lsn + 1 > en->max_written);
                 wal_buf_release(buf);
                 wal_lock(en);
-                en->max_written = buf->start + 1;
+                en->max_written = buf->lsn + 1;
                 cds_list_move(&buf->link, &en->ready);
                 --en->busy_nr;
                 CMOD(wal_busy,  en->busy_nr);
@@ -4701,7 +4701,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 wal_unlock(en);
                 result = 0;
         } else { /* TODO: Handle list linkage. */
-                LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.", en->logname, buf->start, buf->nob, result, errno);
+                LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.", en->logname, buf->lsn, buf->nob, result, errno);
                 result = ERROR(result < 0 ? -errno : -EIO);
         }
         return result;
@@ -4715,14 +4715,14 @@ static void wal_buf_start(struct wal_te *en) {
         struct wal_buf *buf = en->cur = COF(en->ready.next, struct wal_buf, link);
         CMOD(wal_ready, cds_list_length(&en->ready));
         cds_list_del_init(&buf->link);
-        buf->start = en->lsn;
+        buf->lsn = en->lsn;
         buf->used = 1;
         buf->nob = 2 * sizeof(struct wal_rec);
         en->cur_age = time(NULL);
 }
 
 static void wal_buf_end(struct wal_te *en) {
-        ASSERT(en->lsn == en->cur->start);
+        ASSERT(en->lsn == en->cur->lsn);
         cds_list_add(&en->cur->link, &en->busy);
         ++en->busy_nr;
         CMOD(wal_busy, en->busy_nr);
@@ -5117,7 +5117,7 @@ static int wal_wait(struct t2_te *engine, struct t2_tx *trax, const struct times
         int            result = 0;
         ASSERT(tx->id != 0);
         wal_lock(en);
-        if (force && en->cur != NULL && en->cur->start <= tx->id) {
+        if (force && en->cur != NULL && en->cur->lsn <= tx->id) {
                 wal_buf_end(en);
         }
         while (!wal_tx_stable(en, tx->id)) {
