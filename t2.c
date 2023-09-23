@@ -2945,6 +2945,7 @@ static int pageout0(struct node *n) {
                 put(cluster[i]);
         }
         whole = taddr_make(taddr_saddr(n->addr), shift + bshift);
+        ASSERT(FORALL(i, 1 << shift, !pinned(cluster[i])));
         result = SCALL(mod, write, whole, 1 << shift, vec);
         CMOD(l[level(n)].pageout_cluster, nr);
         if (LIKELY(result == 0)) {
