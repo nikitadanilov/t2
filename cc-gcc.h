@@ -6,7 +6,7 @@
 #if __has_attribute(assume)
 #define ASSUME(expr) __attribute__((assume(expr)))
 #else
-#define ASSUME(expr) ((void)(expr))
+#define ASSUME(expr) ((void)sizeof(expr))
 #endif
 #endif
 
