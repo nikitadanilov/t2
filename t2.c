@@ -628,9 +628,11 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_page_clean;
         int64_t wal_page_none;
         int64_t wal_page_done;
+        int64_t wal_log_already;
         int64_t wal_sync_log_head;
         int64_t wal_sync_log_lo;
         int64_t wal_sync_log_time;
+        int64_t wal_page_already;
         int64_t wal_page_wal;
         int64_t wal_page_empty;
         int64_t wal_page_lo;
@@ -750,6 +752,8 @@ static void  mem_free(void *ptr);
 static uint64_t now(void);
 static int32_t max_32(int32_t a, int32_t b);
 static int32_t min_32(int32_t a, int32_t b);
+static int64_t max_64(int64_t a, int64_t b);
+static int64_t min_64(int64_t a, int64_t b);
 static int ilog2(uint32_t x);
 static int cacheline_size();
 static uint64_t threadid(void);
@@ -3105,13 +3109,12 @@ static void cache_fini(struct t2 *mod) {
 static void writeout(struct t2 *mod) {
         int32_t scan = 0;
         uint64_t bolt = mod->cache.bolt;
-        mod->cache.bolt = ~0ULL >> 1; /* Cool everything. */
         do {
                 struct cds_hlist_head *head = &mod->ht.buckets[scan].chain;
                 struct node           *n;
                 cds_hlist_for_each_entry_2(n, head, hash) {
                         if (n->flags & DIRTY) {
-                                pageout(n);
+                                pageout0(n);
                         }
                         ASSERT(!(n->flags & DIRTY));
                 }
@@ -3188,6 +3191,14 @@ static int32_t min_32(int32_t a, int32_t b) {  /* Hacker's Delight. */
 }
 
 static int32_t max_32(int32_t a, int32_t b) {
+        return a - ((a - b) & ((a - b) >> 31));
+}
+
+static int64_t min_64(int64_t a, int64_t b) {
+        return b + ((a - b) & ((a - b) >> 31));
+}
+
+static int64_t max_64(int64_t a, int64_t b) {
         return a - ((a - b) & ((a - b) >> 31));
 }
 
@@ -3340,9 +3351,11 @@ static void counters_print() {
         counter_var_print1(&GVAL(wal_laundry),        "wal.laundry:");
         counter_var_print1(&GVAL(wal_washer),         "wal.washer:");
         printf("wal.page_sync:       %10"PRId64"\n", GVAL(wal_page_sync));
+        printf("wal.log_already:     %10"PRId64"\n", GVAL(wal_log_already));
         printf("wal.sync_log_head:   %10"PRId64"\n", GVAL(wal_sync_log_head));
         printf("wal.sync_log_lo:     %10"PRId64"\n", GVAL(wal_sync_log_lo));
         printf("wal.sync_log_time:   %10"PRId64"\n", GVAL(wal_sync_log_time));
+        printf("wal.page_already:    %10"PRId64"\n", GVAL(wal_page_already));
         printf("wal.page_wal:        %10"PRId64"\n", GVAL(wal_page_wal));
         printf("wal.page_empty:      %10"PRId64"\n", GVAL(wal_page_empty));
         printf("wal.page_lo:         %10"PRId64"\n", GVAL(wal_page_lo));
@@ -3725,7 +3738,7 @@ static void kmod(struct ewma *a, uint32_t t) {
 }
 
 static uint64_t kavg(struct ewma *a, uint32_t t) { /* Typical unit: quarter of nano-Kelvin (of nabi-Kelvin, technically). */
-        return ((uint64_t)kval(a) << (63 - BOLT_EPOCH_SHIFT)) >> MIN(t - a->cur, 63);
+        return ((uint64_t)kval(a) << (63 - BOLT_EPOCH_SHIFT)) >> min_32(t - a->cur, 63);
 }
 
 /* @buf */
@@ -4496,8 +4509,12 @@ struct wal_te {
         int                                    buf_size;
         int                                    buf_size_shift;
         lsn_t                                  log_size;
-        int                                    threshold_lo;
-        int                                    threshold_sync;
+        int                                    threshold_log_syncd;
+        int                                    threshold_log_sync;
+        int                                    threshold_paged;
+        int                                    threshold_page;
+        bool                                   log_syncing;
+        bool                                   page_syncing;
         struct t2                             *mod;
         alignas(MAX_CACHELINE) pthread_mutex_t laundry_lock;
         struct cds_list_head                   laundry;
@@ -4671,23 +4688,31 @@ static lsn_t wal_log_free(const struct wal_te *en) {
         return en->log_size - (en->max_written - en->start_persistent);
 }
 
+enum {
+        DAEMON = 1 << 0
+};
+
 #define COND(cond, counter) ((cond) ? (CINC(counter), true) : false)
 
-static bool wal_should_sync_log(const struct wal_te *en) {
-        return  COND(en->max_written - en->max_synced > WAL_SYNC_NOB, wal_sync_log_head) ||
-                COND(wal_log_free(en) < (en->threshold_sync * en->log_size) >> 10, wal_sync_log_lo) ||
-                COND(READ_ONCE(en->tick) - en->last_log_sync > WAL_SYNC_AGE, wal_sync_log_time);
+static bool wal_should_sync_log(const struct wal_te *en, uint32_t flags) {
+        int threshold = (flags & DAEMON) ? en->threshold_log_syncd : en->threshold_log_sync;
+        return  !COND(en->log_syncing, wal_log_already) &&
+                (COND(en->max_written - en->max_synced > WAL_SYNC_NOB, wal_sync_log_head) ||
+                 COND(wal_log_free(en) < (threshold * en->log_size) >> 10, wal_sync_log_lo) ||
+                 COND(READ_ONCE(en->tick) - en->last_log_sync > WAL_SYNC_AGE, wal_sync_log_time));
 }
 
-static bool wal_should_page(const struct wal_te *en) {
+static bool wal_should_page(const struct wal_te *en, uint32_t flags) {
+        int threshold = (flags & DAEMON) ? en->threshold_paged : en->threshold_page;
         return  !COND(en->max_paged == en->max_persistent, wal_page_wal) &&
                 !COND(en->laundry_nr == 0, wal_page_empty) &&
-                (COND(wal_log_free(en) <= wal_log_need(en) + ((en->threshold_lo * en->log_size) >> 10), wal_page_lo));
+                (COND(wal_log_free(en) <= wal_log_need(en) + ((threshold * en->log_size) >> 10), wal_page_lo));
 }
 
-static bool wal_should_sync_page(const struct wal_te *en) {
-        return  COND(en->max_paged - en->start > WAL_PAGE_SYNC_NOB, wal_sync_page_nob) ||
-                COND(READ_ONCE(en->tick) - en->last_page_sync > WAL_SYNC_AGE, wal_sync_page_time);
+static bool wal_should_sync_page(const struct wal_te *en, uint32_t flags) {
+        return  !COND(en->page_syncing, wal_page_already) &&
+                (COND(en->max_paged - en->start > WAL_PAGE_SYNC_NOB, wal_sync_page_nob) ||
+                 COND(READ_ONCE(en->tick) - en->last_page_sync > WAL_SYNC_AGE, wal_sync_page_time));
 }
 
 #if ON_DARWIN
@@ -4762,12 +4787,12 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 ++en->ready_nr;
                 lsn = cds_list_empty(&en->full) ? en->lsn : COF(en->full.prev, struct wal_buf, link)->lsn;
                 cds_list_for_each_entry(scan, &en->inflight, link) {
-                        lsn = MIN(lsn, scan->lsn);
+                        lsn = min_64(lsn, scan->lsn);
                 }
                 ASSERT(lsn >= en->max_written);
                 if (lsn > en->max_written) {
                         en->max_written = lsn;
-                        en->start_written = MAX(en->start_written, header.u.header.start);
+                        en->start_written = max_64(en->start_written, header.u.header.start);
                         NOFAIL(pthread_cond_broadcast(&en->logwait));
                 }
                 NOFAIL(pthread_cond_signal(&en->bufwait));
@@ -4907,6 +4932,7 @@ static int wal_post(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
 
 static void wal_log_sync(struct wal_te *en) {
         en->last_log_sync = READ_ONCE(en->tick);
+        en->log_syncing = true;
         wal_unlock(en);
         int result = wal_sync(en->fd);
         CINC(wal_write_sync);
@@ -4916,29 +4942,32 @@ static void wal_log_sync(struct wal_te *en) {
                 en->max_synced = en->max_written;
                 en->start_persistent = en->start_synced;
                 en->start_synced = en->start_written;
-                en->min_want = MAX(en->max_persistent - en->log_size, 0);
+                en->min_want = max_64(en->max_persistent - en->log_size, 0);
                 NOFAIL(pthread_cond_broadcast(&en->logwait));
         } else {
                 LOG("Cannot sync log: %i.", errno);
                 wal_print(&en->base);
         }
+        en->log_syncing = false;
 }
 
 static void wal_page_sync(struct wal_te *en) {
         lsn_t max_paged = en->max_paged;
         int   result;
         en->last_page_sync = READ_ONCE(en->tick);
+        en->page_syncing = true;
         wal_unlock(en);
         result = SCALL(en->mod, sync);
         wal_lock(en);
         CINC(wal_page_sync);
         if (LIKELY(result == 0)) {
-                en->start = MAX(en->start, max_paged);
+                en->start = max_64(en->start, max_paged);
                 NOFAIL(pthread_cond_broadcast(&en->logwait));
         } else {
                 LOG("Cannot sync pages: %i.", errno);
                 wal_print(&en->base);
         }
+        en->page_syncing = false;
 }
 
 static void wal_page(struct wal_te *en) {
@@ -4982,12 +5011,15 @@ static void wal_page(struct wal_te *en) {
         }
         tail = en->laundry.prev;
         lsn = LIKELY(tail != &en->laundry) ? COF(tail, struct node, dirty)->lsn : en->max_persistent;
+        lsn = min_64(lsn, en->max_persistent);
         cds_list_for_each_entry(scan, &en->washer, dirty) {
-                lsn = MIN(lsn, scan->lsn);
+                lsn = min_64(lsn, scan->lsn);
+                ASSERT(lsn <= en->max_persistent);
         }
         mutex_unlock(&en->laundry_lock);
         wal_lock(en);
-        en->max_paged = MAX(en->max_paged, lsn);
+        ASSERT(lsn <= en->max_persistent);
+        en->max_paged = max_64(en->max_paged, lsn);
         NOFAIL(pthread_cond_broadcast(&en->logwait));
 }
 
@@ -5000,7 +5032,7 @@ enum {
         BUF_CLOSE  = 1 << 5
 };
 
-static bool wal_progress(struct wal_te *en, uint32_t allowed, int max) {
+static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t flags) {
         struct cds_list_head *tail = en->full.prev;
         int                   done = 0;
         CINC(wal_progress);
@@ -5008,7 +5040,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max) {
                 wal_write(en, COF(tail, struct wal_buf, link));
                 ++done;
         }
-        if (done < max && allowed&LOG_SYNC && wal_should_sync_log(en)) {
+        if (done < max && allowed&LOG_SYNC && wal_should_sync_log(en, flags)) {
                 if (en->max_written != en->max_synced) {
                         wal_log_sync(en);
                         ++done;
@@ -5019,11 +5051,11 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max) {
                         ++done;
                 }
         }
-        if (done < max && allowed&PAGE_WRITE && wal_should_page(en)) {
+        if (done < max && allowed&PAGE_WRITE && wal_should_page(en, flags)) {
                 wal_page(en);
                 ++done;
         }
-        if (done < max && allowed&PAGE_SYNC && wal_should_sync_page(en)) {
+        if (done < max && allowed&PAGE_SYNC && wal_should_sync_page(en, flags)) {
                 wal_page_sync(en);
                 ++done;
         }
@@ -5120,13 +5152,15 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                 NOFAIL(pthread_cond_init(&en->logwait, NULL));
                 NOFAIL(pthread_cond_init(&en->bufwait, NULL));
                 NOFAIL(pthread_cond_init(&en->bufwrite, NULL));
-                en->flags          = flags;
-                en->buf_size       = buf_size;
-                en->buf_size_shift = ilog2(buf_size);
-                en->log_size       = WAL_MAX_LOG;
-                en->logname        = logname;
-                en->threshold_lo   = 256;
-                en->threshold_sync =  64;
+                en->flags               = flags;
+                en->buf_size            = buf_size;
+                en->buf_size_shift      = ilog2(buf_size);
+                en->log_size            = WAL_MAX_LOG;
+                en->logname             = logname;
+                en->threshold_paged     = 256;
+                en->threshold_page      = 128;
+                en->threshold_log_syncd =  64;
+                en->threshold_log_sync  =  32;
                 if (flags & MAKE) {
                         unlink(logname); /* Do not bother checking for errors. */
                 }
@@ -5239,7 +5273,7 @@ static void wal_recovery_done(struct wal_te *en, lsn_t start, lsn_t end) {
         wal_lock(en);
         en->lsn = en->max_persistent = en->max_synced = en->max_written = end;
         en->start_persistent = en->start = en->start_synced = en->start_written = en->max_paged = start;
-        en->min_want = MAX(en->max_persistent - en->log_size, 0);
+        en->min_want = max_64(en->max_persistent - en->log_size, 0);
         en->recovered = true;
         NOFAIL(pthread_cond_broadcast(&en->logwait));
         wal_unlock(en);
@@ -5338,7 +5372,7 @@ static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
                 en->reserved += WAL_RESERVE_QUANTUM;
                 more = wal_log_free(en) < wal_log_need(en);
                 while (more) {
-                        wal_progress(en, LOG_WRITE|LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, 1);
+                        wal_progress(en, LOG_WRITE|LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, 1, 0);
                         more = wal_log_free(en) < wal_log_need(en);
                         if (more) {
                                 wal_cond_wait(en, &en->logwait);
@@ -5409,7 +5443,7 @@ static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *
                 struct timeval  cur;
                 struct timespec deadline;
                 int             result;
-                while (wal_progress(en, mask, ops)) {
+                while (wal_progress(en, mask, ops, DAEMON)) {
                         counters_fold();
                         cache_sync(en->mod);
                 }
