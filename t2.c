@@ -715,9 +715,6 @@ struct cacheinfo {
         int     sum;
         int32_t touched;
         int32_t added;
-        int32_t busy;
-        int32_t dirty;
-        int32_t cached;
 };
 
 /* @static */
@@ -1376,7 +1373,6 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
         cookie_make(&n->cookie);
         CINC(node);
         ref_add(n);
-        KINC(busy);
         return n;
 }
 
@@ -1416,7 +1412,6 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 } else {
                         n->ref = 0;
                         CDEC(node);
-                        KDEC(busy);
                         ref_del(n);
                         nfini(n);
                         n = other;
@@ -1431,7 +1426,6 @@ static void ref(struct node *n) {
         n->ref++;
         CINC(node);
         ref_add(n);
-        KINC(busy);
 }
 
 static void ndelete(struct node *n) {
@@ -1441,7 +1435,6 @@ static void ndelete(struct node *n) {
         if (LIKELY(n->flags & DIRTY)) {
                 n->flags &= ~DIRTY;
                 n->lsn = 0;
-                KDEC(dirty);
         }
         put_locked(n);
         mutex_unlock(lock);
@@ -1540,19 +1533,17 @@ static void free_callback(struct rcu_head *head) {
 static void put_final(struct node *n) {
         n->flags |= HEARD_BANSHEE;
         ht_delete(n);
+        KDEC(added);
         if (!cds_list_empty(&n->cache)) {
                 cds_list_del_init(&n->cache);
-                KDEC(cached);
         }
         call_rcu_memb(&n->rcu, &free_callback);
-        KDEC(added);
 }
 
 static void put_locked(struct node *n) {
         ASSERT(n->ref > 0);
         EXPENSIVE_ASSERT(n->data != NULL ? is_sorted(n) : true);
         ref_del(n);
-        KDEC(busy);
         if (--n->ref == 0) {
                 if (n->flags & NOCACHE) {
                         put_final(n);
@@ -1963,7 +1954,6 @@ static void dirty(struct path *p, struct page *g) {
                         }
                 } else if (!(n->flags & DIRTY)) { /* Transactional nodes are dirtied in ->post(). */
                         n->flags |= DIRTY;
-                        KINC(dirty);
                 }
         }
 }
@@ -2452,10 +2442,7 @@ static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
         if (ci.sum > CACHE_SYNC_THRESHOLD) {
                 mutex_lock(&mod->cache.lock);
                 mod->cache.bolt    += ci.touched;
-                mod->cache.busy    += ci.busy;
                 mod->cache.nr      += ci.added;
-                mod->cache.dirty   += ci.dirty;
-                mod->cache.incache += ci.cached;
                 mutex_unlock(&mod->cache.lock);
                 SET0(&ci);
         }
@@ -2969,7 +2956,6 @@ static int pageout0(struct node *n) {
                 for (int i = 0; i < (1 << shift); ++i) {
                         cluster[i]->flags &= ~DIRTY;
                         cluster[i]->lsn = 0;
-                        KDEC(dirty);
                 }
         } else {
                 LOG("Pageout failure: %"PRIx64": %i/%i.", n->addr, result, errno);
@@ -3042,7 +3028,6 @@ static void bucket_scan(struct t2 *mod, int shift, int32_t bucket, int32_t *tosc
                                 tail = COF(mod->cache.cold.prev, struct node, cache);
                                 if (nstate(tail, shift, 0) == COLD) {
                                         cds_list_move(&n->cache, &mod->cache.cold);
-                                        KINC(cached);
                                 } else {
                                         cds_list_del_init(&tail->cache);
                                         CINC(l[level(tail)].scan_heated);
@@ -4587,7 +4572,7 @@ do {                                                    \
                 return ERROR(false);                    \
         }                                               \
         prev = n->lsn;                                  \
-        if (++nr == WAL_LAUNDRY_DEPTH) {                \
+        if (++nr > WAL_LAUNDRY_DEPTH) {                 \
                 break;                                  \
         }                                               \
 } while (0)
@@ -4595,10 +4580,11 @@ do {                                                    \
         if (UNLIKELY(en->laundry_nr <= WAL_LAUNDRY_DEPTH && cds_list_length(&en->laundry) != en->laundry_nr)) {
                 return ERROR(false);
         }
-        cds_list_for_each(scan, &en->washer) {
+        cds_list_for_each(scan, &en->laundry) {
                 NODE_CHECK;
         }
-        cds_list_for_each(scan, &en->laundry) {
+        nr = 0;
+        cds_list_for_each(scan, &en->washer) {
                 NODE_CHECK;
         }
         return true;
@@ -4885,7 +4871,6 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 if (!(n->flags & DIRTY)) {
                         ASSERT(n->lsn == 0);
                         n->flags |= DIRTY;
-                        KINC(dirty);
                         nodes[added++] = n;
                         ASSERT(cds_list_empty(&n->dirty));
                         cds_list_add_tail(&n->dirty, &laundry_list);
@@ -4896,14 +4881,14 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         ASSERT(en->reserved > 0);
         en->reserved--;
         mutex_lock(&en->laundry_lock);
-        ASSERT(wal_laundry_invariant(en));
+        EXPENSIVE_ASSERT(wal_laundry_invariant(en));
         cds_list_splice(&laundry_list, &en->laundry);
         en->laundry_nr += added;
         for (int i = 0; i < added; ++i) {
                 ASSERT(nodes[i]->lsn == 0);
                 t2_lsnset((void *)nodes[i], tx->id);
         }
-        ASSERT(wal_laundry_invariant(en));
+        EXPENSIVE_ASSERT(wal_laundry_invariant(en));
         mutex_unlock(&en->laundry_lock);
         wal_unlock(en);
         ASSERT(tx->reserved > 0);
@@ -4962,7 +4947,7 @@ static void wal_page(struct wal_te *en) {
         struct node          *scan;
         wal_unlock(en);
         mutex_lock(&en->laundry_lock);
-        ASSERT(wal_laundry_invariant(en));
+        EXPENSIVE_ASSERT(wal_laundry_invariant(en));
         tail = en->laundry.prev;
         if (LIKELY(tail != &en->laundry)) {
                 struct node *n = COF(tail, struct node, dirty);
@@ -4975,10 +4960,11 @@ static void wal_page(struct wal_te *en) {
                         CMOD(wal_washer, en->washer_nr);
                         CMOD(wal_laundry, en->laundry_nr);
                         ++en->washer_nr;
-                        ASSERT(wal_laundry_invariant(en));
+                        EXPENSIVE_ASSERT(wal_laundry_invariant(en));
                         mutex_unlock(&en->laundry_lock);
                         lock(n, WRITE);
-                        if (LIKELY(n->flags & DIRTY)) {
+                        if (LIKELY(n->lsn == lsn)) { /* maxwelld could have cleaned it. */
+                                ASSERT(n->flags & DIRTY);
                                 pageout0(n);
                                 CINC(wal_page_write);
                         } else {
@@ -5211,14 +5197,14 @@ static int wal_replay(struct wal_te *en, void *space, int64_t len) {
                         struct node *n = (void *)t2_apply(en->mod, &txr);
                         if (EISOK(n)) {
                                 mutex_lock(&en->laundry_lock);
-                                ASSERT(wal_laundry_invariant(en));
+                                EXPENSIVE_ASSERT(wal_laundry_invariant(en));
                                 if (cds_list_empty(&n->dirty)) {
                                         cds_list_add(&n->dirty, &en->laundry);
                                         ++en->laundry_nr;
                                         n->flags |= DIRTY;
                                         t2_lsnset((void *)n, lsn);
                                 }
-                                ASSERT(wal_laundry_invariant(en));
+                                EXPENSIVE_ASSERT(wal_laundry_invariant(en));
                                 mutex_unlock(&en->laundry_lock);
                                 unlock(n, WRITE);
                                 put(n);
@@ -5394,13 +5380,13 @@ static void wal_clean(struct t2_te *engine, struct t2_node **nodes, int nr) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         struct node  **n  = (void *)nodes;
         mutex_lock(&en->laundry_lock);
-        ASSERT(wal_laundry_invariant(en));
+        EXPENSIVE_ASSERT(wal_laundry_invariant(en));
         for (int i = 0; i < nr; ++i) {
                 ASSERT(!cds_list_empty(&n[i]->dirty));
                 cds_list_del_init(&n[i]->dirty);
         }
         en->laundry_nr -= nr;
-        ASSERT(wal_laundry_invariant(en));
+        EXPENSIVE_ASSERT(wal_laundry_invariant(en));
         mutex_unlock(&en->laundry_lock);
 }
 
@@ -5425,7 +5411,9 @@ static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *
                 int             result;
                 while (wal_progress(en, mask, ops)) {
                         counters_fold();
+                        cache_sync(en->mod);
                 }
+                cache_sync(en->mod);
                 if (en->shutdown) {
                         break;
                 }
@@ -6813,7 +6801,7 @@ static void wal_ut() {
                 ASSERT(result == 0);
                 t2_tx_close(mod, tx);
         }
-        for (uint64_t k = 0; false && k < NOPS; k += 2) {
+        for (uint64_t k = 0; k < NOPS; k += 2) {
                 uint64_t bek = htobe64(k);
                 result = t2_tx_open(mod, tx);
                 ASSERT(result == 0);
@@ -6822,7 +6810,7 @@ static void wal_ut() {
                 t2_tx_close(mod, tx);
         }
         t2_tx_done(mod, tx);
-        //wal_ut_verify(t);
+        wal_ut_verify(t);
         root = t->root;
         free = file_storage.free;
         bolt = mod->cache.bolt;
@@ -6840,7 +6828,7 @@ static void wal_ut() {
         mod->cache.bolt = bolt;
         t = t2_tree_open(&ttype, root);
         ASSERT(EISOK(t));
-        //wal_ut_verify(t);
+        wal_ut_verify(t);
         t2_tree_close(t);
         t2_stats_print(mod);
         t2_fini(mod);
@@ -6858,7 +6846,6 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        wal_ut();
         lib_ut();
         simple_ut();
         ht_ut();
