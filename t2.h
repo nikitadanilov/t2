@@ -98,6 +98,7 @@ struct t2_storage_op {
         void     (*free) (struct t2_storage *storage, taddr_t addr);
         int      (*read) (struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst);
         int      (*write)(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src);
+        int      (*sync) (struct t2_storage *storage);
 };
 
 struct t2_buf {
