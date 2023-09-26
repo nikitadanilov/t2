@@ -260,8 +260,8 @@ enum {
 #define COUNTERS_ASSERT(expr)
 #endif /* COUNTERS */
 
-#define KINC(cnt) ({ ci.cnt++; ci.sum++; })
-#define KDEC(cnt) ({ ci.cnt--; ci.sum++; })
+#define KINC(cnt, delta) ({ int _d = (delta); ci.cnt += _d; ci.sum += _d; })
+#define KDEC(cnt, delta) ({ int _d = (delta); ci.cnt -= _d; ci.sum += _d; })
 
 #define SCALL(mod, method, ...)                         \
 ({                                                      \
@@ -1094,8 +1094,12 @@ static uint64_t taddr_saddr(taddr_t addr) {
         return addr & TADDR_ADDR_MASK;
 }
 
+static int taddr_sbits(taddr_t addr) {
+        return addr & TADDR_SIZE_MASK;
+}
+
 static int taddr_sshift(taddr_t addr) {
-        return (addr & TADDR_SIZE_MASK) + TADDR_MIN_SHIFT;
+        return taddr_sbits(addr) + TADDR_MIN_SHIFT;
 }
 
 static int taddr_ssize(taddr_t addr) {
@@ -1338,7 +1342,7 @@ static struct node *look(struct t2 *mod, taddr_t addr) {
 }
 
 static struct node *pool_get(struct t2 *mod, taddr_t addr) {
-        struct freelist *free = &mod->cache.pool.free[addr & TADDR_SIZE_MASK];
+        struct freelist *free = &mod->cache.pool.free[taddr_sbits(addr)];
         struct node     *n    = NULL;
         mutex_lock(&free->lock);
         if (!cds_list_empty(&free->head)) {
@@ -1382,7 +1386,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
 }
 
 static void nfini(struct node *n) {
-        struct freelist *free = &n->mod->cache.pool.free[n->addr & TADDR_SIZE_MASK];
+        struct freelist *free = &n->mod->cache.pool.free[taddr_sbits(n->addr)];
         ASSERT(n->ref == 0);
         ASSERT(cds_list_empty(&n->cache));
         ASSERT(cds_list_empty(&n->dirty));
@@ -1408,7 +1412,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 struct node     *other;
                 uint32_t         bucket = ht_bucket(&mod->ht, addr);
                 pthread_mutex_t *lock   = ht_lock(&mod->ht, bucket);
-                KINC(added);
+                KINC(added, 1 << taddr_sbits(addr));
                 mutex_lock(lock);
                 other = ht_lookup(&mod->ht, addr, bucket);
                 if (LIKELY(other == NULL)) {
@@ -1416,7 +1420,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 } else {
                         n->ref = 0;
                         CDEC(node);
-                        KDEC(added);
+                        KDEC(added, 1 << taddr_sbits(addr));
                         ref_del(n);
                         nfini(n);
                         n = other;
@@ -1538,7 +1542,7 @@ static void free_callback(struct rcu_head *head) {
 static void put_final(struct node *n) {
         n->flags |= HEARD_BANSHEE;
         ht_delete(n);
-        KDEC(added);
+        KDEC(added, 1 << taddr_sbits(n->addr));
         if (!cds_list_empty(&n->cache)) {
                 cds_list_del_init(&n->cache);
         }
@@ -2459,7 +2463,7 @@ static uint64_t bolt(const struct node *n) {
 
 static void touch(struct node *n) {
         kmod(&nheader(n)->kelvin, bolt(n));
-        KINC(touched);
+        KINC(touched, 1);
 }
 
 enum {
@@ -2812,7 +2816,7 @@ static void cache_clean(struct t2 *mod) {
 
 static bool is_hot(struct node *n, int shift) {
         return (kavg(&nheader(n)->kelvin, bolt(n)) >>
-                ((n->addr & TADDR_SIZE_MASK) + (64 - BOLT_EPOCH_SHIFT) + (shift - BOLT_EPOCH_SHIFT))) != 0;
+                (taddr_sbits(n->addr) + (64 - BOLT_EPOCH_SHIFT) + (shift - BOLT_EPOCH_SHIFT))) != 0;
 }
 
 static bool pinned(const struct node *n) {
@@ -3966,7 +3970,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         CMOD(l[lev].nr,          nr(n));
         CMOD(l[lev].free,        NCALL(n, free(n)));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
-        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + (n->addr & TADDR_SIZE_MASK))));
+        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
         if (UNLIKELY(nr(n) == 0)) {
                 goto here;
         } else if (LIKELY(n->radix != NULL)) {
