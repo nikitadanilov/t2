@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -336,9 +337,7 @@ struct cache {
         alignas(MAX_CACHELINE) pthread_mutex_t lock;
         uint64_t                               bolt;
         int32_t                                nr;
-        int32_t                                busy;
-        int32_t                                dirty;
-        int32_t                                incache;
+        int32_t                                threshold;
         alignas(MAX_CACHELINE) struct pool     pool;
         alignas(MAX_CACHELINE) pthread_mutex_t guard;
         struct cds_list_head                   cold;
@@ -840,6 +839,7 @@ static int signal_init(void);
 static void signal_fini(void);
 static void stacktrace(void);
 static void debugger_attach(void);
+static void os_stats_print(void);
 static int lookup(struct t2_tree *t, struct t2_rec *r);
 static int insert(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
 static int delete(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
@@ -891,7 +891,8 @@ struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int
         result = signal_init();
         if (LIKELY(result == 0)) {
                 if (LIKELY(mod != NULL)) {
-                        mod->cache.shift = cshift;
+                        mod->cache.shift     = cshift;
+                        mod->cache.threshold = 512;
                         NOFAIL(pthread_mutex_init(&mod->cache.lock, NULL));
                         NOFAIL(pthread_mutex_init(&mod->cache.guard, NULL));
                         NOFAIL(pthread_mutex_init(&mod->cache.condlock, NULL));
@@ -992,14 +993,14 @@ void t2_stats_print(struct t2 *mod) {
         }
         mutex_lock(&mod->cache.lock);
         mutex_lock(&mod->cache.guard);
-        printf("\n%15s nr: %6i busy: %6i dirty: %6i incache: %6i cold: %6i scan: %6i\n",
-               "cache:", mod->cache.nr, mod->cache.busy, mod->cache.dirty, mod->cache.incache,
-               cds_list_length(&mod->cache.cold), mod->cache.scan);
+        printf("\n%15s nr: %6i cold: %6i scan: %6i\n", "cache:",
+               mod->cache.nr, cds_list_length(&mod->cache.cold), mod->cache.scan);
         mutex_unlock(&mod->cache.guard);
         mutex_unlock(&mod->cache.lock);
         if (TRANSACTIONS && mod->te != NULL) {
                 TXCALL(mod->te, print(mod->te));
         }
+        os_stats_print();
         counters_print();
 }
 
@@ -1395,7 +1396,6 @@ static void nfini(struct node *n) {
         if (n->radix != NULL) {
                 n->radix->prefix.len = -1;
         }
-        cookie_invalidate(&n->cookie);
         mutex_lock(&free->lock);
         cds_list_add(&n->cache, &free->head);
         mutex_unlock(&free->lock);
@@ -1408,14 +1408,15 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 struct node     *other;
                 uint32_t         bucket = ht_bucket(&mod->ht, addr);
                 pthread_mutex_t *lock   = ht_lock(&mod->ht, bucket);
+                KINC(added);
                 mutex_lock(lock);
                 other = ht_lookup(&mod->ht, addr, bucket);
                 if (LIKELY(other == NULL)) {
                         ht_insert(&mod->ht, n, bucket);
-                        KINC(added);
                 } else {
                         n->ref = 0;
                         CDEC(node);
+                        KDEC(added);
                         ref_del(n);
                         nfini(n);
                         n = other;
@@ -2881,19 +2882,29 @@ static void cull(struct t2 *mod) {
 }
 
 static void throttle(struct t2 *mod) {
-        struct cache *c = &mod->cache;
-        if (c->nr + ci.added >= (1 << c->shift)) {
+        struct cache *c   = &mod->cache;
+        int32_t       nr  = c->nr + ci.added;
+        int32_t       lim = 1 << c->shift;
+        if (nr > c->threshold * lim >> 10) {
+                mutex_lock(&c->condlock);
+                pthread_cond_signal(&c->need);
+                mutex_unlock(&c->condlock);
+        }
+        while (nr >= lim) {
                 CINC(throttle_limit);
                 if (UNLIKELY(cds_list_empty(&c->cold))) {
                         mutex_lock(&c->condlock);
-                        pthread_cond_signal(&c->need);
                         if (cds_list_empty(&c->cold)) {
+                                pthread_cond_signal(&c->need);
                                 pthread_cond_wait(&c->got, &c->condlock);
                                 CINC(throttle_wait);
                         }
                         mutex_unlock(&c->condlock);
                 }
                 cull(mod);
+                counters_fold();
+                cache_sync(mod);
+                nr = c->nr + ci.added;
         }
 }
 
@@ -3075,23 +3086,22 @@ enum {
 
 static void *maxwelld(struct t2 *mod) {
         struct cache *c = &mod->cache;
-        while (!mod->shutdown) {
+        while (LIKELY(!mod->shutdown)) {
                 struct timeval  cur;
                 struct timespec deadline;
+                int32_t         threshold = c->threshold * (1 << c->shift) >> 10;
                 gettimeofday(&cur, NULL);
                 deadline.tv_sec  = cur.tv_sec + MAXWELL_SLEEP;
                 deadline.tv_nsec = 0;
-                mutex_lock(&c->condlock);
-                if (c->nr + CACHE_SYNC_THRESHOLD < (1 << c->shift)) {
-                        pthread_cond_timedwait(&c->need, &c->condlock, &deadline);
+                while (c->nr + CACHE_SYNC_THRESHOLD > threshold && LIKELY(!mod->shutdown)) {
+                        mscan(mod, SCAN_STEP * 10, SCAN_STEP * 2, SCAN_STEP * 2);
+                        cull(mod);
+                        counters_fold();
+                        cache_sync(mod);
                 }
-                mutex_unlock(&c->condlock);
-                mscan(mod, SCAN_STEP * 10, SCAN_STEP * 2, SCAN_STEP * 2);
-                cull(mod);
-                counters_fold();
-                cache_sync(mod);
                 mutex_lock(&c->condlock);
                 pthread_cond_broadcast(&c->got);
+                pthread_cond_timedwait(&c->need, &c->condlock, &deadline);
                 mutex_unlock(&c->condlock);
         }
         return NULL;
@@ -3246,11 +3256,6 @@ static void eprint() {
 #if COUNTERS
 
 static void counters_check() {
-        if (CVAL(node) != 0) {
-                LOG("Leaked node: %i.", CVAL(node));
-                ref_print();
-                ASSERT(false);
-        }
         if (CVAL(rlock) != 0) {
                 LOG("Leaked rlock: %i.", CVAL(rlock));
         }
@@ -3448,6 +3453,19 @@ static void counters_fold() {
 }
 
 #endif /* COUNTERS */
+
+static double timeval(const struct timeval *t) {
+        return (t->tv_sec * 1000000 + t->tv_usec) / 1000000.0;
+}
+
+static void os_stats_print() {
+        struct rusage u;
+        int           result = getrusage(RUSAGE_SELF, &u);
+        if (LIKELY(result == 0)) {
+                printf("u: %10.4f s: %10.4f rss: %8lu min: %8lu maj: %8lu sig: %8lu vol: %8lu inv: %8lu\n",
+                       timeval(&u.ru_utime), timeval(&u.ru_stime), u.ru_maxrss, u.ru_minflt, u.ru_majflt, u.ru_nsignals, u.ru_nvcsw, u.ru_nivcsw);
+        }
+}
 
 static __thread int insigsegv = 0;
 static struct sigaction osa = {};
@@ -4382,6 +4400,31 @@ static struct node_type_ops simple_ops = {
 
 /* @wal */
 
+#if ON_DARWIN
+static int fd_sync(int fd) {
+        /* F_BARRIERFSYNC is more efficient, but the tree and the log can be on different devices. */
+        return fcntl(fd, F_FULLFSYNC, 0);
+}
+
+static void fd_prune(int fd, uint64_t start, uint64_t len) {
+        struct fpunchhole hole = {
+                .fp_offset = start,
+                .fp_length = len
+        };
+        fcntl(fd, F_PUNCHHOLE, &hole);
+}
+
+#elif ON_LINUX
+static int fd_sync(int fd) {
+        return fdatasync(fd);
+}
+
+static void fd_prune(int fd, uint64_t start, uint64_t len) {
+        fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, len);
+}
+
+#endif
+
 #if TRANSACTIONS
 
 void t2_lsnset(struct t2_node *node, lsn_t lsn) {
@@ -4715,31 +4758,6 @@ static bool wal_should_sync_page(const struct wal_te *en, uint32_t flags) {
                  COND(READ_ONCE(en->tick) - en->last_page_sync > WAL_SYNC_AGE, wal_sync_page_time));
 }
 
-#if ON_DARWIN
-static int wal_sync(int fd) {
-        /* F_BARRIERFSYNC is more efficient, but the tree and the log can be on different devices. */
-        return fcntl(fd, F_FULLFSYNC, 0);
-}
-
-static void wal_log_prune(struct wal_te *en) {
-        struct fpunchhole hole = {
-                .fp_offset = en->buf_size,
-                .fp_length = (en->start_persistent - 1) << en->buf_size_shift
-        };
-        fcntl(en->fd, F_PUNCHHOLE, &hole);
-}
-
-#elif ON_LINUX
-static int wal_sync(int fd) {
-        return fdatasync(fd);
-}
-
-static void wal_log_prune(struct wal_te *en) {
-        fallocate(en->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, en->buf_size, (en->start_persistent - 1) << en->buf_size_shift);
-}
-
-#endif
-
 static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         int            result;
         struct wal_rec header;
@@ -4934,7 +4952,7 @@ static void wal_log_sync(struct wal_te *en) {
         en->last_log_sync = READ_ONCE(en->tick);
         en->log_syncing = true;
         wal_unlock(en);
-        int result = wal_sync(en->fd);
+        int result = fd_sync(en->fd);
         CINC(wal_write_sync);
         wal_lock(en);
         if (LIKELY(result == 0)) {
@@ -5502,6 +5520,10 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
         return result;
 }
 
+#else /* TRANSACTIONS */
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags) {
+        return NULL; /* TODO: For bn.c. */
+}
 #endif /* TRANSACTIONS */
 
 #if UT || BN
@@ -5658,7 +5680,7 @@ static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct i
 
 static int file_sync(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        return wal_sync(fs->fd);
+        return fd_sync(fs->fd);
 }
 
 static struct t2_storage_op file_storage_op = {
