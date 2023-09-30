@@ -890,7 +890,6 @@ static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
 static void cache_clean(struct t2 *mod);
 static void *maxwelld(void *data);
-static void mscan(struct t2 *mod, int32_t toscan, int32_t towrite, int32_t tocache);
 static void writeout(struct t2 *mod);
 static void cache_fini(struct t2 *mod);
 static void cache_sync(struct t2 *mod);
