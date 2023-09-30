@@ -352,7 +352,9 @@ struct freelist {
         alignas(MAX_CACHELINE) pthread_mutex_t lock; /* Careful: this lock is held by rcu completion (nfini()). */
         struct cds_list_head                   head;
         int32_t                                nr;
+        int32_t                                avail;
         pthread_cond_t                         got;
+        int32_t                                total;
 };
 
 struct pool {
@@ -374,7 +376,6 @@ struct cache {
         uint64_t                               bolt;
         uint64_t                               epoch_signalled;
         int                                    shift;
-        int32_t                                nr;
         pthread_cond_t                         want;
         bool                                   want_page;
         alignas(MAX_CACHELINE) struct pool     pool;
@@ -746,7 +747,7 @@ struct node_ref {
 struct cacheinfo {
         int      sum;
         int32_t  touched;
-        int32_t  added;
+        int32_t  anr;
         int32_t  allocated[TADDR_SIZE_MASK + 1];
 };
 
@@ -943,6 +944,7 @@ struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int
                                 NOFAIL(pthread_mutex_init(&p->free[i].lock, NULL));
                                 NOFAIL(pthread_cond_init(&p->free[i].got, NULL));
                                 CDS_INIT_LIST_HEAD(&p->free[i].head);
+                                p->free[i].avail = p->free[i].total = 1 << (cshift - i);
                         }
                         for (; *ttypes != NULL; ++ttypes) {
                                 tree_type_register(mod, *ttypes);
@@ -1031,17 +1033,25 @@ void t2_stats_print(struct t2 *mod) {
         struct cache *c = &mod->cache;
         printf("\n%15s", "free-lists:");
         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %6i", i);
+                printf(" %8i", i);
+        }
+        printf("\n%15s", "avail:");
+        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                printf(" %8i", c->pool.free[i].avail);
+        }
+        printf("\n%15s", "used:");
+        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                printf(" %8i", c->pool.free[i].total - c->pool.free[i].avail);
         }
         printf("\n%15s", "free:");
         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %6i", c->pool.free[i].nr);
+                printf(" %8i", c->pool.free[i].nr);
         }
         printf("\n%15s", "rate:");
         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %6i", kval(&c->pool.rate[i]));
+                printf(" %8i", kval(&c->pool.rate[i]));
         }
-        printf("\n%15s bolt: %8"PRId64" nr: %8i\n", "cache:", c->bolt, c->nr);
+        printf("\n%15s bolt: %8"PRId64"\n", "cache:", c->bolt);
         if (TRANSACTIONS && mod->te != NULL) {
                 TXCALL(mod->te, print(mod->te));
         }
@@ -1398,42 +1408,31 @@ static struct node *look(struct t2 *mod, taddr_t addr) {
 static struct node *pool_get(struct t2 *mod, taddr_t addr) {
         struct cache    *c    = &mod->cache;
         struct freelist *free = &c->pool.free[taddr_sbits(addr)];
-        int32_t          M    = 1 << c->shift;
-        while (true) {
-                struct node *n;
-                if (UNLIKELY(free->nr == 0 && c->nr >= M)) {
-                        mutex_lock(&free->lock);
-                        while (UNLIKELY(free->nr == 0 && c->nr >= M)) {
-                                NOFAIL(pthread_cond_broadcast(&c->want));
-                                NOFAIL(pthread_cond_wait(&free->got, &free->lock));
-                        }
-                } else {
-                        mutex_lock(&free->lock);
+        struct node     *n    = NULL;
+        mutex_lock(&free->lock);
+        if (LIKELY(free->avail == 0)) {
+                while (UNLIKELY(free->nr == 0)) {
+                        NOFAIL(pthread_cond_broadcast(&c->want));
+                        NOFAIL(pthread_cond_wait(&free->got, &free->lock));
                 }
-                if (LIKELY(free->nr > 0)) {
-                        n = COF(free->head.next, struct node, dirty);
-                        cds_list_del_init(&n->dirty);
-                        --free->nr;
-                } else {
-                        n = NULL;
+                n = COF(free->head.next, struct node, dirty);
+                cds_list_del_init(&n->dirty);
+                --free->nr;
+                CINC(alloc_pool);
+                NCALL(n, fini(n));
+                cookie_invalidate(&n->cookie);
+                n->seq   = 0;
+                n->flags = 0;
+                n->ntype = NULL;
+                n->addr  = 0;
+                if (n->radix != NULL) {
+                        n->radix->prefix.len = -1;
                 }
-                mutex_unlock(&free->lock);
-                if (LIKELY(n != NULL)) {
-                        CINC(alloc_pool);
-                        NCALL(n, fini(n));
-                        cookie_invalidate(&n->cookie);
-                        n->seq   = 0;
-                        n->flags = 0;
-                        n->ntype = NULL;
-                        n->addr  = 0;
-                        if (n->radix != NULL) {
-                                n->radix->prefix.len = -1;
-                        }
-                        return n;
-                } else if (UNLIKELY(c->nr < M)) {
-                        return NULL;
-                }
+        } else {
+                --free->avail;
         }
+        mutex_unlock(&free->lock);
+        return n;
 }
 
 static struct node *nalloc(struct t2 *mod, taddr_t addr) {
@@ -1483,7 +1482,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 uint32_t         bucket = ht_bucket(&mod->ht, addr);
                 pthread_mutex_t *lock   = ht_lock(&mod->ht, bucket);
                 int              sbits  = taddr_sbits(addr);
-                KINC(added, 1 << sbits);
+                ci.anr = 1;
                 ci.allocated[sbits]++;
                 mutex_lock(lock);
                 other = ht_lookup(&mod->ht, addr, bucket);
@@ -1492,7 +1491,6 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 } else {
                         n->ref = 0;
                         CDEC(node);
-                        KDEC(added, 1 << sbits);
                         ci.allocated[sbits]--;
                         ref_del(n);
                         nfini(n);
@@ -1615,7 +1613,6 @@ static void free_callback(struct rcu_head *head) {
 static void put_final(struct node *n) {
         n->flags |= HEARD_BANSHEE;
         ht_delete(n);
-        KDEC(added, 1 << taddr_sbits(n->addr));
         call_rcu_memb(&n->rcu, &free_callback);
 }
 
@@ -2518,18 +2515,18 @@ enum { CACHE_SYNC_THRESHOLD = 32 };
 static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
         if (ci.sum > CACHE_SYNC_THRESHOLD) {
                 struct cache *c = &mod->cache;
+                uint64_t epoch;
                 mutex_lock(&c->lock);
                 c->bolt += ci.touched;
-                c->nr   += ci.added;
-                if (c->nr != 0) {
-                        uint64_t epoch = c->bolt >> BOLT_EPOCH_SHIFT;
+                epoch = c->bolt >> BOLT_EPOCH_SHIFT;
+                if (ci.anr != 0) {
                         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
                                 kmod(&c->pool.rate[i], epoch, ci.allocated[i]);
                         }
-                        if (epoch - c->epoch_signalled > EPOCH_DELTA) {
-                                NOFAIL(pthread_cond_broadcast(&mod->cache.want));
-                                c->epoch_signalled = epoch;
-                        }
+                }
+                if (epoch - c->epoch_signalled > EPOCH_DELTA) {
+                        NOFAIL(pthread_cond_broadcast(&mod->cache.want));
+                        c->epoch_signalled = epoch;
                 }
                 mutex_unlock(&c->lock);
                 SET0(&ci);
@@ -3064,8 +3061,8 @@ static bool cache_want_page(struct t2 *mod) {
         return mod->cache.want_page;
 }
 
-static bool enough(struct cache *c, int i, int32_t free) {
-        return free + (uint32_t)c->pool.free[i].nr >= 2 * EPOCH_DELTA * kval(&c->pool.rate[i]);
+static bool enough(struct cache *c, int i) {
+        return c->pool.free[i].avail + (uint32_t)c->pool.free[i].nr >= 2 * EPOCH_DELTA * kval(&c->pool.rate[i]);
 }
 
 static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *lock) {
@@ -3138,9 +3135,8 @@ static void *maxwelld(void *data) {
                 struct timespec end;
                 int             result;
                 while (true) {
-                        int32_t  free = max_32((1 << c->shift) - c->nr, 0);
                         CINC(maxwell_iter);
-                        if (FORALL(i, ARRAY_SIZE(c->pool.free), enough(c, i, free))) {
+                        if (FORALL(i, ARRAY_SIZE(c->pool.free), enough(c, i))) {
                                 break;
                         }
                         pos = scan(mod, pos, SCAN_RUN);
