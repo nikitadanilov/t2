@@ -260,9 +260,6 @@ enum {
 #define COUNTERS_ASSERT(expr)
 #endif /* COUNTERS */
 
-#define KINC(cnt, delta) ({ int _d = (delta); ci.cnt += _d; ci.sum += _d; })
-#define KDEC(cnt, delta) ({ int _d = (delta); ci.cnt -= _d; ci.sum += _d; })
-
 #define SCALL(mod, method, ...)                         \
 ({                                                      \
         struct t2_storage *__stor = (mod)->stor;        \
@@ -745,7 +742,6 @@ struct node_ref {
 };
 
 struct cacheinfo {
-        int      sum;
         int32_t  touched;
         int32_t  anr;
         int32_t  allocated[TADDR_SIZE_MASK + 1];
@@ -1482,7 +1478,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 uint32_t         bucket = ht_bucket(&mod->ht, addr);
                 pthread_mutex_t *lock   = ht_lock(&mod->ht, bucket);
                 int              sbits  = taddr_sbits(addr);
-                ci.anr = 1;
+                ++ci.anr;
                 ci.allocated[sbits]++;
                 mutex_lock(lock);
                 other = ht_lookup(&mod->ht, addr, bucket);
@@ -1491,7 +1487,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 } else {
                         n->ref = 0;
                         CDEC(node);
-                        ci.allocated[sbits]--;
+                        --ci.allocated[sbits];
                         ref_del(n);
                         nfini(n);
                         n = other;
@@ -2513,7 +2509,7 @@ static bool rcu_enter(struct path *p, struct node *extra) {
 enum { CACHE_SYNC_THRESHOLD = 32 };
 
 static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
-        if (ci.sum > CACHE_SYNC_THRESHOLD) {
+        if (ci.touched + ci.anr > CACHE_SYNC_THRESHOLD) {
                 struct cache *c = &mod->cache;
                 uint64_t epoch;
                 mutex_lock(&c->lock);
@@ -2539,7 +2535,7 @@ static uint64_t bolt(const struct node *n) {
 
 static void touch(struct node *n) {
         kmod(&nheader(n)->kelvin, bolt(n), 1);
-        KINC(touched, 1);
+        ++ci.touched;
 }
 
 enum {
@@ -3131,17 +3127,17 @@ static void *maxwelld(void *data) {
         struct cache     *c   = &mod->cache;
         int32_t           pos = arg->idx;
         t2_thread_register();
-        while (!mod->shutdown) {
+        while (true) {
                 struct timespec end;
                 int             result;
-                while (true) {
+                while (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!mod->shutdown)) {
                         CINC(maxwell_iter);
-                        if (FORALL(i, ARRAY_SIZE(c->pool.free), enough(c, i))) {
-                                break;
-                        }
                         pos = scan(mod, pos, SCAN_RUN);
                 }
                 mod->cache.want_page = false;
+                if (UNLIKELY(mod->shutdown)) {
+                        break;
+                }
                 result = WITH_LOCK(pthread_cond_timedwait(&c->want, &c->lock, deadline(0, PULSE_TICK, &end)), &c->lock);
                 ASSERT(result == 0 || result == ETIMEDOUT);
                 if (result == 0) {
@@ -6959,8 +6955,6 @@ int main(int argc, char **argv) {
  *
  * - "streams" (sequential, random)
  *
- * - transaction engine hooks
- *
  * - tools: dump, load, repair
  *
  * - in-place operations
@@ -7016,6 +7010,8 @@ int main(int argc, char **argv) {
  * + abstract node and tree type operations (no direct simple_* calls)
  *
  * ! multi-segment buffers
+ *
+ * + transaction engine hooks
  *
  * References:
  *
