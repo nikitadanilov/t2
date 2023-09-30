@@ -3087,7 +3087,6 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
         struct cds_hlist_head *head = ht_head(ht, pos);
         struct cds_hlist_node *link;
         CINC(scan_bucket);
-        rcu_lock();
         for (link = rcu_dereference(head->next); link != NULL; link = rcu_dereference(link->next)) {
                 struct node *n = COF(link, struct node, hash);
                 int8_t L __attribute__((unused)) = level(n);
@@ -3105,17 +3104,18 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
                         break;
                 }
         }
-        rcu_unlock();
         cache_sync(mod);
         counters_fold();
 }
 
 static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr) {
         CINC(scan);
+        rcu_lock();
         while (nr-- > 0) {
                 scan_bucket(mod, pos);
                 pos = (pos + 1) & ((1 << mod->ht.shift) - 1);
         }
+        rcu_unlock();
         return pos;
 }
 
