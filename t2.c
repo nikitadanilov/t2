@@ -3104,8 +3104,6 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
                         break;
                 }
         }
-        cache_sync(mod);
-        counters_fold();
 }
 
 static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr) {
@@ -3116,6 +3114,8 @@ static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr) {
                 pos = (pos + 1) & ((1 << mod->ht.shift) - 1);
         }
         rcu_unlock();
+        cache_sync(mod);
+        counters_fold();
         return pos;
 }
 
