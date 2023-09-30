@@ -13,6 +13,13 @@ function cadd() {
     echo $* >> config.h
 }
 
+function cundef() {
+    sym="$1"
+    cadd "#if defined($sym)"
+    cadd "#undef $sym"
+    cadd "#endif"
+}
+
 case "$platform" in ####################### Linux #############################
     *Linux*)
         ROCKSDB_LDFLAGS="-lrocksdb -lsnappy -lz -lbz2 -lzstd -llz4 -ldl -lstdc++"
@@ -111,12 +118,16 @@ for o in $options ;do
        *profile*)
         LDFLAGS="$LDFLAGS -lprofiler"
     ;; *nodebug*)
+       cundef DEBUG
        cadd '#define DEBUG  (0)'
     ;; *debug*)
+       cundef DEBUG
        cadd '#define DEBUG  (1)'
     ;; *nocounters*)
+       cundef COUNTERS
        cadd '#define COUNTERS  (0)'
     ;; *counters*)
+       cundef COUNTERS
        cadd '#define COUNTERS  (1)'
     ;; *noopt*)
        CFLAGS="$CFLAGS -O0"
