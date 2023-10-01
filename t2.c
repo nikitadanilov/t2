@@ -3129,9 +3129,13 @@ static void *maxwelld(void *data) {
         while (true) {
                 struct timespec end;
                 int             result;
+                int32_t         start = pos;
                 while (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!mod->shutdown)) {
                         CINC(maxwell_iter);
                         pos = scan(mod, pos, SCAN_RUN);
+                        if (UNLIKELY(pos == start)) {
+                                break;
+                        }
                 }
                 mod->cache.want_page = false;
                 if (UNLIKELY(mod->shutdown)) {
