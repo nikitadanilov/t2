@@ -5640,11 +5640,21 @@ static __attribute__((unused)) struct t2_storage mock_storage = {
 
 /* @file */
 
+enum {
+        FRAG_SHIFT = 4,
+        FRAG_NR    = 1 << FRAG_SHIFT,
+        FRAG_MASK  = FRAG_NR - 1
+};
+
+SASSERT(FRAG_SHIFT <= 8);
+
 struct file_storage {
         struct t2_storage gen;
         const char       *filename;
         pthread_mutex_t   lock;
-        int               fd;
+        int               fd[FRAG_NR];
+        int               hand;
+        uint64_t          frag_free[FRAG_NR];
         uint64_t          free;
 };
 
@@ -5652,31 +5662,54 @@ static int64_t free0 = 512;
 
 static int file_init(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        fs->fd = open(fs->filename, O_RDWR | O_CREAT, 0777);
-        if (fs->fd > 0) {
-                fs->free = free0;
-                return pthread_mutex_init(&fs->lock, NULL);
-        } else {
-                return ERROR(-errno);
+        char name[strlen(fs->filename) + 10];
+        NOFAIL(pthread_mutex_init(&fs->lock, NULL));
+        fs->free = free0;
+        for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
+                fs->frag_free[i] = free0;
+                sprintf(name, "%s.%03x", fs->filename, i);
+                fs->fd[i] = open(name, O_RDWR | O_CREAT, 0777);
+                if (fs->fd < 0) {
+                        return ERROR(-errno);
+                }
         }
+        return 0;
 }
 
 static void file_fini(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        if (fs->fd > 0) {
-                NOFAIL(pthread_mutex_destroy(&fs->lock));
-                fsync(fs->fd);
-                close(fs->fd);
-                fs->fd = -1;
+        NOFAIL(pthread_mutex_destroy(&fs->lock));
+        for (int i = 0; i < FRAG_NR; ++i) {
+                if (fs->fd[i] > 0) {
+                        fsync(fs->fd[i]);
+                        close(fs->fd[i]);
+                        fs->fd[i] = -1;
+                }
         }
+}
+
+static int frag(struct file_storage *fs, taddr_t addr) {
+        ASSERT(((addr >> 48) & 0xff) < FRAG_NR);
+        return (addr >> 48) & 0xff;
+}
+
+static int frag_select(struct file_storage *fs) {
+        return fs->hand++ & FRAG_MASK;
+}
+
+static uint64_t frag_off(uint64_t off) {
+        return off & ~(0xffull << 48);
 }
 
 static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_max) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         taddr_t              result;
+        int                  hand;
         mutex_lock(&fs->lock);
-        result = taddr_make((uint64_t)fs->free, shift_min);
-        fs->free += (uint64_t)1 << shift_min;
+        hand = frag_select(fs);
+        result = taddr_make(fs->frag_free[hand] | ((uint64_t)hand << 48), shift_min);
+        fs->frag_free[hand] += (uint64_t)1 << shift_min;
+        fs->free = max_64(fs->free, fs->frag_free[hand]);
         mutex_unlock(&fs->lock);
         return result;
 }
@@ -5686,13 +5719,14 @@ static void file_free(struct t2_storage *storage, taddr_t addr) {
 
 static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst) {
         struct file_storage *fs    = COF(storage, struct file_storage, gen);
-        uint64_t             off   = taddr_saddr(addr);
+        uint64_t             off   = frag_off(taddr_saddr(addr));
+        int                  fr    = frag(fs, addr);
         int                  result;
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + dst[i].iov_len));
-        if (UNLIKELY(off >= fs->free)) {
+        if (UNLIKELY(off >= fs->frag_free[fr])) {
                 return -ESTALE;
         }
-        result = preadv(fs->fd, dst, nr, off);
+        result = preadv(fs->fd[fr], dst, nr, off);
         if (LIKELY(result == taddr_ssize(addr))) {
                 return 0;
         } else if (result < 0) {
@@ -5704,13 +5738,14 @@ static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct io
 
 static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src) {
         struct file_storage *fs    = COF(storage, struct file_storage, gen);
-        uint64_t             off   = taddr_saddr(addr);
+        uint64_t             off   = frag_off(taddr_saddr(addr));
+        int                  fr    = frag(fs, addr);
         int                  result;
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
-        if (UNLIKELY(off >= fs->free)) {
+        if (UNLIKELY(off >= fs->frag_free[fr])) {
                 return -ESTALE;
         }
-        result = pwritev(fs->fd, src, nr, off);
+        result = pwritev(fs->fd[fr], src, nr, off);
         if (LIKELY(result == taddr_ssize(addr))) {
                 return 0;
         } else if (result < 0) {
@@ -5722,16 +5757,23 @@ static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct i
 
 static int file_sync(struct t2_storage *storage, bool barrier) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        return (barrier ? fd_barrier : fd_sync)(fs->fd);
+        int result = 0;
+        for (int i = 0; i < FRAG_NR; ++i) {
+                int rc = (barrier ? fd_barrier : fd_sync)(fs->fd[i]);
+                result = result ?: rc;
+        }
+        return result;
 }
 
 static bool file_same(struct t2_storage *storage, int fd) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        struct stat st0;
+        struct stat st0[FRAG_NR];
         struct stat st1;
-        NOFAIL(fstat(fs->fd, &st0));
-        NOFAIL(fstat(fd,     &st1));
-        return st0.st_dev == st1.st_dev;
+        for (int i = 0; i < FRAG_NR; ++i) {
+                NOFAIL(fstat(fs->fd[i], &st0[i]));
+        }
+        NOFAIL(fstat(fd, &st1));
+        return FORALL(i, FRAG_NR, st0[i].st_dev == st1.st_dev);
 }
 
 static struct t2_storage_op file_storage_op = {
@@ -5764,6 +5806,18 @@ uint64_t bn_file_free(struct t2_storage *storage) {
 void bn_file_free_set(struct t2_storage *storage, uint64_t free) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         fs->free = free;
+        for (int i = 0; i < FRAG_NR; ++i) {
+                fs->frag_free[i] = free;
+        }
+}
+
+void bn_file_truncate(struct t2_storage *storage, uint64_t off) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        char name[strlen(fs->filename) + 10];
+        for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
+                sprintf(name, "%s.%03x", fs->filename, i);
+                NOFAIL(truncate(name, off));
+        }
 }
 
 uint64_t bn_bolt(const struct t2 *mod) {
@@ -6772,14 +6826,14 @@ static void open_ut() {
                 ASSERT(result == 0 || result == -EEXIST);
         }
         root = t->root;
-        free = file_storage.free;
+        free = bn_file_free(&file_storage.gen);
         bolt = mod->cache.bolt;
         t2_tree_close(t);
         t2_fini(mod);
         utest("open");
         mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
-        file_storage.free = free;
+        bn_file_free_set(&file_storage.gen, free);
         mod->cache.bolt = bolt;
         t = t2_tree_open(&ttype, root);
         ASSERT(EISOK(t));
@@ -6920,14 +6974,12 @@ static void wal_ut() {
         t2_tx_done(mod, tx);
         wal_ut_verify(t);
         root = t->root;
-        free = file_storage.free;
+        free = bn_file_free(&file_storage.gen);
         bolt = mod->cache.bolt;
         t2_tree_close(t);
         t2_fini(mod);
-        result = truncate(file_storage.filename, 0);
-        ASSERT(result == 0);
-        result = truncate(file_storage.filename, free + (1 << 20));
-        ASSERT(result == 0);
+        bn_file_truncate(&file_storage.gen, 0);
+        bn_file_truncate(&file_storage.gen, free + (1 << 20));
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS);
         ASSERT(EISOK(engine));
         free0 = free;
