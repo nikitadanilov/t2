@@ -3131,13 +3131,17 @@ static void *maxwelld(void *data) {
                 int             result;
                 int32_t         start = pos;
                 CINC(maxwell_iter);
-                while (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!mod->shutdown)) {
-                        pos = scan(mod, pos, SCAN_RUN);
-                        if (UNLIKELY(pos == start)) {
+                while (true) {
+                        if (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!mod->shutdown)) {
+                                pos = scan(mod, pos, SCAN_RUN);
+                                if (UNLIKELY(pos == start)) {
+                                        break;
+                                }
+                        } else {
+                                mod->cache.want_page = false;
                                 break;
                         }
                 }
-                mod->cache.want_page = false;
                 if (UNLIKELY(mod->shutdown)) {
                         break;
                 }
@@ -5537,7 +5541,6 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
         int            result;
         en->mod = mod;
         en->use_barrier = SCALL(mod, same, en->fd);
-        printf("use barrier: %i\n", en->use_barrier);
         result = pthread_create(&en->log_writer, NULL, &wal_log_writer, en);
         if (result == 0) { /* TODO: Fix error cleanup. */
                 for (int i = 0; result == 0 && i < ARRAY_SIZE(en->worker); ++i) {
@@ -5669,7 +5672,7 @@ static int file_init(struct t2_storage *storage) {
                 fs->frag_free[i] = free0;
                 sprintf(name, "%s.%03x", fs->filename, i);
                 fs->fd[i] = open(name, O_RDWR | O_CREAT, 0777);
-                if (fs->fd < 0) {
+                if (fs->fd[i] < 0) {
                         return ERROR(-errno);
                 }
         }
