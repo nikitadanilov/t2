@@ -3130,8 +3130,8 @@ static void *maxwelld(void *data) {
                 struct timespec end;
                 int             result;
                 int32_t         start = pos;
+                CINC(maxwell_iter);
                 while (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!mod->shutdown)) {
-                        CINC(maxwell_iter);
                         pos = scan(mod, pos, SCAN_RUN);
                         if (UNLIKELY(pos == start)) {
                                 break;
@@ -4437,16 +4437,19 @@ static struct node_type_ops simple_ops = {
 
 #if ON_DARWIN
 static int fd_sync(int fd) {
-        /* F_BARRIERFSYNC is more efficient, but the tree and the log can be on different devices. */
         return fcntl(fd, F_FULLFSYNC, 0);
 }
 
-static void fd_prune(int fd, uint64_t start, uint64_t len) {
+static int fd_prune(int fd, uint64_t start, uint64_t len) {
         struct fpunchhole hole = {
                 .fp_offset = start,
                 .fp_length = len
         };
-        fcntl(fd, F_PUNCHHOLE, &hole);
+        return fcntl(fd, F_PUNCHHOLE, &hole);
+}
+
+static int fd_barrier(int fd) {
+        return fcntl(fd, F_BARRIERFSYNC, 0);
 }
 
 #elif ON_LINUX
@@ -4454,8 +4457,12 @@ static int fd_sync(int fd) {
         return fdatasync(fd);
 }
 
-static void fd_prune(int fd, uint64_t start, uint64_t len) {
-        fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, len);
+static int fd_prune(int fd, uint64_t start, uint64_t len) {
+        return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, len);
+}
+
+static int fd_barrier(int fd) {
+        return fd_sync(fd);
 }
 
 #endif
@@ -4592,6 +4599,7 @@ struct wal_te {
         int                                    threshold_page;
         bool                                   log_syncing;
         bool                                   page_syncing;
+        bool                                   use_barrier;
         struct t2                             *mod;
         alignas(MAX_CACHELINE) pthread_mutex_t laundry_lock;
         struct cds_list_head                   laundry;
@@ -4986,7 +4994,7 @@ static void wal_log_sync(struct wal_te *en) {
         en->last_log_sync = READ_ONCE(en->mod->tick);
         en->log_syncing = true;
         wal_unlock(en);
-        int result = fd_sync(en->fd);
+        int result = (en->use_barrier ? fd_barrier : fd_sync)(en->fd);
         CINC(wal_write_sync);
         wal_lock(en);
         if (LIKELY(result == 0)) {
@@ -5009,7 +5017,7 @@ static void wal_page_sync(struct wal_te *en) {
         en->last_page_sync = READ_ONCE(en->mod->tick);
         en->page_syncing = true;
         wal_unlock(en);
-        result = SCALL(en->mod, sync);
+        result = SCALL(en->mod, sync, en->use_barrier);
         wal_lock(en);
         CINC(wal_page_sync);
         if (LIKELY(result == 0)) {
@@ -5528,6 +5536,8 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         int            result;
         en->mod = mod;
+        en->use_barrier = SCALL(mod, same, en->fd);
+        printf("use barrier: %i\n", en->use_barrier);
         result = pthread_create(&en->log_writer, NULL, &wal_log_writer, en);
         if (result == 0) { /* TODO: Fix error cleanup. */
                 for (int i = 0; result == 0 && i < ARRAY_SIZE(en->worker); ++i) {
@@ -5604,6 +5614,14 @@ static int mso_write(struct t2_storage *storage, taddr_t addr, int nr, struct io
         return 0;
 }
 
+static int mso_sync(struct t2_storage *storage, bool barrier) {
+        return 0;
+}
+
+static bool mso_same(struct t2_storage *storage, int fd) {
+        return false;
+}
+
 static struct t2_storage_op mock_storage_op = {
         .name     = "mock-storage-op",
         .init     = &mso_init,
@@ -5611,7 +5629,9 @@ static struct t2_storage_op mock_storage_op = {
         .alloc    = &mso_alloc,
         .free     = &mso_free,
         .read     = &mso_read,
-        .write    = &mso_write
+        .write    = &mso_write,
+        .sync     = &mso_sync,
+        .same     = &mso_same
 };
 
 static __attribute__((unused)) struct t2_storage mock_storage = {
@@ -5645,6 +5665,7 @@ static void file_fini(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         if (fs->fd > 0) {
                 NOFAIL(pthread_mutex_destroy(&fs->lock));
+                fsync(fs->fd);
                 close(fs->fd);
                 fs->fd = -1;
         }
@@ -5699,9 +5720,18 @@ static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct i
         }
 }
 
-static int file_sync(struct t2_storage *storage) {
+static int file_sync(struct t2_storage *storage, bool barrier) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        return fd_sync(fs->fd);
+        return (barrier ? fd_barrier : fd_sync)(fs->fd);
+}
+
+static bool file_same(struct t2_storage *storage, int fd) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        struct stat st0;
+        struct stat st1;
+        NOFAIL(fstat(fs->fd, &st0));
+        NOFAIL(fstat(fd,     &st1));
+        return st0.st_dev == st1.st_dev;
 }
 
 static struct t2_storage_op file_storage_op = {
@@ -5712,7 +5742,8 @@ static struct t2_storage_op file_storage_op = {
         .free     = &file_free,
         .read     = &file_read,
         .write    = &file_write,
-        .sync     = &file_sync
+        .sync     = &file_sync,
+        .same     = &file_same
 };
 
 static struct file_storage file_storage = {
