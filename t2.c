@@ -710,6 +710,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var keysize;
                 struct counter_var valsize;
                 struct counter_var repage;
+                struct counter_var repage_time;
                 struct counter_var sepcut;
                 struct counter_var radixmap_left;
                 struct counter_var radixmap_right;
@@ -1552,6 +1553,11 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                            n->mod->ntypes[h->ntype]->shift == taddr_sshift(addr))) {
                                         rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                         CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
+                                        if (COUNTERS && h->treeid != 0) {
+                                                int32_t delta = READ_ONCE(mod->tick) - h->treeid;
+                                                ASSERT(delta >= 0);
+                                                CMOD(l[level(n)].repage_time, READ_ONCE(mod->tick) - h->treeid);
+                                        }
                                         node_seq_increase(n);
                                         NCALL(n, load(n));
                                 } else {
@@ -2982,6 +2988,11 @@ static int pageout0(struct node *n) {
         }
         whole = taddr_make(taddr_saddr(n->addr), shift + bshift);
         ASSERT(FORALL(i, 1 << shift, !pinned(cluster[i])));
+        if (COUNTERS) {
+                for (int i = 0; i < 1 << shift; ++i) {
+                        nheader(cluster[i])->treeid = READ_ONCE(mod->tick);
+                }
+        }
         result = SCALL(mod, write, whole, 1 << shift, vec);
         CMOD(l[level(n)].pageout_cluster, nr);
         if (LIKELY(result == 0)) {
@@ -3444,6 +3455,7 @@ static void counters_print() {
         COUNTER_VAR_PRINT(keysize);
         COUNTER_VAR_PRINT(valsize);
         COUNTER_VAR_PRINT(repage);
+        COUNTER_VAR_PRINT(repage_time);
         COUNTER_VAR_PRINT(sepcut);
         COUNTER_VAR_PRINT(prefix);
         COUNTER_VAR_PRINT(pageout_cluster);
@@ -5644,12 +5656,12 @@ static __attribute__((unused)) struct t2_storage mock_storage = {
 /* @file */
 
 enum {
-        FRAG_SHIFT = 4,
+        FRAG_SHIFT = 10,
         FRAG_NR    = 1 << FRAG_SHIFT,
         FRAG_MASK  = FRAG_NR - 1
 };
 
-SASSERT(FRAG_SHIFT <= 8);
+SASSERT(FRAG_SHIFT <= 16);
 
 struct file_storage {
         struct t2_storage gen;
@@ -5692,8 +5704,8 @@ static void file_fini(struct t2_storage *storage) {
 }
 
 static int frag(struct file_storage *fs, taddr_t addr) {
-        ASSERT(((addr >> 48) & 0xff) < FRAG_NR);
-        return (addr >> 48) & 0xff;
+        ASSERT(((addr >> 40) & 0xffff) < FRAG_NR);
+        return (addr >> 40) & 0xffff;
 }
 
 static int frag_select(struct file_storage *fs) {
@@ -5701,7 +5713,7 @@ static int frag_select(struct file_storage *fs) {
 }
 
 static uint64_t frag_off(uint64_t off) {
-        return off & ~(0xffull << 48);
+        return off & ~(0xffffull << 40);
 }
 
 static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_max) {
