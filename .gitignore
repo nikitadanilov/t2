@@ -1,0 +1,15 @@
+pages.*
+bn
+bn.dSYM
+bn.samples
+config.h
+lmdb
+map.o
+out
+out.svg
+t2.o
+t2.pdf
+t2.prof
+t2.svg
+ut
+ut.dSYM
