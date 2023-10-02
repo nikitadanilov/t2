@@ -4639,7 +4639,7 @@ enum {
         WAL_SYNC_NOB         = 1ULL << 9,  /* Measured in buffers. */
         WAL_PAGE_SYNC_NOB    = 1ULL << 5,
         WAL_MAX_LOG          = 2ULL << 10, /* Measured in buffers. TODO: Make this a parameter. */
-        WAL_RESERVE_QUANTUM  = 1,
+        WAL_RESERVE_QUANTUM  = 10,
         WAL_SYS_RESERVE      = 16
 };
 
@@ -5122,7 +5122,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
                         ++done;
                 } else if (en->full_nr == 0 && en->inflight_nr == 0 && en->sys_reserved > 0 &&
                            (en->start_persistent != en->start_synced || en->start_synced != en->start_written)) {
-                        CINC(wal_buf_force);
+                        CINC(wal_buf_force); /* TODO: To avoid deadlock, write a special "snapshot" block outside of the log. */
                         wal_get(en, 0);
                         wal_buf_end(en);
                         --en->sys_reserved;
