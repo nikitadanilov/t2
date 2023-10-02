@@ -5806,7 +5806,7 @@ static struct t2_storage_op file_storage_op = {
 
 static struct file_storage file_storage = {
         .gen      = { .op = &file_storage_op },
-        .filename = "./pages"
+        .filename = "./pages/p"
 };
 
 /* non-static */ struct t2_storage *bn_storage = &file_storage.gen;
