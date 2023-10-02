@@ -588,7 +588,6 @@ struct header {
         uint32_t    magix;
         uint32_t    csum;
         uint32_t    treeid;
-        uint64_t    timestamp;
 };
 
 struct msg_ctx {
@@ -1554,11 +1553,6 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                            n->mod->ntypes[h->ntype]->shift == taddr_sshift(addr))) {
                                         rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                         CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
-                                        if (COUNTERS) {
-                                                int64_t delta = READ_ONCE(mod->tick) - h->timestamp;
-                                                ASSERT(delta >= 0);
-                                                CMOD(l[level(n)].repage_time, delta);
-                                        }
                                         node_seq_increase(n);
                                         NCALL(n, load(n));
                                 } else {
@@ -2989,11 +2983,6 @@ static int pageout0(struct node *n) {
         }
         whole = taddr_make(taddr_saddr(n->addr), shift + bshift);
         ASSERT(FORALL(i, 1 << shift, !pinned(cluster[i])));
-        if (COUNTERS) {
-                for (int i = 0; i < 1 << shift; ++i) {
-                        nheader(cluster[i])->timestamp = READ_ONCE(mod->tick);
-                }
-        }
         result = SCALL(mod, write, whole, 1 << shift, vec);
         CMOD(l[level(n)].pageout_cluster, nr);
         if (LIKELY(result == 0)) {
@@ -5119,41 +5108,34 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
         struct cds_list_head *tail = en->full.prev;
         int                   done = 0;
         CINC(wal_progress);
-        ASSERT(wal_invariant(en));
         if (((allowed&LOG_WRITE && en->full_nr > 2) || allowed&LOG_LAST) && tail != &en->full) {
                 wal_write(en, COF(tail, struct wal_buf, link));
                 ++done;
         }
-        ASSERT(wal_invariant(en));
         if (done < max && allowed&LOG_SYNC && wal_should_sync_log(en, flags)) {
                 if (en->max_written != en->max_synced) {
                         wal_log_sync(en);
                         ++done;
-                        ASSERT(wal_invariant(en));
                 } else if (en->full_nr == 0 && en->inflight_nr == 0 && en->sys_reserved > 0) {
                         CINC(wal_buf_force);
                         wal_get(en, 0);
                         wal_buf_end(en);
                         --en->sys_reserved;
                         ++done;
-                        ASSERT(wal_invariant(en));
                 }
         }
         if (done < max && allowed&PAGE_WRITE && wal_should_page(en, flags)) {
                 wal_page(en);
                 ++done;
-                ASSERT(wal_invariant(en));
         }
         if (done < max && allowed&PAGE_SYNC && wal_should_sync_page(en, flags)) {
                 wal_page_sync(en);
                 ++done;
-                ASSERT(wal_invariant(en));
         }
         if (done < max && allowed&BUF_CLOSE && UNLIKELY(en->cur != NULL && READ_ONCE(en->mod->tick) - en->cur_age > WAL_AGE_LIMIT && en->cur->used > 1)) {
                 wal_buf_end(en);
                 CINC(wal_cur_aged);
                 ++done;
-                ASSERT(wal_invariant(en));
         }
         counters_fold();
         cache_sync(en->mod);
