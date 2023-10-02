@@ -5569,12 +5569,12 @@ static void wal_print(struct t2_te *engine) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         printf("start-persistent: %8"PRId64" | start-synced: %8"PRId64" | start-written: %8"PRId64" | start:        %8"PRId64" | max-paged: %8"PRId64"\n"
                "max-persistent:   %8"PRId64" | max-synced:   %8"PRId64" | max-written:   %8"PRId64" | max-inflight: %8"PRId64" | lsn:       %8"PRId64"\n"
-               "reserved:         %8"PRId64" | free:         %8"PRId64" (%3"PRId64"%%)\n"
-               "ready:            %8"PRId32" | full:         %8"PRId32" | inflight:      %8"PRId32" | laundry:      %8"PRId32" | washer:    %8"PRId32"\n",
+               "ready:            %8"PRId32" | full:         %8"PRId32" | inflight:      %8"PRId32" | laundry:      %8"PRId32" | washer:    %8"PRId32"\n"
+               "reserved:         %8"PRId64" | free:         %8"PRId64" (%3"PRId64"%%)\n",
                en->start_persistent, en->start_synced, en->start_written, en->start, en->max_paged,
                en->max_persistent, en->max_synced, en->max_written, en->max_inflight, en->lsn,
-               en->reserved, wal_log_free(en), wal_log_free(en) * 100 / en->log_size,
-               en->ready_nr, en->full_nr, en->inflight_nr, en->laundry_nr, en->washer_nr);
+               en->ready_nr, en->full_nr, en->inflight_nr, en->laundry_nr, en->washer_nr,
+               en->reserved, wal_log_free(en), wal_log_free(en) * 100 / en->log_size);
 }
 
 static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *cond) {
