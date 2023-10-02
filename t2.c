@@ -449,6 +449,9 @@ struct radixmap {
         struct t2_buf prefix;
         struct mapel  zero_sentinel;
         struct mapel  idx[256];
+#if COUNTERS
+        int32_t       rebuild;
+#endif
 };
 
 enum node_flags {
@@ -710,7 +713,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var keysize;
                 struct counter_var valsize;
                 struct counter_var repage;
-                struct counter_var repage_time;
                 struct counter_var sepcut;
                 struct counter_var radixmap_left;
                 struct counter_var radixmap_right;
@@ -718,6 +720,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var recpos;
                 struct counter_var prefix;
                 struct counter_var pageout_cluster;
+                struct counter_var radixmap_builds;
                 struct counter_var tx_add[M_NR];
         } l[MAX_TREE_HEIGHT];
 };
@@ -1695,6 +1698,7 @@ static void radixmap_update(struct node *n) {
         }
         m = n->radix;
         CINC(l[level(n)].radixmap_updated);
+        CMOD(l[level(n)].radixmap_builds, ++m->rebuild);
         if (LIKELY(nr(n) > 1)) {
                 if (m->utmost || m->prefix.len == -1) {
                         struct t2_buf l;
@@ -3435,6 +3439,7 @@ static void counters_print() {
         COUNTER_PRINT(scan_hot);
         COUNTER_PRINT(scan_put);
         COUNTER_PRINT(radixmap_updated);
+        COUNTER_VAR_PRINT(radixmap_builds);
         COUNTER_VAR_PRINT(search_span);
         COUNTER_VAR_PRINT(radixmap_left);
         COUNTER_VAR_PRINT(radixmap_right);
@@ -3445,7 +3450,6 @@ static void counters_print() {
         COUNTER_VAR_PRINT(keysize);
         COUNTER_VAR_PRINT(valsize);
         COUNTER_VAR_PRINT(repage);
-        COUNTER_VAR_PRINT(repage_time);
         COUNTER_VAR_PRINT(sepcut);
         COUNTER_VAR_PRINT(prefix);
         COUNTER_VAR_PRINT(pageout_cluster);
@@ -5190,6 +5194,7 @@ static void wal_fini(struct t2_te *engine) {
         if (!(en->flags & KEEP)) {
                 unlink(en->logname);
         }
+        writeout(en->mod);
         ASSERT(cds_list_empty(&en->ready));
         ASSERT(cds_list_empty(&en->laundry));
         ASSERT(cds_list_empty(&en->washer));
@@ -5705,7 +5710,6 @@ static void file_fini(struct t2_storage *storage) {
 }
 
 static int frag(struct file_storage *fs, taddr_t addr) {
-        ASSERT(((addr >> BASE_SHIFT) & 0xffff) < FRAG_NR);
         return (addr >> BASE_SHIFT) & 0xffff;
 }
 
@@ -5739,6 +5743,9 @@ static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct io
         int                  fr    = frag(fs, addr);
         int                  result;
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + dst[i].iov_len));
+        if (UNLIKELY(fr > FRAG_NR)) {
+                return -ESTALE;
+        }
         if (UNLIKELY(off >= fs->frag_free[fr])) {
                 return -ESTALE;
         }
@@ -5758,6 +5765,9 @@ static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct i
         int                  fr    = frag(fs, addr);
         int                  result;
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
+        if (UNLIKELY(fr > FRAG_NR)) {
+                return -ESTALE;
+        }
         if (UNLIKELY(off >= fs->frag_free[fr])) {
                 return -ESTALE;
         }
@@ -7040,6 +7050,10 @@ int main(int argc, char **argv) {
         return 0;
 }
 
+#else /* UT */
+static bool is_sorted(struct node *n) {
+        return true;
+}
 #endif /* UT */
 
 /*
