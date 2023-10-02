@@ -645,7 +645,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_write_sync;
         int64_t wal_page_sync;
         int64_t wal_cur_aged;
-        int64_t wal_buf_force;
+        int64_t wal_cur_aged_skip;
+        int64_t wal_snapshot;
         int64_t wal_get_ready;
         int64_t wal_get_wait;
         int64_t wal_page_write;
@@ -3377,7 +3378,8 @@ static void counters_print() {
         counter_var_print1(&GVAL(wal_write_seg), "wal.write_seg:");
         counter_var_print1(&GVAL(wal_write_nob), "wal.write_nob:");
         printf("wal.cur_aged:        %10"PRId64"\n", GVAL(wal_cur_aged));
-        printf("wal.buf_force:       %10"PRId64"\n", GVAL(wal_buf_force));
+        printf("wal.cur_aged_skip:   %10"PRId64"\n", GVAL(wal_cur_aged_skip));
+        printf("wal.snapshot:        %10"PRId64"\n", GVAL(wal_snapshot));
         printf("wal.sync_log_skip:   %10"PRId64"\n", GVAL(wal_sync_log_skip));
         printf("wal.get_ready:       %10"PRId64"\n", GVAL(wal_get_ready));
         printf("wal.get_wait:        %10"PRId64"\n", GVAL(wal_get_wait));
@@ -4586,6 +4588,7 @@ struct wal_te {
         pthread_cond_t                         logwait;
         pthread_cond_t                         bufwait;
         pthread_cond_t                         bufwrite;
+        lsn_t                                  max_inflight;
         lsn_t                                  max_written;
         lsn_t                                  max_synced;
         lsn_t                                  max_persistent;
@@ -4595,9 +4598,8 @@ struct wal_te {
         lsn_t                                  start_synced;
         lsn_t                                  start_persistent;
         lsn_t                                  reserved;
-        lsn_t                                  sys_reserved;
         lsn_t                                  min_want;
-        uint64_t                               last_log_sync; /* TODO: Avoid frequent calls to now(). */
+        uint64_t                               last_log_sync;
         uint64_t                               last_page_sync;
         uint64_t                               cur_age;
         int                                    fd;
@@ -4639,16 +4641,15 @@ enum {
         WAL_SYNC_NOB         = 1ULL << 9,  /* Measured in buffers. */
         WAL_PAGE_SYNC_NOB    = 1ULL << 5,
         WAL_MAX_LOG          = 2ULL << 10, /* Measured in buffers. TODO: Make this a parameter. */
-        WAL_RESERVE_QUANTUM  = 10,
-        WAL_SYS_RESERVE      = 16
+        WAL_RESERVE_QUANTUM  = 10
 };
 
 static lsn_t wal_log_free(const struct wal_te *en) {
-        return en->log_size - (en->max_written - en->start_persistent);
+        return en->log_size - (en->max_inflight - en->start_persistent);
 }
 
 static lsn_t wal_log_need(const struct wal_te *en) {
-        return en->reserved + en->sys_reserved + en->inflight_nr + en->full_nr + 1; /* +1 for en->cur. */
+        return en->reserved + en->inflight_nr + en->full_nr + 1; /* +1 for en->cur. */
 }
 
 static bool wal_invariant(const struct wal_te *en) {
@@ -4667,7 +4668,8 @@ static bool wal_invariant(const struct wal_te *en) {
                 en->max_paged        <= en->max_persistent &&
                 en->max_persistent   <= en->max_synced &&
                 en->max_synced       <= en->max_written &&
-                en->max_written      <= en->lsn &&
+                en->max_written      <= en->max_inflight &&
+                en->max_inflight     <= en->lsn &&
                 (en->cur != NULL ? en->lsn == en->cur->lsn : true) &&
                 wal_log_free(en) >= wal_log_need(en) &&
                 wal_log_need(en) <= en->log_size;
@@ -4850,6 +4852,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         result = pwritev(en->fd, buf->seg, buf->used + 1, (buf->lsn & (en->log_size - 1)) << en->buf_size_shift);
         if (LIKELY(result == buf->nob)) {
                 lsn_t           lsn;
+                lsn_t           max_pending = 0;
                 struct wal_buf *scan;
                 wal_buf_release(buf);
                 result = 0;
@@ -4860,6 +4863,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 lsn = cds_list_empty(&en->full) ? en->lsn : COF(en->full.prev, struct wal_buf, link)->lsn;
                 cds_list_for_each_entry(scan, &en->inflight, link) {
                         lsn = min_64(lsn, scan->lsn);
+                        max_pending = max_64(max_pending, lsn);
                 }
                 ASSERT(lsn >= en->max_written);
                 if (lsn > en->max_written) {
@@ -4867,6 +4871,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                         en->start_written = max_64(en->start_written, header.u.header.start);
                         NOFAIL(pthread_cond_broadcast(&en->logwait));
                 }
+                en->max_inflight = max_64(max_pending + 1, en->max_written);
                 NOFAIL(pthread_cond_signal(&en->bufwait));
         } else { /* TODO: Handle list linkage. */
                 LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.", en->logname, buf->lsn, buf->nob, result, errno);
@@ -5013,9 +5018,6 @@ static void wal_log_sync(struct wal_te *en) {
         if (LIKELY(result == 0)) {
                 en->max_persistent = en->max_synced;
                 en->max_synced = en->max_written;
-                if (en->sys_reserved < WAL_SYS_RESERVE) {
-                        en->sys_reserved = min_64(en->sys_reserved + en->start_synced - en->start_persistent, WAL_SYS_RESERVE);
-                }
                 en->start_persistent = en->start_synced;
                 en->start_synced = en->start_written;
                 en->min_want = max_64(en->max_persistent - en->log_size, 0);
@@ -5099,6 +5101,53 @@ static void wal_page(struct wal_te *en) {
         NOFAIL(pthread_cond_broadcast(&en->logwait));
 }
 
+static void wal_snapshot(struct wal_te *en) {
+        struct wal_rec header;
+        struct wal_rec footer;
+        struct iovec   vec[2];
+        int            rc1;
+        int            rc2;
+        lsn_t          start      = en->start;
+        lsn_t          max_synced = en->max_synced;
+        wal_unlock(en);
+        header = (struct wal_rec) {
+                .magix = REC_MAGIX,
+                .rtype = HEADER,
+                .len   = 0,
+                .u     = {
+                        .header = {
+                                .lsn   = 0,
+                                .start = start,
+                                .end   = max_synced
+                        }
+                }
+        };
+        CINC(wal_snapshot);
+        footer = (struct wal_rec) {
+                .magix = REC_MAGIX,
+                .rtype = FOOTER,
+                .len   = en->buf_size - sizeof header - sizeof footer
+        };
+        vec[0] = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
+        vec[1] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
+        rc1 = pwritev(en->fd, vec, 2, en->log_size << en->buf_size_shift);
+        rc2 = fd_sync(en->fd);
+        if (LIKELY(rc1 == sizeof header + sizeof footer && rc2 == 0)) {
+                wal_lock(en);
+                en->start_written = max_64(en->start_written, start);
+                en->max_persistent = en->max_synced;
+                en->max_synced = en->max_written;
+                en->start_persistent = en->start_synced;
+                en->start_synced = en->start_written;
+                en->min_want = max_64(en->max_persistent - en->log_size, 0);
+                NOFAIL(pthread_cond_broadcast(&en->logwait));
+        } else {
+                LOG("Snapshot failure %s: %i/%i/%i.", en->logname, rc1, rc2, errno);
+                wal_print(&en->base);
+                wal_lock(en);
+        }
+}
+
 enum {
         LOG_WRITE  = 1 << 0,
         LOG_LAST   = 1 << 1,
@@ -5114,18 +5163,18 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
         CINC(wal_progress);
         if (((allowed&LOG_WRITE && en->full_nr > 2) || allowed&LOG_LAST) && tail != &en->full) {
                 wal_write(en, COF(tail, struct wal_buf, link));
+                ASSERT(wal_invariant(en));
                 ++done;
         }
         if (done < max && allowed&LOG_SYNC && wal_should_sync_log(en, flags)) {
                 if (en->max_written != en->max_synced) {
                         wal_log_sync(en);
+                        ASSERT(wal_invariant(en));
                         ++done;
-                } else if (en->full_nr == 0 && en->inflight_nr == 0 && en->sys_reserved > 0 &&
-                           (en->start_persistent != en->start_synced || en->start_synced != en->start_written)) {
-                        CINC(wal_buf_force); /* TODO: To avoid deadlock, write a special "snapshot" block outside of the log. */
-                        wal_get(en, 0);
-                        wal_buf_end(en);
-                        --en->sys_reserved;
+                } else if (en->full_nr == 0 && en->inflight_nr == 0 &&
+                           (en->start != en->start_written || en->start_persistent != en->start_synced || en->start_synced != en->start_written)) {
+                        wal_snapshot(en);
+                        ASSERT(wal_invariant(en));
                         ++done;
                 } else {
                         CINC(wal_sync_log_skip);
@@ -5133,16 +5182,23 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
         }
         if (done < max && allowed&PAGE_WRITE && wal_should_page(en, flags)) {
                 wal_page(en);
+                ASSERT(wal_invariant(en));
                 ++done;
         }
         if (done < max && allowed&PAGE_SYNC && wal_should_sync_page(en, flags)) {
                 wal_page_sync(en);
+                ASSERT(wal_invariant(en));
                 ++done;
         }
         if (done < max && allowed&BUF_CLOSE && UNLIKELY(en->cur != NULL && READ_ONCE(en->mod->tick) - en->cur_age > WAL_AGE_LIMIT && en->cur->used > 1)) {
-                wal_buf_end(en);
-                CINC(wal_cur_aged);
-                ++done;
+                if (LIKELY(wal_log_free(en) > wal_log_need(en))) {
+                        wal_buf_end(en);
+                        ASSERT(wal_invariant(en));
+                        CINC(wal_cur_aged);
+                        ++done;
+                } else {
+                        CINC(wal_cur_aged_skip);
+                }
         }
         counters_fold();
         cache_sync(en->mod);
@@ -5246,7 +5302,6 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                 en->threshold_page      = 128;
                 en->threshold_log_syncd =  64;
                 en->threshold_log_sync  =  32;
-                en->sys_reserved        = WAL_SYS_RESERVE;
                 if (flags & MAKE) {
                         unlink(logname); /* Do not bother checking for errors. */
                 }
@@ -5357,7 +5412,7 @@ static int wal_recover_log(struct wal_te *en, lsn_t start, lsn_t end) {
 
 static void wal_recovery_done(struct wal_te *en, lsn_t start, lsn_t end) {
         wal_lock(en);
-        en->lsn = en->max_persistent = en->max_synced = en->max_written = end;
+        en->lsn = en->max_persistent = en->max_synced = en->max_written = en->max_inflight = end;
         en->start_persistent = en->start = en->start_synced = en->start_written = en->max_paged = start;
         en->min_want = max_64(en->max_persistent - en->log_size, 0);
         en->recovered = true;
@@ -5512,12 +5567,14 @@ static void wal_clean(struct t2_te *engine, struct t2_node **nodes, int nr) {
 
 static void wal_print(struct t2_te *engine) {
         struct wal_te *en = COF(engine, struct wal_te, base);
-        printf("start-persistent: %8"PRId64" | start-synced: %8"PRId64" | start-written: %8"PRId64" | start:    %8"PRId64" | max-paged: %8"PRId64"\n"
-               "max-persistent:   %8"PRId64" | max-synced:   %8"PRId64" | max-written:   %8"PRId64" | lsn:      %8"PRId64" | free:      %8"PRId64" (%3"PRId64"%%)\n"
-               "reserved:         %8"PRId64" | ready:        %8i | full:          %8i | inflight: %8i | laundry:   %8i | washer: %8i\n",
+        printf("start-persistent: %8"PRId64" | start-synced: %8"PRId64" | start-written: %8"PRId64" | start:        %8"PRId64" | max-paged: %8"PRId64"\n"
+               "max-persistent:   %8"PRId64" | max-synced:   %8"PRId64" | max-written:   %8"PRId64" | max-inflight: %8"PRId64" | lsn:       %8"PRId64"\n"
+               "reserved:         %8"PRId64" | free:         %8"PRId64" (%3"PRId64"%%)\n"
+               "ready:            %8"PRId32" | full:         %8"PRId32" | inflight:      %8"PRId32" | laundry:      %8"PRId32" | washer:    %8"PRId32"\n",
                en->start_persistent, en->start_synced, en->start_written, en->start, en->max_paged,
-               en->max_persistent, en->max_synced, en->max_written, en->lsn, wal_log_free(en), wal_log_free(en) * 100 / en->log_size,
-               en->reserved, en->ready_nr, en->full_nr, en->inflight_nr, en->laundry_nr, en->washer_nr);
+               en->max_persistent, en->max_synced, en->max_written, en->max_inflight, en->lsn,
+               en->reserved, wal_log_free(en), wal_log_free(en) * 100 / en->log_size,
+               en->ready_nr, en->full_nr, en->inflight_nr, en->laundry_nr, en->washer_nr);
 }
 
 static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *cond) {
