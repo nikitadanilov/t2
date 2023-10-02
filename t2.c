@@ -603,6 +603,25 @@ enum dir {
         RIGHT = +1
 };
 
+struct magazine {
+        struct magazine *next;
+        int              used;
+        void            *unit[0];
+};
+
+struct stash {
+        alignas(MAX_CACHELINE) _Atomic(struct magazine *) empty;
+        alignas(MAX_CACHELINE) _Atomic(struct magazine *) inhab;
+        int                                               nr;
+        int                                               size;
+};
+
+struct stash_local {
+        struct magazine *mag;
+        struct stash    *stash;
+        int              nr;
+};
+
 #if COUNTERS
 struct counter_var {
         int64_t sum;
@@ -665,6 +684,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_page_cache;
         int64_t wal_sync_page_nob;
         int64_t wal_sync_page_time;
+        int64_t stash_hit;
+        int64_t stash_miss;
         struct counter_var wal_get_wait_time;
         struct counter_var wal_open_wait_time;
         struct counter_var wal_space_nr;
@@ -676,6 +697,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_inflight;
         struct counter_var wal_laundry;
         struct counter_var wal_washer;
+        struct counter_var stash_used;
         struct level_counters {
                 int64_t insert_balance;
                 int64_t delete_balance;
@@ -885,6 +907,12 @@ static void os_stats_print(void);
 static int lookup(struct t2_tree *t, struct t2_rec *r);
 static int insert(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
 static int delete(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
+static void *stash_get(struct stash_local *sl);
+static void stash_put(struct stash_local *sl, void *unit);
+static void stash_init(struct stash *s, int nr, int size);
+static void stash_fini(struct stash *s);
+static void stash_local_init(struct stash_local *sl, struct stash *s);
+static void stash_local_fini(struct stash_local *sl);
 static bool cookie_is_valid(const struct t2_cookie *k);
 static void cookie_invalidate(uint64_t *addr);
 static void cookie_make(uint64_t *addr);
@@ -3164,6 +3192,114 @@ static void *maxwelld(void *data) {
         return NULL;
 }
 
+/* @stash */
+
+static void mag_put(_Atomic(struct magazine *) *head, struct magazine *item) {
+        do {
+                item->next = *head;
+        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &item->next, item)));
+}
+
+static struct magazine *mag_get(_Atomic(struct magazine *) *head) {
+        struct magazine *item;
+        do {
+                item = *head;
+        } while (UNLIKELY(item != NULL && !atomic_compare_exchange_weak(head, &item, item->next)));
+        return item;
+}
+
+static void mag_free_to(struct magazine *mag, int to) {
+        for (int i = mag->used; i < to; ++i) {
+                mem_free(mag->unit[i]);
+        }
+        mem_free(mag);
+}
+
+static struct magazine *mag_init(struct stash *s) {
+        struct magazine *mag = mem_alloc(sizeof *mag + s->nr * sizeof mag->unit[0]);
+        return mag;
+}
+
+static struct magazine *mag_alloc(struct stash *s) {
+        struct magazine *mag = mag_init(s);
+        if (mag != NULL) {
+                for (int i = 0; i < s->nr; ++i) {
+                        mag->unit[i] = mem_alloc(s->size);
+                        if (UNLIKELY(mag->unit[i] == NULL)) {
+                                mag_free_to(mag, i + 1);
+                                return EPTR(NULL);
+                        }
+                }
+        }
+        mag->used = s->nr;
+        return mag;
+}
+
+static void mag_free(struct stash *s, struct magazine *mag) {
+        mag_free_to(mag, s->nr);
+}
+
+static void *stash_get(struct stash_local *sl) {
+        if (UNLIKELY(sl->mag == NULL || sl->mag->used == 0)) {
+                sl->mag = mag_get(&sl->stash->inhab);
+                if (UNLIKELY(sl->mag == NULL)) {
+                        sl->mag = mag_alloc(sl->stash);
+                        if (UNLIKELY(sl->mag == NULL)) {
+                                return EPTR(NULL);
+                        }
+                }
+        }
+        CMOD(stash_used, sl->mag->used);
+        ASSERT(sl->mag->used > 0);
+        return sl->mag->unit[--sl->mag->used];
+}
+
+static void stash_put(struct stash_local *sl, void *unit) {
+        if (UNLIKELY(sl->mag != NULL && sl->mag->used == sl->nr)) {
+                mag_put(&sl->stash->inhab, sl->mag);
+                sl->mag = NULL;
+        }
+        if (UNLIKELY(sl->mag == NULL)) {
+                sl->mag = mag_get(&sl->stash->empty);
+        }
+        if (UNLIKELY(sl->mag == NULL)) {
+                sl->mag = mag_init(sl->stash);
+                ASSERT(sl->mag != NULL); /* TODO: Handle oom. */
+        }
+        ASSERT(sl->mag->used < sl->nr);
+        CMOD(stash_used, sl->mag->used);
+        sl->mag->unit[sl->mag->used++] = unit;
+}
+
+static void stash_init(struct stash *s, int nr, int size) {
+        s->nr = nr;
+        s->size = size;
+}
+
+static void stash_fini(struct stash *s) {
+        struct magazine *mag;
+        while ((mag = mag_get(&s->empty)) != NULL) {
+                mag_free(s, mag);
+        }
+        while ((mag = mag_get(&s->inhab)) != NULL) {
+                mag_free(s, mag);
+        }
+}
+
+static void stash_local_init(struct stash_local *sl, struct stash *s) {
+        ASSERT(sl->nr == 0);
+        ASSERT(sl->mag == NULL);
+        sl->nr = s->nr;
+        sl->stash = s;
+}
+
+static void stash_local_fini(struct stash_local *sl) {
+        ASSERT(sl->nr != 0);
+        if (sl->mag != NULL) {
+                mag_put(sl->mag->used == 0 ? &sl->stash->empty : &sl->stash->inhab, sl->mag);
+        }
+}
+
 /* @lib */
 
 __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...)
@@ -3406,6 +3542,9 @@ static void counters_print() {
         printf("wal.page_cache:      %10"PRId64"\n", GVAL(wal_page_cache));
         printf("wal.sync_page_nob:   %10"PRId64"\n", GVAL(wal_sync_page_nob));
         printf("wal.sync_page_time:  %10"PRId64"\n", GVAL(wal_sync_page_time));
+        printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
+        printf("stash.miss:          %10"PRId64"\n", GVAL(stash_miss));
+        counter_var_print1(&GVAL(stash_used),         "stash.used:");
         printf("%20s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
@@ -4550,9 +4689,10 @@ struct wal_rec {
 };
 
 struct wal_tx {
-        struct t2_tx base;
-        lsn_t        id;
-        lsn_t        reserved;
+        struct t2_tx       base;
+        struct stash_local stash;
+        lsn_t              id;
+        lsn_t              reserved;
 };
 
 enum { WAL_MAX_BUF_SEG = 1024 }; /* __IOV_MAX on Linux and UIO_MAXIOV on Darwin are both 1024. */
@@ -4584,6 +4724,7 @@ struct wal_te {
         alignas(MAX_CACHELINE) pthread_mutex_t lock;
         struct wal_buf                        *cur;
         lsn_t                                  lsn;
+        struct stash                           stash;
         struct cds_list_head                   ready;
         struct cds_list_head                   full;
         struct cds_list_head                   inflight;
@@ -4760,9 +4901,16 @@ static int wal_cond_timedwait(struct wal_te *en, pthread_cond_t *cond, const str
         return result;
 }
 
-static void *wal_space(struct wal_te *en, int nr, int32_t nob, int32_t *out) {
+static void *wal_space(struct wal_te *en, struct wal_tx *tx, int nr, int32_t nob, int32_t *out) {
         int32_t size = nob + nr * sizeof(struct wal_rec);
-        void   *buf  = mem_alloc(size);
+        void   *buf;
+        if (UNLIKELY(size > en->stash.size)) {
+                buf = mem_alloc(size);
+                CINC(stash_miss);
+        } else {
+                buf = stash_get(&tx->stash);
+                CINC(stash_hit);
+        }
         if (LIKELY(buf != NULL)) {
                 *out = size;
         }
@@ -4772,9 +4920,13 @@ static void *wal_space(struct wal_te *en, int nr, int32_t nob, int32_t *out) {
         return buf;
 }
 
-static void wal_buf_release(struct wal_buf *buf) {
+static void wal_buf_release(struct wal_buf *buf, struct stash_local *sl) {
         for (int i = 1; i < buf->used; ++i) {
-                mem_free(buf->seg[i].iov_base);
+                if (UNLIKELY((int)buf->seg[i].iov_len > sl->stash->size)) {
+                        mem_free(buf->seg[i].iov_base);
+                } else {
+                        stash_put(sl, buf->seg[i].iov_base);
+                }
                 buf->seg[i].iov_base = NULL;
         }
 }
@@ -4857,9 +5009,12 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         buf->seg[buf->used] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
         result = pwritev(en->fd[buf->lsn & WAL_LOG_MASK], buf->seg, buf->used + 1, ((buf->lsn & (en->log_size - 1)) << en->buf_size_shift) >> WAL_LOG_SHIFT);
         if (LIKELY(result == buf->nob)) {
-                lsn_t           lsn;
-                struct wal_buf *scan;
-                wal_buf_release(buf);
+                lsn_t              lsn;
+                struct wal_buf    *scan;
+                struct stash_local sl = {};
+                stash_local_init(&sl, &en->stash);
+                wal_buf_release(buf, &sl);
+                stash_local_fini(&sl);
                 result = 0;
                 wal_lock(en);
                 cds_list_move(&buf->link, &en->ready);
@@ -4951,7 +5106,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         struct cds_list_head laundry_list = CDS_LIST_HEAD_INIT(laundry_list);
         struct node    *nodes[nr];
         ASSERT(en->recovered);
-        rec = space = wal_space(en, nr, nob, &size);
+        rec = space = wal_space(en, tx, nr, nob, &size);
         if (UNLIKELY(rec == NULL)) {
                 return ERROR(-ENOMEM);
         }
@@ -5288,6 +5443,7 @@ static void wal_fini(struct t2_te *engine) {
         NOFAIL(pthread_cond_destroy(&en->logwait));
         NOFAIL(pthread_mutex_destroy(&en->laundry_lock));
         NOFAIL(pthread_mutex_destroy(&en->lock));
+        stash_fini(&en->stash);
         mem_free(en);
 }
 
@@ -5328,6 +5484,7 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                 en->threshold_page      = 128;
                 en->threshold_log_syncd =  64;
                 en->threshold_log_sync  =  32;
+                stash_init(&en->stash, 16, 1 << 12);
                 for (int i = 0; result == 0 && i < WAL_LOG_NR; ++i) {
                         if (flags & MAKE) {
                                 WITH_LOGNAME(en, i, unlink); /* Do not bother checking for errors. */
@@ -5493,9 +5650,11 @@ static int wal_recover(struct wal_te  *en) {
         return result;
 }
 
-static struct t2_tx *wal_make(struct t2_te *te) {
+static struct t2_tx *wal_make(struct t2_te *engine) {
+        struct wal_te *en = COF(engine, struct wal_te, base);
         struct wal_tx *tx = mem_alloc(sizeof *tx);
         if (LIKELY(tx != NULL)) {
+                stash_local_init(&tx->stash, &en->stash);
                 return &tx->base;
         } else {
                 return NULL;
@@ -5564,6 +5723,7 @@ static void wal_done(struct t2_te *engine, struct t2_tx *trax) {
                 en->reserved -= tx->reserved;
                 wal_unlock(en);
         }
+        stash_local_fini(&tx->stash);
         mem_free(tx);
 }
 
