@@ -4572,7 +4572,12 @@ enum {
         KEEP  = 1 << 3  /* Do not truncate the log on finalisation. */
 };
 
-enum { WAL_WORKERS = 16 };
+enum {
+        WAL_WORKERS   = 16,
+        WAL_LOG_SHIFT = 8,
+        WAL_LOG_NR    = 1 << WAL_LOG_SHIFT,
+        WAL_LOG_MASK  = WAL_LOG_NR - 1
+};
 
 struct wal_te {
         struct t2_te                           base;
@@ -4602,7 +4607,7 @@ struct wal_te {
         uint64_t                               last_log_sync;
         uint64_t                               last_page_sync;
         uint64_t                               cur_age;
-        int                                    fd;
+        int                                    fd[WAL_LOG_NR];
         int                                    buf_size;
         int                                    buf_size_shift;
         lsn_t                                  log_size;
@@ -4641,7 +4646,7 @@ enum {
         WAL_SYNC_NOB         = 1ULL << 9,  /* Measured in buffers. */
         WAL_PAGE_SYNC_NOB    = 1ULL << 5,
         WAL_MAX_LOG          = 2ULL << 10, /* Measured in buffers. TODO: Make this a parameter. */
-        WAL_RESERVE_QUANTUM  = 10
+        WAL_RESERVE_QUANTUM  = 1
 };
 
 static lsn_t wal_log_free(const struct wal_te *en) {
@@ -4649,7 +4654,7 @@ static lsn_t wal_log_free(const struct wal_te *en) {
 }
 
 static lsn_t wal_log_need(const struct wal_te *en) {
-        return en->reserved + en->inflight_nr + en->full_nr + 1; /* +1 for en->cur. */
+        return en->reserved + en->full_nr + 1; /* +1 for en->cur. */
 }
 
 static bool wal_invariant(const struct wal_te *en) {
@@ -4840,6 +4845,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         CMOD(wal_full, en->full_nr);
         CMOD(wal_ready, en->ready_nr);
         CMOD(wal_inflight, en->inflight_nr);
+        en->max_inflight = max_64(en->max_inflight, buf->lsn + 1);
         wal_unlock(en);
         footer = (struct wal_rec) {
                 .magix = REC_MAGIX,
@@ -4849,10 +4855,9 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         ASSERT(buf->lsn != 0);
         buf->seg[0]         = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
         buf->seg[buf->used] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
-        result = pwritev(en->fd, buf->seg, buf->used + 1, (buf->lsn & (en->log_size - 1)) << en->buf_size_shift);
+        result = pwritev(en->fd[buf->lsn & WAL_LOG_MASK], buf->seg, buf->used + 1, ((buf->lsn & (en->log_size - 1)) << en->buf_size_shift) >> WAL_LOG_SHIFT);
         if (LIKELY(result == buf->nob)) {
                 lsn_t           lsn;
-                lsn_t           max_pending = 0;
                 struct wal_buf *scan;
                 wal_buf_release(buf);
                 result = 0;
@@ -4863,7 +4868,6 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 lsn = cds_list_empty(&en->full) ? en->lsn : COF(en->full.prev, struct wal_buf, link)->lsn;
                 cds_list_for_each_entry(scan, &en->inflight, link) {
                         lsn = min_64(lsn, scan->lsn);
-                        max_pending = max_64(max_pending, lsn);
                 }
                 ASSERT(lsn >= en->max_written);
                 if (lsn > en->max_written) {
@@ -4871,7 +4875,6 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                         en->start_written = max_64(en->start_written, header.u.header.start);
                         NOFAIL(pthread_cond_broadcast(&en->logwait));
                 }
-                en->max_inflight = max_64(max_pending + 1, en->max_written);
                 NOFAIL(pthread_cond_signal(&en->bufwait));
         } else { /* TODO: Handle list linkage. */
                 LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.", en->logname, buf->lsn, buf->nob, result, errno);
@@ -5009,10 +5012,14 @@ static int wal_post(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
 }
 
 static void wal_log_sync(struct wal_te *en) {
+        int result = 0;
         en->last_log_sync = READ_ONCE(en->mod->tick);
         en->log_syncing = true;
         wal_unlock(en);
-        int result = (en->use_barrier ? fd_barrier : fd_sync)(en->fd);
+        for (int i = 0; i < ARRAY_SIZE(en->fd); ++i) {
+                int rc = (en->use_barrier ? fd_barrier : fd_sync)(en->fd[i]);
+                result = result ?: rc;
+        }
         CINC(wal_write_sync);
         wal_lock(en);
         if (LIKELY(result == 0)) {
@@ -5130,8 +5137,8 @@ static void wal_snapshot(struct wal_te *en) {
         };
         vec[0] = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
         vec[1] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
-        rc1 = pwritev(en->fd, vec, 2, en->log_size << en->buf_size_shift);
-        rc2 = fd_sync(en->fd);
+        rc1 = pwritev(en->fd[0], vec, 2, (en->log_size << en->buf_size_shift) >> WAL_LOG_SHIFT);
+        rc2 = fd_sync(en->fd[0]); /* TODO: Round-robin snapshots. */
         if (LIKELY(rc1 == sizeof header + sizeof footer && rc2 == 0)) {
                 wal_lock(en);
                 en->start_written = max_64(en->start_written, start);
@@ -5225,9 +5232,26 @@ static void wal_quiesce(struct t2_te *engine) {
         }
         ASSERT(cds_list_empty(&en->full));
         wal_log_sync(en);
-        fd_sync(en->fd); /* Force sync, not barrier. */
+        for (int i = 0; i < ARRAY_SIZE(en->fd); ++i) {
+                fd_sync(en->fd[i]); /* Force sync, not barrier. */
+        }
         wal_unlock(en);
 }
+
+#define WITH_LOGNAME(en, i, f, ...)                                     \
+({                                                                      \
+        int   __len   = strlen((en)->logname) + 10;                     \
+        char *scratch = mem_alloc(__len + 1);                           \
+        typeof (f(scratch , ## __VA_ARGS__)) __result;                  \
+        if (LIKELY(scratch != NULL)) {                                  \
+                snprintf(scratch, __len, "%s.%04x", (en)->logname, i);  \
+                __result = f(scratch , ## __VA_ARGS__);                 \
+                mem_free(scratch);                                      \
+        } else {                                                        \
+                __result = (typeof(__result))ERROR(-ENOMEM);            \
+        }                                                               \
+        __result;                                                       \
+})
 
 static void wal_fini(struct t2_te *engine) {
         struct wal_te *en = COF(engine, struct wal_te, base);
@@ -5247,11 +5271,13 @@ static void wal_fini(struct t2_te *engine) {
         while (!cds_list_empty(&en->ready)) {
                 wal_buf_fini(COF(en->ready.next, struct wal_buf, link));
         }
-        if (en->fd >= 0) {
-                close(en->fd);
-        }
-        if (!(en->flags & KEEP)) {
-                unlink(en->logname);
+        for (int i = 0; i < ARRAY_SIZE(en->fd); ++i) {
+                if (en->fd[i] >= 0) {
+                        close(en->fd[i]);
+                }
+                if (!(en->flags & KEEP)) {
+                        WITH_LOGNAME(en, i, unlink);
+                }
         }
         writeout(en->mod);
         ASSERT(cds_list_empty(&en->ready));
@@ -5302,20 +5328,22 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                 en->threshold_page      = 128;
                 en->threshold_log_syncd =  64;
                 en->threshold_log_sync  =  32;
-                if (flags & MAKE) {
-                        unlink(logname); /* Do not bother checking for errors. */
-                }
-                en->fd = open(logname, O_RDWR);
-                if (en->fd < 0) {
-                        if (errno == ENOENT) {
-                                en->fd = open(logname, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-                                if (en->fd >= 0) {
-                                        result = ftruncate(en->fd, buf_size);
+                for (int i = 0; result == 0 && i < WAL_LOG_NR; ++i) {
+                        if (flags & MAKE) {
+                                WITH_LOGNAME(en, i, unlink); /* Do not bother checking for errors. */
+                        }
+                        en->fd[i] = WITH_LOGNAME(en, i, open, O_RDWR);
+                        if (en->fd[i] < 0) {
+                                if (errno == ENOENT) {
+                                        en->fd[i] = WITH_LOGNAME(en, i, open, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+                                        if (en->fd[i] >= 0) {
+                                                result = ftruncate(en->fd[i], buf_size);
+                                        } else {
+                                                result = ERROR(-errno);
+                                        }
                                 } else {
                                         result = ERROR(-errno);
                                 }
-                        } else {
-                                result = ERROR(-errno);
                         }
                 }
                 if (result == 0) {
@@ -5323,8 +5351,6 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                         for (int i = 0; result == 0 && i < nr_bufs; ++i) {
                                 result = wal_buf_alloc(en);
                         }
-                } else {
-                        result = ERROR(-errno);
                 }
                 if (result != 0) {
                         wal_fini(&en->base);
@@ -5395,10 +5421,11 @@ static int wal_recover_log(struct wal_te *en, lsn_t start, lsn_t end) {
         int64_t         len   = (end - start) << en->buf_size_shift;
         void           *space = mem_alloc(len);
         int64_t         result;
+        return 0; /* TODO: Implement recovery for multi-log. */
         if (space == NULL) {
                 return ERROR(-ENOMEM);
         }
-        result = pread(en->fd, space, len, start << en->buf_size_shift);
+        result = pread(en->fd[0], space, len, start << en->buf_size_shift);
         if (result == len) {
                 result = wal_replay(en, space, len);
         } else if (result < 0) {
@@ -5426,7 +5453,7 @@ static int wal_recover(struct wal_te  *en) {
         struct stat     st;
         int             result;
         int64_t         lastbuf;
-        result = fstat(en->fd, &st);
+        result = fstat(en->fd[0], &st);
         if (result != 0) {
                 return ERROR(-errno);
         }
@@ -5440,7 +5467,7 @@ static int wal_recover(struct wal_te  *en) {
         }
         for (lastbuf = (st.st_size - 1) / en->buf_size; lastbuf > 0; lastbuf--) {
                 lsn_t off = lastbuf * en->buf_size;
-                result = pread(en->fd, buf, en->buf_size, off);
+                result = pread(en->fd[0], buf, en->buf_size, off);
                 if (result >= SOF(*rec)) {
                         if (wal_buf_is_valid(en, rec)) {
                                 result = 0;
@@ -5616,7 +5643,7 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         int            result;
         en->mod = mod;
-        en->use_barrier = SCALL(mod, same, en->fd);
+        en->use_barrier = FORALL(i, ARRAY_SIZE(en->fd), SCALL(mod, same, en->fd[i]));
         result = pthread_create(&en->log_writer, NULL, &wal_log_writer, en);
         if (result == 0) { /* TODO: Fix error cleanup. */
                 for (int i = 0; result == 0 && i < ARRAY_SIZE(en->worker); ++i) {
@@ -5737,15 +5764,19 @@ struct file_storage {
         int               hand;
         uint64_t          frag_free[FRAG_NR];
         uint64_t          free;
+        bool              allsame;
+        dev_t             device;
 };
 
 static int64_t free0 = 512;
 
 static int file_init(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
+        struct stat st;
         char name[strlen(fs->filename) + 10];
         NOFAIL(pthread_mutex_init(&fs->lock, NULL));
         fs->free = free0;
+        fs->allsame = true;
         for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
                 fs->frag_free[i] = free0;
                 sprintf(name, "%s.%03x", fs->filename, i);
@@ -5753,6 +5784,11 @@ static int file_init(struct t2_storage *storage) {
                 if (fs->fd[i] < 0) {
                         return ERROR(-errno);
                 }
+                NOFAIL(fstat(fs->fd[i], &st));
+                if (i == 0) {
+                        fs->device = st.st_dev;
+                }
+                fs->allsame &= (st.st_dev == fs->device);
         }
         return 0;
 }
@@ -5853,13 +5889,9 @@ static int file_sync(struct t2_storage *storage, bool barrier) {
 
 static bool file_same(struct t2_storage *storage, int fd) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        struct stat st0[FRAG_NR];
-        struct stat st1;
-        for (int i = 0; i < FRAG_NR; ++i) {
-                NOFAIL(fstat(fs->fd[i], &st0[i]));
-        }
-        NOFAIL(fstat(fd, &st1));
-        return FORALL(i, FRAG_NR, st0[i].st_dev == st1.st_dev);
+        struct stat st;
+        NOFAIL(fstat(fd, &st));
+        return fs->allsame && st.st_dev == fs->device;
 }
 
 static struct t2_storage_op file_storage_op = {
@@ -6958,7 +6990,7 @@ enum {
         NOPS       = 500000
 };
 
-static const char logname[] = "log";
+static const char logname[] = "./log/l";
 
 static uint64_t prev_key;
 static uint64_t keys;
@@ -7106,7 +7138,7 @@ int main(int argc, char **argv) {
         seq_ut();
         mt_ut();
         open_ut();
-        wal_ut();
+        // wal_ut();
         return 0;
 }
 

@@ -674,7 +674,7 @@ enum {
         KEEP  = 1 << 3  /* Do not truncate the log on finalisation. */
 };
 
-static const char logname[] = "log";
+static const char logname[] = "./log/l";
 static bool transactions = false;
 
 static void t_mount(struct benchmark *b) {
