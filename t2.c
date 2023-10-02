@@ -449,9 +449,7 @@ struct radixmap {
         struct t2_buf prefix;
         struct mapel  zero_sentinel;
         struct mapel  idx[256];
-#if COUNTERS
         int32_t       rebuild;
-#endif
 };
 
 enum node_flags {
@@ -658,6 +656,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_sync_log_head;
         int64_t wal_sync_log_lo;
         int64_t wal_sync_log_time;
+        int64_t wal_sync_log_skip;
         int64_t wal_page_already;
         int64_t wal_page_wal;
         int64_t wal_page_empty;
@@ -3379,6 +3378,7 @@ static void counters_print() {
         counter_var_print1(&GVAL(wal_write_nob), "wal.write_nob:");
         printf("wal.cur_aged:        %10"PRId64"\n", GVAL(wal_cur_aged));
         printf("wal.buf_force:       %10"PRId64"\n", GVAL(wal_buf_force));
+        printf("wal.sync_log_skip:   %10"PRId64"\n", GVAL(wal_sync_log_skip));
         printf("wal.get_ready:       %10"PRId64"\n", GVAL(wal_get_ready));
         printf("wal.get_wait:        %10"PRId64"\n", GVAL(wal_get_wait));
         counter_var_print1(&GVAL(wal_get_wait_time),  "wal.get_wait_time:");
@@ -5120,12 +5120,15 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
                 if (en->max_written != en->max_synced) {
                         wal_log_sync(en);
                         ++done;
-                } else if (en->full_nr == 0 && en->inflight_nr == 0 && en->sys_reserved > 0) {
+                } else if (en->full_nr == 0 && en->inflight_nr == 0 && en->sys_reserved > 0 &&
+                           (en->start_persistent != en->start_synced || en->start_synced != en->start_written)) {
                         CINC(wal_buf_force);
                         wal_get(en, 0);
                         wal_buf_end(en);
                         --en->sys_reserved;
                         ++done;
+                } else {
+                        CINC(wal_sync_log_skip);
                 }
         }
         if (done < max && allowed&PAGE_WRITE && wal_should_page(en, flags)) {
