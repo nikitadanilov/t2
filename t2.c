@@ -1066,14 +1066,18 @@ void t2_fini(struct t2 *mod) {
         case TX_INIT:
                 TXCALL(mod->te, quiesce(mod->te));
                 TXCALL(mod->te, fini(mod->te));
+                __attribute__((fallthrough));
         case MAXWELLD:
                 cache_clean(mod);
                 cache_fini(mod);
+                __attribute__((fallthrough));
         case STORAGE_INIT:
                 SCALL(mod, fini);
+                __attribute__((fallthrough));
         case HT_INIT:
                 ht_clean(&mod->ht);
                 ht_fini(&mod->ht);
+                __attribute__((fallthrough));
         case POOL:
                 pool_clean(mod);
                 for (int i = 0; i < ARRAY_SIZE(p->free); ++i) {
@@ -1081,28 +1085,35 @@ void t2_fini(struct t2 *mod) {
                         NOFAIL(pthread_mutex_destroy(&p->free[i].lock));
                         ASSERT(cds_list_empty(&p->free[i].head));
                 }
+                __attribute__((fallthrough));
         case TTYPES:
                 for (int i = 0; i < ARRAY_SIZE(mod->ttypes); ++i) {
                         if (mod->ttypes[i] != NULL) {
                                 tree_type_degister(mod->ttypes[i]);
                         }
                 }
+                __attribute__((fallthrough));
         case NTYPES:
                 for (int i = 0; i < ARRAY_SIZE(mod->ntypes); ++i) {
                         if (mod->ntypes[i] != NULL) {
                                 node_type_degister(mod->ntypes[i]);
                         }
                 }
+                __attribute__((fallthrough));
         case FIELDS:
                 pthread_join(mod->pulse, NULL);
                 NOFAIL(pthread_cond_destroy(&c->want));
                 NOFAIL(pthread_mutex_destroy(&c->lock));
+                __attribute__((fallthrough));
         case SIGNAL_INIT:
                 signal_fini();
+                __attribute__((fallthrough));
         case THREAD_REGISTER:
                 t2_thread_degister();
+                __attribute__((fallthrough));
         case ALLOCATED:
                 mem_free(mod);
+                __attribute__((fallthrough));
         case NOTHING:
                 ;
         }
