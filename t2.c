@@ -40,7 +40,8 @@ enum {
         MAX_ERR_DEPTH     =      16,
         MAX_CACHELINE     =      64,
         MAX_SEPARATOR_CUT =      10,
-        MAX_PREFIX        =      32
+        MAX_PREFIX        =      32,
+        MAX_ALLOC_BUCKET  =      32
 };
 
 /* @macro */
@@ -688,6 +689,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t stash_miss;
         int64_t stash_mags;
         int64_t stash_units;
+        int64_t malloc[MAX_ALLOC_BUCKET];
         struct counter_var wal_get_wait_time;
         struct counter_var wal_open_wait_time;
         struct counter_var wal_space_nr;
@@ -973,7 +975,7 @@ struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int
                                 NOFAIL(pthread_mutex_init(&p->free[i].lock, NULL));
                                 NOFAIL(pthread_cond_init(&p->free[i].got, NULL));
                                 CDS_INIT_LIST_HEAD(&p->free[i].head);
-                                p->free[i].avail = p->free[i].total = 1 << (cshift - i);
+                                p->free[i].avail = p->free[i].total = 1 << max_32(cshift - i, 0);
                         }
                         for (; *ttypes != NULL; ++ttypes) {
                                 tree_type_register(mod, *ttypes);
@@ -3190,6 +3192,7 @@ static void *maxwelld(void *data) {
                 cache_sync(mod);
                 counters_fold();
         }
+        mem_free(arg);
         t2_thread_degister();
         return NULL;
 }
@@ -3210,8 +3213,8 @@ static struct magazine *mag_get(_Atomic(struct magazine *) *head) {
         return item;
 }
 
-static void mag_free_to(struct magazine *mag, int to) {
-        for (int i = mag->used; i < to; ++i) {
+static void mag_free(struct magazine *mag) {
+        for (int i = 0; i < mag->used; ++i) {
                 mem_free(mag->unit[i]);
         }
         mem_free(mag);
@@ -3231,17 +3234,14 @@ static struct magazine *mag_alloc(struct stash *s) {
                         mag->unit[i] = mem_alloc(s->size);
                         CINC(stash_units);
                         if (UNLIKELY(mag->unit[i] == NULL)) {
-                                mag_free_to(mag, i + 1);
+                                mag->used = i + 1;
+                                mag_free(mag);
                                 return NULL;
                         }
                 }
                 mag->used = s->nr;
         }
         return mag;
-}
-
-static void mag_free(struct stash *s, struct magazine *mag) {
-        mag_free_to(mag, s->nr);
 }
 
 static void *stash_get(struct stash_local *sl) {
@@ -3298,10 +3298,10 @@ static void stash_init(struct stash *s, int nr, int size) {
 static void stash_fini(struct stash *s) {
         struct magazine *mag;
         while ((mag = mag_get(&s->empty)) != NULL) {
-                mag_free(s, mag);
+                mag_free(mag);
         }
         while ((mag = mag_get(&s->inhab)) != NULL) {
-                mag_free(s, mag);
+                mag_free(mag);
         }
 }
 
@@ -3346,11 +3346,17 @@ void *t2_errptr(int errcode) {
         return (void *)(uint64_t)-errcode;
 }
 
+static void mem_alloc_count(size_t size, int delta) {
+        static int x = 0;
+        CADD(malloc[min_32(ilog2(size), MAX_ALLOC_BUCKET - 1)], delta);
+}
+
 static void *mem_alloc_align(size_t size, int alignment) {
         void *out = NULL;
         int   result = posix_memalign(&out, alignment, size);
         if (result == 0) {
                 memset(out, 0, size);
+                mem_alloc_count(size, +1);
         }
         return out;
 }
@@ -3359,6 +3365,7 @@ static void *mem_alloc(size_t size) {
         void *out = malloc(size);
         if (LIKELY(out != NULL)) {
                 memset(out, 0, size);
+                mem_alloc_count(size, +1);
         }
         return out;
 }
@@ -3566,6 +3573,9 @@ static void counters_print() {
         counter_var_print1(&GVAL(stash_used),         "stash.used:");
         printf("stash.mags:          %10"PRId64"\n", GVAL(stash_mags));
         printf("stash.units:         %10"PRId64"\n", GVAL(stash_units));
+        for (int i = 0; i < MAX_ALLOC_BUCKET; ++i) {
+                printf("malloc[%02d]:          %10"PRId64"\n", i, GVAL(malloc[i]));
+        }
         printf("%20s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
