@@ -4115,7 +4115,7 @@ static void buf_free(struct t2_buf *b) {
 struct dir_element {
         int32_t koff; /* Start of the key. */
         int32_t voff; /* End of the value. */
-};
+} __attribute__((packed));
 
 struct sheader { /* Simple node format. */
         struct header head;
@@ -5532,67 +5532,66 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         struct wal_te *en     = mem_alloc(sizeof *en);
         int            result = 0;
         ASSERT(nr_bufs > 0);
-        if (en != NULL) {
-                en->base.ante    = &wal_ante;
-                en->base.init    = &wal_init;
-                en->base.post    = &wal_post;
-                en->base.quiesce = &wal_quiesce;
-                en->base.fini    = &wal_fini;
-                en->base.make    = &wal_make;
-                en->base.wait    = &wal_wait;
-                en->base.done    = &wal_done;
-                en->base.pinned  = &wal_pinned;
-                en->base.wantout = &wal_wantout;
-                en->base.print   = &wal_print;
-                en->base.name    = "wal";
+        if (en == NULL) {
+                return EPTR(-ENOMEM);
+        }
+        en->base.ante    = &wal_ante;
+        en->base.init    = &wal_init;
+        en->base.post    = &wal_post;
+        en->base.quiesce = &wal_quiesce;
+        en->base.fini    = &wal_fini;
+        en->base.make    = &wal_make;
+        en->base.wait    = &wal_wait;
+        en->base.done    = &wal_done;
+        en->base.pinned  = &wal_pinned;
+        en->base.wantout = &wal_wantout;
+        en->base.print   = &wal_print;
+        en->base.name    = "wal";
 
-                CDS_INIT_LIST_HEAD(&en->ready);
-                CDS_INIT_LIST_HEAD(&en->full);
-                CDS_INIT_LIST_HEAD(&en->inflight);
-                CDS_INIT_LIST_HEAD(&en->laundry);
-                CDS_INIT_LIST_HEAD(&en->washer);
-                NOFAIL(pthread_mutex_init(&en->lock, NULL));
-                NOFAIL(pthread_mutex_init(&en->laundry_lock, NULL));
-                NOFAIL(pthread_cond_init(&en->logwait, NULL));
-                NOFAIL(pthread_cond_init(&en->bufwait, NULL));
-                NOFAIL(pthread_cond_init(&en->bufwrite, NULL));
-                en->flags               = flags;
-                en->buf_size            = buf_size;
-                en->buf_size_shift      = ilog2(buf_size);
-                en->log_size            = WAL_MAX_LOG;
-                en->logname             = logname;
-                en->threshold_paged     = 256;
-                en->threshold_page      = 128;
-                en->threshold_log_syncd =  64;
-                en->threshold_log_sync  =  32;
-                stash_init(&en->stash, 16, 1 << 12);
-                for (int i = 0; result == 0 && i < WAL_LOG_NR; ++i) {
-                        if (flags & MAKE) {
-                                WITH_LOGNAME(en, i, unlink); /* Do not bother checking for errors. */
-                        }
-                        en->fd[i] = WITH_LOGNAME(en, i, open, O_RDWR);
-                        if (en->fd[i] < 0) {
-                                if (errno == ENOENT) {
-                                        en->fd[i] = WITH_LOGNAME(en, i, open, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-                                        if (en->fd[i] < 0) {
-                                                result = ERROR(-errno);
-                                        }
-                                } else {
+        CDS_INIT_LIST_HEAD(&en->ready);
+        CDS_INIT_LIST_HEAD(&en->full);
+        CDS_INIT_LIST_HEAD(&en->inflight);
+        CDS_INIT_LIST_HEAD(&en->laundry);
+        CDS_INIT_LIST_HEAD(&en->washer);
+        NOFAIL(pthread_mutex_init(&en->lock, NULL));
+        NOFAIL(pthread_mutex_init(&en->laundry_lock, NULL));
+        NOFAIL(pthread_cond_init(&en->logwait, NULL));
+        NOFAIL(pthread_cond_init(&en->bufwait, NULL));
+        NOFAIL(pthread_cond_init(&en->bufwrite, NULL));
+        en->flags               = flags;
+        en->buf_size            = buf_size;
+        en->buf_size_shift      = ilog2(buf_size);
+        en->log_size            = WAL_MAX_LOG;
+        en->logname             = logname;
+        en->threshold_paged     = 256;
+        en->threshold_page      = 128;
+        en->threshold_log_syncd =  64;
+        en->threshold_log_sync  =  32;
+        stash_init(&en->stash, 16, 1 << 12);
+        for (int i = 0; result == 0 && i < WAL_LOG_NR; ++i) {
+                if (flags & MAKE) {
+                        WITH_LOGNAME(en, i, unlink); /* Do not bother checking for errors. */
+                }
+                en->fd[i] = WITH_LOGNAME(en, i, open, O_RDWR);
+                if (en->fd[i] < 0) {
+                        if (errno == ENOENT) {
+                                en->fd[i] = WITH_LOGNAME(en, i, open, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+                                if (en->fd[i] < 0) {
                                         result = ERROR(-errno);
                                 }
+                        } else {
+                                result = ERROR(-errno);
                         }
                 }
-                if (result == 0) {
-                        en->nr_bufs = nr_bufs;
-                        for (int i = 0; result == 0 && i < nr_bufs; ++i) {
-                                result = wal_buf_alloc(en);
-                        }
+        }
+        if (result == 0) {
+                en->nr_bufs = nr_bufs;
+                for (int i = 0; result == 0 && i < nr_bufs; ++i) {
+                        result = wal_buf_alloc(en);
                 }
-                if (result != 0) {
-                        wal_fini(&en->base);
-                }
-        } else {
-                result = ERROR(-ENOMEM);
+        }
+        if (result != 0) {
+                wal_fini(&en->base);
         }
         return result == 0 ? &en->base : EPTR(result);
 }
@@ -5764,7 +5763,11 @@ static int wal_recover(struct wal_te *en) {
         int          buf_nr = 0;
         int          result;
         struct rbuf *index;
-        int64_t     *size = alloca(sizeof size[0] * WAL_LOG_NR);
+        int64_t     *size;
+        size = mem_alloc(sizeof size[0] * WAL_LOG_NR);
+        if (size == NULL) {
+                return ERROR(-ENOMEM);
+        }
         for (int i = 0; i < WAL_LOG_NR; ++i) {
                 struct stat st;
                 result = fstat(en->fd[i], &st);
@@ -5799,6 +5802,7 @@ static int wal_recover(struct wal_te *en) {
         } else {
                 result = ERROR(-ENOMEM);
         }
+        mem_free(size);
         return result;
 }
 
@@ -6081,17 +6085,19 @@ struct file_storage {
 };
 
 static int64_t free0 = 512;
+static const char file_fmt[] = "%s.%03x";
 
 static int file_init(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         struct stat st;
-        char name[strlen(fs->filename) + 10];
+        int namesize = strlen(fs->filename) + 10;
+        char name[namesize]; /* VLA */
         NOFAIL(pthread_mutex_init(&fs->lock, NULL));
         fs->free = free0;
         fs->allsame = true;
         for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
                 fs->frag_free[i] = free0;
-                sprintf(name, "%s.%03x", fs->filename, i);
+                snprintf(name, namesize, file_fmt, fs->filename, i);
                 fs->fd[i] = open(name, O_RDWR | O_CREAT, 0777);
                 if (fs->fd[i] < 0) {
                         return ERROR(-errno);
@@ -6243,9 +6249,10 @@ void bn_file_free_set(struct t2_storage *storage, uint64_t free) {
 
 void bn_file_truncate(struct t2_storage *storage, uint64_t off) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
-        char name[strlen(fs->filename) + 10];
+        int namesize = strlen(fs->filename) + 10;
+        char name[namesize]; /* VLA */
         for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
-                sprintf(name, "%s.%03x", fs->filename, i);
+                snprintf(name, namesize, file_fmt, fs->filename, i);
                 NOFAIL(truncate(name, off));
         }
 }
