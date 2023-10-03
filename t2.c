@@ -3347,7 +3347,6 @@ void *t2_errptr(int errcode) {
 }
 
 static void mem_alloc_count(size_t size, int delta) {
-        static int x = 0;
         CADD(malloc[min_32(ilog2(size), MAX_ALLOC_BUCKET - 1)], delta);
 }
 
