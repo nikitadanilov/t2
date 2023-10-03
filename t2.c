@@ -1769,7 +1769,7 @@ static void rcu_quiescent() {
         urcu_memb_quiescent_state();
 }
 
-static void __attribute__((no_sanitize("address"))) radixmap_update(struct node *n) {
+static void radixmap_update(struct node *n) {
         struct radixmap *m;
         int32_t          i;
         int16_t          ch;

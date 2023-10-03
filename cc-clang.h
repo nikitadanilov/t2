@@ -4,6 +4,12 @@
 
 #define ASSUME(expr) __builtin_assume(expr)
 
+#if __has_feature(address_sanitizer)
+#define NOSANITISE_ADDRESS __attribute__((no_sanitize("address")))
+#else
+#define NOSANITISE_ADDRESS
+#endif
+
 /*
  *  Local variables:
  *  c-indentation-style: "K&R"

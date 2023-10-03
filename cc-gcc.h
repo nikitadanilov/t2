@@ -10,6 +10,12 @@
 #endif
 #endif
 
+#if __has_attribute(no_sanitize_address)
+#define NOSANITISE_ADDRESS __attribute__((no_sanitize_address))
+#else
+#define NOSANITISE_ADDRESS
+#endif
+
 /*
  *  Local variables:
  *  c-indentation-style: "K&R"
