@@ -686,6 +686,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_sync_page_time;
         int64_t stash_hit;
         int64_t stash_miss;
+        int64_t stash_mags;
+        int64_t stash_units;
         struct counter_var wal_get_wait_time;
         struct counter_var wal_open_wait_time;
         struct counter_var wal_space_nr;
@@ -3217,21 +3219,24 @@ static void mag_free_to(struct magazine *mag, int to) {
 
 static struct magazine *mag_init(struct stash *s) {
         struct magazine *mag = mem_alloc(sizeof *mag + s->nr * sizeof mag->unit[0]);
+        CINC(stash_mags);
         return mag;
 }
 
 static struct magazine *mag_alloc(struct stash *s) {
         struct magazine *mag = mag_init(s);
-        if (mag != NULL) {
+        if (LIKELY(mag != NULL)) {
+                ASSERT(mag->used == 0);
                 for (int i = 0; i < s->nr; ++i) {
                         mag->unit[i] = mem_alloc(s->size);
+                        CINC(stash_units);
                         if (UNLIKELY(mag->unit[i] == NULL)) {
                                 mag_free_to(mag, i + 1);
-                                return EPTR(NULL);
+                                return NULL;
                         }
                 }
+                mag->used = s->nr;
         }
-        mag->used = s->nr;
         return mag;
 }
 
@@ -3240,35 +3245,49 @@ static void mag_free(struct stash *s, struct magazine *mag) {
 }
 
 static void *stash_get(struct stash_local *sl) {
-        if (UNLIKELY(sl->mag == NULL || sl->mag->used == 0)) {
-                sl->mag = mag_get(&sl->stash->inhab);
-                if (UNLIKELY(sl->mag == NULL)) {
-                        sl->mag = mag_alloc(sl->stash);
-                        if (UNLIKELY(sl->mag == NULL)) {
-                                return EPTR(NULL);
+        struct stash    *s   = sl->stash;
+        struct magazine *mag = sl->mag;
+        void            *unit;
+        if (UNLIKELY(mag == NULL)) {
+                mag = mag_get(&s->inhab);
+                if (UNLIKELY(mag == NULL)) {
+                        mag = mag_alloc(s);
+                        if (UNLIKELY(mag == NULL)) {
+                                return NULL;
                         }
                 }
+                sl->mag = mag;
         }
+        ASSERT(mag->used > 0);
+        unit = mag->unit[--sl->mag->used];
         CMOD(stash_used, sl->mag->used);
-        ASSERT(sl->mag->used > 0);
-        return sl->mag->unit[--sl->mag->used];
+        if (UNLIKELY(mag->used == 0)) {
+                mag_put(&s->empty, mag);
+                sl->mag = NULL;
+        }
+        return unit;
 }
 
 static void stash_put(struct stash_local *sl, void *unit) {
-        if (UNLIKELY(sl->mag != NULL && sl->mag->used == sl->nr)) {
-                mag_put(&sl->stash->inhab, sl->mag);
+        struct stash    *s   = sl->stash;
+        struct magazine *mag = sl->mag;
+        if (UNLIKELY(mag == NULL)) {
+                mag = mag_get(&s->empty);
+                if (UNLIKELY(mag == NULL)) {
+                        mag = mag_init(s);
+                        if (UNLIKELY(mag == NULL)) {
+                                LOG("Stash failure."); /* TODO: Handle allocation failure. */
+                        }
+                }
+                sl->mag = mag;
+        }
+        ASSERT(mag->used < s->nr);
+        mag->unit[sl->mag->used++] = unit;
+        CMOD(stash_used, sl->mag->used);
+        if (UNLIKELY(mag->used == s->nr)) {
+                mag_put(&s->inhab, mag);
                 sl->mag = NULL;
         }
-        if (UNLIKELY(sl->mag == NULL)) {
-                sl->mag = mag_get(&sl->stash->empty);
-        }
-        if (UNLIKELY(sl->mag == NULL)) {
-                sl->mag = mag_init(sl->stash);
-                ASSERT(sl->mag != NULL); /* TODO: Handle oom. */
-        }
-        ASSERT(sl->mag->used < sl->nr);
-        CMOD(stash_used, sl->mag->used);
-        sl->mag->unit[sl->mag->used++] = unit;
 }
 
 static void stash_init(struct stash *s, int nr, int size) {
@@ -3545,6 +3564,8 @@ static void counters_print() {
         printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
         printf("stash.miss:          %10"PRId64"\n", GVAL(stash_miss));
         counter_var_print1(&GVAL(stash_used),         "stash.used:");
+        printf("stash.mags:          %10"PRId64"\n", GVAL(stash_mags));
+        printf("stash.units:         %10"PRId64"\n", GVAL(stash_units));
         printf("%20s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
