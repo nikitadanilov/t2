@@ -41,7 +41,8 @@ enum {
         MAX_CACHELINE     =      64,
         MAX_SEPARATOR_CUT =      10,
         MAX_PREFIX        =      32,
-        MAX_ALLOC_BUCKET  =      32
+        MAX_ALLOC_BUCKET  =      32,
+        MIN_RADIX_LEVEL   =       2
 };
 
 /* @macro */
@@ -1718,7 +1719,7 @@ static void radixmap_update(struct node *n) {
         int32_t          pidx = -1;
         int32_t          plen;
         SLOT_DEFINE(s, n);
-        if (is_stable(n)) {
+        if (level(n) < MIN_RADIX_LEVEL || is_stable(n)) {
                 return;
         }
         if (UNLIKELY(n->radix == NULL)) {
@@ -4789,6 +4790,7 @@ struct wal_te {
         bool                                   log_syncing;
         bool                                   page_syncing;
         bool                                   use_barrier;
+        int                                    snapshot_hand;
         struct t2                             *mod;
         alignas(MAX_CACHELINE) pthread_mutex_t laundry_lock;
         struct cds_list_head                   laundry;
@@ -5037,7 +5039,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         ASSERT(buf->lsn != 0);
         buf->seg[0]         = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
         buf->seg[buf->used] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
-        result = pwritev(en->fd[buf->lsn & WAL_LOG_MASK], buf->seg, buf->used + 1, ((buf->lsn & (en->log_size - 1)) << en->buf_size_shift) >> WAL_LOG_SHIFT);
+        result = pwritev(en->fd[buf->lsn & WAL_LOG_MASK], buf->seg, buf->used + 1, ((buf->lsn >> WAL_LOG_SHIFT) & (en->log_size - 1)) << en->buf_size_shift);
         if (LIKELY(result == buf->nob)) {
                 lsn_t              lsn;
                 struct wal_buf    *scan;
@@ -5301,6 +5303,7 @@ static void wal_snapshot(struct wal_te *en) {
         int            rc2;
         lsn_t          start      = en->start;
         lsn_t          max_synced = en->max_synced;
+        int            idx        = en->snapshot_hand++ & WAL_LOG_MASK;
         wal_unlock(en);
         header = (struct wal_rec) {
                 .magix = REC_MAGIX,
@@ -5322,8 +5325,8 @@ static void wal_snapshot(struct wal_te *en) {
         };
         vec[0] = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
         vec[1] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
-        rc1 = pwritev(en->fd[0], vec, 2, (en->log_size << en->buf_size_shift) >> WAL_LOG_SHIFT);
-        rc2 = fd_sync(en->fd[0]); /* TODO: Round-robin snapshots. */
+        rc1 = pwritev(en->fd[idx], vec, 2, (en->log_size << en->buf_size_shift) >> WAL_LOG_SHIFT);
+        rc2 = fd_sync(en->fd[idx]);
         if (LIKELY(rc1 == sizeof header + sizeof footer && rc2 == 0)) {
                 wal_lock(en);
                 en->start_written = max_64(en->start_written, start);
@@ -5523,9 +5526,7 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                         if (en->fd[i] < 0) {
                                 if (errno == ENOENT) {
                                         en->fd[i] = WITH_LOGNAME(en, i, open, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-                                        if (en->fd[i] >= 0) {
-                                                result = ftruncate(en->fd[i], buf_size);
-                                        } else {
+                                        if (en->fd[i] < 0) {
                                                 result = ERROR(-errno);
                                         }
                                 } else {
@@ -5562,7 +5563,7 @@ static bool wal_buf_is_valid(struct wal_te *en, struct wal_rec *rec) {
         return wal_rec_invariant(rec) && rec->rtype == HEADER;
 }
 
-static int wal_replay(struct wal_te *en, void *space, int64_t len) {
+static int wal_buf_replay(struct wal_te *en, void *space, int len) {
         struct wal_rec *rec;
         int             result = 0;
         lsn_t           lsn    = -1;
@@ -5604,26 +5605,6 @@ static int wal_replay(struct wal_te *en, void *space, int64_t len) {
         return result;
 }
 
-static int wal_recover_log(struct wal_te *en, lsn_t start, lsn_t end) {
-        int64_t         len   = (end - start) << en->buf_size_shift;
-        void           *space = mem_alloc(len);
-        int64_t         result;
-        return 0; /* TODO: Implement recovery for multi-log. */
-        if (space == NULL) {
-                return ERROR(-ENOMEM);
-        }
-        result = pread(en->fd[0], space, len, start << en->buf_size_shift);
-        if (result == len) {
-                result = wal_replay(en, space, len);
-        } else if (result < 0) {
-                result = ERROR(-errno);
-        } else {
-                result = ERROR(-EIO);
-        }
-        mem_free(space);
-        return result;
-}
-
 static void wal_recovery_done(struct wal_te *en, lsn_t start, lsn_t end) {
         wal_lock(en);
         en->lsn = en->max_persistent = en->max_synced = en->max_written = en->max_inflight = end;
@@ -5634,49 +5615,142 @@ static void wal_recovery_done(struct wal_te *en, lsn_t start, lsn_t end) {
         wal_unlock(en);
 }
 
-static int wal_recover(struct wal_te  *en) {
-        void           *buf;
-        struct wal_rec *rec;
-        struct stat     st;
-        int             result;
-        int64_t         lastbuf;
-        result = fstat(en->fd[0], &st);
-        if (result != 0) {
-                return ERROR(-errno);
+struct rbuf {
+        int     idx;
+        int64_t off;
+        lsn_t   lsn;
+        lsn_t   start;
+        lsn_t   end;
+};
+
+static int rbuf_cmp(const void *a0, const void *a1) {
+        const struct rbuf *r0 = a0;
+        const struct rbuf *r1 = a1;
+        if (r0->lsn == r1->lsn) {
+                if (r0->lsn != 0) {
+                        LOG("Duplicate lsn-s %8"PRId64" in the logs %04x+%"PRId64" and %04x+%"PRId64".",
+                            r0->lsn, r0->idx, r0->off, r1->idx, r1->off);
+                }
+                return r0->end - r1->end;
         }
-        if (st.st_size == en->buf_size) {
-                wal_recovery_done(en, 1, 1);
-                return 0;
-        }
-        rec = buf = mem_alloc(en->buf_size);
-        if (UNLIKELY(buf == NULL)) {
-                return ERROR(-ENOMEM);
-        }
-        for (lastbuf = (st.st_size - 1) / en->buf_size; lastbuf > 0; lastbuf--) {
-                lsn_t off = lastbuf * en->buf_size;
-                result = pread(en->fd[0], buf, en->buf_size, off);
-                if (result >= SOF(*rec)) {
-                        if (wal_buf_is_valid(en, rec)) {
-                                result = 0;
-                                break;
-                        } else {
-                                result = ERROR(-EIO);
+        return r0->lsn - r1->lsn;
+}
+
+static void rbuf_print(const struct rbuf *rbuf) {
+        printf("%04x+%"PRId64": %8"PRId64" [%8"PRId64" .. %8"PRId64"]\n", rbuf->idx, rbuf->off, rbuf->lsn, rbuf->start, rbuf->end);
+}
+
+static int wal_index_replay(struct wal_te *en, int nr, struct rbuf *index, lsn_t start, lsn_t end, void *buf) {
+        int result = 0;
+        LOG("Recovering: %8"PRId64" .. %8"PRId64".", start, end);
+        for (int i = 0; result == 0 && i < nr; ++i) {
+                struct rbuf *r = &index[i];
+                if (start <= r->lsn && r->lsn < end) {
+                        result = pread(en->fd[r->idx], buf, en->buf_size, r->off);
+                        if (result < SOF(struct wal_rec)) {
+                                LOG("Cannot read log buffer %04x+%"PRId64": %i/%i.", r->idx, r->off, result, errno);
+                                return ERROR(result < 0 ? -errno : -EIO);
                         }
-                } else {
-                        result = ERROR(result < 0 ? -errno : -EIO);
+                        result = wal_buf_replay(en, buf, result);
                 }
         }
-        if (result == 0) {
-                if (lastbuf >= 1) {
-                        result = wal_recover_log(en, rec->u.header.start, rec->u.header.end);
-                        if (result == 0) {
-                                wal_recovery_done(en, rec->u.header.start, rec->u.header.end);
+        return result;
+}
+
+static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64_t *size, struct rbuf *out) {
+        int result;
+        int snapend;
+        int pos = 0;
+        ASSERT(*nr > 0);
+        for (int i = 0; i < WAL_LOG_NR; ++i) {
+                for (int64_t off = 0; off < size[i]; off += en->buf_size) {
+                        struct wal_rec rec;
+                        result = pread(en->fd[i], &rec, sizeof rec, off);
+                        if (off == 0 && IS0(&rec)) { /* Log never wrapped around. */
+                                continue;
                         }
-                } else {
+                        if (result != sizeof rec) {
+                                LOG("Cannot read log record %04x+%"PRId64": %i/%i.", i, off, result, errno);
+                                return ERROR(result < 0 ? -errno : -EIO);
+                        }
+                        if (rec.magix != REC_MAGIX || rec.rtype != HEADER) {
+                                LOG("Wrong record in log %04x+%"PRId64": %016"PRIx64" != %016"PRIx64" or %016"PRIx32" != %016"PRIx32".",
+                                    i, off, rec.magix, REC_MAGIX, rec.rtype, (int32_t)HEADER);
+                                return ERROR(-EIO);
+                        }
+                        ASSERT(pos < *nr);
+                        index[pos++] = (struct rbuf) {
+                                .idx   = i,
+                                .off   = off,
+                                .lsn   = rec.u.header.lsn,
+                                .start = rec.u.header.start,
+                                .end   = rec.u.header.end
+                        };
+                }
+        }
+        ASSERT(pos <= *nr);
+        *nr = pos;
+        qsort(index, pos, sizeof(struct rbuf), &rbuf_cmp);
+        for (snapend = 0; snapend < pos && index[snapend].lsn == 0; ++snapend) {
+                ;
+        }
+        LOG("Found %i snapshots.", snapend);
+        for (int i = snapend + 1; i < pos; ++i) {
+                if (index[i].start < index[i - 1].start || index[i].end < index[i - 1].end) {
+                        LOG("Non-monotonic records.");
+                        rbuf_print(&index[i - 1]);
+                        rbuf_print(&index[i]);
                         return ERROR(-EIO);
                 }
         }
-        mem_free(buf);
+        *out = index[pos - 1];
+        if (snapend > 0 && index[snapend - 1].end > out->end) {
+                *out = index[snapend - 1];
+        }
+        LOG("Latest record:");
+        rbuf_print(out);
+        return 0;
+}
+
+static int wal_recover(struct wal_te *en) {
+        int          buf_nr = 0;
+        int          result;
+        struct rbuf *index;
+        int64_t     *size = alloca(sizeof size[0] * WAL_LOG_NR);
+        for (int i = 0; i < WAL_LOG_NR; ++i) {
+                struct stat st;
+                result = fstat(en->fd[i], &st);
+                if (result != 0) {
+                        LOG("Cannot stat log %04x.", i);
+                        return ERROR(result);
+                }
+                size[i] = st.st_size;
+                buf_nr += (st.st_size + en->buf_size - 1) >> en->buf_size_shift;
+        }
+        if (buf_nr == 0) {
+                wal_recovery_done(en, 1, 1);
+                return 0;
+        }
+        index = mem_alloc(sizeof index[0] * buf_nr);
+        if (index != NULL) {
+                struct rbuf last;
+                result = wal_index_build(en, &buf_nr, index, size, &last);
+                if (result == 0) {
+                        void *buf = mem_alloc(en->buf_size);
+                        if (buf != NULL) {
+                                result = wal_index_replay(en, buf_nr, index, last.start, last.end, buf);
+                                if (result == 0) {
+                                        wal_recovery_done(en, last.start, last.end);
+                                }
+                                mem_free(buf);
+                        } else {
+                                result = ERROR(-ENOMEM);
+                        }
+                }
+                mem_free(index);
+        } else {
+                result = ERROR(-ENOMEM);
+        }
         return result;
 }
 
@@ -7314,6 +7388,7 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        wal_ut();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -7328,7 +7403,7 @@ int main(int argc, char **argv) {
         seq_ut();
         mt_ut();
         open_ut();
-        // wal_ut();
+        wal_ut();
         return 0;
 }
 
