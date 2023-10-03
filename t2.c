@@ -402,6 +402,21 @@ struct node_type_ops {
         int32_t (*used)      (const struct node *n);
 };
 
+enum t2_initialisation_stage {
+        NOTHING,
+        ALLOCATED,
+        THREAD_REGISTER,
+        SIGNAL_INIT,
+        FIELDS,
+        NTYPES,
+        TTYPES,
+        POOL,
+        HT_INIT,
+        STORAGE_INIT,
+        MAXWELLD,
+        TX_INIT
+};
+
 struct t2 {
         alignas(MAX_CACHELINE) struct ht     ht;
         alignas(MAX_CACHELINE) struct cache  cache;
@@ -413,6 +428,7 @@ struct t2 {
         struct t2_storage                   *stor;
         pthread_t                            pulse;
         bool                                 shutdown;
+        enum t2_initialisation_stage         stage;
 };
 
 SASSERT(MAX_TREE_HEIGHT <= 255); /* Level is 8 bit. */
@@ -956,67 +972,81 @@ static __thread volatile struct {
 static struct node_type_ops simple_ops;
 static char *argv0;
 
+static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stage stage) {
+        if (LIKELY(success)) {
+                if (stage > 0) {
+                        ASSERT(mod->stage == stage - 1);
+                        mod->stage = stage;
+                }
+        } else {
+                t2_fini(mod);
+        }
+        return !success;
+}
+
+#define NEXT_STAGE(mod, result, stage)                          \
+({                                                              \
+        typeof(result) __result = (result);                     \
+        if (next_stage((mod), __result == 0, (stage))) {        \
+                return EPTR(__result);                          \
+        }                                                       \
+})
+
 struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int cshift,
                    struct t2_tree_type **ttypes, struct t2_node_type **ntypes) {
-        int result;
-        struct t2 *mod = mem_alloc(sizeof *mod);
+        int               result;
+        struct t2        *mod;
+        struct cache_arg *ca;
+        struct cache     *c;
+        struct pool      *p;
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
+        mod = mem_alloc(sizeof *mod);
+        ca  = mem_alloc(sizeof *ca);
+        if (mod == NULL || ca == NULL) {
+                mem_free(mod);
+                mem_free(ca);
+                return EPTR(-ENOMEM);
+        }
+        mod->stage = ALLOCATED;
         t2_thread_register();
         eclear();
-        result = signal_init();
-        if (LIKELY(result == 0)) {
-                if (LIKELY(mod != NULL)) {
-                        struct cache *c = &mod->cache;
-                        struct pool  *p = &c->pool;
-                        mod->cache.shift = cshift;
-                        NOFAIL(pthread_mutex_init(&c->lock, NULL)); /* TODO: Handle errors. */
-                        NOFAIL(pthread_create(&mod->pulse, NULL, &pulse, mod));
-                        NOFAIL(pthread_cond_init(&c->want, NULL));
-                        for (int i = 0; i < ARRAY_SIZE(p->free); ++i) {
-                                NOFAIL(pthread_mutex_init(&p->free[i].lock, NULL));
-                                NOFAIL(pthread_cond_init(&p->free[i].got, NULL));
-                                CDS_INIT_LIST_HEAD(&p->free[i].head);
-                                p->free[i].avail = p->free[i].total = 1 << max_32(cshift - i, 0);
-                        }
-                        for (; *ttypes != NULL; ++ttypes) {
-                                tree_type_register(mod, *ttypes);
-                        }
-                        for (; *ntypes != NULL; ++ntypes) {
-                                node_type_register(mod, *ntypes);
-                        }
-                        mod->stor = storage;
-                        result = SCALL(mod, init);
-                        if (LIKELY(result == 0)) {
-                                result = ht_init(&mod->ht, hshift);
-                                if (LIKELY(result == 0)) {
-                                        struct cache_arg *ca = mem_alloc(sizeof *ca);
-                                        ASSERT(ca != NULL);
-                                        ca->mod = mod;
-                                        ca->idx = 0;
-                                        result = pthread_create(&mod->cache.md, NULL, &maxwelld, ca);
-                                        ASSERT(result == 0);
-                                        mod->te = te; /* Set before calling ->init(), so that the daemons see the engine. */
-                                        result = TXCALL(te, init(te, mod));
-                                        if (UNLIKELY(result != 0)) {
-                                                mod->te = NULL;
-                                                cache_fini(mod);
-                                        }
-                                        if (result != 0) {
-                                                ht_fini(&mod->ht);
-                                        }
-                                }
-                                if (result != 0) {
-                                        SCALL(mod, fini);
-                                }
-                        }
-                } else {
-                        result = ERROR(-ENOMEM);
-                }
-                if (result != 0) {
-                        signal_fini();
-                }
+        next_stage(mod, true, THREAD_REGISTER);
+        NEXT_STAGE(mod, signal_init(), SIGNAL_INIT);
+        c = &mod->cache;
+        p = &c->pool;
+        mod->cache.shift = cshift;
+        NEXT_STAGE(mod, pthread_mutex_init(&c->lock, NULL), 0);
+        NEXT_STAGE(mod, pthread_create(&mod->pulse, NULL, &pulse, mod), 0);
+        NEXT_STAGE(mod, pthread_cond_init(&c->want, NULL), 0);
+        mod->stor = storage;
+        mod->te   = te;
+        next_stage(mod, true, FIELDS);
+        for (; *ntypes != NULL; ++ntypes) {
+                node_type_register(mod, *ntypes);
         }
-        return result != 0 ? EPTR(result) : mod;
+        next_stage(mod, true, NTYPES);
+        for (; *ttypes != NULL; ++ttypes) {
+                tree_type_register(mod, *ttypes);
+        }
+        next_stage(mod, true, TTYPES);
+        for (int i = 0; i < ARRAY_SIZE(p->free); ++i) {
+                NEXT_STAGE(mod, pthread_mutex_init(&p->free[i].lock, NULL), 0);
+                NEXT_STAGE(mod, pthread_cond_init(&p->free[i].got, NULL), 0);
+                CDS_INIT_LIST_HEAD(&p->free[i].head);
+                p->free[i].avail = p->free[i].total = 1 << max_32(cshift - i, 0);
+        }
+        next_stage(mod, true, POOL);
+        NEXT_STAGE(mod, ht_init(&mod->ht, hshift), HT_INIT);
+        NEXT_STAGE(mod, SCALL(mod, init), STORAGE_INIT);
+        ca->mod = mod;
+        ca->idx = 0;
+        result = pthread_create(&mod->cache.md, NULL, &maxwelld, ca);
+        if (next_stage(mod, result == 0, MAXWELLD)) {
+                mem_free(ca);
+                return EPTR(-ENOMEM);
+        }
+        NEXT_STAGE(mod, TXCALL(te, init(te, mod)), TX_INIT);
+        return mod;
 }
 
 enum {
@@ -1029,36 +1059,53 @@ void t2_fini(struct t2 *mod) {
         struct pool  *p = &c->pool;
         eclear();
         urcu_memb_barrier();
-        SET0(&ci);
-        TXCALL(mod->te, quiesce(mod->te));
-        TXCALL(mod->te, fini(mod->te));
-        cache_clean(mod);
-        cache_fini(mod);
-        SCALL(mod, fini);
-        ht_clean(&mod->ht);
-        ht_fini(&mod->ht);
-        signal_fini();
-        pool_clean(mod);
-        pthread_join(mod->pulse, NULL);
-        for (int i = 0; i < ARRAY_SIZE(p->free); ++i) {
-                NOFAIL(pthread_cond_destroy(&p->free[i].got));
-                NOFAIL(pthread_mutex_destroy(&p->free[i].lock));
-                ASSERT(cds_list_empty(&p->free[i].head));
-        }
-        NOFAIL(pthread_cond_destroy(&c->want));
-        NOFAIL(pthread_mutex_destroy(&c->lock));
-        for (int i = 0; i < ARRAY_SIZE(mod->ttypes); ++i) {
-                if (mod->ttypes[i] != NULL) {
-                        tree_type_degister(mod->ttypes[i]);
+        cache_sync(mod);
+        counters_fold();
+        mod->shutdown = true;
+        switch (mod->stage) {
+        case TX_INIT:
+                TXCALL(mod->te, quiesce(mod->te));
+                TXCALL(mod->te, fini(mod->te));
+        case MAXWELLD:
+                cache_clean(mod);
+                cache_fini(mod);
+        case STORAGE_INIT:
+                SCALL(mod, fini);
+        case HT_INIT:
+                ht_clean(&mod->ht);
+                ht_fini(&mod->ht);
+        case POOL:
+                pool_clean(mod);
+                for (int i = 0; i < ARRAY_SIZE(p->free); ++i) {
+                        NOFAIL(pthread_cond_destroy(&p->free[i].got));
+                        NOFAIL(pthread_mutex_destroy(&p->free[i].lock));
+                        ASSERT(cds_list_empty(&p->free[i].head));
                 }
-        }
-        for (int i = 0; i < ARRAY_SIZE(mod->ntypes); ++i) {
-                if (mod->ntypes[i] != NULL) {
-                        node_type_degister(mod->ntypes[i]);
+        case TTYPES:
+                for (int i = 0; i < ARRAY_SIZE(mod->ttypes); ++i) {
+                        if (mod->ttypes[i] != NULL) {
+                                tree_type_degister(mod->ttypes[i]);
+                        }
                 }
+        case NTYPES:
+                for (int i = 0; i < ARRAY_SIZE(mod->ntypes); ++i) {
+                        if (mod->ntypes[i] != NULL) {
+                                node_type_degister(mod->ntypes[i]);
+                        }
+                }
+        case FIELDS:
+                pthread_join(mod->pulse, NULL);
+                NOFAIL(pthread_cond_destroy(&c->want));
+                NOFAIL(pthread_mutex_destroy(&c->lock));
+        case SIGNAL_INIT:
+                signal_fini();
+        case THREAD_REGISTER:
+                t2_thread_degister();
+        case ALLOCATED:
+                mem_free(mod);
+        case NOTHING:
+                ;
         }
-        mem_free(mod);
-        t2_thread_degister();
 }
 
 void t2_stats_print(struct t2 *mod) {
@@ -1720,7 +1767,7 @@ static void radixmap_update(struct node *n) {
         int32_t          plen;
         SLOT_DEFINE(s, n);
         if (level(n) < MIN_RADIX_LEVEL || is_stable(n)) {
-                return;
+                return; /* TODO: Use n->seq and prefix stats to decide. */
         }
         if (UNLIKELY(n->radix == NULL)) {
                 n->radix = mem_alloc(sizeof *n->radix);
@@ -2917,7 +2964,6 @@ static bool cache_invariant(struct cache *c) {
 }
 
 static void cache_fini(struct t2 *mod) {
-        mod->shutdown = true;
         NOFAIL(pthread_cond_signal(&mod->cache.want));
         NOFAIL(pthread_join(mod->cache.md, NULL));
 }
@@ -3731,6 +3777,8 @@ static int signal_init() {
                 if (LIKELY(result == 0)) {
                         signal_set = 1;
                 }
+        } else {
+                ++signal_set;
         }
         return result;
 }
@@ -6489,6 +6537,7 @@ static void traverse_ut() {
         usuite("traverse");
         utest("t2_init");
         struct t2 *mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        ASSERT(EISOK(mod));
         ttype.mod = mod;
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
@@ -7388,7 +7437,6 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        wal_ut();
         lib_ut();
         simple_ut();
         ht_ut();
