@@ -91,7 +91,7 @@ enum {
         SASSERT(IS_ARRAY(array));                       \
         ((unsigned long)(idx)) < ARRAY_SIZE(array);     \
 })
-#define COF(ptr, type, member) ((type *)((char *)(ptr) - (char *)(&((type *)0)->member)))
+#define COF(ptr, type, member) ((type *)((char *)(ptr) - __builtin_offsetof(type, member)))
 #define LOG(fmt, ...) llog(MSG_PREP(fmt) , ## __VA_ARGS__)
 #define ERROR_INFO(errcode, fmt, a0, a1)                \
 ({                                                      \
@@ -1769,7 +1769,7 @@ static void rcu_quiescent() {
         urcu_memb_quiescent_state();
 }
 
-static void radixmap_update(struct node *n) {
+static void __attribute__((no_sanitize("address"))) radixmap_update(struct node *n) {
         struct radixmap *m;
         int32_t          i;
         int16_t          ch;
@@ -4776,7 +4776,7 @@ struct wal_rec {
                 } header;
         } u;
         uint8_t data[0];
-};
+} __attribute__((packed));
 
 struct wal_tx {
         struct t2_tx       base;
