@@ -702,6 +702,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_page_cache;
         int64_t wal_sync_page_nob;
         int64_t wal_sync_page_time;
+        int64_t wal_dirty_clean;
+        int64_t wal_redirty;
         int64_t stash_hit;
         int64_t stash_miss;
         int64_t stash_mags;
@@ -718,6 +720,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_inflight;
         struct counter_var wal_laundry;
         struct counter_var wal_washer;
+        struct counter_var wal_redirty_lsn;
         struct counter_var stash_used;
         struct level_counters {
                 int64_t insert_balance;
@@ -795,7 +798,7 @@ struct cacheinfo {
 };
 
 enum {
-        BILLION = 1000000000ULL
+        BILLION = 1000000000ull
 };
 
 /* @static */
@@ -867,6 +870,7 @@ static void touch_unlock(struct node *n, enum lock_mode mode);
 static void dirty(struct path *p, struct page *g);
 static void radixmap_update(struct node *n);
 static struct header *nheader(const struct node *n);
+static void node_state_print(struct node *n, char state);
 static void rcu_lock();
 static void rcu_unlock();
 static void rcu_leave(struct path *p, struct node *extra);
@@ -1438,6 +1442,14 @@ static bool node_locked_invariant(struct node *n, enum lock_mode mode) {
         return true;
 }
 
+enum { NODE_LOGGING = 1 };
+
+static void node_state_print(struct node *n, char state) {
+        if (NODE_LOGGING) {
+                printf("N %18"PRId64" %016"PRIx64" %d %c\n", READ_ONCE(n->mod->tick), n->addr, level(n), state);
+        }
+}
+
 static void lock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         COUNTERS_ASSERT(CVAL(rcu) == 0);
@@ -1447,9 +1459,11 @@ static void lock(struct node *n, enum lock_mode mode) {
                 NOFAIL(pthread_rwlock_wrlock(&n->lock));
                 ASSERT(is_stable(n));
                 CINC(wlock);
+                node_state_print(n, 'L');
         } else if (mode == READ) {
                 NOFAIL(pthread_rwlock_rdlock(&n->lock));
                 CINC(rlock);
+                node_state_print(n, 'l');
         }
         ASSERT(node_locked_invariant(n, mode));
 }
@@ -1460,6 +1474,7 @@ static void unlock(struct node *n, enum lock_mode mode) {
         if (LIKELY(mode == NONE)) {
                 ;
         } else if (mode == WRITE) {
+                node_state_print(n, 'U');
                 if (!is_stable(n)) {
                         radixmap_update(n);
                         node_seq_increase(n);
@@ -1467,6 +1482,7 @@ static void unlock(struct node *n, enum lock_mode mode) {
                 NOFAIL(pthread_rwlock_unlock(&n->lock));
                 CDEC(wlock);
         } else if (mode == READ) {
+                node_state_print(n, 'u');
                 NOFAIL(pthread_rwlock_unlock(&n->lock));
                 CDEC(rlock);
         }
@@ -1554,6 +1570,7 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
 static void nfini(struct node *n) {
         struct cache    *c    = &n->mod->cache;
         struct freelist *free = &c->pool.free[taddr_sbits(n->addr)];
+        node_state_print(n, 'F');
         ASSERT(n->ref == 0);
         ASSERT(cds_list_empty(&n->dirty));
         ASSERT(!(n->flags & DIRTY));
@@ -1588,6 +1605,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                         ref(n);
                 }
                 mutex_unlock(lock);
+                node_state_print(n, 'A');
         }
         return n;
 }
@@ -1596,6 +1614,7 @@ static void ref(struct node *n) {
         n->ref++;
         CINC(node);
         ref_add(n);
+        node_state_print(n, 'r');
 }
 
 static void ndelete(struct node *n) {
@@ -1612,6 +1631,7 @@ static void ndelete(struct node *n) {
 
 static int readdata(struct node *n) {
         struct iovec io = { .iov_base = n->data, .iov_len = taddr_ssize(n->addr) };
+        node_state_print(n, 'R');
         return SCALL(n->mod, read, n->addr, 1, &io);
 }
 
@@ -1686,6 +1706,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level, struct mod *cap) {
                         n->ntype = ntype;
                         NCALL(n, make(n, cap));
                         unlock(n, WRITE);
+                        node_state_print(n, 'a');
                 }
         } else {
                 n = EPTR(addr);
@@ -1703,12 +1724,14 @@ static void free_callback(struct rcu_head *head) {
 static void put_final(struct node *n) {
         n->flags |= HEARD_BANSHEE;
         ht_delete(n);
+        node_state_print(n, 'P');
         call_rcu_memb(&n->rcu, &free_callback);
 }
 
 static void put_locked(struct node *n) {
         ASSERT(n->ref > 0);
         EXPENSIVE_ASSERT(n->data != NULL ? is_sorted(n) : true);
+        node_state_print(n, 'p');
         ref_del(n);
         if (--n->ref == 0) {
                 if (n->flags & NOCACHE) {
@@ -1725,6 +1748,7 @@ static void put(struct node *n) {
 
 static int dealloc(struct node *n) {
         struct t2 *mod = n->mod;
+        node_state_print(n, 'f');
         ndelete(n);
         SCALL(mod, free, n->addr);
         return 0;
@@ -2113,6 +2137,7 @@ static void dirty(struct path *p, struct page *g) {
                 int32_t start = nsize(n);
                 ASSERT(is_stable(n));
                 node_seq_increase(n);
+                node_state_print(n, 'D');
                 if (TRANSACTIONS && p->tx != NULL) {
                         for (int i = 0; i < ARRAY_SIZE(g->mod.ext); ++i) {
                                 g->mod.ext[i] = (struct ext) { .start = start, .end = 0 };
@@ -2693,6 +2718,7 @@ static int traverse(struct path *p) {
                                 flags |= PINNED;
                         }
                 } else {
+                        node_state_print(n, 'e');
                         if (!is_stable(n)) { /* This is racy, but OK. */
                                 rcu_leave(p, n);
                                 lock(n, READ); /* Wait for stabilisation. */
@@ -3043,6 +3069,7 @@ static int pageout0(struct node *n) {
         taddr_t       whole;
         int           result;
         int           shift;
+        int           towrite;
         int           bshift = taddr_sshift(n->addr);
         ASSERT((n->flags & DIRTY) && TXA(n, !cds_list_empty(&n->dirty) && n->lsn != 0));
         node_iovec(n, &vec[0]);
@@ -3070,27 +3097,32 @@ static int pageout0(struct node *n) {
                 break;
         }
         shift = ilog2(nr);
-        for (int i = 1 << shift; i < nr; ++i) {
+        towrite = 1 << shift;
+        for (int i = towrite; i < nr; ++i) {
                 ASSERT(node_locked_invariant(cluster[i], WRITE));
                 NOFAIL(pthread_rwlock_unlock(&cluster[i]->lock));
                 put(cluster[i]);
         }
         whole = taddr_make(taddr_saddr(n->addr), shift + bshift);
-        ASSERT(FORALL(i, 1 << shift, !pinned(cluster[i])));
-        result = SCALL(mod, write, whole, 1 << shift, vec);
+        ASSERT(FORALL(i, towrite, !pinned(cluster[i])));
+        for (int i = 0; i < towrite; ++i) {
+                node_state_print(cluster[i], 'W');
+        }
+        result = SCALL(mod, write, whole, towrite, vec);
         CMOD(l[level(n)].pageout_cluster, nr);
         if (LIKELY(result == 0)) {
                 CINC(write);
                 CADD(write_bytes, taddr_ssize(whole));
-                TXCALL(mod->te, clean(mod->te, (struct t2_node **)cluster, 1 << shift));
-                for (int i = 0; i < (1 << shift); ++i) {
+                TXCALL(mod->te, clean(mod->te, (struct t2_node **)cluster, towrite));
+                for (int i = 0; i < towrite; ++i) {
                         cluster[i]->flags &= ~DIRTY;
                         cluster[i]->lsn = 0;
+                        node_state_print(cluster[i], 'C');
                 }
         } else {
                 LOG("Pageout failure: %"PRIx64": %i/%i.", n->addr, result, errno);
         }
-        for (int i = 1; i < 1 << shift; ++i) {
+        for (int i = 1; i < towrite; ++i) {
                 assert(node_locked_invariant(cluster[i], WRITE));
                 NOFAIL(pthread_rwlock_unlock(&cluster[i]->lock));
                 put(cluster[i]);
@@ -3625,6 +3657,9 @@ static void counters_print() {
         printf("wal.page_cache:      %10"PRId64"\n", GVAL(wal_page_cache));
         printf("wal.sync_page_nob:   %10"PRId64"\n", GVAL(wal_sync_page_nob));
         printf("wal.sync_page_time:  %10"PRId64"\n", GVAL(wal_sync_page_time));
+        printf("wal.dirty_clean:     %10"PRId64"\n", GVAL(wal_dirty_clean));
+        printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
+        counter_var_print1(&GVAL(wal_redirty_lsn),    "wal.redirty_lsn:");
         printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
         printf("stash.miss:          %10"PRId64"\n", GVAL(stash_miss));
         counter_var_print1(&GVAL(stash_used),         "stash.used:");
@@ -4183,7 +4218,7 @@ static void *skey(struct sheader *sh, int pos, int32_t *size) {
 
 static void *sval(struct sheader *sh, int pos, int32_t *size) {
         struct dir_element *del = sat(sh, pos + 1);
-        *size = sat(sh, pos)->voff  - del->voff;
+        *size = sat(sh, pos)->voff - del->voff;
         return (void *)sh + del->voff;
 }
 
@@ -4875,9 +4910,9 @@ enum {
         WAL_AGE_LIMIT        = 2 * BILLION,
         WAL_IDLE_LIMIT       = BILLION / 10,
         WAL_SYNC_AGE         = BILLION, /* Nanoseconds. */
-        WAL_SYNC_NOB         = 1ULL << 9,  /* Measured in buffers. */
-        WAL_PAGE_SYNC_NOB    = 1ULL << 5,
-        WAL_MAX_LOG          = 2ULL << 10, /* Measured in buffers. TODO: Make this a parameter. */
+        WAL_SYNC_NOB         = 1ull << 9,  /* Measured in buffers. */
+        WAL_PAGE_SYNC_NOB    = 1ull << 5,
+        WAL_MAX_LOG          = 2ull << 10, /* Measured in buffers. TODO: Make this a parameter. */
         WAL_RESERVE_QUANTUM  = 1
 };
 
@@ -5190,7 +5225,8 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         struct wal_te  *en  = COF(engine, struct wal_te, base);
         struct wal_tx  *tx  = COF(trax, struct wal_tx, base);
         struct wal_rec *rec;
-        struct node   *n;
+        struct node    *n;
+        struct node    *prev = NULL;
         void           *space;
         int32_t         size;
         int             added = 0;
@@ -5218,7 +5254,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 memcpy(rec->data, txr[i].part.addr, rec->len);
                 rec = wal_next(rec);
         }
-        for (int i = 0; i < nr; ++i) {
+        for (int i = 0; i < nr; ++i, prev = n) {
                 n = (void *)txr[i].node;
                 if (!(n->flags & DIRTY)) {
                         ASSERT(n->lsn == 0);
@@ -5226,6 +5262,10 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                         nodes[added++] = n;
                         ASSERT(cds_list_empty(&n->dirty));
                         cds_list_add_tail(&n->dirty, &laundry_list);
+                        CINC(wal_dirty_clean);
+                } else if (COUNTERS && prev != n) {
+                        CINC(wal_redirty);
+                        CMOD(wal_redirty_lsn, en->lsn - n->lsn);
                 }
         }
         wal_lock(en);
@@ -5774,11 +5814,7 @@ static int wal_recover(struct wal_te *en) {
         int          buf_nr = 0;
         int          result;
         struct rbuf *index;
-        int64_t     *size;
-        size = mem_alloc(sizeof size[0] * WAL_LOG_NR);
-        if (size == NULL) {
-                return ERROR(-ENOMEM);
-        }
+        int64_t     *size = alloca(sizeof size[0] * WAL_LOG_NR);
         for (int i = 0; i < WAL_LOG_NR; ++i) {
                 struct stat st;
                 result = fstat(en->fd[i], &st);
@@ -5813,7 +5849,6 @@ static int wal_recover(struct wal_te *en) {
         } else {
                 result = ERROR(-ENOMEM);
         }
-        mem_free(size);
         return result;
 }
 
@@ -6150,10 +6185,15 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         taddr_t              result;
         int                  hand;
+        uint64_t             bkr;
         mutex_lock(&fs->lock);
         hand = frag_select(fs);
+        brk = fs->frag_free[hand] + (1ull << shift_min);
+        if (UNLIKELY(brk >= 1ull << BASE_SHIFT)) {
+                return ERROR(-ENOSPC);
+        }
         result = taddr_make(fs->frag_free[hand] | ((uint64_t)hand << BASE_SHIFT), shift_min);
-        fs->frag_free[hand] += (uint64_t)1 << shift_min;
+        fs->frag_free[hand] = brk;
         fs->free = max_64(fs->free, fs->frag_free[hand]);
         mutex_unlock(&fs->lock);
         return result;
