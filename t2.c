@@ -250,6 +250,20 @@ enum {
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
 #define DMOD(cnt, d) ({ struct double_var *v = &(__d_counters.cnt); v->sum += (d); v->nr++; })
 #define COUNTERS_ASSERT(expr) ASSERT(expr)
+#define TIMED(expr, mod, counter)                       \
+({                                                      \
+        typeof (expr) __result;                         \
+        uint64_t      __t = READ_ONCE(mod->tick);       \
+        __result = (expr);                              \
+        CMOD(counter, READ_ONCE(mod->tick) - __t);      \
+        __result;                                       \
+})
+#define TIMED_VOID(expr, mod, counter)                  \
+({                                                      \
+        uint64_t __t = READ_ONCE(mod->tick);            \
+        (expr);                                         \
+        CMOD(counter, READ_ONCE(mod->tick) - __t);      \
+})
 #else
 #define CINC(cnt)    ((void)0)
 #define CDEC(cnt)    ((void)0)
@@ -260,6 +274,8 @@ enum {
 #define CMOD(cnt, d) ((void)(d))
 #define DMOD(cnt, d) ((void)(d))
 #define COUNTERS_ASSERT(expr)
+#define TIMED(expr, mod, counter) (expr)
+#define TIMED_VOID(expr, mod, counter) (expr)
 #endif /* COUNTERS */
 
 #define SCALL(mod, method, ...)                         \
@@ -687,6 +703,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_get_ready;
         int64_t wal_get_wait;
         int64_t wal_page_write;
+        int64_t wal_page_put;
         int64_t wal_page_clean;
         int64_t wal_page_none;
         int64_t wal_page_done;
@@ -709,6 +726,11 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t stash_mags;
         int64_t stash_units;
         int64_t malloc[MAX_ALLOC_BUCKET];
+        struct counter_var time_traverse;
+        struct counter_var time_complete;
+        struct counter_var time_prepare;
+        struct counter_var time_get;
+        struct counter_var time_open;
         struct counter_var wal_get_wait_time;
         struct counter_var wal_open_wait_time;
         struct counter_var wal_space_nr;
@@ -723,6 +745,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_redirty_lsn;
         struct counter_var stash_used;
         struct level_counters {
+                int64_t traverse_hit;
+                int64_t traverse_miss;
                 int64_t insert_balance;
                 int64_t delete_balance;
                 int64_t get;
@@ -890,7 +914,6 @@ static bool simple_can_merge(const struct node *n0, const struct node *n1);
 static void simple_fini(struct node *n);
 static void simple_print(struct node *n);
 static bool simple_invariant(const struct node *n);
-static int simple_keycmp(const struct node *n, int pos, void *addr, int32_t len, uint64_t mask);
 static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 static int shift(struct page *d, struct page *s, const struct slot *insert, enum dir dir);
 static int merge(struct page *d, struct page *s, enum dir dir);
@@ -951,7 +974,8 @@ static void writeout(struct t2 *mod);
 static void cache_fini(struct t2 *mod);
 static void cache_sync(struct t2 *mod);
 static void cache_pulse(struct t2 *mod);
-static int pageout0(struct node *n);
+static bool cache_want_page(struct t2 *mod);
+static int pageout(struct node *n);
 static void kmod(struct ewma *a, uint32_t t, int32_t nr);
 static uint64_t kavg(struct ewma *a, uint32_t t);
 static void ref_add(struct node *n);
@@ -1276,8 +1300,10 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx) {
                 if (EISOK(root)) {
                         int result;
                         t->root = root->addr;
-                        put(root); /* Release earlier to keep counters happy. */
+                        CDEC(node); /* To keep counters_check() happy. */
                         result = insert(t, &(struct t2_rec) { .key = &zero, .val = &zero }, tx);
+                        CINC(node);
+                        put(root);
                         if (result != 0) {
                                 t = EPTR(result);
                         }
@@ -1442,10 +1468,10 @@ static bool node_locked_invariant(struct node *n, enum lock_mode mode) {
         return true;
 }
 
-enum { NODE_LOGGING = 1 };
+enum { NODE_LOGGING = 0 };
 
 static void node_state_print(struct node *n, char state) {
-        if (NODE_LOGGING) {
+        if (NODE_LOGGING) { /* Keep node-trace.py in sync. */
                 printf("N %18"PRId64" %016"PRIx64" %d %c\n", READ_ONCE(n->mod->tick), n->addr, level(n), state);
         }
 }
@@ -1466,11 +1492,13 @@ static void lock(struct node *n, enum lock_mode mode) {
                 node_state_print(n, 'l');
         }
         ASSERT(node_locked_invariant(n, mode));
+        EXPENSIVE_ASSERT(mode != NONE ? is_sorted(n) : true);
 }
 
 static void unlock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         ASSERT(node_locked_invariant(n, mode));
+        EXPENSIVE_ASSERT(mode != NONE ? is_sorted(n) : true);
         if (LIKELY(mode == NONE)) {
                 ;
         } else if (mode == WRITE) {
@@ -1669,6 +1697,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                         CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
                                         node_seq_increase(n);
                                         NCALL(n, load(n));
+                                        EXPENSIVE_ASSERT(is_sorted(n));
                                 } else {
                                         result = ERROR(-ESTALE);
                                 }
@@ -1734,7 +1763,7 @@ static void put_locked(struct node *n) {
         node_state_print(n, 'p');
         ref_del(n);
         if (--n->ref == 0) {
-                if (n->flags & NOCACHE) {
+                if ((n->flags & NOCACHE) && !(n->flags & DIRTY)) {
                         put_final(n);
                 }
         }
@@ -1948,6 +1977,8 @@ static int split_right_exec_insert(struct path *p, int idx) {
         int result = 0;
         rec_todo(p, idx, &s);
         /* Maybe ->plan() overestimated keysize and shift is not needed. */
+        EXPENSIVE_ASSERT(is_sorted(left));
+        EXPENSIVE_ASSERT(right != NULL ? is_sorted(right) : true);
         if (right != NULL && !can_insert(left, &s.rec)) {
                 s.idx = r->pos + 1;
                 result = shift(&r->allocated, &r->page, &s, RIGHT);
@@ -1970,7 +2001,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
                 NOFAIL(NCALL(s.node, insert(&s, &p->mod)));
-                EXPENSIVE_ASSERT(result != 0 || is_sorted(s.node));
+                EXPENSIVE_ASSERT(is_sorted(s.node));
                 if (r->flags & ALUSED) {
                         struct t2_buf lkey = {};
                         struct t2_buf rkey;
@@ -1988,9 +2019,11 @@ static int split_right_exec_insert(struct path *p, int idx) {
                         NOFAIL(buf_alloc(&r->scratch, &rkey));
                         r->keyout = r->scratch;
                         ptr_buf(right, &r->valout);
-                        return +1;
+                        result = +1;
                 }
         }
+        EXPENSIVE_ASSERT(is_sorted(left));
+        EXPENSIVE_ASSERT(right != NULL ? is_sorted(right) : true);
         return result;
 }
 
@@ -2528,6 +2561,7 @@ static int insert_balance(struct path *p) {
 static int insert_complete(struct path *p, struct node *n) {
         struct rung *r = &p->rung[p->used];
         int result = rec_insert(n, r->pos + 1, p->rec, &r->page.mod);
+        EXPENSIVE_ASSERT(is_sorted(n));
         if (result == -ENOSPC) {
                 result = insert_balance(p);
         }
@@ -2687,6 +2721,8 @@ static int traverse_complete(struct path *p, int result) {
 
 static int traverse(struct path *p) {
         struct t2 *mod   = p->tree->ttype->mod;
+#define PREPARE(p, expr) TIMED(traverse_complete(p, (expr)), mod, time_prepare)
+#define COMPLETE(expr) TIMED((expr), mod, time_complete)
         int        result;
         ASSERT(p->used == -1);
         ASSERT(p->opt == LOOKUP || p->opt == INSERT || p->opt == DELETE || p->opt == NEXT);
@@ -2699,9 +2735,9 @@ static int traverse(struct path *p) {
                 COUNTERS_ASSERT(CVAL(rcu) == 1);
                 CINC(traverse_iter);
                 n = peek(mod, p->next);
-                if (n == NULL || rcu_dereference(n->ntype) == NULL) {
+                if (UNLIKELY(n == NULL || rcu_dereference(n->ntype) == NULL)) {
                         rcu_leave(p, NULL);
-                        n = get(mod, p->next);
+                        n = TIMED(get(mod, p->next), mod, time_get);
                         if (EISERR(n)) {
                                 if (ERRCODE(n) == -ESTALE) {
                                         path_reset(p);
@@ -2712,12 +2748,14 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else {
+                                CINC(l[level(n)].traverse_miss);
                                 if (UNLIKELY(rcu_enter(p, n))) {
                                         continue;
                                 }
                                 flags |= PINNED;
                         }
                 } else {
+                        CINC(l[level(n)].traverse_hit);
                         node_state_print(n, 'e');
                         if (!is_stable(n)) { /* This is racy, but OK. */
                                 rcu_leave(p, n);
@@ -2736,7 +2774,7 @@ static int traverse(struct path *p) {
                 path_add(p, n, flags);
                 if (is_leaf(n)) {
                         if (p->opt == LOOKUP) {
-                                result = lookup_complete(p, n);
+                                result = COMPLETE(lookup_complete(p, n));
                                 if (!path_is_valid(p)) {
                                         path_reset(p);
                                 } else {
@@ -2745,27 +2783,27 @@ static int traverse(struct path *p) {
                                 }
                         } else if (p->opt == INSERT) {
                                 rcu_leave(p, NULL);
-                                result = traverse_complete(p, insert_prep(p));
-                                if (result == DONE) {
-                                        result = insert_complete(p, n);
+                                result = PREPARE(p, insert_prep(p));
+                                if (LIKELY(result == DONE)) {
+                                        result = COMPLETE(insert_complete(p, n));
                                         break;
                                 } else if (result < 0) {
                                         break;
                                 }
                         } else if (p->opt == DELETE) {
                                 rcu_leave(p, NULL);
-                                result = traverse_complete(p, delete_prep(p));
-                                if (result == DONE) {
-                                        result = delete_complete(p, n);
+                                result = PREPARE(p, delete_prep(p));
+                                if (LIKELY(result == DONE)) {
+                                        result = COMPLETE(delete_complete(p, n));
                                         break;
                                 } else if (result < 0) {
                                         break;
                                 }
                         } else {
                                 rcu_leave(p, NULL);
-                                result = traverse_complete(p, next_prep(p));
-                                if (result == DONE) {
-                                        result = next_complete(p, n);
+                                result = PREPARE(p, next_prep(p));
+                                if (LIKELY(result == DONE)) {
+                                        result = COMPLETE(next_complete(p, n));
                                         break;
                                 } else if (result < 0) {
                                         break;
@@ -2777,6 +2815,8 @@ static int traverse(struct path *p) {
         }
         COUNTERS_ASSERT(CVAL(rcu) == 0);
         return result;
+#undef PREPARE
+#undef COMPLETE
 }
 
 static int traverse_result(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx, enum optype opt) {
@@ -2787,7 +2827,7 @@ static int traverse_result(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx
         result = cookie_try(&p);
         if (result == -ESTALE) {
                 CINC(cookie_miss);
-                result = traverse(&p);
+                result = TIMED(traverse(&p), t->ttype->mod, time_traverse);
         } else {
                 CINC(cookie_hit);
         }
@@ -2901,7 +2941,7 @@ struct t2_tx *t2_tx_make(struct t2 *mod) {
 }
 
 int t2_tx_open(struct t2 *mod, struct t2_tx *tx) {
-        return TXCALL(mod->te, open(mod->te, tx));
+        return TIMED(TXCALL(mod->te, open(mod->te, tx)), mod, time_open);
 }
 
 void t2_tx_close(struct t2 *mod, struct t2_tx *tx) {
@@ -3059,7 +3099,7 @@ enum {
 };
 
 #define TXA(n, ...) ((n)->mod->te != NULL ? (__VA_ARGS__) : true)
-static int pageout0(struct node *n) {
+static int pageout(struct node *n) {
         struct t2    *mod = n->mod;
         struct node  *cluster[MAX_CLUSTER];
         struct iovec  vec[MAX_CLUSTER + 1];
@@ -3130,18 +3170,6 @@ static int pageout0(struct node *n) {
         return result;
 }
 
-static int pageout(struct node *n) {
-        int result;
-        lock(n, WRITE);
-        if (LIKELY(nstate(n, n->mod->cache.shift, 1) == PAGE)) {
-                result = pageout0(n);
-        } else {
-                result = +1;
-        }
-        unlock(n, WRITE);
-        return result;
-}
-
 static void cache_clean(struct t2 *mod) {
         writeout(mod);
 }
@@ -3153,7 +3181,7 @@ static void writeout(struct t2 *mod) {
                 struct node           *n;
                 cds_hlist_for_each_entry_2(n, head, hash) {
                         if (n->flags & DIRTY) {
-                                pageout0(n);
+                                pageout(n);
                         }
                         ASSERT(!(n->flags & DIRTY));
                 }
@@ -3216,6 +3244,7 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
         for (link = rcu_dereference(head->next); link != NULL; link = rcu_dereference(link->next)) {
                 struct node *n = COF(link, struct node, hash);
                 int8_t L __attribute__((unused)) = level(n);
+                node_state_print(n, 's');
                 if (UNLIKELY(n->ref != 0)) {
                         CINC(l[L].scan_skip_busy);
                 } else if (n->flags & DIRTY) {
@@ -3640,6 +3669,7 @@ static void counters_print() {
         counter_var_print1(&GVAL(wal_full),           "wal.full:");
         counter_var_print1(&GVAL(wal_inflight),       "wal.inflight:");
         printf("wal.page_write:      %10"PRId64"\n", GVAL(wal_page_write));
+        printf("wal.page_put:        %10"PRId64"\n", GVAL(wal_page_put));
         printf("wal.page_clean:      %10"PRId64"\n", GVAL(wal_page_clean));
         printf("wal.page_none:       %10"PRId64"\n", GVAL(wal_page_none));
         printf("wal.page_done:       %10"PRId64"\n", GVAL(wal_page_done));
@@ -3668,11 +3698,19 @@ static void counters_print() {
         for (int i = 0; i < MAX_ALLOC_BUCKET; ++i) {
                 printf("malloc[%02d]:          %10"PRId64"\n", i, GVAL(malloc[i]));
         }
+        counter_var_print1(&GVAL(time_traverse), "time.traverse:");
+        counter_var_print1(&GVAL(time_prepare),  "time.prepare:");
+        counter_var_print1(&GVAL(time_complete), "time.complete:");
+        counter_var_print1(&GVAL(time_get),      "time.get:");
+        counter_var_print1(&GVAL(time_open),     "time.open:");
         printf("%20s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
         }
         puts("");
+        COUNTER_PRINT(traverse_hit);
+        COUNTER_PRINT(traverse_miss);
+        COUNTER_PRINT(insert_balance);
         COUNTER_PRINT(insert_balance);
         COUNTER_PRINT(delete_balance);
         COUNTER_PRINT(get);
@@ -4280,7 +4318,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
         if (UNLIKELY(nr(n) == 0)) {
                 goto here;
-        } else if (LIKELY(n->radix != NULL)) {
+        } else if (LIKELY(n->radix != NULL && n->radix->prefix.len != -1)) {
                 int16_t ch;
                 plen = n->radix->prefix.len;
                 cmp = memcmp(n->radix->prefix.addr, kaddr, min_32(plen, klen)) ?: klen < plen ? +1 : 0;
@@ -4912,8 +4950,8 @@ enum {
         WAL_SYNC_AGE         = BILLION, /* Nanoseconds. */
         WAL_SYNC_NOB         = 1ull << 9,  /* Measured in buffers. */
         WAL_PAGE_SYNC_NOB    = 1ull << 5,
-        WAL_MAX_LOG          = 2ull << 10, /* Measured in buffers. TODO: Make this a parameter. */
-        WAL_RESERVE_QUANTUM  = 1
+        WAL_MAX_LOG          = 1ull << 11, /* Measured in buffers. TODO: Make this a parameter. */
+        WAL_RESERVE_QUANTUM  = 10
 };
 
 static lsn_t wal_log_free(const struct wal_te *en) {
@@ -4968,7 +5006,7 @@ do {                                                    \
         }                                               \
 } while (0)
 
-        if (UNLIKELY(en->laundry_nr <= WAL_LAUNDRY_DEPTH && cds_list_length(&en->laundry) != en->laundry_nr)) {
+        if (UNLIKELY(en->laundry_nr <= WAL_LAUNDRY_DEPTH && cds_list_length(&en->laundry) + cds_list_length(&en->washer) != en->laundry_nr)) {
                 return ERROR(false);
         }
         cds_list_for_each(scan, &en->laundry) {
@@ -5197,10 +5235,8 @@ static void wal_get(struct wal_te *en, int32_t size) {
                                 ASSERT(wal_fits(en, en->cur, size));
                                 return;
                         } else {
-                                uint64_t start = READ_ONCE(en->mod->tick);
                                 CINC(wal_get_wait);
-                                wal_cond_wait(en, &en->bufwait);
-                                CMOD(wal_get_wait_time, READ_ONCE(en->mod->tick) - start);
+                                TIMED_VOID(wal_cond_wait(en, &en->bufwait), en->mod, wal_get_wait_time);
                         }
                 }
                 if (LIKELY(wal_fits(en, en->cur, size))) {
@@ -5341,10 +5377,11 @@ static void wal_page_sync(struct wal_te *en) {
         en->page_syncing = false;
 }
 
-static void wal_page(struct wal_te *en) {
+static int wal_page0(struct wal_te *en) {
         lsn_t                 lsn = 0;
         struct cds_list_head *tail;
         struct node          *scan;
+        int                   result = 0;
         wal_unlock(en);
         mutex_lock(&en->laundry_lock);
         EXPENSIVE_ASSERT(wal_laundry_invariant(en));
@@ -5365,8 +5402,13 @@ static void wal_page(struct wal_te *en) {
                         lock(n, WRITE);
                         if (LIKELY(n->lsn == lsn)) { /* maxwelld could have cleaned it. */
                                 ASSERT(n->flags & DIRTY);
-                                pageout0(n);
+                                pageout(n);
                                 CINC(wal_page_write);
+                                ASSERT(!(n->flags & DIRTY));
+                                if (cache_want_page(n->mod) && !is_hot(n, n->mod->cache.shift)) {
+                                        n->flags |= NOCACHE;
+                                        CINC(wal_page_put);
+                                }
                         } else {
                                 CINC(wal_page_clean);
                         }
@@ -5376,9 +5418,11 @@ static void wal_page(struct wal_te *en) {
                         --en->washer_nr;
                 } else {
                         CINC(wal_page_done);
+                        result = +1;
                 }
         } else {
                 CINC(wal_page_none);
+                result = +1;
         }
         tail = en->laundry.prev;
         lsn = LIKELY(tail != &en->laundry) ? COF(tail, struct node, dirty)->lsn : en->max_persistent;
@@ -5392,6 +5436,17 @@ static void wal_page(struct wal_te *en) {
         ASSERT(lsn <= en->max_persistent);
         en->max_paged = max_64(en->max_paged, lsn);
         NOFAIL(pthread_cond_broadcast(&en->logwait));
+        return result;
+}
+
+enum { WAL_PAGE_BATCH = 256 };
+
+static void wal_page(struct wal_te *en) {
+        for (int i = 0; i < WAL_PAGE_BATCH; ++i) {
+                if (wal_page0(en) != 0) {
+                        break;
+                }
+        }
 }
 
 static void wal_snapshot(struct wal_te *en) {
@@ -5452,10 +5507,11 @@ enum {
 };
 
 static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t flags) {
-        struct cds_list_head *tail = en->full.prev;
+        struct cds_list_head *tail;
         int                   done = 0;
         CINC(wal_progress);
-        if (((allowed&LOG_WRITE && en->full_nr > 2) || allowed&LOG_LAST) && tail != &en->full) {
+        tail = en->full.prev;
+        if (done < max && ((allowed&LOG_WRITE && en->full_nr > 2) || allowed&LOG_LAST) && tail != &en->full) {
                 wal_write(en, COF(tail, struct wal_buf, link));
                 ASSERT(wal_invariant(en));
                 ++done;
@@ -5891,18 +5947,14 @@ static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
         struct wal_te *en    = COF(engine, struct wal_te, base);
         struct wal_tx *tx    = COF(trax, struct wal_tx, base);
         if (tx->reserved == 0) {
-                bool     more;
                 uint64_t start = READ_ONCE(en->mod->tick);
                 if (UNLIKELY(en->log_size < wal_log_need(en) + WAL_RESERVE_QUANTUM)) {
                         return ERROR_INFO(-EAGAIN, "Concurrency is too high. Increase the log size", 0, 0);
                 }
                 tx->reserved = WAL_RESERVE_QUANTUM;
                 wal_lock(en);
-                more = wal_log_free(en) < wal_log_need(en) + WAL_RESERVE_QUANTUM;
-                while (more) {
-                        wal_progress(en, LOG_WRITE|LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, 1, 0);
-                        more = wal_log_free(en) < wal_log_need(en) + WAL_RESERVE_QUANTUM;
-                        if (more) {
+                while (wal_log_free(en) < wal_log_need(en) + WAL_RESERVE_QUANTUM) {
+                        if (!wal_progress(en, LOG_WRITE|LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, INT_MAX, 0)) {
                                 wal_cond_wait(en, &en->logwait);
                         }
                 }
@@ -6185,15 +6237,15 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         taddr_t              result;
         int                  hand;
-        uint64_t             bkr;
+        uint64_t             lim;
         mutex_lock(&fs->lock);
         hand = frag_select(fs);
-        brk = fs->frag_free[hand] + (1ull << shift_min);
-        if (UNLIKELY(brk >= 1ull << BASE_SHIFT)) {
+        lim = fs->frag_free[hand] + (1ull << shift_min);
+        if (UNLIKELY(lim >= 1ull << BASE_SHIFT)) {
                 return ERROR(-ENOSPC);
         }
         result = taddr_make(fs->frag_free[hand] | ((uint64_t)hand << BASE_SHIFT), shift_min);
-        fs->frag_free[hand] = brk;
+        fs->frag_free[hand] = lim;
         fs->free = max_64(fs->free, fs->frag_free[hand]);
         mutex_unlock(&fs->lock);
         return result;
@@ -6329,6 +6381,34 @@ void bn_counters_fold(void) {
         counters_fold();
 }
 
+static bool is_sorted(struct node *n) {
+        struct sheader *sh = simple_header(n);
+        SLOT_DEFINE(ss, n);
+        char   *keyarea = NULL;
+        int32_t keysize = 0;
+        for (int32_t i = 0; i < sh->nr; ++i) {
+                rec_get(&ss, i);
+                if (i > 0) {
+                        int cmp = skeycmp(sh, i, 0, keyarea, keysize, nsize(n) - 1);
+                        if (cmp <= 0) {
+                                printf("Misordered at %i: ", i);
+                                range_print(keyarea, keysize,
+                                            keyarea, keysize);
+                                printf(" %c ", cmpch(cmp));
+                                range_print(n->data, nsize(n),
+                                            ss.rec.key->addr,
+                                            ss.rec.key->len);
+                                printf("\n");
+                                simple_print(n);
+                                return false;
+                        }
+                }
+                keyarea = ss.rec.key->addr;
+                keysize = ss.rec.key->len;
+        }
+        return true;
+}
+
 #endif /* UT || BN */
 
 /* @ut */
@@ -6373,34 +6453,6 @@ static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
 static void buf_init_str(struct t2_buf *b, const char *s) {
         b->len  = (int32_t)strlen(s) + 1;
         b->addr = (void *)s;
-}
-
-static bool is_sorted(struct node *n) {
-        struct sheader *sh = simple_header(n);
-        SLOT_DEFINE(ss, n);
-        char   *keyarea = NULL;
-        int32_t keysize = 0;
-        for (int32_t i = 0; i < sh->nr; ++i) {
-                rec_get(&ss, i);
-                if (i > 0) {
-                        int cmp = skeycmp(sh, i, 0, keyarea, keysize, nsize(n) - 1);
-                        if (cmp <= 0) {
-                                printf("Misordered at %i: ", i);
-                                range_print(keyarea, keysize,
-                                            keyarea, keysize);
-                                printf(" %c ", cmpch(cmp));
-                                range_print(n->data, nsize(n),
-                                            ss.rec.key->addr,
-                                            ss.rec.key->len);
-                                printf("\n");
-                                simple_print(n);
-                                return false;
-                        }
-                }
-                keyarea = ss.rec.key->addr;
-                keysize = ss.rec.key->len;
-        }
-        return true;
 }
 
 static struct t2_node_type ntype = {
@@ -7513,10 +7565,6 @@ int main(int argc, char **argv) {
         return 0;
 }
 
-#else /* UT */
-static bool is_sorted(struct node *n) {
-        return true;
-}
 #endif /* UT */
 
 /*
