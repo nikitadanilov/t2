@@ -396,7 +396,6 @@ struct shepherd {
         lsn_t                            min;
         lsn_t                            cur_min;
         pthread_t                        thread;
-        int                              scans;
 };
 
 struct cache {
@@ -693,6 +692,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t peek;
         int64_t alloc;
         int64_t alloc_pool;
+        int64_t alloc_wait;
         int64_t alloc_fresh;
         int64_t traverse;
         int64_t traverse_restart;
@@ -756,6 +756,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var time_prepare;
         struct counter_var time_get;
         struct counter_var time_open;
+        struct counter_var time_pool_get;
         struct counter_var wal_get_wait_time;
         struct counter_var wal_open_wait_time;
         struct counter_var wal_space_nr;
@@ -869,6 +870,7 @@ static void ht_delete(struct node *n);
 static uint64_t ht_hash(taddr_t addr);
 static void pool_clean(struct t2 *mod);
 static int64_t pool_used(struct t2 *mod);
+static struct node *pool_get(struct t2 *mod, taddr_t addr);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
 static void buf_clip_node(struct t2_buf *b, const struct node *n);
@@ -964,7 +966,7 @@ static bool wal_wantout (struct t2_te *engine, struct t2_node *n);
 static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_print   (struct t2_te *engine);
 static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
-static void wal_scan_end(struct t2_te *engine, int32_t sector, int64_t cleaned);
+static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
 static void wal_pulse   (struct t2 *mod);
 static void mod_print(const struct mod *mod);
 static void counters_check();
@@ -998,6 +1000,7 @@ static void cache_clean(struct t2 *mod);
 static void *maxwelld(void *data);
 static void *shepherd(void *data);
 static void writeout(struct t2 *mod);
+static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr);
 static void cache_fini(struct t2 *mod);
 static void cache_sync(struct t2 *mod);
 static void cache_pulse(struct t2 *mod);
@@ -1218,8 +1221,8 @@ void t2_stats_print(struct t2 *mod) {
         printf("\nshepherd: ");
         for (int i = 0; i < ARRAY_SIZE(mod->cache.sh); ++i) {
                 struct shepherd *sh = &mod->cache.sh[i];
-                printf("[%6"PRId64" : %6"PRId64" / %4d] ", sh->lim, sh->min, sh->scans);
-                if ((i & 3) == 3) {
+                printf("[%6"PRId64" : %6"PRId64"] ", sh->lim, sh->min);
+                if ((i & 7) == 7) {
                         printf("\n          ");
                 }
         }
@@ -1590,38 +1593,8 @@ static struct node *look(struct t2 *mod, taddr_t addr) {
         return n;
 }
 
-static struct node *pool_get(struct t2 *mod, taddr_t addr) {
-        struct cache    *c    = &mod->cache;
-        struct freelist *free = &c->pool.free[taddr_sbits(addr)];
-        struct node     *n    = NULL;
-        mutex_lock(&free->lock);
-        if (LIKELY(free->avail == 0)) {
-                while (UNLIKELY(free->nr == 0)) {
-                        NOFAIL(pthread_cond_broadcast(&c->want));
-                        NOFAIL(pthread_cond_wait(&free->got, &free->lock));
-                }
-                n = COF(free->head.next, struct node, free);
-                cds_list_del_init(&n->free);
-                --free->nr;
-                CINC(alloc_pool);
-                NCALL(n, fini(n));
-                cookie_invalidate(&n->cookie);
-                n->seq   = 0;
-                n->flags = 0;
-                n->ntype = NULL;
-                n->addr  = 0;
-                if (n->radix != NULL) {
-                        n->radix->prefix.len = -1;
-                }
-        } else {
-                --free->avail;
-        }
-        mutex_unlock(&free->lock);
-        return n;
-}
-
 static struct node *nalloc(struct t2 *mod, taddr_t addr) {
-        struct node *n = pool_get(mod, addr);
+        struct node *n = TIMED(pool_get(mod, addr), mod, time_pool_get);
         CINC(alloc);
         if (UNLIKELY(n == NULL)) {
                 void *data = mem_alloc_align(taddr_ssize(addr), taddr_ssize(addr));
@@ -3267,7 +3240,7 @@ static bool cache_want_page(struct t2 *mod) {
 }
 
 static bool enough(struct cache *c, int i) {
-        return c->pool.free[i].avail + (uint32_t)c->pool.free[i].nr >= 2 * EPOCH_DELTA * kval(&c->pool.rate[i]);
+        return c->pool.free[i].avail + (uint32_t)c->pool.free[i].nr >= 2 * EPOCH_DELTA * kval(&c->pool.rate[i]) + 1;
 }
 
 static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *lock) {
@@ -3329,8 +3302,6 @@ static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr) {
                 pos = (pos + 1) & ((1 << mod->ht.shift) - 1);
         }
         rcu_unlock();
-        cache_sync(mod);
-        counters_fold();
         return pos;
 }
 
@@ -3351,6 +3322,8 @@ static void *maxwelld(void *data) {
                 while (true) {
                         if (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!mod->shutdown)) {
                                 pos = scan(mod, pos, SCAN_RUN);
+                                cache_sync(mod);
+                                counters_fold();
                                 if (UNLIKELY(pos == start)) {
                                         break;
                                 }
@@ -3440,13 +3413,9 @@ static int32_t shepherd_scan(struct t2 *mod, struct shepherd *sh, int32_t pos, i
         ASSERT(sh->lim != 0);
         rcu_lock();
         while (nr-- > 0) {
-                cleaned += shepherd_bucket(mod, pos++, sh);
+                cleaned += shepherd_bucket(mod, pos++ & ((1 << mod->ht.shift) - 1), sh);
         }
         rcu_unlock();
-        sh->min = sh->cur_min;
-        ++sh->scans;
-        cache_sync(mod);
-        counters_fold();
         return cleaned;
 }
 
@@ -3471,9 +3440,12 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
                 struct timespec end;
                 int             result;
                 CINC(shepherd_iter);
-                while (LIKELY(!(mod->shutdown)) && need_cleaning(mod, self)) {
+                while (LIKELY(!mod->shutdown) && need_cleaning(mod, self)) {
                         int64_t cleaned = shepherd_scan(mod, self, sector_start, sector_size);
-                        TXCALL(mod->te, scan_end(mod->te, sector, cleaned));
+                        self->min = self->cur_min;
+                        TXCALL(mod->te, scan_end(mod->te, cleaned));
+                        cache_sync(mod);
+                        counters_fold();
                         if (cleaned == 0) {
                                 break;
                         }
@@ -3813,6 +3785,7 @@ static void counters_print() {
         printf("peek:                %10"PRId64"\n", GVAL(peek));
         printf("alloc:               %10"PRId64"\n", GVAL(alloc));
         printf("alloc.pool:          %10"PRId64"\n", GVAL(alloc_pool));
+        printf("alloc.wait:          %10"PRId64"\n", GVAL(alloc_wait));
         printf("alloc.fresh:         %10"PRId64"\n", GVAL(alloc_fresh));
         printf("traverse:            %10"PRId64"\n", GVAL(traverse));
         printf("traverse.restart:    %10"PRId64"\n", GVAL(traverse_restart));
@@ -3869,7 +3842,6 @@ static void counters_print() {
         printf("wal.dirty_clean:     %10"PRId64"\n", GVAL(wal_dirty_clean));
         printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
         counter_var_print1(&GVAL(wal_redirty_lsn),    "wal.redirty_lsn:");
-        printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
         printf("shepherd:            %10"PRId64"\n", GVAL(shepherd_iter));
         printf("shepherd.bucket:     %10"PRId64"\n", GVAL(shepherd_bucket));
         printf("shepherd.skip:       %10"PRId64"\n", GVAL(shepherd_skip));
@@ -3889,6 +3861,7 @@ static void counters_print() {
         counter_var_print1(&GVAL(time_complete), "time.complete:");
         counter_var_print1(&GVAL(time_get),      "time.get:");
         counter_var_print1(&GVAL(time_open),     "time.open:");
+        counter_var_print1(&GVAL(time_pool_get), "time.pool_get:");
         printf("%20s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
@@ -4264,6 +4237,63 @@ static int64_t pool_allocated(struct t2 *mod, int idx) {
 
 static int64_t pool_used(struct t2 *mod) {
         return REDUCE(i, ARRAY_SIZE(mod->cache.pool.free), 0ull, + pool_allocated(mod, i));
+}
+
+enum {
+        FREE_HI         = 9,
+        FREE_LO         = 4,
+        SCAN_RATE_SHIFT = 6
+};
+
+static struct node *pool_get(struct t2 *mod, taddr_t addr) {
+        int              idx  = taddr_sbits(addr);
+        struct cache    *c    = &mod->cache;
+        struct freelist *free = &c->pool.free[idx];
+        struct node     *n    = NULL;
+        int64_t          nr   = pool_allocated(mod, idx);
+        int64_t          hi   = nr >> (10 - FREE_HI);
+        int64_t          lo   = nr >> (10 - FREE_LO);
+        int64_t          have = free->avail + free->nr;
+        if (have < hi) {
+                int     pressure = 31 - ilog2((max_64(have - lo, 0) << 32) / (hi - lo));
+                int32_t rate     = SCAN_RATE_SHIFT - pressure / (32 / SCAN_RATE_SHIFT);
+                int32_t cookie   = ht_bucket(&mod->ht, addr);
+                int32_t run      = 1 << ((pressure / 4) + 3);
+                if (UNLIKELY((cookie & ((1 << rate) - 1)) == 0)) {
+                        if (LIKELY(cache_want_page(mod))) {
+                                struct shepherd sh       = { .lim = LLONG_MAX };
+                                int64_t         cleaned  = shepherd_scan(mod, &sh, cookie, run);
+                                if (cleaned > 0) {
+                                        TXCALL(mod->te, scan_end(mod->te, cleaned));
+                                }
+                        }
+                        scan(mod, cookie, run);
+                }
+        }
+        mutex_lock(&free->lock);
+        if (LIKELY(free->avail == 0)) {
+                while (UNLIKELY(free->nr == 0)) {
+                        NOFAIL(pthread_cond_broadcast(&c->want));
+                        NOFAIL(pthread_cond_wait(&free->got, &free->lock));
+                        CINC(alloc_wait);
+                }
+                n = COF(free->head.next, struct node, free);
+                cds_list_del_init(&n->free);
+                --free->nr;
+                CINC(alloc_pool);
+                NCALL(n, fini(n));
+                cookie_invalidate(&n->cookie);
+                n->seq   = 0;
+                n->flags = 0;
+                n->ntype = NULL;
+                if (n->radix != NULL) {
+                        n->radix->prefix.len = -1;
+                }
+        } else {
+                --free->avail;
+        }
+        mutex_unlock(&free->lock);
+        return n;
 }
 
 static void pool_clean(struct t2 *mod) {
@@ -5389,6 +5419,7 @@ static void wal_get(struct wal_te *en, int32_t size) {
                                 CINC(wal_get_ready);
                                 wal_buf_start(en);
                                 ASSERT(wal_fits(en, en->cur, size));
+                                CMOD(wal_get_wait_time, 0);
                                 return;
                         } else {
                                 CINC(wal_get_wait);
@@ -5529,12 +5560,14 @@ static bool wal_need(struct t2_te *engine, struct shepherd *sh) {
         struct wal_te  *en     = COF(engine, struct wal_te, base);
         lsn_t           delta  = (2 * en->threshold_paged * en->log_size) >> 10;
         lsn_t           target = min_64(en->start + delta, en->max_persistent);
+        wal_lock(en); /* Lock is needed to avoid a race with wal_diff(). */
         sh->cur_min = en->lsn;
-        sh->lim     = target;
+        wal_unlock(en);
+        sh->lim = target;
         return target > en->max_paged;
 }
 
-static void wal_scan_end(struct t2_te *engine, int32_t sector, int64_t cleaned) {
+static void wal_scan_end(struct t2_te *engine, int64_t cleaned) {
         struct wal_te *en  = COF(engine, struct wal_te, base);
         lsn_t          min = FOLD(i, m, ARRAY_SIZE(en->mod->cache.sh), en->max_persistent, min_64(m, en->mod->cache.sh[i].min));
         wal_lock(en);
@@ -6030,8 +6063,8 @@ static int wal_wait(struct t2_te *engine, struct t2_tx *trax, const struct times
 static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
         struct wal_te *en    = COF(engine, struct wal_te, base);
         struct wal_tx *tx    = COF(trax, struct wal_tx, base);
+        uint64_t       start = READ_ONCE(en->mod->tick);
         if (tx->reserved == 0) {
-                uint64_t start = READ_ONCE(en->mod->tick);
                 if (UNLIKELY(en->log_size < wal_log_need(en) + WAL_RESERVE_QUANTUM)) {
                         return ERROR_INFO(-EAGAIN, "Concurrency is too high. Increase the log size", 0, 0);
                 }
@@ -6044,8 +6077,8 @@ static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
                 }
                 en->reserved += WAL_RESERVE_QUANTUM;
                 wal_unlock(en);
-                CMOD(wal_open_wait_time, READ_ONCE(en->mod->tick) - start);
         }
+        CMOD(wal_open_wait_time, READ_ONCE(en->mod->tick) - start);
         ASSERT(en->reserved > 0); /* No locking is needed. */
         return 0;
 }
