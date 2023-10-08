@@ -393,7 +393,8 @@ enum {
 
 struct shepherd {
         alignas(MAX_CACHELINE) lsn_t     lim;
-        lsn_t                            max;
+        lsn_t                            min;
+        lsn_t                            cur_min;
         pthread_t                        thread;
 };
 
@@ -742,6 +743,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t shepherd_bucket;
         int64_t shepherd_skip;
         int64_t shepherd_locked;
+        int64_t shepherd_wake;
+        int64_t shepherd_to;
         int64_t stash_hit;
         int64_t stash_miss;
         int64_t stash_mags;
@@ -1211,10 +1214,15 @@ void t2_stats_print(struct t2 *mod) {
         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
                 printf(" %8i", kval(&c->pool.rate[i]));
         }
+#define INF(x) ((x) == LLONG_MAX ? -1 : (x))
         printf("\nshepherd: ");
         for (int i = 0; i < ARRAY_SIZE(mod->cache.sh); ++i) {
-                printf("[%5"PRId64":%5"PRId64"] ", mod->cache.sh[i].lim, mod->cache.sh[i].max);
+                printf("[%8"PRId64":%8"PRId64"] ", INF(mod->cache.sh[i].lim), INF(mod->cache.sh[i].min));
+                if ((i & 7) == 7) {
+                        printf("\n          ");
+                }
         }
+#undef INF
         printf("\n%15s bolt: %8"PRId64"\n", "cache:", c->bolt);
         if (TRANSACTIONS && mod->te != NULL) {
                 TXCALL(mod->te, print(mod->te));
@@ -3389,12 +3397,16 @@ static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthr
                                         nr += pageout(n);
                                 }
                                 unlock(n, WRITE);
+                                if (n->lsn != 0) {
+                                        sh->cur_min = MIN(sh->cur_min, n->lsn);
+                                }
                                 mutex_lock(mut);
                                 put_locked(n);
-                                sh->max = max_64(sh->max, n->lsn);
                                 break;
                         }
-                        sh->max = max_64(sh->max, n->lsn);
+                        if (n->lsn != 0) {
+                                sh->cur_min = MIN(sh->cur_min, n->lsn);
+                        }
                 }
         } while (link != NULL);
         mutex_unlock(mut);
@@ -3425,11 +3437,14 @@ static int32_t shepherd_bucket(struct t2 *mod, int32_t pos, struct shepherd *sh)
 static int32_t shepherd_scan(struct t2 *mod, struct shepherd *sh, int32_t pos, int32_t nr) {
         int32_t cleaned = 0;
         CINC(shepherd_scan);
+        sh->cur_min = LLONG_MAX;
+        ASSERT(sh->lim != 0);
         rcu_lock();
         while (nr-- > 0) {
                 cleaned += shepherd_bucket(mod, pos++, sh);
         }
         rcu_unlock();
+        sh->min = sh->cur_min;
         cache_sync(mod);
         counters_fold();
         return cleaned;
@@ -3463,15 +3478,28 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
         SASSERT((SCAN_RUN & (SCAN_RUN - 1)) == 0);
         ASSERT(SCAN_RUN <= 1 << sector_shift);
         while (true) {
+                struct timespec end;
+                int             result;
                 CINC(shepherd_iter);
-                while (LIKELY(!(mod->shutdown) && need_cleaning(mod, self))) {
+                while (LIKELY(!(mod->shutdown)) && need_cleaning(mod, self)) {
                         int64_t cleaned = shepherd_scan(mod, self, sector_start, sector_size);
                         TXCALL(mod->te, scan_end(mod->te, sector, cleaned));
+                        if (cleaned == 0) {
+                                break;
+                        }
                 }
                 if (UNLIKELY(mod->shutdown)) {
                         break;
                 }
-                NOFAIL(WITH_LOCK(pthread_cond_wait(&c->wantclean, &c->cleanlock), &c->cleanlock));
+                result = WITH_LOCK(pthread_cond_timedwait(&c->wantclean, &c->cleanlock,
+                                                          deadline(0, cache_want_page(mod) ? PULSE_TICK >> 3 : PULSE_TICK, &end)),
+                                   &c->cleanlock);
+                ASSERT(result == 0 || result == ETIMEDOUT);
+                if (result == 0) {
+                        CINC(shepherd_wake);
+                } else {
+                        CINC(shepherd_to);
+                }
                 cache_sync(mod);
                 counters_fold();
         }
@@ -3856,6 +3884,8 @@ static void counters_print() {
         printf("shepherd.bucket:     %10"PRId64"\n", GVAL(shepherd_bucket));
         printf("shepherd.skip:       %10"PRId64"\n", GVAL(shepherd_skip));
         printf("shepherd.locked:     %10"PRId64"\n", GVAL(shepherd_locked));
+        printf("shepherd.wake:       %10"PRId64"\n", GVAL(shepherd_wake));
+        printf("shepherd.to:         %10"PRId64"\n", GVAL(shepherd_to));
         printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
         printf("stash.miss:          %10"PRId64"\n", GVAL(stash_miss));
         counter_var_print1(&GVAL(stash_used),         "stash.used:");
@@ -5507,7 +5537,7 @@ static void wal_page_sync(struct wal_te *en) {
 
 static bool wal_need(struct t2_te *engine, struct shepherd *sh) {
         struct wal_te  *en = COF(engine, struct wal_te, base);
-        lsn_t           delta  = (en->threshold_paged * en->log_size) >> 10;
+        lsn_t           delta  = (2 * en->threshold_paged * en->log_size) >> 10;
         lsn_t           target = min_64(en->start + delta, en->max_persistent);
         if (target > en->max_paged) {
                 sh->lim = target;
@@ -5519,13 +5549,12 @@ static bool wal_need(struct t2_te *engine, struct shepherd *sh) {
 
 static void wal_scan_end(struct t2_te *engine, int32_t sector, int64_t cleaned) {
         struct wal_te *en  = COF(engine, struct wal_te, base);
-        lsn_t          max = FOLD(i, m, ARRAY_SIZE(en->mod->cache.sh), LLONG_MAX, min_64(m, en->mod->cache.sh[i].max));
+        lsn_t          min = FOLD(i, m, ARRAY_SIZE(en->mod->cache.sh), en->max_persistent, MIN(m, en->mod->cache.sh[i].min));
         wal_lock(en);
-        max = min_64(max, en->max_persistent);
         ASSERT(en->dirty_nr > cleaned);
         en->dirty_nr -= cleaned;
-        if (max > en->max_paged) {
-                en->max_paged = max;
+        if (min > en->max_paged) {
+                en->max_paged = min;
                 NOFAIL(pthread_cond_broadcast(&en->logwait));
         }
         wal_unlock(en);
@@ -5743,7 +5772,7 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         en->buf_size_shift      = ilog2(buf_size);
         en->log_size            = WAL_MAX_LOG;
         en->logname             = logname;
-        en->threshold_paged     = 512;
+        en->threshold_paged     =  32;
         en->threshold_page      = 128;
         en->threshold_log_syncd =  64;
         en->threshold_log_sync  =  32;
