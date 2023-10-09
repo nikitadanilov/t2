@@ -1522,11 +1522,11 @@ static bool node_locked_invariant(struct node *n, enum lock_mode mode) {
         return true;
 }
 
-enum { NODE_LOGGING = 0 };
+enum { NODE_LOGGING = false };
 
 static void node_state_print(struct node *n, char state) {
         if (NODE_LOGGING) { /* Keep node-trace.py in sync. */
-                printf("N %18"PRId64" %016"PRIx64" %d %c\n", READ_ONCE(n->mod->tick), n->addr, level(n), state);
+                printf("N %18"PRId64" %18"PRId64" %016"PRIx64" %d %c\n", READ_ONCE(n->mod->tick), n->mod->cache.bolt, n->addr, level(n), state);
         }
 }
 
@@ -5357,7 +5357,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         ASSERT(buf->lsn != 0);
         buf->seg[0]         = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
         buf->seg[buf->used] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
-        result = pwritev(en->fd[buf->lsn & WAL_LOG_MASK], buf->seg, buf->used + 1, ((buf->lsn >> WAL_LOG_SHIFT) & (en->log_size - 1)) << en->buf_size_shift);
+        result = pwritev(en->fd[buf->lsn & WAL_LOG_MASK], buf->seg, buf->used + 1, ((buf->lsn & (en->log_size - 1)) >> WAL_LOG_SHIFT) << en->buf_size_shift);
         if (LIKELY(result == buf->nob)) {
                 lsn_t              lsn;
                 struct wal_buf    *scan;
