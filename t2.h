@@ -40,22 +40,24 @@ struct t2_tx { /* Transaction. */
 };
 
 typedef int64_t lsn_t;
-
+struct shepherd;
 struct t2_te { /* Transaction engine. */
-        int           (*post)   (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
-        int           (*ante)   (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
-        int           (*init)   (struct t2_te *te, struct t2 *mod);
-        void          (*fini)   (struct t2_te *te);
-        void          (*quiesce)(struct t2_te *te);
-        struct t2_tx *(*make)   (struct t2_te *te);
-        int           (*open)   (struct t2_te *te, struct t2_tx *tx);
-        void          (*close)  (struct t2_te *te, struct t2_tx *tx);
-        int           (*wait)   (struct t2_te *te, struct t2_tx *tx, const struct timespec *deadline, bool force);
-        void          (*done)   (struct t2_te *te, struct t2_tx *tx);
-        bool          (*pinned) (struct t2_te *te, struct t2_node *n);
-        bool          (*wantout)(struct t2_te *te, struct t2_node *n);
-        void          (*clean)  (struct t2_te *te, struct t2_node **nodes, int nr);
-        void          (*print)  (struct t2_te *te);
+        int           (*post)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
+        int           (*ante)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
+        int           (*init)    (struct t2_te *te, struct t2 *mod);
+        void          (*fini)    (struct t2_te *te);
+        void          (*quiesce) (struct t2_te *te);
+        struct t2_tx *(*make)    (struct t2_te *te);
+        int           (*open)    (struct t2_te *te, struct t2_tx *tx);
+        void          (*close)   (struct t2_te *te, struct t2_tx *tx);
+        int           (*wait)    (struct t2_te *te, struct t2_tx *tx, const struct timespec *deadline, bool force);
+        void          (*done)    (struct t2_te *te, struct t2_tx *tx);
+        bool          (*pinned)  (struct t2_te *te, struct t2_node *n);
+        bool          (*wantout) (struct t2_te *te, struct t2_node *n);
+        void          (*clean)   (struct t2_te *te, struct t2_node **nodes, int nr);
+        bool          (*need)    (struct t2_te *te, struct shepherd *sh);
+        void          (*scan_end)(struct t2_te *te, int64_t cleaned);
+        void          (*print)   (struct t2_te *te);
         const char     *name;
 };
 
