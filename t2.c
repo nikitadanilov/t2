@@ -1724,6 +1724,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                         node_seq_increase(n);
                                         NCALL(n, load(n));
                                         EXPENSIVE_ASSERT(is_sorted(n));
+                                        SET0(&h->kelvin);
                                 } else {
                                         result = ERROR(-ESTALE);
                                 }
@@ -5444,6 +5445,17 @@ static struct wal_rec *wal_next(struct wal_rec *rec) {
         return (void *)&rec->data[rec->len];
 }
 
+enum {
+        LOG_WRITE  = 1 << 0,
+        LOG_LAST   = 1 << 1,
+        LOG_SYNC   = 1 << 2,
+        PAGE_WRITE = 1 << 3,
+        PAGE_SYNC  = 1 << 4,
+        BUF_CLOSE  = 1 << 5
+};
+
+static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t flags);
+
 static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype) {
         struct wal_te  *en  = COF(engine, struct wal_te, base);
         struct wal_tx  *tx  = COF(trax, struct wal_tx, base);
@@ -5489,6 +5501,9 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 }
         }
         wal_lock(en);
+        if (en->ready_nr == 0) {
+                wal_progress(en, LOG_WRITE, 1, 0);
+        }
         tx->id = wal_attach(en, size, space);
         ASSERT(en->reserved > 0);
         en->reserved--;
@@ -5632,15 +5647,6 @@ static void wal_snapshot(struct wal_te *en) {
                 wal_lock(en);
         }
 }
-
-enum {
-        LOG_WRITE  = 1 << 0,
-        LOG_LAST   = 1 << 1,
-        LOG_SYNC   = 1 << 2,
-        PAGE_WRITE = 1 << 3,
-        PAGE_SYNC  = 1 << 4,
-        BUF_CLOSE  = 1 << 5
-};
 
 static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t flags) {
         struct cds_list_head *tail;
