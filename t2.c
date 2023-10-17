@@ -19,6 +19,7 @@
 #include <stdalign.h>
 #include <unistd.h>
 #include <time.h>
+#include <aio.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -746,6 +747,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t shepherd_locked;
         int64_t shepherd_wake;
         int64_t shepherd_to;
+        int64_t shepherd_clean;
+        int64_t throttle_clean;
         int64_t stash_hit;
         int64_t stash_miss;
         int64_t stash_mags;
@@ -771,6 +774,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct level_counters {
                 int64_t traverse_hit;
                 int64_t traverse_miss;
+                int64_t allocated;
                 int64_t insert_balance;
                 int64_t delete_balance;
                 int64_t get;
@@ -815,6 +819,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var prefix;
                 struct counter_var pageout_cluster;
                 struct counter_var radixmap_builds;
+                struct counter_var page_dirty_nr;
                 struct counter_var tx_add[M_NR];
         } l[MAX_TREE_HEIGHT];
 };
@@ -871,6 +876,7 @@ static uint64_t ht_hash(taddr_t addr);
 static void pool_clean(struct t2 *mod);
 static int64_t pool_used(struct t2 *mod);
 static struct node *pool_get(struct t2 *mod, taddr_t addr);
+static bool stress(struct freelist *free, int *pressure);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
 static void buf_clip_node(struct t2_buf *b, const struct node *n);
@@ -1008,6 +1014,7 @@ static bool cache_want_page(struct t2 *mod);
 static int pageout(struct node *n);
 static void kmod(struct ewma *a, uint32_t t, int32_t nr);
 static uint64_t kavg(struct ewma *a, uint32_t t);
+static uint64_t krate(struct ewma *a, uint32_t t);
 static void ref_add(struct node *n);
 static void ref_del(struct node *n);
 static void ref_print(void);
@@ -1216,7 +1223,13 @@ void t2_stats_print(struct t2 *mod) {
         }
         printf("\n%15s", "rate:");
         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %8i", kval(&c->pool.rate[i]));
+                printf(" %8"PRId64, krate(&c->pool.rate[i], mod->cache.bolt >> BOLT_EPOCH_SHIFT));
+        }
+        printf("\n%15s ", "pressure:");
+        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                int pressure = 0;
+                bool underpressure = stress(&c->pool.free[i], &pressure);
+                printf(" %7i%s", pressure, underpressure ? "*" : " ");
         }
         printf("\nshepherd: ");
         for (int i = 0; i < ARRAY_SIZE(mod->cache.sh); ++i) {
@@ -1677,7 +1690,6 @@ static void ndelete(struct node *n) {
         if (LIKELY(n->flags & DIRTY)) {
                 n->flags &= ~DIRTY;
                 n->lsn = 0;
-                ASSERT(0);
         }
         put_locked(n);
         mutex_unlock(lock);
@@ -1724,7 +1736,6 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                         node_seq_increase(n);
                                         NCALL(n, load(n));
                                         EXPENSIVE_ASSERT(is_sorted(n));
-                                        SET0(&h->kelvin);
                                 } else {
                                         result = ERROR(-ESTALE);
                                 }
@@ -1763,6 +1774,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level, struct mod *cap) {
                         NCALL(n, make(n, cap));
                         unlock(n, WRITE);
                         node_state_print(n, 'a');
+                        CINC(l[level].allocated);
                 }
         } else {
                 n = EPTR(addr);
@@ -2204,7 +2216,6 @@ static void dirty(struct path *p, struct page *g) {
                         }
                 } else if (!(n->flags & DIRTY)) { /* Transactional nodes are dirtied in ->post(). */
                         n->flags |= DIRTY;
-                        ASSERT(0);
                 }
         }
 }
@@ -3074,8 +3085,7 @@ static void cache_fini(struct t2 *mod) {
 }
 
 static bool is_hot(struct node *n, int shift) {
-        return (kavg(&nheader(n)->kelvin, bolt(n)) >>
-                (taddr_sbits(n->addr) + (64 - BOLT_EPOCH_SHIFT) + (shift - BOLT_EPOCH_SHIFT))) != 0;
+        return krate(&nheader(n)->kelvin, bolt(n)) != 0;
 }
 
 static bool pinned(const struct node *n) {
@@ -3129,7 +3139,7 @@ enum {
 #define TXA(n, ...) ((n)->mod->te != NULL ? (__VA_ARGS__) : true)
 static int pageout(struct node *n) {
         struct t2    *mod = n->mod;
-        struct node  *cluster[MAX_CLUSTER];
+        struct node  *c[MAX_CLUSTER];
         struct iovec  vec[MAX_CLUSTER + 1];
         int           nr;
         taddr_t       cur;
@@ -3141,8 +3151,8 @@ static int pageout(struct node *n) {
         int           bshift = taddr_sshift(n->addr);
         ASSERT((n->flags & DIRTY) && TXA(n, n->lsn != 0));
         node_iovec(n, &vec[0]);
-        cluster[0] = n;
-        for (cur = n->addr, nr = 1; nr < ARRAY_SIZE(cluster); ++nr, cur = next) {
+        c[0] = n;
+        for (cur = n->addr, nr = 1; nr < ARRAY_SIZE(c); ++nr, cur = next) {
                 struct node *right; /* This makes a lot of assumptions about taddr_t semantics. */
                 next = taddr_make(taddr_saddr(cur) + taddr_ssize(cur), bshift);
                 right = look(mod, next);
@@ -3153,7 +3163,7 @@ static int pageout(struct node *n) {
                                 ;
                         } else if (nstate(right, mod->cache.shift, 1) == PAGE) {
                                 ASSERT(TXA(right, right->lsn != 0));
-                                cluster[nr] = right;
+                                c[nr] = right;
                                 node_iovec(right, &vec[nr]);
                                 continue;
                         } else {
@@ -3167,33 +3177,35 @@ static int pageout(struct node *n) {
         shift = ilog2(nr);
         towrite = 1 << shift;
         for (int i = towrite; i < nr; ++i) {
-                ASSERT(node_locked_invariant(cluster[i], WRITE));
-                NOFAIL(pthread_rwlock_unlock(&cluster[i]->lock));
-                put(cluster[i]);
+                ASSERT(node_locked_invariant(c[i], WRITE));
+                NOFAIL(pthread_rwlock_unlock(&c[i]->lock));
+                put(c[i]);
         }
         whole = taddr_make(taddr_saddr(n->addr), shift + bshift);
-        ASSERT(FORALL(i, towrite, !pinned(cluster[i])));
+        ASSERT(FORALL(i, towrite, !pinned(c[i])));
         for (int i = 0; i < towrite; ++i) {
-                node_state_print(cluster[i], 'W');
+                node_state_print(c[i], 'W');
         }
         result = SCALL(mod, write, whole, towrite, vec);
         CMOD(l[level(n)].pageout_cluster, nr);
         if (LIKELY(result == 0)) {
                 CINC(write);
                 CADD(write_bytes, taddr_ssize(whole));
-                TXCALL(mod->te, clean(mod->te, (struct t2_node **)cluster, towrite));
+                TXCALL(mod->te, clean(mod->te, (struct t2_node **)c, towrite));
                 for (int i = 0; i < towrite; ++i) {
-                        cluster[i]->flags &= ~DIRTY;
-                        cluster[i]->lsn = 0;
-                        node_state_print(cluster[i], 'C');
+                        c[i]->flags &= ~DIRTY;
+                        c[i]->lsn = 0;
+                        node_state_print(c[i], 'C');
+                        CMOD(l[level(c[i])].page_dirty_nr, c[i]->flags >> 40);
+                        c[i]->flags &= ~(~0ull << 40);
                 }
         } else {
                 LOG("Pageout failure: %"PRIx64": %i/%i.", n->addr, result, errno);
         }
         for (int i = 1; i < towrite; ++i) {
-                assert(node_locked_invariant(cluster[i], WRITE));
-                NOFAIL(pthread_rwlock_unlock(&cluster[i]->lock));
-                put(cluster[i]);
+                assert(node_locked_invariant(c[i], WRITE));
+                NOFAIL(pthread_rwlock_unlock(&c[i]->lock));
+                put(c[i]);
         }
         ASSERT(result == 0);
         return towrite;
@@ -3218,7 +3230,7 @@ static void writeout(struct t2 *mod) {
         } while (scan != 0);
 }
 
-enum { PULSE_TICK = BILLION / 10 };
+enum { PULSE_TICK = BILLION / 100 };
 
 static void *pulse(void *arg) {
         struct t2 *mod = arg;
@@ -3241,7 +3253,10 @@ static bool cache_want_page(struct t2 *mod) {
 }
 
 static bool enough(struct cache *c, int i) {
-        return c->pool.free[i].avail + (uint32_t)c->pool.free[i].nr >= 2 * EPOCH_DELTA * kval(&c->pool.rate[i]) + 1;
+        int dummy;
+        struct freelist *free = &c->pool.free[i];
+        return  (uint64_t)free->avail + free->nr >= 2 * EPOCH_DELTA * krate(&c->pool.rate[i], c->bolt >> BOLT_EPOCH_SHIFT) + 1 &&
+                !stress(free, &dummy);
 }
 
 static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *lock) {
@@ -3445,6 +3460,7 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
                         int64_t cleaned = shepherd_scan(mod, self, sector_start, sector_size);
                         self->min = self->cur_min;
                         TXCALL(mod->te, scan_end(mod->te, cleaned));
+                        CADD(shepherd_clean, cleaned);
                         cache_sync(mod);
                         counters_fold();
                         if (cleaned == 0) {
@@ -3474,14 +3490,14 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
 
 static void mag_put(_Atomic(struct magazine *) *head, struct magazine *item) {
         do {
-                item->next = *head;
+                item->next = atomic_load(head);
         } while (UNLIKELY(!atomic_compare_exchange_weak(head, &item->next, item)));
 }
 
 static struct magazine *mag_get(_Atomic(struct magazine *) *head) {
         struct magazine *item;
         do {
-                item = *head;
+                item = atomic_load(head);
         } while (UNLIKELY(item != NULL && !atomic_compare_exchange_weak(head, &item, item->next)));
         return item;
 }
@@ -3532,8 +3548,8 @@ static void *stash_get(struct stash_local *sl) {
                 sl->mag = mag;
         }
         ASSERT(mag->used > 0);
-        unit = mag->unit[--sl->mag->used];
-        CMOD(stash_used, sl->mag->used);
+        unit = mag->unit[--mag->used];
+        CMOD(stash_used, mag->used);
         if (UNLIKELY(mag->used == 0)) {
                 mag_put(&s->empty, mag);
                 sl->mag = NULL;
@@ -3550,13 +3566,14 @@ static void stash_put(struct stash_local *sl, void *unit) {
                         mag = mag_init(s);
                         if (UNLIKELY(mag == NULL)) {
                                 LOG("Stash failure."); /* TODO: Handle allocation failure. */
+                                return;
                         }
                 }
                 sl->mag = mag;
         }
         ASSERT(mag->used < s->nr);
-        mag->unit[sl->mag->used++] = unit;
-        CMOD(stash_used, sl->mag->used);
+        mag->unit[mag->used++] = unit;
+        CMOD(stash_used, mag->used);
         if (UNLIKELY(mag->used == s->nr)) {
                 mag_put(&s->inhab, mag);
                 sl->mag = NULL;
@@ -3755,7 +3772,7 @@ static void counter_var_print1(struct counter_var *v, const char *label) {
 }
 
 static void counter_var_print(int offset, const char *label) {
-        printf("%-20s ", label);
+        printf("%-20s   ", label);
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 struct counter_var *v = (((void *)&GVAL(l[i])) + offset);
                 printf("%10.1f ", v->nr ? 1.0 * v->sum / v->nr : 0.0);
@@ -3764,7 +3781,7 @@ static void counter_var_print(int offset, const char *label) {
 }
 
 static void double_var_print(int offset, const char *label) {
-        printf("%-20s ", label);
+        printf("%-20s      ", label);
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 struct double_var *v = (((void *)&GDVAL(l[i])) + offset);
                 printf("%10.4f ", v->nr ? 1.0 * v->sum / v->nr : 0.0);
@@ -3843,12 +3860,15 @@ static void counters_print() {
         printf("wal.dirty_clean:     %10"PRId64"\n", GVAL(wal_dirty_clean));
         printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
         counter_var_print1(&GVAL(wal_redirty_lsn),    "wal.redirty_lsn:");
-        printf("shepherd:            %10"PRId64"\n", GVAL(shepherd_iter));
+        printf("shepherd.iter:       %10"PRId64"\n", GVAL(shepherd_iter));
+        printf("shepherd.scan:       %10"PRId64"\n", GVAL(shepherd_scan));
         printf("shepherd.bucket:     %10"PRId64"\n", GVAL(shepherd_bucket));
         printf("shepherd.skip:       %10"PRId64"\n", GVAL(shepherd_skip));
         printf("shepherd.locked:     %10"PRId64"\n", GVAL(shepherd_locked));
         printf("shepherd.wake:       %10"PRId64"\n", GVAL(shepherd_wake));
         printf("shepherd.to:         %10"PRId64"\n", GVAL(shepherd_to));
+        printf("shepherd.clean:      %10"PRId64"\n", GVAL(shepherd_clean));
+        printf("throttle.clean:      %10"PRId64"\n", GVAL(throttle_clean));
         printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
         printf("stash.miss:          %10"PRId64"\n", GVAL(stash_miss));
         counter_var_print1(&GVAL(stash_used),         "stash.used:");
@@ -3870,6 +3890,7 @@ static void counters_print() {
         puts("");
         COUNTER_PRINT(traverse_hit);
         COUNTER_PRINT(traverse_miss);
+        COUNTER_PRINT(allocated);
         COUNTER_PRINT(insert_balance);
         COUNTER_PRINT(insert_balance);
         COUNTER_PRINT(delete_balance);
@@ -3893,6 +3914,7 @@ static void counters_print() {
         COUNTER_PRINT(page_tx_want);
         COUNTER_PRINT(page_pageout);
         COUNTER_PRINT(page_cold);
+        COUNTER_VAR_PRINT(page_dirty_nr);
         COUNTER_PRINT(scan_skip_busy);
         COUNTER_PRINT(scan_skip_dirty);
         COUNTER_PRINT(scan_skip_hot);
@@ -4241,36 +4263,50 @@ static int64_t pool_used(struct t2 *mod) {
 }
 
 enum {
-        FREE_HI         = 9,
+        FREE_HI         = 5,
         FREE_LO         = 4,
         SCAN_RATE_SHIFT = 6
 };
+
+static bool stress(struct freelist *free, int *pressure) {
+        int64_t have = free->avail + free->nr;
+        int64_t nr   = free->total - have;
+        int64_t hi   = nr >> (10 - FREE_HI);
+        int64_t lo   = nr >> (10 - FREE_LO);
+        if (have < hi) {
+                *pressure = 31 - ilog2((max_64(have - lo, 0) << 32) / (hi - lo));
+                return true;
+        } else {
+                return false;
+        }
+}
+
+static void pool_throttle(struct t2 *mod, struct freelist *free, taddr_t addr) {
+        int pressure;
+        if (stress(free, &pressure)) {
+                int32_t rate   = SCAN_RATE_SHIFT - pressure / (32 / SCAN_RATE_SHIFT);
+                int32_t cookie = ht_bucket(&mod->ht, addr);
+                int32_t run    = 1 << ((pressure / 4) + 3);
+                if (UNLIKELY((cookie & ((1 << rate) - 1)) == 0)) {
+                        if (true || LIKELY(cache_want_page(mod))) {
+                                struct shepherd sh       = { .lim = LLONG_MAX };
+                                int64_t         cleaned  = shepherd_scan(mod, &sh, cookie, run);
+                                if (cleaned > 0) {
+                                        TXCALL(mod->te, scan_end(mod->te, cleaned));
+                                        CADD(throttle_clean, cleaned);
+                                }
+                        }
+                        scan(mod, cookie, run);
+                }
+        }
+}
 
 static struct node *pool_get(struct t2 *mod, taddr_t addr) {
         int              idx  = taddr_sbits(addr);
         struct cache    *c    = &mod->cache;
         struct freelist *free = &c->pool.free[idx];
         struct node     *n    = NULL;
-        int64_t          nr   = pool_allocated(mod, idx);
-        int64_t          hi   = nr >> (10 - FREE_HI);
-        int64_t          lo   = nr >> (10 - FREE_LO);
-        int64_t          have = free->avail + free->nr;
-        if (have < hi) {
-                int     pressure = 31 - ilog2((max_64(have - lo, 0) << 32) / (hi - lo));
-                int32_t rate     = SCAN_RATE_SHIFT - pressure / (32 / SCAN_RATE_SHIFT);
-                int32_t cookie   = ht_bucket(&mod->ht, addr);
-                int32_t run      = 1 << ((pressure / 4) + 3);
-                if (UNLIKELY((cookie & ((1 << rate) - 1)) == 0)) {
-                        if (LIKELY(cache_want_page(mod))) {
-                                struct shepherd sh       = { .lim = LLONG_MAX };
-                                int64_t         cleaned  = shepherd_scan(mod, &sh, cookie, run);
-                                if (cleaned > 0) {
-                                        TXCALL(mod->te, scan_end(mod->te, cleaned));
-                                }
-                        }
-                        scan(mod, cookie, run);
-                }
-        }
+        pool_throttle(mod, free, addr);
         mutex_lock(&free->lock);
         if (LIKELY(free->avail == 0)) {
                 while (UNLIKELY(free->nr == 0)) {
@@ -4332,6 +4368,10 @@ static void kmod(struct ewma *a, uint32_t t, int32_t nr) {
 
 static uint64_t kavg(struct ewma *a, uint32_t t) { /* Typical unit: quarter of nano-Kelvin (of nabi-Kelvin, technically). */
         return ((uint64_t)kval(a) << (63 - BOLT_EPOCH_SHIFT)) >> min_32(t - a->cur, 63);
+}
+
+static uint64_t krate(struct ewma *a, uint32_t t) {
+        return (uint64_t)kval(a) >> min_32(t - a->cur, 63);
 }
 
 /* @buf */
@@ -5304,7 +5344,7 @@ static bool wal_should_sync_log(const struct wal_te *en, uint32_t flags) {
         int threshold = (flags & DAEMON) ? en->threshold_log_syncd : en->threshold_log_sync;
         return  !COND(en->log_syncing, wal_log_already) &&
                 (COND(en->max_written - en->max_synced > WAL_SYNC_NOB, wal_sync_log_head) ||
-                 COND(wal_log_free(en) < (threshold * en->log_size) >> 10, wal_sync_log_lo) ||
+                 COND(wal_log_free(en) < wal_log_need(en) + ((threshold * en->log_size) >> 10), wal_sync_log_lo) ||
                  COND(READ_ONCE(en->mod->tick) - en->last_log_sync > WAL_SYNC_AGE, wal_sync_log_time));
 }
 
@@ -5312,13 +5352,13 @@ static bool wal_should_page(const struct wal_te *en, uint32_t flags) {
         int threshold = (flags & DAEMON) ? en->threshold_paged : en->threshold_page;
         return  !COND(en->max_paged == en->max_persistent, wal_page_wal) &&
                 !COND(en->dirty_nr == 0, wal_page_empty) &&
-                (COND(en->max_paged - en->start < ((threshold * en->log_size) >> 10), wal_page_lo) ||
+                (COND(en->max_paged - en->start < wal_log_need(en) + ((threshold * en->log_size) >> 10), wal_page_lo) ||
                  COND(cache_want_page(en->mod), wal_page_cache));
 }
 
 static bool wal_should_sync_page(const struct wal_te *en, uint32_t flags) {
         return  !COND(en->page_syncing, wal_page_already) &&
-                (COND(en->max_paged - en->start > WAL_PAGE_SYNC_NOB, wal_sync_page_nob) ||
+                (COND(en->max_paged - en->start > wal_log_need(en) + WAL_PAGE_SYNC_NOB, wal_sync_page_nob) ||
                  COND(READ_ONCE(en->mod->tick) - en->last_page_sync > WAL_SYNC_AGE, wal_sync_page_time));
 }
 
@@ -5498,6 +5538,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 } else if (COUNTERS && prev != n) {
                         CINC(wal_redirty);
                         CMOD(wal_redirty_lsn, en->lsn - n->lsn);
+                        n->flags += 1ull << 40;
                 }
         }
         wal_lock(en);
@@ -5757,7 +5798,6 @@ static void wal_fini(struct t2_te *engine) {
                 }
         }
         writeout(en->mod);
-        ASSERT(en->dirty_nr == 0);
         ASSERT(cds_list_empty(&en->ready));
         NOFAIL(pthread_cond_destroy(&en->bufwrite));
         NOFAIL(pthread_cond_destroy(&en->bufwait));
@@ -5798,7 +5838,7 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         en->buf_size_shift      = ilog2(buf_size);
         en->log_size            = WAL_MAX_LOG;
         en->logname             = logname;
-        en->threshold_paged     =  32;
+        en->threshold_paged     = 512;
         en->threshold_page      = 128;
         en->threshold_log_syncd =  64;
         en->threshold_log_sync  =  32;
@@ -7522,7 +7562,7 @@ enum {
         NR_BUFS    = 200,
         BUF_SIZE   = 1 << 20,
         FLAGS      = 0, /* noforce-nosteal == redo only. */
-        NOPS       = 500000
+        NOPS       = 200000
 };
 
 static const char logname[] = "./log/l";
@@ -7659,6 +7699,7 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        wal_ut();
         lib_ut();
         simple_ut();
         ht_ut();
