@@ -9,25 +9,25 @@ def trace(fname):
     L = defaultdict(int)
     with open(fname, 'r') as f:
         for line in f:
-            # 0         1         2         3         4
-            # 01234567890123456789012345678901234567890123456789
-            # N   2430467499187000 00006e0000000200 0 L
+            # 0         1         2         3         4         5         6
+            # 0123456789012345678901234567890123456789012345678901234567890
+            # N   2796330504163000             143931 0000910000000203 0 L
             if line[0] == 'N':
                 time  = int(line[ 4:20])
-                addr  = int(line[21:37], 16)
-                level = int(line[38:39])
-                state =     line[40:41]
-                T[addr].append(time)
+                bolt  = int(line[21:39])
+                addr  = int(line[40:56], 16)
+                level = int(line[57:58])
+                state =     line[59:60]
+                T[addr].append(bolt)
                 S[addr].append(state)
                 L[addr] = max(L[addr], level)
     for addr in S:
-        rep = ""
+        print('{:016x} {:1d}'.format(addr, L[addr]), end = ' ')
         for idx, state in enumerate(S[addr]):
             if idx > 0 and T[addr][idx - 1] != 0:
-                diff = int((T[addr][idx] - T[addr][idx - 1]) / 100000000)
-                rep += diff * "."
-            rep += state
-        print("%016x %1d %s" % (addr, L[addr], rep))
+                print(int((T[addr][idx] - T[addr][idx - 1]) / 30) * '.', end = '')
+            print(state, end = '')
+        print('')
 
 if __name__ == "__main__":
     trace(sys.argv[1])
