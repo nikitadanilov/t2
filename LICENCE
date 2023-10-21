@@ -1,3 +1,19 @@
+  This library is released under the terms LGPLv2.1, included below, with the
+following clarification: the acts of
+
+    - dynamically linking against the library,
+    - statically linking against the library (in the form of object or library files),
+    - including the public library headers,
+    - providing implementations of the interfaces exposed by the library with the
+      purpose of extending its funcitonality
+
+do not produce works derived from the library.
+
+    This library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Lesser General Public License for more details.
+
                   GNU LESSER GENERAL PUBLIC LICENSE
                        Version 2.1, February 1999
 
