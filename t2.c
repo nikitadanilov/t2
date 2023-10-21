@@ -956,6 +956,7 @@ static void node_type_degister(struct t2_node_type *ntype);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
 static uint32_t kval(struct ewma *a);
+static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob);
 static struct t2_tx *wal_make(struct t2_te *te);
 static int  wal_init    (struct t2_te *engine, struct t2 *mod);
 static void wal_quiesce (struct t2_te *engine);
@@ -1364,16 +1365,21 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx) {
         eclear();
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (LIKELY(t != NULL)) {
-                struct mod dummy;
-                t->ttype = ttype; /* TODO: Fix transactions here. */
-                struct node *root = alloc(t, 0, &dummy);
+                struct page p = { .lm = WRITE };
+                t->ttype = ttype;
+                struct node *root = p.node = alloc(t, 0, &p.mod);
                 if (EISOK(root)) {
                         int result;
+                        if (TRANSACTIONS && tx != NULL) {
+                                struct t2_txrec txr[M_NR];
+                                int32_t         nob = 0;
+                                struct t2_te   *te  = ttype->mod->te;
+                                int             nr  = txadd(&p, txr, &nob);
+                                TXCALL(te, post(te, tx, nob, nr, txr));
+                        }
                         t->root = root->addr;
-                        CDEC(node); /* To keep counters_check() happy. */
-                        result = insert(t, &(struct t2_rec) { .key = &zero, .val = &zero }, tx);
-                        CINC(node);
                         put(root);
+                        result = insert(t, &(struct t2_rec) { .key = &zero, .val = &zero }, tx);
                         if (result != 0) {
                                 t = EPTR(result);
                         }
@@ -2206,16 +2212,11 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struc
 static void dirty(struct path *p, struct page *g) {
         struct node *n = g->node;
         if (n != NULL && g->lm == WRITE) {
-                int32_t start = nsize(n);
                 ASSERT(is_stable(n));
                 node_seq_increase(n);
                 node_state_print(n, 'D');
-                if (TRANSACTIONS && p->tx != NULL) {
-                        for (int i = 0; i < ARRAY_SIZE(g->mod.ext); ++i) {
-                                g->mod.ext[i] = (struct ext) { .start = start, .end = 0 };
-                        }
-                } else if (!(n->flags & DIRTY)) { /* Transactional nodes are dirtied in ->post(). */
-                        n->flags |= DIRTY;
+                if (!TRANSACTIONS || p->tx == NULL) {
+                        n->flags |= DIRTY; /* Transactional nodes are dirtied in ->post(). */
                 }
         }
 }
@@ -2379,6 +2380,13 @@ static bool rung_is_valid(const struct path *p, int i) {
         return is_valid;
 }
 
+static void page_mod_init(struct page *g) {
+        int32_t start = nsize(g->node);
+        for (int i = 0; i < ARRAY_SIZE(g->mod.ext); ++i) {
+                g->mod.ext[i] = (struct ext) { .start = start, .end = 0 };
+        }
+}
+
 static void path_add(struct path *p, struct node *n, uint64_t flags) {
         struct rung *r = &p->rung[++p->used];
         ASSERT(IS_IN(p->used + 1, p->rung));
@@ -2458,6 +2466,9 @@ static int insert_prep(struct path *p) {
         do {
                 struct rung *r = &p->rung[idx];
                 r->page.lm = WRITE;
+                if (TRANSACTIONS && p->tx != NULL) {
+                        page_mod_init(&r->page);
+                }
                 if (can_insert(r->page.node, rec) && !should_split(r->page.node)) {
                         break;
                 } else {
@@ -3208,7 +3219,7 @@ static int pageout(struct node *n) {
                 put(c[i]);
         }
         ASSERT(result == 0);
-        return towrite;
+        return towrite << taddr_sbits(n->addr);
 }
 
 static void cache_clean(struct t2 *mod) {
@@ -3366,7 +3377,7 @@ static void *maxwelld(void *data) {
 }
 
 static bool canpage(const struct node *n, lsn_t target) {
-        return !pinned(n) && 0 < n->lsn && n->lsn < target;
+        return !TRANSACTIONS || (!pinned(n) && 0 < n->lsn && n->lsn < target);
 }
 
 static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *mut, struct shepherd *sh) {
@@ -3489,16 +3500,23 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
 /* @stash */
 
 static void mag_put(_Atomic(struct magazine *) *head, struct magazine *item) {
+        struct magazine *top;
         do {
-                item->next = atomic_load(head);
-        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &item->next, item)));
+                top = atomic_load(head);
+                item->next = top;
+        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, item)));
 }
 
 static struct magazine *mag_get(_Atomic(struct magazine *) *head) {
         struct magazine *item;
+        struct magazine *top;
         do {
-                item = atomic_load(head);
-        } while (UNLIKELY(item != NULL && !atomic_compare_exchange_weak(head, &item, item->next)));
+                top = atomic_load(head);
+                if (top == NULL) {
+                        return NULL;
+                }
+                item = top;
+        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, item->next)));
         return item;
 }
 
@@ -5251,13 +5269,13 @@ enum { WAL_LOCK_PROFILE = false };
 
 static void wal_lock_enter(struct wal_te *en) {
         if (WAL_LOCK_PROFILE) {
-                en->lock_stamp = now();
+                en->lock_stamp = LIKELY(en->mod != NULL) ? READ_ONCE(en->mod->tick_nr) : 0;
         }
 }
 
 static void wal_lock_leave(struct wal_te *en) {
         if (WAL_LOCK_PROFILE) {
-                uint64_t duration = now() - en->lock_stamp;
+                uint64_t duration = LIKELY(en->mod != NULL) ? READ_ONCE(en->mod->tick_nr) - en->lock_stamp : 0;
                 if (duration > en->lock_longest) {
                         printf("longest wait: %"PRId64"\n", duration);
                         stacktrace();
@@ -5505,7 +5523,8 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         void           *space;
         int32_t         size;
         int             added = 0;
-        struct node    *nodes[nr];
+        int             blks  = 0;
+        struct node    *nodes[nr]; /* VLA */
         ASSERT(en->recovered);
         rec = space = wal_space(en, tx, nr, nob, &size);
         if (UNLIKELY(rec == NULL)) {
@@ -5534,6 +5553,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                         ASSERT(n->lsn == 0);
                         n->flags |= DIRTY;
                         nodes[added++] = n;
+                        blks += 1 << taddr_sbits(n->addr);
                         CINC(wal_dirty_clean);
                 } else if (COUNTERS && prev != n) {
                         CINC(wal_redirty);
@@ -5548,7 +5568,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         tx->id = wal_attach(en, size, space);
         ASSERT(en->reserved > 0);
         en->reserved--;
-        en->dirty_nr += added; /* TODO: Account for different node sizes. */
+        en->dirty_nr += blks;
         for (int i = 0; i < added; ++i) {
                 ASSERT(nodes[i]->lsn == 0);
                 t2_lsnset((void *)nodes[i], tx->id);
@@ -5717,7 +5737,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
                 wal_page_sync(en);
                 ++done;
         }
-        if (done < max && allowed&BUF_CLOSE && UNLIKELY(en->cur != NULL && READ_ONCE(en->mod->tick) - en->cur_age > WAL_AGE_LIMIT && en->cur->used > 1)) {
+        if (false && done < max && allowed&BUF_CLOSE && UNLIKELY(en->cur != NULL && READ_ONCE(en->mod->tick) - en->cur_age > WAL_AGE_LIMIT && en->cur->used > 1)) {
                 if (LIKELY(wal_log_free(en) > wal_log_need(en))) {
                         wal_buf_end(en);
                         CINC(wal_cur_aged);
@@ -5908,7 +5928,7 @@ static int wal_buf_replay(struct wal_te *en, void *space, int len) {
                         struct node *n = (void *)t2_apply(en->mod, &txr);
                         if (EISOK(n)) {
                                 if (!(n->flags & DIRTY)) {
-                                        ++en->dirty_nr;
+                                        en->dirty_nr += 1 << taddr_sbits(n->addr);
                                         n->flags |= DIRTY;
                                         t2_lsnset((void *)n, lsn);
                                 }
