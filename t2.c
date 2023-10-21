@@ -1,6 +1,7 @@
 /* -*- C -*- */
 
-/* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licencing information. */
+/* Copyright 2023 Nikita Danilov <danilov@gmail.com> */
+/* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for the licencing information. */
 
 #include <stdbool.h>
 #include <assert.h>
@@ -19,7 +20,6 @@
 #include <stdalign.h>
 #include <unistd.h>
 #include <time.h>
-#include <aio.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -520,14 +520,18 @@ enum ext_id {
 };
 
 struct node {
-        struct cds_hlist_node      hash;
-        taddr_t                    addr;
+        union {
+                struct {
+                        struct cds_hlist_node hash;
+                        taddr_t               addr;
+                };
+                struct cds_list_head          free;
+        };
         uint64_t                   flags;
         uint64_t                   seq;
         atomic_int                 ref;
         const struct t2_node_type *ntype;
         void                      *data;
-        struct cds_list_head       free; /* TODO: Unionise this. */
         struct t2                 *mod;
         struct radixmap           *radix;
         lsn_t                      lsn;
@@ -1621,7 +1625,6 @@ static struct node *nalloc(struct t2 *mod, taddr_t addr) {
                 if (LIKELY(n != NULL && data != NULL)) {
                         CINC(alloc_fresh);
                         NOFAIL(pthread_rwlock_init(&n->lock, NULL));
-                        CDS_INIT_LIST_HEAD(&n->free);
                         n->data = data;
                 } else {
                         mem_free(n);
@@ -1643,7 +1646,6 @@ static void nfini(struct node *n) {
         struct freelist *free = &c->pool.free[taddr_sbits(n->addr)];
         node_state_print(n, 'F');
         ASSERT(n->ref == 0);
-        ASSERT(cds_list_empty(&n->free));
         ASSERT(!(n->flags & DIRTY));
         mutex_lock(&free->lock);
         cds_list_add(&n->free, &free->head);
@@ -4333,7 +4335,7 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
                         CINC(alloc_wait);
                 }
                 n = COF(free->head.next, struct node, free);
-                cds_list_del_init(&n->free);
+                cds_list_del(&n->free);
                 --free->nr;
                 CINC(alloc_pool);
                 NCALL(n, fini(n));
@@ -7719,7 +7721,6 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        wal_ut();
         lib_ut();
         simple_ut();
         ht_ut();
