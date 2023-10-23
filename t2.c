@@ -115,110 +115,64 @@ enum {
         }                                                       \
 })
 
-/* Returns the number of array elements that satisfy given criteria. */
-#define COUNT(var, nr, ...)                             \
-({                                                      \
-        unsigned __nr = (nr);                           \
-        unsigned var;                                   \
-        unsigned count;                                 \
-                                                        \
-        for (count = var = 0; var < __nr; ++var) {      \
-                if (__VA_ARGS__)                        \
-                        ++count;                        \
-        }                                               \
-        count;                                          \
+#define COUNT(var, limit, ...)                                          \
+({                                                                      \
+        int __lim;                                                      \
+        int __result;                                                   \
+        int var;                                                        \
+        for (__lim = (limit), __result = 0, var = 0; var < __lim; ++var) { \
+                if (__VA_ARGS__) {                                      \
+                        ++__result;                                     \
+                }                                                       \
+        }                                                               \
+        __result;                                                       \
 })
 
-/*
- * Returns a conjunction (logical AND) of an expression evaluated over a range
- *
- * Declares an unsigned integer variable named "var" in a new scope and
- * evaluates user-supplied expression (the last argument) with "var" iterated
- * over successive elements of [0 .. NR - 1] range, while this expression
- * returns true. Returns true iff the whole range was iterated over.
- *
- * This function is useful for invariant checking.
- *
- * bool foo_invariant(const struct foo *f)
- * {
- *        return FORALL(i, ARRAY_SIZE(f->f_nr_bar), f->f_bar[i].b_count > 0);
- * }
- */
-#define FORALL(var, nr, ...)                                    \
-({                                                              \
-        unsigned __nr = (nr);                                   \
-        unsigned var;                                           \
-                                                                \
-        for (var = 0; var < __nr && ({ __VA_ARGS__ ; }); ++var) \
-                ;                                               \
-        var == __nr;                                            \
+#define FORALL(var, limit, ...)                                         \
+({                                                                      \
+        int __lim;                                                      \
+        int var;                                                        \
+        for (__lim = (limit), var = 0; var < __lim && ({ __VA_ARGS__; }); ++var) { \
+                ;                                                       \
+        }                                                               \
+        var == __lim;                                                   \
 })
 
-/*
- * Returns a disjunction (logical OR) of an expression evaluated over a range.
- *
- * bool haystack_contains(int needle)
- * {
- *         return EXISTS(i, ARRAY_SIZE(haystack), haystack[i] == needle);
- * }
- */
-#define EXISTS(var, nr, ...) (!FORALL(var, (nr), !(__VA_ARGS__)))
+#define EXISTS(var, limit, ...) (!FORALL(var, (limit), !(__VA_ARGS__)))
 
-/*
- * Reduces ("aggregates") given expression over an interval.
- *
- * @see http://en.wikipedia.org/wiki/Fold_(higher-order_function)
- *
- * Example uses
- *
- * sum = REDUCE(i, ARRAY_SIZE(a), 0, + a[i]);
- * product = REDUCE(i, ARRAY_SIZE(b), 1, * b[i]);
- */
-#define REDUCE(var, nr, init, exp)              \
-({                                              \
-        unsigned __nr = (nr);                   \
-        unsigned var;                           \
-        typeof(init) __accum = (init);          \
-                                                \
-        for (var = 0; var < __nr; ++var) {      \
-                __accum = __accum exp;          \
-        }                                       \
-        __accum;                                \
+#define REDUCE(var, limit, init, iter)                                  \
+({                                                                      \
+        int          __lim;                                             \
+        typeof(init) __result;                                          \
+        int          var;                                               \
+        for (var = 0, __lim = (limit), __result = (init) ; var < __lim; ++var) { \
+                __result = __result iter;                               \
+        }                                                               \
+        __result;                                                       \
 })
 
-/*
- * Folds given expression over an interval.
- *
- * This is a generalised version of REDUCE().
- *
- * @see http://en.wikipedia.org/wiki/Fold_(higher-order_function)
- *
- * Example uses
- *
- * sum = FOLD(i, s, ARRAY_SIZE(a), 0, s + a[i]);
- * max = FOLD(i, m, ARRAY_SIZE(b), INT_MIN, MAX(m, a[i]));
- */
-#define FOLD(var, accum, nr, init, exp)         \
-({                                              \
-        unsigned __nr = (nr);                   \
-        unsigned var;                           \
-        typeof(init) accum = (init);            \
-                                                \
-        for (var = 0; var < __nr; ++var) {      \
-                accum = exp;                    \
-        }                                       \
-        accum;                                  \
+/* A generalised REDUCE. "iter" can use both "var" and "result". */
+#define FOLD(var, result, limit, init, iter)                            \
+({                                                                      \
+        int          __lim;                                             \
+        typeof(init) result;                                            \
+        int          var;                                               \
+        for (var = 0, __lim = (limit), result = (init); var < __lim; ++var) { \
+                result = iter;                                          \
+        }                                                               \
+        result;                                                         \
 })
 
 #define SASSERT(cond) _Static_assert((cond), #cond)
 
 #define SET0(obj)                               \
 ({                                              \
+        typeof(obj) __obj = (obj);              \
         SASSERT(!IS_ARRAY(obj));                \
-        memset((obj), 0, sizeof *(obj));        \
+        memset(__obj, 0, sizeof *__obj);        \
 })
 
-#define IS0(obj) FORALL(i, sizeof *(obj), ((char *)obj)[i] == 0)
+#define IS0(obj) FORALL(i, sizeof *(obj), ((uint8_t *)obj)[i] == 0)
 
 #define MAX(a, b)                               \
 ({                                              \
@@ -665,11 +619,16 @@ struct magazine {
         void            *unit[0];
 };
 
+struct aba_ptr {
+        uintptr_t  gen;
+        void      *ptr;
+};
+
 struct stash {
-        alignas(MAX_CACHELINE) _Atomic(struct magazine *) empty;
-        alignas(MAX_CACHELINE) _Atomic(struct magazine *) inhab;
-        int                                               nr;
-        int                                               size;
+        alignas(MAX_CACHELINE) _Atomic(struct aba_ptr) empty;
+        alignas(MAX_CACHELINE) _Atomic(struct aba_ptr) inhab;
+        int                                            nr;
+        int                                            size;
 };
 
 struct stash_local {
@@ -2809,7 +2768,7 @@ static int traverse(struct path *p) {
                 } else {
                         CINC(l[level(n)].traverse_hit);
                         node_state_print(n, 'e');
-                        if (!is_stable(n)) { /* This is racy, but OK. */
+                        if (UNLIKELY(!is_stable(n))) { /* This is racy, but OK. */
                                 rcu_leave(p, n);
                                 lock(n, READ); /* Wait for stabilisation. */
                                 unlock(n, READ);
@@ -3501,25 +3460,27 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
 
 /* @stash */
 
-static void mag_put(_Atomic(struct magazine *) *head, struct magazine *item) {
-        struct magazine *top;
-        do {
-                top = atomic_load(head);
-                item->next = top;
+static void mag_put(_Atomic(struct aba_ptr) *head, struct magazine *mag) {
+        struct aba_ptr item;
+        struct aba_ptr top = atomic_load(head);
+        do { /* atomic_compare_exchange_weak() updates "top" on failure. */
+                mag->next = top.ptr;
+                item.gen  = top.gen + 1;
+                item.ptr  = mag;
         } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, item)));
 }
 
-static struct magazine *mag_get(_Atomic(struct magazine *) *head) {
-        struct magazine *item;
-        struct magazine *top;
+static struct magazine *mag_get(_Atomic(struct aba_ptr) *head) {
+        struct aba_ptr item;
+        struct aba_ptr top = atomic_load(head);
         do {
-                top = atomic_load(head);
-                if (top == NULL) {
+                if (top.ptr == NULL) {
                         return NULL;
                 }
-                item = top;
-        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, item->next)));
-        return item;
+                item.gen = top.gen + 1;
+                item.ptr = ((struct magazine *)top.ptr)->next;
+        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, item)));
+        return top.ptr;
 }
 
 static void mag_free(struct magazine *mag) {
