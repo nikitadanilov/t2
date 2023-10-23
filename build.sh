@@ -2,12 +2,12 @@
 
 echo > config.h
 platform="$(uname -srm)"
-LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -rdynamic"
+LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -latomic -rdynamic"
 CC=${CC:-cc}
 CPP=${CPP:-c++}
-CFLAGS="-I/usr/local/include -march=native -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
+CFLAGS="-I/usr/local/include -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
 cc="$($CC -v 2>&1)"
-OPTFLAGS="-O6"
+OPTFLAGS="-O6 -Ofast"
 
 function cadd() {
     echo $* >> config.h
@@ -20,8 +20,12 @@ function cundef() {
     cadd "#endif"
 }
 
+function cpuflag() {
+        :
+}
+
 case "$platform" in ####################### Linux #############################
-    *Linux*)
+    (*Linux*)
         ROCKSDB_LDFLAGS="-lrocksdb -lsnappy -lz -lbz2 -lzstd -llz4 -ldl -lstdc++"
         LMDB_LDFLAGS="-L/usr/local/lib -llmdb"
         MAP_LDFLAGS="-lstdc++"
@@ -29,44 +33,67 @@ case "$platform" in ####################### Linux #############################
         cadd '#define ON_LINUX  (1)'
         cadd '#define ON_DARWIN (0)'
         cadd '#include "os-linux.h"'
+        function cpuflag() {
+                flag="$1"
+                if command -v lscpu >/dev/null 2>/dev/null ;then
+                        lscpu | grep " $flag " >/dev/null 2>/dev/null && echo "-m$flag"
+                else
+                        cat /proc/cpuinfo | grep " $flag " >/dev/null 2>/dev/null && echo "-m$flag"
+                fi
+        }
         ;;
 esac
 
 case "$platform" in ####################### Linux x86_64 ######################
-    *Linux*x86_64*)
+    (*Linux*x86_64*)
+        ;;
+esac
+
+case "$platform" in
+    (*x86_64*)
+	# popcnt for ilog2()
+	# cx16 for mag_{get,put}() (128-bit CAS)
+        MFLAGS="popcnt cx16"
         ;;
 esac
 
 case "$platform" in ####################### Darwin #############################
-    *Darwin*)
+    (*Darwin*)
         ROCKSDB_LDFLAGS="-lrocksdb"
         LMDB_LDFLAGS="-L/usr/local/lib -llmdb"
         MAP_LDFLAGS="-lstdc++"
         cadd '#define ON_LINUX  (0)'
         cadd '#define ON_DARWIN (1)'
         cadd '#include "os-darwin.h"'
+        function cpuflag() {
+                sysctl -a | grep machdep.cpu.features | grep -i " $1 " >/dev/null 2>/dev/null && echo "-m$flag"
+        }
         ;;
 esac
 
 case "$platform" in ####################### Darwin x86_64 ######################
-    *Darwin*x86_64*)
+    (*Darwin*x86_64*)
         ;;
 esac
 
-case "$cc" in *gcc*13.1.0*)
+case "$cc" in (*gcc*13.1.0*)
     CFLAGS="$CFLAGS -Wno-stringop-overflow -Wno-array-bounds"
 esac
 
-case "$cc" in *gcc*)
+case "$cc" in (*gcc\ version*)
     cadd '#include "cc-gcc.h"'
 esac
 
-case "$cc" in *clang*)
+case "$cc" in (*clang*)
     cadd '#include "cc-clang.h"'
-    OPTFLAGS="-O3"
+    OPTFLAGS="-O3 -Ofast"
     CFLAGS="$CFLAGS -Wno-assume"
     MAP_CFLAGS="$MAP_CFLAGS -std=gnu++11"
 esac
+
+for flag in $MFLAGS ;do
+    OPTFLAGS="$OPTFLAGS $(cpuflag $flag)"
+done
 
 function run() {
     echo "$* "
@@ -86,27 +113,27 @@ lmdb=0
 map=0
 while [ $# != 0 ] ;do
       case "$1" in
-          '-o')
+          ('-o')
               options="$options $2"
               shift
-      ;;  '-u')
+      ;;  ('-u')
 	      runut=1
-      ;;  '-r')
+      ;;  ('-r')
 	      rocksdb=1
-      ;;  '-l')
+      ;;  ('-l')
 	      lmdb=1
-      ;;  '-m')
+      ;;  ('-m')
 	      map=1
-      ;;  '-f')
+      ;;  ('-f')
 	      options="$options nodebug nocounters opt"
-      ;;  '-d')
+      ;;  ('-d')
 	      options="$options debug counters noopt profile"
-      ;;  '-D')
+      ;;  ('-D')
 	      CFLAGS="$CFLAGS -D$2"
 	      shift
-      ;;  '-b')
+      ;;  ('-b')
 	      runbn=1
-      ;;  *)
+      ;;  (*)
 	      echo "Unknown argument $1"
 	      exit 1
       esac
@@ -115,25 +142,25 @@ done
 
 for o in $options ;do
     case $o in 
-       *profile*)
+       (*profile*)
         LDFLAGS="$LDFLAGS -lprofiler"
-    ;; *nodebug*)
+    ;; (*nodebug*)
        cundef DEBUG
        cadd '#define DEBUG  (0)'
-    ;; *debug*)
+    ;; (*debug*)
        cundef DEBUG
        cadd '#define DEBUG  (1)'
-    ;; *nocounters*)
+    ;; (*nocounters*)
        cundef COUNTERS
        cadd '#define COUNTERS  (0)'
-    ;; *counters*)
+    ;; (*counters*)
        cundef COUNTERS
        cadd '#define COUNTERS  (1)'
-    ;; *noopt*)
+    ;; (*noopt*)
        CFLAGS="$CFLAGS -O0"
-    ;; *opt*)
+    ;; (*opt*)
        CFLAGS="$CFLAGS $OPTFLAGS"
-    ;; *)
+    ;; (*)
        echo "Unknown option '$o'"
        exit 1
     esac       
