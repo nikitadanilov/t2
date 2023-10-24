@@ -476,19 +476,15 @@ enum ext_id {
 };
 
 struct node {
-        union {
-                struct {
-                        struct cds_hlist_node hash;
-                        taddr_t               addr;
-                };
-                struct cds_list_head          free;
-        };
+        struct cds_hlist_node      hash;
+        taddr_t                    addr;
         uint64_t                   flags;
         uint64_t                   seq;
         atomic_int                 ref;
         const struct t2_node_type *ntype;
         void                      *data;
         struct t2                 *mod;
+        struct cds_list_head       free;
         struct radixmap           *radix;
         lsn_t                      lsn;
         uint64_t                   cookie;
@@ -615,20 +611,24 @@ enum dir {
         RIGHT = +1
 };
 
+struct aba_item {
+        void *next;
+};
+
+struct aba_head {
+        uintptr_t        gen;
+        struct aba_item *ptr;
+};
+
 struct magazine {
-        struct magazine *next;
+        struct aba_item  next;
         int              used;
         void            *unit[0];
 };
 
-struct aba_ptr {
-        uintptr_t  gen;
-        void      *ptr;
-};
-
 struct stash {
-        alignas(MAX_CACHELINE) _Atomic(struct aba_ptr) empty;
-        alignas(MAX_CACHELINE) _Atomic(struct aba_ptr) inhab;
+        alignas(MAX_CACHELINE) _Atomic(struct aba_head) empty;
+        alignas(MAX_CACHELINE) _Atomic(struct aba_head) inhab;
         int                                            nr;
         int                                            size;
 };
@@ -853,6 +853,8 @@ static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn)
 static void *mem_alloc(size_t size);
 static void *mem_alloc_align(size_t size, int alignment);
 static void  mem_free(void *ptr);
+static void aba_put(_Atomic(struct aba_head) *head, struct aba_item *data);
+static struct aba_item *aba_get(_Atomic(struct aba_head) *head);
 static uint64_t now(void);
 static struct timespec *deadline(uint64_t sec, uint64_t nsec, struct timespec *out);
 static int32_t max_32(int32_t a, int32_t b);
@@ -3462,27 +3464,13 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
 
 /* @stash */
 
-static void mag_put(_Atomic(struct aba_ptr) *head, struct magazine *mag) {
-        struct aba_ptr item;
-        struct aba_ptr top = atomic_load(head);
-        do { /* atomic_compare_exchange_weak() updates "top" on failure. */
-                mag->next = top.ptr;
-                item.gen  = top.gen + 1;
-                item.ptr  = mag;
-        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, item)));
+static void mag_put(_Atomic(struct aba_head) *head, struct magazine *mag) {
+        aba_put(head, &mag->next);
 }
 
-static struct magazine *mag_get(_Atomic(struct aba_ptr) *head) {
-        struct aba_ptr item;
-        struct aba_ptr top = atomic_load(head);
-        do {
-                if (top.ptr == NULL) {
-                        return NULL;
-                }
-                item.gen = top.gen + 1;
-                item.ptr = ((struct magazine *)top.ptr)->next;
-        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, item)));
-        return top.ptr;
+static struct magazine *mag_get(_Atomic(struct aba_head) *head) {
+        struct aba_item *item = aba_get(head);
+        return COF(item, struct magazine, next);
 }
 
 static void mag_free(struct magazine *mag) {
@@ -3644,6 +3632,29 @@ static void *mem_alloc(size_t size) {
 
 static void mem_free(void *ptr) {
         free(ptr);
+}
+
+static void aba_put(_Atomic(struct aba_head) *head, struct aba_item *data) {
+        struct aba_head new;
+        struct aba_head top = atomic_load(head);
+        do { /* atomic_compare_exchange_weak() updates "top" on failure. */
+                data->next = top.ptr;
+                new.gen  = top.gen + 1;
+                new.ptr  = data;
+        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, new)));
+}
+
+static struct aba_item *aba_get(_Atomic(struct aba_head) *head) {
+        struct aba_head new;
+        struct aba_head top = atomic_load(head);
+        do {
+                if (top.ptr == NULL) {
+                        return NULL;
+                }
+                new.gen = top.gen + 1;
+                new.ptr = top.ptr->next;
+        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, new)));
+        return top.ptr;
 }
 
 static uint64_t now(void) {
@@ -4336,6 +4347,7 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
                 n = COF(free->head.next, struct node, free);
                 cds_list_del(&n->free);
                 --free->nr;
+                mutex_unlock(&free->lock);
                 CINC(alloc_pool);
                 NCALL(n, fini(n));
                 cookie_invalidate(&n->cookie);
@@ -4347,8 +4359,8 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
                 }
         } else {
                 --free->avail;
+                mutex_unlock(&free->lock);
         }
-        mutex_unlock(&free->lock);
         return n;
 }
 
@@ -5231,8 +5243,8 @@ enum {
         WAL_SYNC_AGE         = BILLION, /* Nanoseconds. */
         WAL_SYNC_NOB         = 1ull << 9,  /* Measured in buffers. */
         WAL_PAGE_SYNC_NOB    = 1ull << 5,
-        WAL_MAX_LOG          = 1ull << 11, /* Measured in buffers. TODO: Make this a parameter. */
-        WAL_RESERVE_QUANTUM  = 10
+        WAL_MAX_LOG          = 1ull << 14, /* Measured in buffers. TODO: Make this a parameter. */
+        WAL_RESERVE_QUANTUM  = 64
 };
 
 static lsn_t wal_log_free(const struct wal_te *en) {
