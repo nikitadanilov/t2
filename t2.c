@@ -3,6 +3,7 @@
 /* Copyright 2023 Nikita Danilov <danilov@gmail.com> */
 /* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for the licencing information. */
 
+#define _GNU_SOURCE
 #include <stdbool.h>
 #include <assert.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 #include <sys/uio.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <dlfcn.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -3981,13 +3983,49 @@ static __thread int insigsegv = 0;
 static struct sigaction osa = {};
 static int signal_set = 0;
 
-static void stacktrace() {
-        int    size;
-        void  *tracebuf[512];
-
-        size = backtrace(tracebuf, ARRAY_SIZE(tracebuf));
-        backtrace_symbols_fd(tracebuf, size, 1);
+static void frame_dladdr(void *addr) {
+        Dl_info info;
+        dladdr(addr, &info);
+        if (info.dli_sname != NULL) {
+                printf("%s+%#lx ", info.dli_sname, addr - info.dli_saddr);
+        }
+        if (info.dli_fname != NULL) {
+                printf("(%s) ", info.dli_fname);
+        }
 }
+
+static void frame_backtrace(void *addr) {
+        backtrace_symbols_fd(&addr, 1, 1);
+}
+
+#if ON_DARWIN
+static void stacktrace() {
+        void  *tracebuf[512];
+        int    size = backtrace(tracebuf, ARRAY_SIZE(tracebuf));
+        for (int i = 0; i < size; ++i) {
+                printf("%03d: %08#x ", i, tracebuf[i]);
+                frame_dladdr(tracebuf[i]);
+                frame_backtrace(tracebuf[i]);
+        }
+}
+#elif ON_LINUX
+#define UNW_LOCAL_ONLY
+#include <libunwind.h>
+static void stacktrace() {
+        unw_cursor_t  cursor;
+        unw_context_t context;
+        unw_getcontext(&context);
+        unw_init_local(&cursor, &context);
+        for (int i = 0; unw_step(&cursor) > 0; ++i) {
+                unw_word_t offset;
+                unw_word_t pc;
+                char       name[128] = {};
+                unw_get_reg(&cursor, UNW_REG_IP, &pc);
+                unw_get_proc_name(&cursor, name, sizeof(name), &offset);
+                printf("%03d: %08lx: %s+%#08x\n", i, (long)pc, name, (unsigned)offset);
+    }
+}
+#endif
 
 static void sigsegv(int signo, siginfo_t *si, void *uctx) {
         volatile jmp_buf *buf = addr_check.buf;
@@ -5785,6 +5823,7 @@ static void wal_fini(struct t2_te *engine) {
         NOFAIL(pthread_cond_destroy(&en->bufwrite));
         NOFAIL(pthread_cond_destroy(&en->bufwait));
         NOFAIL(pthread_cond_destroy(&en->logwait));
+        NOFAIL(pthread_mutex_destroy(&en->lock));
         stash_fini(&en->stash);
         mem_free(en);
 }

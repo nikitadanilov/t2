@@ -2,7 +2,7 @@
 
 echo > config.h
 platform="$(uname -srm)"
-LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -latomic -rdynamic"
+LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -latomic -ldl -lunwind -rdynamic"
 CC=${CC:-cc}
 CPP=${CPP:-c++}
 CFLAGS="-I/usr/local/include -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
