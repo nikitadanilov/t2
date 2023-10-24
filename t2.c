@@ -5738,7 +5738,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
                 wal_page_sync(en);
                 ++done;
         }
-        if (false && done < max && allowed&BUF_CLOSE && UNLIKELY(en->cur != NULL && READ_ONCE(en->mod->tick) - en->cur_age > WAL_AGE_LIMIT && en->cur->used > 1)) {
+        if (done < max && allowed&BUF_CLOSE && UNLIKELY(en->cur != NULL && READ_ONCE(en->mod->tick) - en->cur_age > WAL_AGE_LIMIT && en->cur->used > 1)) {
                 if (LIKELY(wal_log_free(en) > wal_log_need(en))) {
                         wal_buf_end(en);
                         CINC(wal_cur_aged);
