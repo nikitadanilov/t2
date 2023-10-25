@@ -518,7 +518,8 @@ struct page {
 enum rung_flags {
         PINNED = 1ull << 0,
         ALUSED = 1ull << 1,
-        SEPCHG = 1ull << 2
+        SEPCHG = 1ull << 2,
+        DELDEX = 1ull << 3
 };
 
 enum policy_id {
@@ -1734,6 +1735,14 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
         return n;
 }
 
+static struct node *tryget(struct t2 *mod, taddr_t addr) {
+        struct node *n = look(mod, addr);
+        if (n == NULL) {
+                n = get(mod, addr);
+        }
+        return n;
+}
+
 static struct node *alloc(struct t2_tree *t, int8_t level, struct mod *cap) {
         struct t2           *mod   = t->ttype->mod;
         struct t2_node_type *ntype = t->ttype->ntype(t, level);
@@ -2113,14 +2122,15 @@ static int split_right_exec_delete(struct path *p, int idx) {
         }
         if (right != NULL && can_merge(r->page.node, right)) {
                 ASSERT(nr(right) > 0);
-                NOFAIL(merge(&r->page, brother(r, RIGHT), LEFT)); /* TODO: deallocate the empty node. */
+                NOFAIL(merge(&r->page, brother(r, RIGHT), LEFT));
                 ASSERT(nr(r->page.node) > 0);
                 EXPENSIVE_ASSERT(is_sorted(r->page.node));
+                r->flags |= DELDEX;
                 r->flags &= ~SEPCHG;
                 result = +1;
         } else if (UNLIKELY(nr(r->page.node) == 0)) {
                 ASSERT(utmost_path(p, idx, RIGHT));
-                return +1;
+                result = +1;
         }
         return result;
 }
@@ -2234,7 +2244,11 @@ static void path_fini(struct path *p) {
                 struct page *right = brother(r, RIGHT);
                 if (UNLIKELY(right->node != NULL)) {
                         touch_unlock(right->node, right->lm);
-                        put(right->node);
+                        if (UNLIKELY(r->flags & DELDEX)) {
+                                dealloc(right->node);
+                        } else {
+                                put(right->node);
+                        }
                 }
                 touch_unlock(r->page.node, r->page.lm);
                 if (UNLIKELY(left->node != NULL)) {
@@ -2406,7 +2420,7 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
         }
         ASSERT(r->page.lm == NONE || r->page.lm == mode);
         r->page.lm = mode;
-        down = internal_child(r->page.node, r->pos + d, false); /* TODO: this calls get(), which is optimised for node non-existence. */
+        down = internal_child(r->page.node, r->pos + d, false);
         while (down != NULL && EISOK(down)) {
                 r = &p->rung[++i];
                 ASSERT(r->page.lm == NONE || r->page.lm == mode);
@@ -4742,7 +4756,7 @@ static taddr_t internal_get(const struct node *n, int32_t pos) {
 }
 
 static struct node *internal_child(const struct node *n, int32_t pos, bool peekp) {
-        return (peekp ? peek : get)(n->mod, internal_get(n, pos));
+        return (peekp ? peek : tryget)(n->mod, internal_get(n, pos));
 }
 
 static int leaf_search(struct node *n, struct path *p, struct slot *s) {
