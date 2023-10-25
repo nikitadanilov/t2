@@ -380,6 +380,7 @@ struct node_type_ops {
         void    (*delete)    (struct slot *, struct mod *);
         void    (*get)       (struct slot *);
         int     (*load)      (struct node *);
+        bool    (*check)     (struct node *);
         void    (*make)      (struct node *, struct mod *);
         void    (*print)     (struct node *);
         void    (*fini)      (const struct node *n);
@@ -904,6 +905,7 @@ static void simple_delete(struct slot *s, struct mod *mod);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n, struct mod *mod);
 static int simple_load(struct node *n);
+static bool simple_check(struct node *n);
 static bool simple_search(struct node *n, struct path *p, struct slot *out);
 static int32_t simple_nr(const struct node *n);
 static int32_t simple_free(const struct node *n);
@@ -1666,6 +1668,15 @@ static void ndelete(struct node *n) {
         mutex_unlock(lock);
 }
 
+static bool ncheck(struct node *n) {
+        struct header *h = nheader(n);
+        return  h->magix == NODE_MAGIX &&
+                IS_IN(h->ntype, n->mod->ntypes) &&
+                n->mod->ntypes[h->ntype] != NULL &&
+                n->mod->ntypes[h->ntype]->shift == taddr_sshift(n->addr) &&
+                0 <= h->level && h->level < MAX_TREE_HEIGHT;
+}
+
 static int readdata(struct node *n) {
         struct iovec io = { .iov_base = n->data, .iov_len = taddr_ssize(n->addr) };
         node_state_print(n, 'R');
@@ -1698,10 +1709,8 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                 if (LIKELY(n->ntype == NULL)) {
                         int result = readdata(n);
                         if (LIKELY(result == 0)) {
-                                struct header *h = nheader(n);
-                                /* TODO: check node. */
-                                if (LIKELY(IS_IN(h->ntype, n->mod->ntypes) && n->mod->ntypes[h->ntype] != NULL &&
-                                           n->mod->ntypes[h->ntype]->shift == taddr_sshift(addr))) {
+                                if (LIKELY(NCALL(n, check(n)) && addr != 0)) {
+                                        struct header *h = nheader(n);
                                         rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                         CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
                                         node_seq_increase(n);
@@ -1929,7 +1938,6 @@ static void internal_parent_rec(struct path *p, int idx) {
         SLOT_DEFINE(s, r->page.node);
         int32_t       maxlen;
         int32_t       keylen;
-        ASSERT(nr(r->page.node) > 0);
         ASSERT(r->allocated.node != NULL);
         rec_todo(p, idx, &s);
         maxlen = buf_len(s.rec.key);
@@ -4925,6 +4933,10 @@ static void simple_make(struct node *n, struct mod *mod) {
 
 static int simple_load(struct node *n) {
         return 0;
+}
+
+static bool simple_check(struct node *n) {
+        return ncheck(n);
 }
 
 static int32_t simple_nr(const struct node *n) {
