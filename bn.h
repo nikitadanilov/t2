@@ -180,6 +180,7 @@ struct kvdata {
                         struct t2_cursor     c;
                         void                *cur;
                         struct t2_tx        *tx;
+                        struct t2_cookie     kookie;
                 } t2;
         } u;
 };

@@ -847,6 +847,7 @@ static bool stress(struct freelist *free, int *pressure);
 static int val_copy(struct t2_rec *r, struct node *n, struct slot *s);
 static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin);
 static void buf_clip_node(struct t2_buf *b, const struct node *n);
+static bool node_seq_is_valid(const struct node *n, uint64_t expected);
 static taddr_t internal_search(struct node *n, struct path *p, int32_t *pos);
 static taddr_t internal_get(const struct node *n, int32_t pos);
 static struct node *internal_child(const struct node *n, int32_t pos, bool peek);
@@ -1391,87 +1392,6 @@ static void rec_delete(struct node *n, int32_t idx, struct mod *mod) {
 static void rec_get(struct slot *s, int32_t idx) {
         s->idx = idx;
         NCALL(s->node, get(s));
-}
-
-static int cookie_node_complete(struct t2_tree *t, struct path *p, struct node *n, enum optype opt) {
-        struct t2_rec *r = p->rec;
-        int            result;
-        bool           found;
-        SLOT_DEFINE(s, n);
-        rec_get(&s, 0);
-        if (buf_cmp(s.rec.key, r->key) > 0) {
-                return -ESTALE;
-        }
-        rec_get(&s, nr(n) - 1);
-        if (buf_cmp(s.rec.key, r->key) < 0) {
-                return -ESTALE;
-        }
-        found = leaf_search(n, p, &s);
-        switch (opt) {
-        case LOOKUP:
-                result = found ? val_copy(r, n, &s) : -ENOENT;
-                break;
-        case INSERT:
-                if (!found) {
-                        result = rec_insert(n, s.idx + 1, r, NULL); /* TODO: Update modification tracking. */
-                        if (result == -ENOSPC) {
-                                result = -ESTALE;
-                        }
-                } else {
-                        result = -EEXIST;
-                }
-                break;
-        case DELETE:
-                if (found) {
-                        if (keep(n)) {
-                                rec_delete(n, s.idx, NULL);
-                                result = 0;
-                        } else {
-                                result = -ESTALE;
-                        }
-                } else {
-                        result = -ENOENT;
-                }
-                break;
-        case NEXT:
-                result = -ESTALE;
-                break; /* TODO: implement. */
-        default:
-                IMMANENTISE("Wrong opt: %i", opt);
-        }
-        return result;
-}
-
-static int cookie_try(struct path *p) {
-        return -ESTALE; /* Cookies do not seem to be very useful. */
-        enum lock_mode mode = p->opt == LOOKUP || p->opt == NEXT ? READ : WRITE;
-        struct t2_rec *r    = p->rec;
-        ASSERT(p->used == -1);
-        rcu_lock();
-        if (cookie_is_valid(&r->cookie)) {
-                struct node *n = COF(r->cookie.hi, struct node, cookie);
-                if (is_leaf(n) && nr(n) > 0) { /* TODO: More checks? */
-                        int result;
-                        rcu_leave(p, n);
-                        lock(n, mode); /* TODO: Lock-less lookup. */
-                        if (LIKELY(!rcu_try(p, n))) {
-                                /* TODO: Re-check node. */
-                                result = cookie_node_complete(p->tree, p, n, p->opt);
-                                if (result == 0) {
-                                        dirty(NULL, NULL); /* TODO: Modification tracking. */
-                                        /* TODO: Add to the transaction. */
-                                }
-                                touch_unlock(n, mode);
-                                put(n);
-                                return result;
-                        } else {
-                                touch_unlock(n, mode);
-                                return -ESTALE;
-                        }
-                }
-        }
-        rcu_unlock();
-        return -ESTALE;
 }
 
 static uint64_t node_seq(const struct node *n) {
@@ -2860,12 +2780,89 @@ static int traverse(struct path *p) {
 #undef COMPLETE
 }
 
+static int cookie_node_complete(struct path *p, struct node *n) {
+        struct t2_rec *r      = p->rec;
+        struct rung   *rung   = &p->rung[0];
+        int            result = -ESTALE;
+        bool           found;
+        SLOT_DEFINE(s, n);
+        rec_get(&s, 0);
+        buf_clip_node(s.rec.key, n);
+        if (buf_cmp(s.rec.key, r->key) > 0) {
+                return -ESTALE;
+        }
+        rec_get(&s, nr(n) - 1);
+        buf_clip_node(s.rec.key, n);
+        if (buf_cmp(s.rec.key, r->key) < 0) {
+                return -ESTALE;
+        }
+        found = leaf_search(n, p, &s);
+        switch (p->opt) {
+        case LOOKUP:
+                result = found ? val_copy(r, n, &s) : -ENOENT;
+                if (!node_seq_is_valid(n, rung->page.seq)) { /* No need to run full path_is_valid(). */
+                        result = -ESTALE;
+                }
+                break;
+        case INSERT:
+        case DELETE:
+                if (found == (p->opt == DELETE)) {
+                        rcu_leave(p, NULL);
+                        lock(n, WRITE);
+                        result = traverse_complete(p, 0);
+                        if (LIKELY(result == DONE)) {
+                                if (p->opt == INSERT) {
+                                        result = rec_insert(n, s.idx + 1, r, &rung->page.mod);
+                                        if (result == -ENOSPC) {
+                                                result = -ESTALE;
+                                        }
+                                } else {
+                                        rec_delete(n, s.idx, &rung->page.mod);
+                                        result = 0;
+                                }
+                                if (result == 0) {
+                                        path_txadd(p);
+                                }
+                                rcu_lock();
+                        } else {
+                                result = -ESTALE;
+                        }
+                        unlock(n, WRITE);
+                } else {
+                        result = p->opt == INSERT ? -EEXIST : -ENOENT;
+                }
+                break;
+        case NEXT:
+                break; /* TODO: implement. */
+        default:
+                IMMANENTISE("Wrong opt: %i", p->opt);
+        }
+        return result;
+}
+
+static int cookie_try(struct path *p) {
+        struct t2_rec *r      = p->rec;
+        int            result = -ESTALE;
+        ASSERT(p->used == -1);
+        rcu_lock();
+        if (cookie_is_valid(&r->cookie)) {
+                struct node *n = COF(r->cookie.hi, struct node, cookie);
+                if (is_leaf(n)) { /* TODO: More checks? */
+                        path_add(p, n, 0);
+                        result = cookie_node_complete(p, n);
+                        path_fini(p);
+                }
+        }
+        rcu_unlock();
+        return result;
+}
+
 static int traverse_result(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx, enum optype opt) {
         int         result;
         struct path p = {};
         counters_check();
         path_init(&p, t, r, tx, opt);
-        result = cookie_try(&p);
+        result = -ESTALE; /* cookie_try(&p); --- cookies are not efficient, until right delimiting key is known. */
         if (result == -ESTALE) {
                 CINC(cookie_miss);
                 result = TIMED(traverse(&p), t->ttype->mod, time_traverse);
