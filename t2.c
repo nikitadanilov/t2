@@ -1737,6 +1737,10 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
 
 static struct node *tryget(struct t2 *mod, taddr_t addr) {
         struct node *n = look(mod, addr);
+        if (LIKELY(n != NULL) && UNLIKELY(rcu_dereference(n->ntype) == NULL)) {
+                put(n);
+                n = NULL;
+        }
         if (n == NULL) {
                 n = get(mod, addr);
         }
@@ -2812,11 +2816,11 @@ static int traverse(struct path *p) {
                 if (is_leaf(n)) {
                         if (p->opt == LOOKUP) {
                                 result = COMPLETE(lookup_complete(p, n));
-                                if (!path_is_valid(p)) {
-                                        path_reset(p);
-                                } else {
+                                if (LIKELY(path_is_valid(p))) {
                                         rcu_unlock();
                                         break;
+                                } else {
+                                        path_reset(p);
                                 }
                         } else if (p->opt == INSERT) {
                                 rcu_leave(p, NULL);
