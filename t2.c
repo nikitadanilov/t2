@@ -190,6 +190,12 @@ enum {
         __a < __b ? __a : __b;                  \
 })
 
+#define CONCAT_INNER(a, b) a ## b
+#define CONCAT(a, b) CONCAT_INNER(a, b)
+
+#define STRINGIFY_INNER(x) #x
+#define STRINGIFY(x) STRINGIFY_INNER(x)
+
 #define SLOT_DEFINE(s, n)                                               \
         struct t2_buf __key;                                            \
         struct t2_buf __val;                                            \
@@ -241,10 +247,11 @@ enum {
         __stor->op->method(__stor , ##  __VA_ARGS__);   \
 })
 
-#define DEFAULT_FORMAT (1)
+#define HAS_DEFAULT_FORMAT (1)
+#define DEFAULT_FORMAT lazy
 
-#if DEFAULT_FORMAT
-#define NCALL(n, ...) ((void)(n), simple_ ## __VA_ARGS__)
+#if HAS_DEFAULT_FORMAT
+#define NCALL(n, ...) ((void)(n), CONCAT(CONCAT(DEFAULT_FORMAT, _), __VA_ARGS__))
 #else
 #define NCALL(n, ...) ((n)->ntype->ops-> __VA_ARGS__)
 #endif
@@ -383,13 +390,12 @@ struct node_type_ops {
         bool    (*check)     (struct node *);
         void    (*make)      (struct node *, struct mod *);
         void    (*print)     (struct node *);
-        void    (*fini)      (const struct node *n);
+        void    (*fini)      (struct node *n);
         bool    (*search)    (struct node *n, struct path *p, struct slot *out);
         bool    (*can_merge) (const struct node *n0, const struct node *n1);
         int     (*can_insert)(const struct slot *s);
         int32_t (*nr)        (const struct node *n);
         int32_t (*free)      (const struct node *n);
-        int32_t (*used)      (const struct node *n);
 };
 
 enum t2_initialisation_stage {
@@ -485,6 +491,7 @@ struct node {
         const struct t2_node_type *ntype;
         void                      *data;
         struct t2                 *mod;
+        void                      *typedata;
         struct cds_list_head       free;
         struct radixmap           *radix;
         lsn_t                      lsn;
@@ -917,6 +924,20 @@ static bool simple_can_merge(const struct node *n0, const struct node *n1);
 static void simple_fini(struct node *n);
 static void simple_print(struct node *n);
 static bool simple_invariant(const struct node *n);
+static int lazy_insert(struct slot *s, struct mod *mod);
+static void lazy_delete(struct slot *s, struct mod *mod);
+static void lazy_get(struct slot *s);
+static int lazy_load(struct node *n);
+static bool lazy_check(struct node *n);
+static void lazy_make(struct node *n, struct mod *mod);
+static void lazy_print(struct node *n);
+static void lazy_fini(struct node *n);
+static bool lazy_search(struct node *n, struct path *p, struct slot *out);
+static int32_t lazy_free(const struct node *n);
+static int32_t lazy_used(const struct node *n);
+static bool lazy_can_merge(const struct node *n0, const struct node *n1);
+static int lazy_can_insert(const struct slot *s);
+static int32_t lazy_nr (const struct node *n);
 static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 static int shift(struct page *d, struct page *s, const struct slot *insert, enum dir dir);
 static int merge(struct page *d, struct page *s, enum dir dir);
@@ -947,6 +968,8 @@ static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
 static void wal_pulse   (struct t2 *mod);
 static void mod_print(const struct mod *mod);
+static void mod_init(struct mod *cap, uint32_t size);
+static void page_mod_init(struct page *g, struct t2_tx *tx);
 static void counters_check();
 static void counters_print();
 static void counters_clear();
@@ -1007,6 +1030,7 @@ static __thread volatile struct {
         volatile jmp_buf *buf;
 } addr_check = {};
 static struct node_type_ops simple_ops;
+static struct node_type_ops lazy_ops;
 static char *argv0;
 
 static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stage stage) {
@@ -1264,7 +1288,9 @@ struct t2_node_type *t2_node_type_init(int16_t id, const char *name, int shift, 
                 nt->id    = id;
                 nt->name  = name;
                 nt->shift = shift;
-                nt->ops   = &simple_ops;
+                nt->ops   = &lazy_ops;
+                (void)simple_ops;
+                (void)lazy_ops;
         }
         return nt;
 }
@@ -1635,7 +1661,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                         rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                         CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
                                         node_seq_increase(n);
-                                        NCALL(n, load(n));
+                                        NCALL(n, load(n)); /* TODO: Handle errors. */
                                         EXPENSIVE_ASSERT(is_sorted(n));
                                 } else {
                                         result = ERROR(-ESTALE);
@@ -1684,6 +1710,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level, struct mod *cap) {
                                 .treeid = t->id
                         };
                         n->ntype = ntype;
+                        mod_init(cap, nsize(n));
                         NCALL(n, make(n, cap));
                         unlock(n, WRITE);
                         node_state_print(n, 'a');
@@ -1761,11 +1788,11 @@ static int32_t nsize(const struct node *n) {
 
 static void rcu_lock() {
         urcu_memb_read_lock();
-        COUNTERS_ASSERT(CVAL(rcu) == 0);
         CINC(rcu);
 }
 
 static void rcu_unlock() {
+        COUNTERS_ASSERT(CVAL(rcu) > 0);
         CDEC(rcu);
         urcu_memb_read_unlock();
 }
@@ -2291,10 +2318,17 @@ static bool rung_is_valid(const struct path *p, int i) {
         return is_valid;
 }
 
-static void page_mod_init(struct page *g) {
-        int32_t start = nsize(g->node);
-        for (int i = 0; i < ARRAY_SIZE(g->mod.ext); ++i) {
-                g->mod.ext[i] = (struct ext) { .start = start, .end = 0 };
+static void mod_init(struct mod *cap, uint32_t size) {
+        for (int i = 0; i < ARRAY_SIZE(cap->ext); ++i) {
+                struct ext *e = &cap->ext[i];
+                ASSERT(IS0(e));
+                *e = (struct ext) { .start = size, .end = 0 };
+        }
+}
+
+static void page_mod_init(struct page *g, struct t2_tx *tx) {
+        if (TRANSACTIONS && tx != NULL) {
+                mod_init(&g->mod, nsize(g->node));
         }
 }
 
@@ -2346,10 +2380,13 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
         r->page.lm = mode;
         down = internal_child(r->page.node, r->pos + d, false);
         while (down != NULL && EISOK(down)) {
+                struct page *sibling;
                 r = &p->rung[++i];
                 ASSERT(r->page.lm == NONE || r->page.lm == mode);
                 r->page.lm = mode;
-                *brother(r, d) = (struct page) { .node = down, .lm = mode, .seq = node_seq(down) };
+                sibling = brother(r, d);
+                *sibling = (struct page) { .node = down, .lm = mode, .seq = node_seq(down) };
+                page_mod_init(sibling, p->tx);
                 if (i == idx) {
                         break;
                 }
@@ -2377,9 +2414,7 @@ static int insert_prep(struct path *p) {
         do {
                 struct rung *r = &p->rung[idx];
                 r->page.lm = WRITE;
-                if (TRANSACTIONS && p->tx != NULL) {
-                        page_mod_init(&r->page);
-                }
+                page_mod_init(&r->page, p->tx);
                 if (can_insert(r->page.node, rec) && !should_split(r->page.node)) {
                         break;
                 } else {
@@ -2414,6 +2449,7 @@ static int delete_prep(struct path *p) {
         do {
                 struct rung *r = &p->rung[idx];
                 r->page.lm = WRITE;
+                page_mod_init(&r->page, p->tx);
                 if (keep(r->page.node)) {
                         break;
                 } else {
@@ -3229,6 +3265,23 @@ static void writeout(struct t2 *mod) {
         } while (scan != 0);
 }
 
+/* Called after recovery to check and load all nodes. */
+static int cache_load(struct t2 *mod) {
+        for (int32_t scan = 0; scan < (1 << mod->ht.shift); ++scan) {
+                struct cds_hlist_head *head = &mod->ht.buckets[scan].chain;
+                struct node           *n;
+                cds_hlist_for_each_entry_2(n, head, hash) {
+                        if (n->flags & DIRTY) {
+                                if (!NCALL(n, check(n))) {
+                                        return ERROR(-EIO);
+                                }
+                                NCALL(n, load(n)); /* TODO: Check for errors. */
+                        }
+                }
+        }
+        return 0;
+}
+
 enum { PULSE_TICK = BILLION / 100 };
 
 static void *pulse(void *arg) {
@@ -3559,7 +3612,7 @@ static void stash_put(struct stash_local *sl, void *unit) {
                 if (UNLIKELY(mag == NULL)) {
                         mag = mag_init(s);
                         if (UNLIKELY(mag == NULL)) {
-                                LOG("Stash failure."); /* TODO: Handle allocation failure. */
+                                mem_free(unit);
                                 return;
                         }
                 }
@@ -3705,7 +3758,15 @@ static void llog(const struct msg_ctx *ctx, ...) {
         puts("");
 }
 
-static int32_t min_32(int32_t a, int32_t b) {  /* Hacker's Delight. */
+static int16_t min_16(int16_t a, int16_t b) { /* Hacker's Delight. */
+        return b + ((a - b) & ((a - b) >> 31));
+}
+
+static int16_t max_16(int16_t a, int16_t b) {
+        return a - ((a - b) & ((a - b) >> 31));
+}
+
+static int32_t min_32(int32_t a, int32_t b) {
         return b + ((a - b) & ((a - b) >> 31));
 }
 
@@ -4394,6 +4455,7 @@ static void pool_clean(struct t2 *mod) {
                 while (!cds_list_empty(&free->head)) {
                         struct node *n = COF(free->head.next, struct node, free);
                         cds_list_del(&n->free);
+                        NCALL(n, fini(n));
                         NOFAIL(pthread_rwlock_destroy(&n->lock));
                         mem_free(n->radix);
                         mem_free(n->data);
@@ -4620,7 +4682,8 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         bool            found = false;
         struct sheader *sh    = simple_header(n);
         int             l     = -1;
-        int             delta = nr(n) + 1;
+        int32_t         nr    = simple_nr(n);
+        int             delta = nr + 1;
         void           *kaddr = rec->key->addr;
         int32_t         klen  = rec->key->len;
         int             cmp   = -1;
@@ -4632,25 +4695,25 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         ASSERT(((uint64_t)sh & mask) == 0);
         EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         CINC(l[lev].search);
-        CMOD(l[lev].nr,          nr(n));
-        CMOD(l[lev].free,        NCALL(n, free(n)));
+        CMOD(l[lev].nr,          nr);
+        CMOD(l[lev].free,        simple_free(n));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
         DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
-        if (UNLIKELY(nr(n) == 0)) {
+        if (UNLIKELY(nr == 0)) {
                 goto here;
         } else if (LIKELY(n->radix != NULL && n->radix->prefix.len != -1)) {
                 int16_t ch;
                 plen = n->radix->prefix.len;
                 cmp = memcmp(n->radix->prefix.addr, kaddr, min_32(plen, klen)) ?: klen < plen ? +1 : 0;
                 if (UNLIKELY(cmp != 0)) {
-                        l = cmp > 0 ? -1 : nr(n) - 1;
+                        l = cmp > 0 ? -1 : nr - 1;
                         goto here;
                 }
                 ch = LIKELY(klen > plen) ? ((uint8_t *)kaddr)[plen] : -1;
                 l     = n->radix->idx[ch].l;
                 delta = n->radix->idx[ch].delta;
                 CMOD(l[lev].radixmap_left,  l + 1);
-                CMOD(l[lev].radixmap_right, nr(n) - l - delta);
+                CMOD(l[lev].radixmap_right, nr - l - delta);
                 if (UNLIKELY(l < 0)) {
                         goto here;
                 }
@@ -4661,8 +4724,8 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                         found = true;
                         goto here;
                 }
-                l = max_32(min_32(nr(n) - 1, l), -1);
-                delta = min_32(delta, nr(n) - l);
+                l = max_32(min_32(nr - 1, l), -1);
+                delta = min_32(delta, nr - l);
         }
         CMOD(l[lev].search_span, delta);
         span = 1 << ilog2(delta);
@@ -4718,7 +4781,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                 val->addr = sval(sh, l, &val->len);
                 buf_clip(val, mask, sh);
                 CMOD(l[lev].keysize, key->len);
-                CMOD(l[lev].valsize, key->len);
+                CMOD(l[lev].valsize, val->len);
         }
         return found;
 }
@@ -4974,15 +5037,21 @@ static void range_print(void *orig, int32_t nsize, void *start, int32_t nob) {
         printf("]");
 }
 
+static void header_print(struct node *n) {
+        struct header *h = nheader(n);
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64"\n",
+               n->addr, h->treeid, h->level, h->ntype,
+               nr(n), nsize(n), n, n->ref, n->flags, n->lsn);
+}
+
 static void simple_print(struct node *n) {
         int32_t         size = nsize(n);
         struct sheader *sh   = simple_header(n);
         if (n == NULL) {
                 printf("nil node");
         }
-        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u dir_off: %u dir_end: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64"\n",
-               n->addr, sh->head.treeid, sh->head.level, sh->head.ntype,
-               sh->nr, size, sh->dir_off, sdirend(sh), n, n->ref, n->flags, n->lsn);
+        header_print(n);
+        printf("    dir_off: %u dir_end: %u\n", sh->dir_off, sdirend(sh));
         for (int32_t i = 0; i <= sh->nr; ++i) {
                 struct dir_element *del = sat(sh, i);
                 printf("        %4u %4u %4u: ", i, del->koff, del->voff);
@@ -5000,6 +5069,24 @@ static void simple_print(struct node *n) {
                 printf("\n");
         }
 }
+
+static void nprint(struct node *n) {
+        int32_t size = nsize(n);
+        SLOT_DEFINE(s, n);
+        header_print(n);
+        for (int32_t i = 0; i < nr(n); ++i) {
+                rec_get(&s, i);
+                printf("        %4u %4lu %4lu: ", i, s.rec.key->addr - n->data, s.rec.val->addr - n->data);
+                range_print(n->data, size, s.rec.key->addr, s.rec.key->len);
+                printf(" ");
+                range_print(n->data, size, s.rec.val->addr, s.rec.val->len);
+                if (!is_leaf(n)) {
+                        printf("    (%p)", peek(n->mod, internal_get(n, i)));
+                }
+                printf("\n");
+        }
+}
+
 
 static void buf_print(const struct t2_buf *b) {
         range_print(b->addr, b->len, b->addr, b->len);
@@ -5067,8 +5154,538 @@ static struct node_type_ops simple_ops = {
         .can_merge  = &simple_can_merge,
         .can_insert = &simple_can_insert,
         .nr         = &simple_nr,
-        .free       = &simple_free,
-        .used       = &simple_used,
+        .free       = &simple_free
+};
+
+/* @lazy */
+
+enum {
+        LREC_FREE = -1
+};
+
+struct lheader {
+        struct header head;
+        int32_t       nr;
+};
+
+struct lrec {
+        int16_t vlen;
+        int16_t klen;
+};
+
+struct piece {
+        int32_t off;
+        int16_t len;
+};
+
+struct collect {
+        struct node *node; /* To avoid using non-standard qsort_r(). */
+        struct piece key;
+        struct piece val;
+};
+
+struct ldir {
+        int32_t       nr;
+        int32_t       cap;
+        int32_t       free;
+        int32_t       vend;
+        int32_t       kend;
+        struct piece *val;
+        struct piece  key[0];
+};
+
+static int32_t lvlen(struct lrec *rec) {
+        return rec->vlen >= 0 ? rec->vlen : LREC_FREE - rec->vlen;
+}
+
+static struct lrec *lnext(struct lrec *rec) {
+        return (void *)(rec + 1) + lvlen(rec);
+}
+
+static int lcmp(const void *a0, const void *a1) {
+        const struct collect *c0   = a0;
+        const struct collect *c1   = a1;
+        int16_t               size = min_16(c0->key.len, c1->key.len);
+        return memcmp(c0->node->data + c0->key.off, c0->node->data + c1->key.off, size) ?: int32_cmp(c0->key.len, c1->key.len);
+}
+
+enum {
+        CAP_MIN = 16,
+        HSIZE   = SOF(struct lheader),
+        RSIZE   = SOF(struct lrec)
+};
+
+static struct lheader *lheader(struct node *n) {
+        return n->data;
+}
+
+static int32_t lnr(const struct node *n) {
+        return lheader((void *)n)->nr;
+}
+
+static bool lazy_invariant(const struct node *n) {
+        struct ldir *d   = n->typedata;
+        int32_t size     = nsize(n);
+        int32_t vcur     = HSIZE;
+        int32_t kcur     = size;
+        int32_t nr       = 0;
+        if (d->nr > d->cap) {
+                return false;
+        }
+        for (int32_t i = 0; i < lnr(n); ++i) {
+                struct lrec *rec = n->data + vcur;
+                vcur += RSIZE;
+                kcur -= rec->klen;
+                if (!(HSIZE <= vcur && vcur <= kcur && kcur <= size)) {
+                        printf("Order at %i.\n", i);
+                        return false;
+                }
+                if (rec->vlen >= 0) {
+                        if (!EXISTS(j, d->nr, d->key[j].off == kcur && d->val[j].off == vcur &&
+                                    d->val[j].len == rec->vlen && d->key[j].len == rec->klen)) {
+                                printf("Match at %i.\n", i);
+                                return false;
+                        }
+                        ++nr;
+                }
+                vcur += lvlen(rec);
+        }
+        return d->nr == nr && d->vend == vcur && d->kend == kcur;
+}
+
+static int lazy_parse(struct node *n) {
+        int32_t         size = nsize(n);
+        int32_t         free = size - HSIZE;
+        int32_t         nr   = lnr(n);
+        struct lrec    *rec;
+        struct collect *set;
+        struct ldir    *dir;
+        struct piece   *val;
+        int32_t         cap;
+        int             result;
+        ASSERT(free >= 0);
+        cap = max_32(CAP_MIN, nr + nr / 2); /* TODO: Take free into account? */
+        dir = mem_alloc(sizeof *dir + cap * sizeof dir->key[0]);
+        val = mem_alloc(sizeof val[0] * cap);
+        set = mem_alloc(sizeof set[0] * nr);
+        if (dir != NULL && val != NULL && set != NULL) {
+                int32_t i;
+                int32_t here = 0;
+                int32_t kcur = size;
+                int32_t vcur = HSIZE;
+                for (rec = (void *)(lheader(n) + 1), i = 0; i < nr; rec = lnext(rec), ++i) {
+                        kcur -= rec->klen;
+                        vcur += RSIZE;
+                        if (rec->vlen >= 0) {
+                                set[here++] = (struct collect){
+                                        .node = n,
+                                        .val  = { .len = rec->vlen, .off = vcur },
+                                        .key  = { .len = rec->klen, .off = kcur }
+                                };
+                                free -= RSIZE + rec->vlen + rec->klen;
+                        }
+                        vcur += lvlen(rec);
+                }
+                qsort(set, here, sizeof set[0], &lcmp);
+                dir->cap  = cap;
+                dir->nr   = here;
+                dir->free = free;
+                dir->val  = val;
+                dir->vend = vcur;
+                dir->kend = kcur;
+                for (i = 0; i < here; ++i) {
+                        dir->key[i] = set[i].key;
+                        dir->val[i] = set[i].val;
+                }
+                n->typedata = dir;
+                mem_free(set);
+                result = 0;
+                ASSERT(lazy_invariant(n));
+        } else {
+                mem_free(dir);
+                mem_free(val);
+                mem_free(set);
+                result = ERROR(-ENOMEM);
+        }
+        return result;
+}
+
+static void lmove(void *start, void *end, int32_t shift) {
+        memmove(start + shift, start, end - start);
+}
+
+static int lazy_grow(struct node *n, int32_t idx) {
+        struct ldir  *d   = n->typedata;
+        int32_t       cap = max_32(CAP_MIN, d->cap + d->cap / 2);
+        struct ldir  *dir = mem_alloc(sizeof *dir + cap * sizeof dir->key[0]);
+        struct piece *val = mem_alloc(sizeof val[0] * cap);
+        ASSERT(lazy_invariant(n));
+        if (dir != NULL && val != NULL) {
+                *dir = *d;
+                dir->cap = cap;
+                dir->val = val;
+                memmove(dir->key, d->key, idx * sizeof d->key[0]);
+                memmove(dir->val, d->val, idx * sizeof d->val[0]);
+                memmove(&dir->key[idx + 1], &d->key[idx], (d->nr - idx) * sizeof d->key[0]);
+                memmove(&dir->val[idx + 1], &d->val[idx], (d->nr - idx) * sizeof d->val[0]);
+                mem_free(d);
+                n->typedata = dir;
+                ++dir->nr;
+                return 0;
+        } else {
+                urcu_memb_synchronize_rcu();
+                mem_free(dir);
+                mem_free(val);
+                return ERROR(-ENOMEM);
+        }
+}
+
+static int lazy_compact(struct node *n, struct mod *mod) {
+        int32_t      size    = nsize(n);
+        struct ldir *d       = n->typedata;
+        void        *scratch = mem_alloc(size);
+        int32_t      vcur    = HSIZE;
+        int32_t      kcur    = size;
+        ASSERT(lazy_invariant(n));
+        if (scratch != NULL) {
+                for (int32_t i = 0; i < d->nr; ++i) {
+                        *(struct lrec *)(scratch + vcur) = (struct lrec){ .vlen = d->val[i].len, .klen = d->key[i].len };
+                        kcur -= d->key[i].len;
+                        vcur += RSIZE;
+                        memcpy(scratch + vcur, n->data + d->val[i].off, d->val[i].len);
+                        memcpy(scratch + kcur, n->data + d->key[i].off, d->key[i].len);
+                        d->val[i].off = vcur;
+                        d->key[i].off = kcur;
+                        vcur += d->val[i].len;
+                }
+                memcpy(n->data + HSIZE, scratch + HSIZE, size - HSIZE);
+                mem_free(scratch);  /* We could just replaced n->data with scratch, but let's keep ->data constant. */
+                d->vend = vcur;
+                d->kend = kcur;
+                ext_merge(&mod->ext[VAL], HSIZE, vcur);
+                ext_merge(&mod->ext[KEY], kcur, nsize(n));
+                lheader(n)->nr = d->nr;
+                ext_merge(&mod->ext[HDR], offsetof(struct lheader, nr), HSIZE);
+                ASSERT(lazy_invariant(n));
+                return 0;
+        } else {
+                return ERROR(-ENOMEM);
+        }
+}
+
+static int lazy_insert(struct slot *s, struct mod *mod) {
+        int          idx  = s->idx;
+        struct node *n    = s->node;
+        struct ldir *d    = n->typedata;
+        int32_t      klen = buf_len(s->rec.key);
+        int32_t      vlen = buf_len(s->rec.val);
+        int16_t      incr = klen + vlen + RSIZE;
+        int32_t      kend;
+        int32_t      vend;
+        int          result;
+        ASSERT(idx <= d->nr);
+        ASSERT(lazy_invariant(n));
+        if (d->free < incr) {
+                return -ENOSPC;
+        }
+        if (d->kend - d->vend < incr) {
+                result = lazy_compact(n, mod);
+                if (UNLIKELY(result != 0)) {
+                        return ERROR(result);
+                }
+        }
+        ASSERT(d->kend - d->vend >= incr);
+        if (d->nr == d->cap) {
+                result = lazy_grow(n, idx);
+                if (UNLIKELY(result != 0)) {
+                        return ERROR(result);
+                }
+                d = n->typedata;
+        } else {
+                memmove(&d->key[idx + 1], &d->key[idx], (d->nr - idx) * sizeof d->key[0]);
+                memmove(&d->val[idx + 1], &d->val[idx], (d->nr - idx) * sizeof d->val[0]);
+                ++d->nr;
+        }
+        kend = d->kend - klen;
+        *(struct lrec *)(n->data + d->vend) = (struct lrec){ .klen = klen, .vlen = vlen };
+        vend = d->vend + RSIZE;
+        d->key[idx] = (struct piece){ .off = kend, .len = klen };
+        d->val[idx] = (struct piece){ .off = vend, .len = vlen };
+        memcpy(n->data + kend, s->rec.key->addr, klen);
+        memcpy(n->data + vend, s->rec.val->addr, vlen);
+        ext_merge(&mod->ext[VAL], d->vend, vend + vlen);
+        ext_merge(&mod->ext[KEY], kend, d->kend);
+        d->vend = vend + vlen;
+        d->kend = kend;
+        d->free -= incr;
+        ++lheader(n)->nr;
+        ext_merge(&mod->ext[HDR], offsetof(struct lheader, nr), HSIZE);
+        ASSERT(lazy_invariant(n));
+        return 0;
+}
+
+static void lazy_delete(struct slot *s, struct mod *mod) {
+        int          idx = s->idx;
+        struct node *n   = s->node;
+        struct ldir *d   = n->typedata;
+        struct lrec *rec = n->data + d->val[idx].off - RSIZE;
+        ASSERT(s->idx < d->nr);
+        ASSERT(lazy_invariant(n));
+        d->free += d->val[idx].len + d->key[idx].len + RSIZE;
+        rec->vlen = LREC_FREE - d->val[idx].len;
+        ext_merge(&mod->ext[VAL], (void *)rec - n->data, (void *)rec - n->data + sizeof rec->vlen);
+        if (false && d->key[idx].off == d->kend) {
+                d->kend += d->key[idx].len;
+                d->vend -= d->val[idx].len + RSIZE;
+                --lheader(n)->nr;
+                ext_merge(&mod->ext[HDR], offsetof(struct lheader, nr), HSIZE);
+        }
+        memmove(&d->key[idx], &d->key[idx + 1], (d->nr - idx - 1) * sizeof d->key[0]);
+        memmove(&d->val[idx], &d->val[idx + 1], (d->nr - idx - 1) * sizeof d->val[0]);
+        --d->nr;
+        ASSERT(lazy_invariant(n));
+}
+
+#define LDIR(n) ((struct ldir *)rcu_dereference(n->typedata))
+
+static void lazy_get(struct slot *s) {
+        struct node *n   = s->node;
+        int          idx = s->idx;
+        struct ldir *d;
+        rcu_lock();
+        d = LDIR(n);
+        s->rec.key->addr = n->data + d->key[idx].off;
+        s->rec.key->len  = d->key[idx].len;
+        s->rec.val->addr = n->data + d->val[idx].off;
+        s->rec.val->len  = d->val[idx].len;
+        rcu_unlock();
+}
+
+static int lazy_load(struct node *n) {
+        return LIKELY(n->typedata == NULL) ? lazy_parse(n) : 0;
+}
+
+static bool lazy_check(struct node *n) {
+        return ncheck(n);
+}
+
+static void lazy_make(struct node *n, struct mod *mod) {
+        lheader(n)->nr = 0;
+        if (TRANSACTIONS) {
+                mod->ext[HDR].start = 0;
+                mod->ext[HDR].end = HSIZE;
+        }
+        int result = lazy_parse(n); /* TODO: Handle errors properly. */
+        ASSERT(result == 0);
+        ASSERT(lazy_invariant(n));
+}
+
+static void lazy_print(struct node *n) {
+        int32_t         size = nsize(n);
+        struct ldir    *d    = n->typedata;
+        struct header  *head = nheader(n);
+        int32_t         i;
+        struct lrec    *rec;
+        int32_t         vcur;
+        int32_t         kcur;
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u vend: %u kend: %u free: %u cap: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64"\n",
+               n->addr, head->treeid, head->level, head->ntype,
+               lnr(n), size, d->vend, d->kend, d->free, d->cap, n, n->ref, n->flags, n->lsn);
+        vcur = HSIZE;
+        kcur = size;
+        for (rec = (void *)(lheader(n) + 1), i = 0; i < lnr(n); rec = lnext(rec), ++i) {
+                kcur -= rec->klen;
+                printf("        %4d %4d %4d: ", i, vcur, kcur);
+                if (rec->vlen >= 0) {
+                        printf("[%4d %4d] ", rec->klen, rec->vlen);
+                        range_print(n->data, size, n->data + kcur, rec->klen);
+                        printf(" ");
+                        range_print(n->data, size, n->data + RSIZE + vcur, rec->vlen);
+                } else {
+                        printf("[%4d %4d] FREE", lvlen(rec), rec->klen);
+                }
+                printf("\n");
+                vcur += RSIZE + lvlen(rec);
+        }
+}
+
+static void lazy_fini(struct node *n) {
+        struct ldir *d = n->typedata;
+        SET0(nheader(n));
+        if (d != NULL) {
+                n->typedata = NULL;
+                mem_free(d->val);
+                mem_free(d);
+        }
+}
+
+static int lkeycmp(struct node *n, struct ldir *d, int32_t idx, int32_t prefix, void *key, int32_t klen, uint32_t mask) {
+        int32_t koff  = (d->key[idx].off + prefix) & mask;
+        int16_t ksize = min_32((d->key[idx].len - prefix) & mask, mask + 1 - koff);
+        klen -= prefix;
+        return memcmp(n->data + koff, key + prefix, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
+}
+
+static bool lazy_search(struct node *n, struct path *p, struct slot *out) {
+        struct t2_rec  *rec   = p->rec;
+        bool            found = false;
+        int             l     = -1;
+        void           *kaddr = rec->key->addr;
+        int32_t         klen  = rec->key->len;
+        int             cmp   = -1;
+        uint32_t        mask  = nsize(n) - 1;
+        int32_t         plen  = 0;
+        int32_t         span;
+        int32_t         nr;
+        int             delta;
+        struct ldir    *d;
+        uint8_t __attribute__((unused)) lev = level(n);
+        ASSERT((nsize(n) & mask) == 0);
+        ASSERT(((uint64_t)n->data & mask) == 0);
+        EXPENSIVE_ASSERT(scheck(sh, n->ntype));
+        CINC(l[lev].search);
+        CMOD(l[lev].free,        lazy_free(n));
+        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
+        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
+        rcu_lock();
+        d = LDIR(n);
+        nr = d->nr;
+        delta = nr + 1;
+        CMOD(l[lev].nr, nr);
+        if (UNLIKELY(nr == 0)) {
+                goto here;
+        } else if (LIKELY(n->radix != NULL && n->radix->prefix.len != -1)) {
+                int16_t ch;
+                plen = n->radix->prefix.len;
+                cmp = memcmp(n->radix->prefix.addr, kaddr, min_32(plen, klen)) ?: klen < plen ? +1 : 0;
+                if (UNLIKELY(cmp != 0)) {
+                        l = cmp > 0 ? -1 : nr - 1;
+                        goto here;
+                }
+                ch = LIKELY(klen > plen) ? ((uint8_t *)kaddr)[plen] : -1;
+                l     = n->radix->idx[ch].l;
+                delta = n->radix->idx[ch].delta;
+                CMOD(l[lev].radixmap_left,  l + 1);
+                CMOD(l[lev].radixmap_right, nr - l - delta);
+                if (UNLIKELY(l < 0)) {
+                        goto here;
+                }
+                cmp = lkeycmp(n, d, l, plen, kaddr, klen, mask);
+                if (cmp > 0) {
+                        l--;
+                } else if (cmp == 0) {
+                        found = true;
+                        goto here;
+                }
+                l = max_32(min_32(nr - 1, l), -1);
+                delta = min_32(delta, nr - l);
+        }
+        CMOD(l[lev].search_span, delta);
+        span = 1 << ilog2(delta);
+        if (span != delta && lkeycmp(n, d, l + span, plen, kaddr, klen, mask) <= 0) {
+                l += delta - span;
+        }
+#define RANGE(x, prefetchp)                                                  \
+        case 1 << (x):                                                       \
+                span >>= 1;                                                  \
+                if (prefetchp) {                                             \
+                        __builtin_prefetch(&d->key[l + span + (span >> 1)]); \
+                        __builtin_prefetch(&d->key[l + span - (span >> 1)]); \
+                }                                                            \
+                cmp = lkeycmp(n, d, l + span, plen, kaddr, klen, mask);      \
+                if (cmp <= 0) {                                              \
+                        l += span;                                           \
+                        if (cmp == 0) {                                      \
+                                found = true;                                \
+                                goto here;                                   \
+                        }                                                    \
+                }                                                            \
+                __attribute__((fallthrough));
+        switch (span) {
+        default:
+                IMMANENTISE("Impossible span: %i.", span);
+                RANGE(16,  true)
+                RANGE(15,  true)
+                RANGE(14,  true)
+                RANGE(13,  true)
+                RANGE(12,  true)
+                RANGE(11,  true)
+                RANGE(10,  true)
+                RANGE( 9,  true)
+                RANGE( 8,  true)
+                RANGE( 7,  true)
+                RANGE( 6,  true)
+                RANGE( 5,  true)
+                RANGE( 4, false)
+                RANGE( 3, false)
+                RANGE( 2, false)
+                RANGE( 1, false)
+        case 1:
+                ;
+        }
+#undef RANGE
+ here:
+        out->idx = l;
+        if (0 <= l && l < nr) {
+                struct t2_buf *key  = out->rec.key;
+                struct t2_buf *val  = out->rec.val;
+                void          *orig = n->data;
+                key->addr = orig + d->key[l].off;
+                key->len  = d->key[l].len;
+                buf_clip(key, mask, orig);
+                val->addr = orig + d->val[l].off;
+                val->len  = d->val[l].len;
+                buf_clip(val, mask, orig);
+                CMOD(l[lev].keysize, key->len);
+                CMOD(l[lev].valsize, val->len);
+        }
+        rcu_unlock();
+        return found;
+}
+
+static int32_t lazy_free(const struct node *n) {
+        struct ldir *d = n->typedata;
+        return d->free;
+}
+
+static int32_t lazy_used(const struct node *n) {
+        int32_t used;
+        rcu_lock();
+        used = nsize(n) - HSIZE - LDIR(n)->free;
+        rcu_unlock();
+        return used;
+}
+
+static bool lazy_can_merge(const struct node *n0, const struct node *n1) {
+        return lazy_used(n0) + lazy_used(n1) <= nsize(n0) - HSIZE;
+}
+
+static int lazy_can_insert(const struct slot *s) {
+        return lazy_free(s->node) >= rec_len(&s->rec) + RSIZE;
+}
+
+static int32_t lazy_nr (const struct node *n) {
+        int32_t nr;
+        rcu_lock();
+        nr = LDIR(n)->nr;
+        rcu_unlock();
+        return nr;
+}
+
+static struct node_type_ops lazy_ops = {
+        .insert     = &lazy_insert,
+        .delete     = &lazy_delete,
+        .get        = &lazy_get,
+        .load       = &lazy_load,
+        .check      = &lazy_check,
+        .make       = &lazy_make,
+        .print      = &lazy_print,
+        .fini       = &lazy_fini,
+        .search     = &lazy_search,
+        .can_merge  = &lazy_can_merge,
+        .can_insert = &lazy_can_insert,
+        .nr         = &lazy_nr,
+        .free       = &lazy_free,
 };
 
 /* @wal */
@@ -5973,6 +6590,7 @@ static int wal_buf_replay(struct wal_te *en, void *space, int len) {
                                         n->flags |= DIRTY;
                                         t2_lsnset((void *)n, lsn);
                                 }
+                                ASSERT(ncheck(n));
                                 unlock(n, WRITE);
                                 put(n);
                         } else {
@@ -6118,7 +6736,10 @@ static int wal_recover(struct wal_te *en) {
                         if (buf != NULL) {
                                 result = wal_index_replay(en, buf_nr, index, last.start, last.end, buf);
                                 if (result == 0) {
-                                        wal_recovery_done(en, last.start, last.end);
+                                        result = cache_load(en->mod);
+                                        if (result == 0) {
+                                                wal_recovery_done(en, last.start, last.end);
+                                        }
                                 }
                                 mem_free(buf);
                         } else {
@@ -6595,14 +7216,13 @@ void bn_counters_fold(void) {
 }
 
 static bool is_sorted(struct node *n) {
-        struct sheader *sh = simple_header(n);
         SLOT_DEFINE(ss, n);
         char   *keyarea = NULL;
         int32_t keysize = 0;
-        for (int32_t i = 0; i < sh->nr; ++i) {
+        for (int32_t i = 0; i < nr(n); ++i) {
                 rec_get(&ss, i);
                 if (i > 0) {
-                        int cmp = skeycmp(sh, i, 0, keyarea, keysize, nsize(n) - 1);
+                        int cmp = memcmp(ss.rec.key->addr, keyarea, MIN(ss.rec.key->len, keysize)) ?: int32_cmp(ss.rec.key->len, keysize);
                         if (cmp <= 0) {
                                 printf("Misordered at %i: ", i);
                                 range_print(keyarea, keysize,
@@ -6612,7 +7232,7 @@ static bool is_sorted(struct node *n) {
                                             ss.rec.key->addr,
                                             ss.rec.key->len);
                                 printf("\n");
-                                simple_print(n);
+                                nprint(n);
                                 return false;
                         }
                 }
@@ -6670,7 +7290,7 @@ static void buf_init_str(struct t2_buf *b, const char *s) {
 
 static struct t2_node_type ntype = {
         .id    = 8,
-        .name  = "simple-ut",
+        .name  = "ut-ntype",
         .shift = 9
 };
 
@@ -6722,7 +7342,8 @@ static void simple_ut() {
         radixmap_update(&n);
         utest("get");
         for (int32_t i = 0; i < sh->nr; ++i) {
-                rec_get(&s, i);
+                s.idx = i;
+                simple_get(&s);
                 ASSERT(buf_len(s.rec.key) == (int32_t)strlen(key0) + 1);
                 ASSERT(buf_len(s.rec.val) == (int32_t)strlen(val0) + 1);
         }
@@ -6734,7 +7355,7 @@ static void simple_ut() {
                 ASSERT(sh->nr == i);
         }
         s.idx = 0;
-        while (nr(&n) > 0) {
+        while (simple_nr(&n) > 0) {
                 simple_delete(&s, &m);
                 radixmap_update(&n);
         }
@@ -6744,13 +7365,13 @@ static void simple_ut() {
                 struct path p = { .rec = &s.rec };
                 result = simple_search(&n, &p, &s);
                 ASSERT(!result);
-                ASSERT(-1 <= s.idx && s.idx < nr(&n));
+                ASSERT(-1 <= s.idx && s.idx < simple_nr(&n));
                 s.idx++;
                 key = BUF_VAL(key0);
                 val = BUF_VAL(val0);
                 NOFAIL(simple_insert(&s, &m));
                 radixmap_update(&n);
-                ASSERT(is_sorted(&n));
+                ASSERT(HAS_DEFAULT_FORMAT && strcmp(STRINGIFY(DEFAULT_FORMAT), "simple") == 0 ? is_sorted(&n) : true);
                 key0[1] += 251; /* Co-prime with 256. */
                 if (key0[1] == 'a') {
                         key0[2]++;
@@ -6826,13 +7447,11 @@ static void traverse_ut() {
                 .seq   = 1
         };
         ASSERT(n.data != NULL);
-        struct sheader *sh = simple_header(&n);
-        *sh = (struct sheader) {
-                .head = {
-                        .magix = NODE_MAGIX,
-                        .ntype = ntype.id,
-                        .level = 0,
-                }
+        struct header *h = nheader(&n);
+        *h = (struct header) {
+                .magix = NODE_MAGIX,
+                .ntype = ntype.id,
+                .level = 0,
         };
         char key0[] = "0";
         char val0[] = "+";
@@ -6866,16 +7485,18 @@ static void traverse_ut() {
         buf_init_str(&val, val0);
         n.mod = mod;
         utest("prepare");
-        simple_make(&n, &m);
+        NCALL(&n, make(&n, &m));
         ht_insert(&mod->ht, &n, ht_bucket(&mod->ht, n.addr));
         for (int i = 0; i < 20; ++i, key0[0] += 2) {
                 struct path p = { .rec = &s.rec };
-                result = simple_search(&n, &p, &s);
+                result = NCALL(&n, search(&n, &p, &s));
                 ASSERT(!result);
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
-                NOFAIL(simple_insert(&s, &m));
+                SET0(&m);
+                mod_init(&m, nsize(&n));
+                NOFAIL(NCALL(&n, insert(&s, &m)));
                 radixmap_update(&n);
                 ASSERT(is_sorted(&n));
         }
@@ -6922,7 +7543,7 @@ static void insert_ut() {
                 .val = &val
         };
         int result;
-        struct mod m;
+        struct mod m = {};
         ASSERT(EISOK(mod));
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
@@ -7623,7 +8244,7 @@ enum {
         NR_BUFS    = 200,
         BUF_SIZE   = 1 << 20,
         FLAGS      = 0, /* noforce-nosteal == redo only. */
-        NOPS       = 200000
+        NOPS       = 20000 /* Must fit in the log. */
 };
 
 static const char logname[] = "./log/l";
@@ -7809,8 +8430,6 @@ int main(int argc, char **argv) {
  *
  * - pre-allocated struct path (to reduce stack pressure)
  *
- * - node format that avoids memmove (always add at the end, compact as needed)
- *
  * - balancing policies (per-level?)
  *
  * - check validity of user input (4 records in a node, etc.)
@@ -7820,8 +8439,6 @@ int main(int argc, char **argv) {
  * - avoid dynamic allocations in *_balance(), pre-allocate in *_prepare()
  *
  * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
- *
- * - simple node: store key offsets separately from value offsets
  *
  * Done:
  *
@@ -7852,6 +8469,10 @@ int main(int argc, char **argv) {
  * ! multi-segment buffers
  *
  * + transaction engine hooks
+ *
+ * + node format that avoids memmove (always add at the end, compact as needed)
+ *
+ * ! simple node: store key offsets separately from value offsets
  *
  * References:
  *
