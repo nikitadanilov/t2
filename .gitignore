@@ -1,4 +1,5 @@
-pages.*
+pages/*
+log/*
 bn
 bn.dSYM
 bn.samples
