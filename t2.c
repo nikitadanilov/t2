@@ -2229,7 +2229,7 @@ static void path_fini(struct path *p) {
 static void path_reset(struct path *p) {
         path_fini(p);
         memset(p->rung, 0, sizeof p->rung);
-        SET0(&p->newroot.node);
+        SET0(&p->newroot);
         p->next = p->tree->root;
         CINC(traverse_restart);
 }
@@ -2335,6 +2335,7 @@ static void page_cap_init(struct page *g, struct t2_tx *tx) {
 static void path_add(struct path *p, struct node *n, uint64_t flags) {
         struct rung *r = &p->rung[++p->used];
         ASSERT(IS_IN(p->used + 1, p->rung));
+        ASSERT(IS0(r));
         r->page.node = n;
         r->page.seq  = node_seq(n);
         r->flags     = flags;
@@ -7469,11 +7470,7 @@ static void traverse_ut() {
                 .ttype = &ttype,
                 .root  = addr
         };
-        struct path p = {
-                .tree = &t,
-                .opt  = LOOKUP,
-                .rec  = &s.rec
-        };
+        struct path p = {};
         struct cap m = {};
         int result;
         usuite("traverse");
@@ -7503,22 +7500,27 @@ static void traverse_ut() {
         n.seq = 2;
         utest("existing");
         key0[0] = '0';
-        p.used = -1;
+        SET0(&p);
+        path_init(&p, &t, &s.rec, NULL, LOOKUP);
         NOFAIL(traverse(&p));
         key0[0] = '2';
-        p.used = -1;
+        SET0(&p);
+        path_init(&p, &t, &s.rec, NULL, LOOKUP);
         NOFAIL(traverse(&p));
         key0[0] = '8';
-        p.used = -1;
+        SET0(&p);
+        path_init(&p, &t, &s.rec, NULL, LOOKUP);
         NOFAIL(traverse(&p));
         utest("too-small");
         key0[0] = ' ';
-        p.used = -1;
+        SET0(&p);
+        path_init(&p, &t, &s.rec, NULL, LOOKUP);
         result = traverse(&p);
         ASSERT(result == -ENOENT);
         utest("non-existent");
         key0[0] = '1';
-        p.used = -1;
+        SET0(&p);
+        path_init(&p, &t, &s.rec, NULL, LOOKUP);
         result = traverse(&p);
         ASSERT(result == -ENOENT);
         ht_delete(&n);
