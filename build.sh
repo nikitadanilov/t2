@@ -2,9 +2,9 @@
 
 echo > config.h
 platform="$(uname -srm)"
-LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -latomic -ldl -lunwind -rdynamic"
+LDFLAGS="$LDFLAGS -L/usr/local/lib/ -ltcmalloc -lurcu -lpthread -latomic -ldl -lunwind -rdynamic"
 CC=${CC:-cc}
-CPP=${CPP:-c++}
+CXX=${CXX:-c++}
 CFLAGS="-I/usr/local/include -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
 cc="$($CC -v 2>&1)"
 OPTFLAGS="-O6 -Ofast"
@@ -41,6 +41,7 @@ case "$platform" in ####################### Linux #############################
                         cat /proc/cpuinfo | grep " $flag " >/dev/null 2>/dev/null && echo "-m$flag"
                 fi
         }
+	grep -q Ubuntu /etc/os-release 2>/dev/null && linuxdistro=ubuntu
         ;;
 esac
 
@@ -106,6 +107,30 @@ function run() {
     fi
 }
 
+function setup_prereq() {
+    case "$linuxdistro" in
+	(ubuntu)
+	    sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev
+    ;;  (*)
+	    echo "Unknown linux distro '$linuxdistro'"
+	    exit 1
+    esac
+}
+
+function setup() {
+    setup_prereq
+    echo Installing userspace-rcu
+    run rm -fr userspace-rcu
+    run git clone git://git.liburcu.org/userspace-rcu.git
+    run cd userspace-rcu
+    run ./bootstrap
+    run ./configure
+    run make
+    run sudo make install
+    run cd ..
+    run rm -fr userspace-rcu
+}
+
 runut=0
 runbn=0
 rocksdb=0
@@ -133,6 +158,9 @@ while [ $# != 0 ] ;do
 	      shift
       ;;  ('-b')
 	      runbn=1
+      ;;  ('-S')
+	      setup
+	      exit 0
       ;;  (*)
 	      echo "Unknown argument $1"
 	      exit 1
@@ -181,7 +209,7 @@ else
    BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=0"
 fi
 if [ $map == 1 ] ;then
-   run $CPP $MAP_CFLAGS -c map.cpp -o map.o
+   run $CXX $MAP_CFLAGS -c map.cpp -o map.o
    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=1"
    BN_LDFLAGS="$BN_LDFLAGS map.o $MAP_LDFLAGS"
 else
