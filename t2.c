@@ -248,7 +248,7 @@ enum {
 })
 
 #define HAS_DEFAULT_FORMAT (1)
-#define DEFAULT_FORMAT lazy
+#define DEFAULT_FORMAT simple
 
 #if HAS_DEFAULT_FORMAT
 #define NCALL(n, ...) ((void)(n), CONCAT(CONCAT(DEFAULT_FORMAT, _), __VA_ARGS__))
