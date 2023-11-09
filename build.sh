@@ -8,6 +8,7 @@ CXX=${CXX:-c++}
 CFLAGS="-I/usr/local/include -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
 cc="$($CC -v 2>&1)"
 OPTFLAGS="-O6 -Ofast"
+distro=unknown
 
 function cadd() {
     echo $* >> config.h
@@ -41,7 +42,7 @@ case "$platform" in ####################### Linux #############################
                         cat /proc/cpuinfo | grep " $flag " >/dev/null 2>/dev/null && echo "-m$flag"
                 fi
         }
-	grep -q Ubuntu /etc/os-release 2>/dev/null && linuxdistro=ubuntu
+	grep -q Ubuntu /etc/os-release 2>/dev/null && distro=ubuntu
         ;;
 esac
 
@@ -69,6 +70,7 @@ case "$platform" in ####################### Darwin #############################
         function cpuflag() {
                 sysctl -a | grep machdep.cpu.features | grep -i " $1 " >/dev/null 2>/dev/null && echo "-m$flag"
         }
+	distro=darwin
         ;;
 esac
 
@@ -108,11 +110,13 @@ function run() {
 }
 
 function setup_prereq() {
-    case "$linuxdistro" in
+    case "$distro" in
 	(ubuntu)
-	    sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev
+	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev
+    ;;  (darwin)
+	    run brew install automake autoconf libtool gcc gperftools
     ;;  (*)
-	    echo "Unknown linux distro '$linuxdistro'"
+	    echo "Unknown distro '$distro'"
 	    exit 1
     esac
 }

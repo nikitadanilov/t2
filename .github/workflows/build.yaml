@@ -2,8 +2,11 @@ name: build-test
 run-name: ${{ github.actor }} initiated build
 on: [push]
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-and-ut:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: ./build.sh -S
