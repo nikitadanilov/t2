@@ -2,7 +2,7 @@
 
 echo > config.h
 platform="$(uname -srm)"
-LDFLAGS="$LDFLAGS -L/usr/local/lib/ -ltcmalloc -lurcu -lpthread -latomic -ldl -lunwind -rdynamic"
+LDFLAGS="$LDFLAGS -L/usr/local/lib/ -ltcmalloc -lurcu -lpthread -ldl -lunwind -rdynamic"
 CC=${CC:-cc}
 CXX=${CXX:-c++}
 CFLAGS="-I/usr/local/include -g2 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
@@ -30,7 +30,7 @@ case "$platform" in ####################### Linux #############################
         ROCKSDB_LDFLAGS="-lrocksdb -lsnappy -lz -lbz2 -lzstd -llz4 -ldl -lstdc++"
         LMDB_LDFLAGS="-L/usr/local/lib -llmdb"
         MAP_LDFLAGS="-lstdc++"
-        LDFLAGS="$LDFLAGS -lm"
+        LDFLAGS="$LDFLAGS -lm -latomic"
         cadd '#define ON_LINUX  (1)'
         cadd '#define ON_DARWIN (0)'
         cadd '#include "os-linux.h"'
