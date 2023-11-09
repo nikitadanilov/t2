@@ -386,7 +386,7 @@ struct node_type_ops {
         int     (*insert)    (struct slot *, struct cap *);
         void    (*delete)    (struct slot *, struct cap *);
         void    (*get)       (struct slot *);
-        int     (*load)      (struct node *);
+        int     (*load)      (struct node *, const struct t2_node_type *);
         bool    (*check)     (struct node *);
         void    (*make)      (struct node *, struct cap *);
         void    (*print)     (struct node *);
@@ -913,7 +913,7 @@ static int simple_insert(struct slot *s, struct cap *cap);
 static void simple_delete(struct slot *s, struct cap *cap);
 static void simple_get(struct slot *s);
 static void simple_make(struct node *n, struct cap *cap);
-static int simple_load(struct node *n);
+static int simple_load(struct node *n, const struct t2_node_type *nt);
 static bool simple_check(struct node *n);
 static bool simple_search(struct node *n, struct path *p, struct slot *out);
 static int32_t simple_nr(const struct node *n);
@@ -927,7 +927,7 @@ static bool simple_invariant(const struct node *n);
 static int lazy_insert(struct slot *s, struct cap *cap);
 static void lazy_delete(struct slot *s, struct cap *cap);
 static void lazy_get(struct slot *s);
-static int lazy_load(struct node *n);
+static int lazy_load(struct node *n, const struct t2_node_type *nt);
 static bool lazy_check(struct node *n);
 static void lazy_make(struct node *n, struct cap *cap);
 static void lazy_print(struct node *n);
@@ -1658,11 +1658,11 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                         if (LIKELY(result == 0)) {
                                 if (LIKELY(NCALL(n, check(n)) && addr != 0)) {
                                         struct header *h = nheader(n);
-                                        rcu_assign_pointer(n->ntype, n->mod->ntypes[h->ntype]);
                                         CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
                                         node_seq_increase(n);
-                                        NCALL(n, load(n)); /* TODO: Handle errors. */
+                                        NCALL(n, load(n, mod->ntypes[h->ntype])); /* TODO: Handle errors. */
                                         EXPENSIVE_ASSERT(is_sorted(n));
+                                        rcu_assign_pointer(n->ntype, mod->ntypes[h->ntype]);
                                 } else {
                                         result = ERROR(-ESTALE);
                                 }
@@ -3276,7 +3276,7 @@ static int cache_load(struct t2 *mod) {
                                 if (!NCALL(n, check(n))) {
                                         return ERROR(-EIO);
                                 }
-                                NCALL(n, load(n)); /* TODO: Check for errors. */
+                                NCALL(n, load(n, mod->ntypes[nheader(n)->ntype])); /* TODO: Check for errors. */
                         }
                 }
         }
@@ -5010,7 +5010,7 @@ static void simple_make(struct node *n, struct cap *cap) {
         }
 }
 
-static int simple_load(struct node *n) {
+static int simple_load(struct node *n, const struct t2_node_type *nt) {
         return 0;
 }
 
@@ -5254,8 +5254,8 @@ static bool lazy_invariant(const struct node *n) {
         return d->nr == nr && d->vend == vcur && d->kend == kcur;
 }
 
-static int lazy_parse(struct node *n) {
-        int32_t         size = nsize(n);
+static int lazy_parse(struct node *n, const struct t2_node_type *nt) {
+        int32_t         size = 1 << nt->shift;
         int32_t         free = size - HSIZE;
         int32_t         nr   = lnr(n);
         struct lrec    *rec;
@@ -5301,7 +5301,6 @@ static int lazy_parse(struct node *n) {
                 n->typedata = dir;
                 mem_free(set);
                 result = 0;
-                ASSERT(lazy_invariant(n));
         } else {
                 mem_free(dir);
                 mem_free(val);
@@ -5462,8 +5461,8 @@ static void lazy_get(struct slot *s) {
         rcu_unlock();
 }
 
-static int lazy_load(struct node *n) {
-        return LIKELY(n->typedata == NULL) ? lazy_parse(n) : 0;
+static int lazy_load(struct node *n, const struct t2_node_type *nt) {
+        return LIKELY(n->typedata == NULL) ? lazy_parse(n, nt) : 0;
 }
 
 static bool lazy_check(struct node *n) {
@@ -5476,7 +5475,7 @@ static void lazy_make(struct node *n, struct cap *cap) {
                 cap->ext[HDR].start = 0;
                 cap->ext[HDR].end = HSIZE;
         }
-        int result = lazy_parse(n); /* TODO: Handle errors properly. */
+        int result = lazy_parse(n, n->ntype); /* TODO: Handle errors properly. */
         ASSERT(result == 0);
         ASSERT(lazy_invariant(n));
 }
