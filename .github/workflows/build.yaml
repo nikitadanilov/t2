@@ -8,4 +8,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./build.sh -S
       - run: ./build.sh -d
+      - run: ./ut
 
