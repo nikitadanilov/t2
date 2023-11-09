@@ -3253,7 +3253,7 @@ static void cache_clean(struct t2 *mod) {
 static void writeout(struct t2 *mod) {
         int32_t scan = 0;
         do {
-                struct cds_hlist_head *head = &mod->ht.buckets[scan].chain;
+                struct cds_hlist_head *head = ht_head(&mod->ht, scan);
                 struct node           *n;
                 cds_hlist_for_each_entry_2(n, head, hash) {
                         if (n->flags & DIRTY) {
@@ -3268,7 +3268,7 @@ static void writeout(struct t2 *mod) {
 /* Called after recovery to check and load all nodes. */
 static int cache_load(struct t2 *mod) {
         for (int32_t scan = 0; scan < (1 << mod->ht.shift); ++scan) {
-                struct cds_hlist_head *head = &mod->ht.buckets[scan].chain;
+                struct cds_hlist_head *head = ht_head(&mod->ht, scan);
                 struct node           *n;
                 cds_hlist_for_each_entry_2(n, head, hash) {
                         if (n->flags & DIRTY) {
@@ -4291,7 +4291,7 @@ static void ht_fini(struct ht *ht) {
 
 static void ht_clean(struct ht *ht) {
         for (int i = 0; i < (1 << ht->shift); i++) {
-                struct cds_hlist_head *head = &ht->buckets[i].chain;
+                struct cds_hlist_head *head = ht_head(ht, i);
                 struct node           *scan;
                 struct node           *next;
                 mutex_lock(&ht->bucketlocks[i].lock);
