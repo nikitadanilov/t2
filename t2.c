@@ -4098,7 +4098,7 @@ static void stacktrace() {
         void  *tracebuf[512];
         int    size = backtrace(tracebuf, ARRAY_SIZE(tracebuf));
         for (int i = 0; i < size; ++i) {
-                printf("%03d: %08#x ", i, tracebuf[i]);
+                printf("%03d: %08lx ", i, (long)tracebuf[i]);
                 frame_dladdr(tracebuf[i]);
                 frame_backtrace(tracebuf[i]);
         }
