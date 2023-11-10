@@ -104,7 +104,7 @@ extern uint64_t bn_bolt(const struct t2 *mod);
 extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
 extern void bn_counters_print(struct t2 *mod);
 extern void bn_counters_fold(void);
-extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags);
+extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift);
 
 static struct kv kv[KVNR];
 static enum kvtype kvt = T2;
@@ -664,7 +664,11 @@ static void brun(struct benchmark *b) {
 enum {
         NR_BUFS    = 200,
         BUF_SIZE   = 1 << 20,
-        FLAGS      = 0 /* noforce-nosteal == redo only. */
+        FLAGS      = 0, /* noforce-nosteal == redo only. */
+        WORKERS    = 16,
+        LOG_SHIFT  = 8,
+        MIN_RADIX_LEVEL = 2,
+        MAX_CLUSTER = 256
 };
 
 enum {
@@ -678,7 +682,7 @@ static const char logname[] = "./log/l";
 static bool transactions = false;
 
 static void t_mount(struct benchmark *b) {
-        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE) : NULL;
+        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WORKERS, LOG_SHIFT) : NULL;
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
         bn_ntype_twig     = t2_node_type_init(1, "simple-bn-twig",     shift_twig,     0);
         bn_ntype_leaf     = t2_node_type_init(0, "simple-bn-leaf",     shift_leaf,     0);
@@ -696,6 +700,8 @@ static void t_mount(struct benchmark *b) {
                                                            .te = engine,
                                                            .hshift = ht_shift,
                                                            .cshift = cache_shift,
+                                                           .min_radix_level = MIN_RADIX_LEVEL,
+                                                           .max_cluster = MAX_CLUSTER,
                                                            .ttypes = ttypes,
                                                            .ntypes = ntypes});
         if (b->kv.u.t2.free != 0) {

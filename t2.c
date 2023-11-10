@@ -1160,7 +1160,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         struct pool       *p;
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
         if (conf->hshift <= 0 || conf->cshift <= 0 || conf->min_radix_level < 0 || conf->cache_shepherd_shift < 0 || conf->cache_shepherd_shift > conf->hshift ||
-            conf->max_cluster < 0 || conf->scan_run < 0) {
+            conf->max_cluster <= 0 || conf->scan_run < 0) {
                 return EPTR(-EINVAL);
         }
         mod = mem_alloc(sizeof *mod);
@@ -1181,8 +1181,10 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         NEXT_STAGE(mod, -pthread_mutex_init(&c->lock, NULL), 0);
         NEXT_STAGE(mod, -pthread_create(&mod->pulse, NULL, &pulse, mod), 0);
         NEXT_STAGE(mod, -pthread_cond_init(&c->want, NULL), 0);
-        mod->stor = conf->storage;
-        mod->te   = conf->te;
+        mod->stor            = conf->storage;
+        mod->te              = conf->te;
+        mod->min_radix_level = conf->min_radix_level;
+        c->max_cluster       = conf->max_cluster;
         next_stage(mod, true, FIELDS);
         for (struct t2_node_type **nt = conf->ntypes; *nt != NULL; ++nt) {
                 node_type_register(mod, *nt);
@@ -3277,10 +3279,6 @@ static void node_iovec(struct node *n, struct iovec *v) {
         v->iov_base = n->data;
         v->iov_len  = nsize(n);
 }
-
-enum {
-        MAX_CLUSTER = 256
-};
 
 #define TXA(n, ...) ((n)->mod->te != NULL ? (__VA_ARGS__) : true)
 static int pageout(struct node *n) {
@@ -7023,7 +7021,7 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
 }
 
 #else /* TRANSACTIONS */
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags) {
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift) {
         return NULL; /* TODO: For bn.c. */
 }
 #endif /* TRANSACTIONS */
