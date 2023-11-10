@@ -45,7 +45,6 @@ enum {
         MAX_SEPARATOR_CUT =      10,
         MAX_PREFIX        =      32,
         MAX_ALLOC_BUCKET  =      32,
-        MIN_RADIX_LEVEL   =       2
 };
 
 /* @macro */
@@ -422,6 +421,7 @@ struct t2 {
         struct t2_te                        *te;
         uint64_t                             tick;
         uint64_t                             tick_nr;
+        int                                  min_radix_level;
         struct t2_tree_type                 *ttypes[MAX_TREE_TYPE];
         struct t2_node_type                 *ntypes[MAX_NODE_TYPE];
         struct t2_storage                   *stor;
@@ -1054,6 +1054,25 @@ static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stag
                 return EPTR(__result);                          \
         }                                                       \
 })
+
+enum {
+        DEFAULT_HSHIFT = 22,
+        DEFAULT_CSHIFT = 22,
+        DEFAULT_MIN_RADIX_LEVEL = 2
+};
+
+struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
+        if (param->conf.hshift == 0) {
+                param->conf.hshift = DEFAULT_HSHIFT;
+        }
+        if (param->conf.cshift == 0) {
+                param->conf.cshift = DEFAULT_CSHIFT;
+        }
+        if (param->conf.min_radix_level == 0) {
+                param->conf.min_radix_level = DEFAULT_MIN_RADIX_LEVEL;
+        }
+        return t2_init(&param->conf);
+}
 
 struct t2 *t2_init(const struct t2_conf *conf) {
         int                result;
@@ -1822,7 +1841,7 @@ static void radixmap_update(struct node *n) {
         int32_t          pidx = -1;
         int32_t          plen;
         SLOT_DEFINE(s, n);
-        if (level(n) < MIN_RADIX_LEVEL || is_stable(n)) {
+        if (level(n) < n->mod->min_radix_level || is_stable(n)) {
                 return; /* TODO: Use n->seq and prefix stats to decide. */
         }
         if (UNLIKELY(n->radix == NULL)) {
@@ -7317,7 +7336,7 @@ static struct t2_tree_type ttype = {
 };
 
 static void simple_ut() {
-        struct t2 mod = {};
+        struct t2 mod = { .min_radix_level = DEFAULT_MIN_RADIX_LEVEL };
         struct node n = {
                 .ntype = &ntype,
                 .addr  = taddr_make(0x100000, ntype.shift),
@@ -7450,7 +7469,7 @@ static struct t2_tree_type *ttypes[] = {
         NULL
 };
 
-#define T2_INIT(s, t, h, c, tt, nt) t2_init(&(struct t2_conf) { .storage = s, .te = t, .hshift = h, .cshift = c, .ttypes = tt, .ntypes = nt })
+#define T2_INIT(s, t, h, c, tt, nt) t2_init_with(0, &(struct t2_param) { .conf = { .storage = s, .te = t, .hshift = h, .cshift = c, .ttypes = tt, .ntypes = nt } })
 
 static void traverse_ut() {
         taddr_t addr = taddr_make(0x100000, ntype.shift);
