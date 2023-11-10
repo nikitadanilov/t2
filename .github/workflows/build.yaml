@@ -10,11 +10,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./build.sh -S
-      - run: ./build.sh -d
-      - run: |
-          ulimit -n 32000
-          ulimit -c unlimited
-          export LD_LIBRARY_PATH=/usr/local/lib
-          mkdir pages log
-          ./ut
-
+      - run: ./build.sh -d -u

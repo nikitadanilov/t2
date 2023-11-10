@@ -221,9 +221,14 @@ else
 fi
 run $CC $CFLAGS $BN_CFLAGS bn.c t2.o $BN_LDFLAGS $LDFLAGS -o bn
 if [ $runut == 1 ] ;then
-   ./ut
+    export LD_LIBRARY_PATH=/usr/local/lib
+    run ulimit -n 32000
+    run ulimit -c unlimited
+    run mkdir pages log
+    run ./ut
 fi
 if [ $runbn == 1 ] ;then
-   run rm -fr pages testdb/
-   run ./bn -h22 -n12 -t14 -N16 -kt2 -f '1*10000000*100:insert$rnd1-6/seq0-20;1*10000000*100:lookup$rnd1-6/20;1*10000000*100:delete$rnd1-6'
+    run rm -fr pages log testdb
+    run mkdir pages log
+    run ./bn -h22 -n12 -t14 -N16 -kt2 -f '1*10000000*100:insert$rnd1-6/seq0-20;1*10000000*100:lookup$rnd1-6/20;1*10000000*100:delete$rnd1-6'
 fi
