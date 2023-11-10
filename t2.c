@@ -970,7 +970,7 @@ static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_print   (struct t2_te *engine);
 static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age);
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob);
 static void wal_pulse   (struct t2 *mod);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
@@ -1133,7 +1133,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                                 CONFLICT(flags, "wal_log_nr is not a power of 2.");
                         }
                         te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags, param->wal_workers,
-                                      ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age);
+                                      ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age, param->wal_sync_nob);
                         if (EISERR(te)) {
                                 return EPTR(te);
                         }
@@ -5962,6 +5962,7 @@ struct wal_te {
         int                                    buf_size;
         int                                    buf_size_shift;
         lsn_t                                  log_size;
+        int64_t                                sync_nob;
         int                                    threshold_log_syncd;
         int                                    threshold_log_sync;
         int                                    threshold_paged;
@@ -5985,7 +5986,6 @@ struct wal_te {
 };
 
 enum {
-        WAL_SYNC_NOB         = 1ull << 9,  /* Measured in buffers. */
         WAL_PAGE_SYNC_NOB    = 1ull << 5,
         WAL_MAX_LOG          = 1ull << 14, /* Measured in buffers. TODO: Make this a parameter. */
         WAL_RESERVE_QUANTUM  = 64
@@ -6118,7 +6118,7 @@ static void wal_buf_fini(struct wal_buf *buf) {
 static bool wal_should_sync_log(const struct wal_te *en, uint32_t flags) {
         int threshold = (flags & DAEMON) ? en->threshold_log_syncd : en->threshold_log_sync;
         return  !COND(en->log_syncing, wal_log_already) &&
-                (COND(en->max_written - en->max_synced > WAL_SYNC_NOB, wal_sync_log_head) ||
+                (COND(en->max_written - en->max_synced > en->sync_nob, wal_sync_log_head) ||
                  COND(wal_log_free(en) < wal_log_need(en) + ((threshold * en->log_size) >> 10), wal_sync_log_lo) ||
                  COND(READ_ONCE(en->mod->tick) - en->last_log_sync > en->sync_age, wal_sync_log_time));
 }
@@ -6133,7 +6133,7 @@ static bool wal_should_page(const struct wal_te *en, uint32_t flags) {
 
 static bool wal_should_sync_page(const struct wal_te *en, uint32_t flags) {
         return  !COND(en->page_syncing, wal_page_already) &&
-                (COND(en->max_paged - en->start > wal_log_need(en) + WAL_PAGE_SYNC_NOB, wal_sync_page_nob) ||
+                (COND(en->max_paged - en->start > wal_log_need(en) + en->sync_nob, wal_sync_page_nob) ||
                  COND(READ_ONCE(en->mod->tick) - en->last_page_sync > en->sync_age, wal_sync_page_time));
 }
 
@@ -6586,7 +6586,7 @@ static void wal_fini(struct t2_te *engine) {
         mem_free(en);
 }
 
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age) {
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob) {
         struct wal_te *en     = mem_alloc(sizeof *en);
         pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
         int           *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
@@ -6607,6 +6607,7 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         en->log_shift    = log_shift;
         en->log_sleep    = log_sleep;
         en->sync_age     = sync_age;
+        en->sync_nob     = sync_nob;
         en->base.ante    = &wal_ante;
         en->base.init    = &wal_init;
         en->base.post    = &wal_post;
@@ -7030,7 +7031,7 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
 }
 
 #else /* TRANSACTIONS */
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age) {
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob) {
         return NULL; /* TODO: For bn.c. */
 }
 #endif /* TRANSACTIONS */
@@ -8418,7 +8419,8 @@ enum {
         WAL_WORKERS   = 16,
         WAL_LOG_SHIFT = 8,
         WAL_AGE_LIMIT = BILLION,
-        WAL_SYNC_AGE  = BILLION
+        WAL_SYNC_AGE  = BILLION,
+        WAL_SYNC_NOB  = 1ull << 9
 };
 
 const double WAL_LOG_SLEEP = 1.0;
@@ -8434,13 +8436,13 @@ static void wal_ut() {
         int result;
         usuite("wal");
         utest("init");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB);
         ASSERT(EISOK(engine));
         mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t2_fini(mod);
         utest("tree-create");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB);
         ASSERT(EISOK(engine));
         mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
@@ -8455,7 +8457,7 @@ static void wal_ut() {
         t2_tx_done(mod, tx);
         t2_fini(mod);
         utest("replay-ops");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB);
         ASSERT(EISOK(engine));
         mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
@@ -8491,7 +8493,7 @@ static void wal_ut() {
         t2_fini(mod);
         bn_file_truncate(&file_storage.gen, 0);
         bn_file_truncate(&file_storage.gen, free + (1 << 20));
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB);
         ASSERT(EISOK(engine));
         free0 = free;
         mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
