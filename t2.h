@@ -57,7 +57,6 @@ struct t2_param {
         int            wal_log_nr;
         double         wal_log_sleep;
         double         wal_age_limit;
-        double         wal_idle_limit;
         double         wal_sync_age;
         int64_t        wal_sync_nob;
         int64_t        wal_page_sync_nob;

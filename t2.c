@@ -1079,7 +1079,6 @@ enum {
 
 const double DEFAULT_WAL_LOG_SLEEP   =     1.0;
 const double DEFAULT_WAL_AGE_LIMIT   =     2.0;
-const double DEFAULT_WAL_IDLE_LIMIT  =     0.1;
 const double DEFAULT_WAL_SYNC_AGE    =     1.0;
 
 #define DECIDE(flags, ...) do {                                 \
@@ -1100,7 +1099,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
         if ((param->conf.te != NULL || param->te_type == NULL || strcmp(param->te_type, "wal")) &&
             (param->wal_logname != NULL || param->wal_nr_bufs != 0 || param->wal_buf_size != 0 || param->wal_flags != 0 ||
              param->wal_workers != 0 || param->wal_log_nr != 0 || param->wal_log_sleep != 0 ||
-             param->wal_age_limit != 0 || param->wal_idle_limit != 0 || param->wal_sync_age != 0 || param->wal_sync_nob != 0 ||
+             param->wal_age_limit != 0 || param->wal_sync_age != 0 || param->wal_sync_nob != 0 ||
              param->wal_page_sync_nob != 0 || param->wal_max_log != 0 || param->wal_reserve_quantum != 0 ||
              param->wal_threshold_paged != 0 || param->wal_threshold_page != 0 || param->wal_threshold_log_syncd != 0 || param->wal_threshold_log_sync)) {
                 CONFLICT(flags, "wal parameters set, but transaction engine is not wal or pre-configured.");
@@ -1121,7 +1120,6 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SETIF0DEFAULT(flags, param, wal_log_nr,               DEFAULT_WAL_LOG_NR,                "d");
                         SETIF0DEFAULT(flags, param, wal_log_sleep,            DEFAULT_WAL_LOG_SLEEP,             "f");
                         SETIF0DEFAULT(flags, param, wal_age_limit,            DEFAULT_WAL_AGE_LIMIT,             "f");
-                        SETIF0DEFAULT(flags, param, wal_idle_limit,           DEFAULT_WAL_IDLE_LIMIT,            "f");
                         SETIF0DEFAULT(flags, param, wal_sync_age,             DEFAULT_WAL_SYNC_AGE,              "f");
                         SETIF0DEFAULT(flags, param, wal_sync_nob,             DEFAULT_WAL_SYNC_NOB,              PRId64);
                         SETIF0DEFAULT(flags, param, wal_page_sync_nob,        DEFAULT_WAL_PAGE_SYNC_NOB,         PRId64);
@@ -5986,7 +5984,6 @@ struct wal_te {
 };
 
 enum {
-        WAL_IDLE_LIMIT       = BILLION / 10,
         WAL_SYNC_AGE         = BILLION, /* Nanoseconds. */
         WAL_SYNC_NOB         = 1ull << 9,  /* Measured in buffers. */
         WAL_PAGE_SYNC_NOB    = 1ull << 5,
