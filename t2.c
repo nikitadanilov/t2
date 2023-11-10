@@ -968,7 +968,7 @@ static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_print   (struct t2_te *engine);
 static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags);
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers);
 static void wal_pulse   (struct t2 *mod);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
@@ -1128,7 +1128,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SETIF0DEFAULT(flags, param, wal_threshold_page,       DEFAULT_WAL_THRESHOLD_PAGE,        "d");
                         SETIF0DEFAULT(flags, param, wal_threshold_log_syncd,  DEFAULT_WAL_THRESHOLD_LOG_SYNCD,   "d");
                         SETIF0DEFAULT(flags, param, wal_threshold_log_sync,   DEFAULT_WAL_THRESHOLD_LOG_SYNC,    "d");
-                        te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags);
+                        te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags, param->wal_workers);
                         if (EISERR(te)) {
                                 return EPTR(te);
                         }
@@ -5972,7 +5972,8 @@ struct wal_te {
         struct t2                             *mod;
         int                                    snapshot_hand;
         pthread_t                              log_writer;
-        pthread_t                              worker[WAL_WORKERS];
+        int                                    nr_workers;
+        pthread_t                             *worker;
         const char                            *logname;
         bool                                   recovered;
         int                                    nr_bufs;
@@ -6559,9 +6560,10 @@ static void wal_fini(struct t2_te *engine) {
         NOFAIL(pthread_cond_broadcast(&en->logwait));
         wal_unlock(en);
         pthread_join(en->log_writer, NULL);
-        for (int i = 0; i < ARRAY_SIZE(en->worker); ++i) {
+        for (int i = 0; i < en->nr_workers; ++i) {
                 pthread_join(en->worker[i], NULL);
         }
+        mem_free(en->worker);
         ASSERT(cds_list_empty(&en->inflight));
         if (en->cur != NULL) {
                 wal_buf_fini(en->cur);
@@ -6587,13 +6589,20 @@ static void wal_fini(struct t2_te *engine) {
         mem_free(en);
 }
 
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags) {
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers) {
         struct wal_te *en     = mem_alloc(sizeof *en);
+        pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
         int            result = 0;
         ASSERT(nr_bufs > 0);
-        if (en == NULL) {
+        ASSERT((buf_size & (buf_size - 1)) == 0);
+        ASSERT(workers > 0);
+        if (en == NULL || ws == NULL) {
+                mem_free(en);
+                mem_free(ws);
                 return EPTR(-ENOMEM);
         }
+        en->worker       = ws;
+        en->nr_workers   = workers;
         en->base.ante    = &wal_ante;
         en->base.init    = &wal_init;
         en->base.post    = &wal_post;
@@ -6997,7 +7006,7 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
         en->use_barrier = FORALL(i, ARRAY_SIZE(en->fd), SCALL(mod, same, en->fd[i]));
         result = pthread_create(&en->log_writer, NULL, &wal_log_writer, en);
         if (result == 0) { /* TODO: Fix error cleanup. */
-                for (int i = 0; result == 0 && i < ARRAY_SIZE(en->worker); ++i) {
+                for (int i = 0; result == 0 && i < en->nr_workers; ++i) {
                         result = pthread_create(&en->worker[i], NULL, &wal_worker, en);
                 }
                 if (result == 0) {
@@ -8404,13 +8413,13 @@ static void wal_ut() {
         int result;
         usuite("wal");
         utest("init");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS);
         ASSERT(EISOK(engine));
         mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t2_fini(mod);
         utest("tree-create");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS);
         ASSERT(EISOK(engine));
         mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
@@ -8425,7 +8434,7 @@ static void wal_ut() {
         t2_tx_done(mod, tx);
         t2_fini(mod);
         utest("replay-ops");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP, WAL_WORKERS);
         ASSERT(EISOK(engine));
         mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
@@ -8461,7 +8470,7 @@ static void wal_ut() {
         t2_fini(mod);
         bn_file_truncate(&file_storage.gen, 0);
         bn_file_truncate(&file_storage.gen, free + (1 << 20));
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS);
+        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS, WAL_WORKERS);
         ASSERT(EISOK(engine));
         free0 = free;
         mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
