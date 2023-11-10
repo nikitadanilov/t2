@@ -37,7 +37,6 @@ struct t2_conf {
         int                   scan_run;
         int                   free_hi;
         int                   free_lo;
-        int                   scan_rate_shift;
         struct t2_tree_type **ttypes;
         struct t2_node_type **ntypes;
 };
@@ -206,7 +205,7 @@ enum t2_node_type_flags {
         T2_NT_LEAF     = 1ull << 3
 };
 
-#define T2_FILL(flags, ...) t2_fill((flags), &(struct t2_conf){ __VA_ARGS__ })
+#define T2_INIT_WITH(flags, ...) t2_init_with((flags), &(struct t2_conf){ __VA_ARGS__ })
 
 struct t2 *t2_init_with(uint64_t flags, struct t2_param *param);
 struct t2 *t2_init(const struct t2_conf *conf);

@@ -1062,6 +1062,10 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         struct cache      *c;
         struct pool       *p;
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
+        if (conf->hshift <= 0 || conf->cshift <= 0 || conf->min_radix_level < 0 || conf->cache_shepherd_shift < 0 || conf->cache_shepherd_shift > conf->hshift ||
+            conf->max_cluster < 0 || conf->scan_run < 0) {
+                return EPTR(-EINVAL);
+        }
         mod = mem_alloc(sizeof *mod);
         ca  = mem_alloc(sizeof *ca);
         if (mod == NULL || ca == NULL) {
@@ -1112,7 +1116,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         c->sh_shift = conf->cache_shepherd_shift;
         c->sh = mem_alloc((1 << c->sh_shift) * sizeof c->sh[0]);
         if (next_stage(mod, c->sh != NULL, 0)) {
-                        return EPTR(-ENOMEM);
+                return EPTR(-ENOMEM);
         }
         for (c->sh_nr = 0; c->sh_nr < (1 << c->sh_shift); ++c->sh_nr) {
                 ca = mem_alloc(sizeof *ca);
