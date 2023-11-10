@@ -1053,8 +1053,7 @@ static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stag
         }                                                       \
 })
 
-struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int cshift,
-                   struct t2_tree_type **ttypes, struct t2_node_type **ntypes) {
+struct t2 *t2_init(const struct t2_conf *conf) {
         int                result;
         struct t2         *mod;
         struct daemon_arg *ca;
@@ -1075,29 +1074,29 @@ struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int
         NEXT_STAGE(mod, signal_init(), SIGNAL_INIT);
         c = &mod->cache;
         p = &c->pool;
-        mod->cache.shift = cshift;
+        mod->cache.shift = conf->cshift;
         NEXT_STAGE(mod, -pthread_mutex_init(&c->lock, NULL), 0);
         NEXT_STAGE(mod, -pthread_create(&mod->pulse, NULL, &pulse, mod), 0);
         NEXT_STAGE(mod, -pthread_cond_init(&c->want, NULL), 0);
-        mod->stor = storage;
-        mod->te   = te;
+        mod->stor = conf->storage;
+        mod->te   = conf->te;
         next_stage(mod, true, FIELDS);
-        for (; *ntypes != NULL; ++ntypes) {
-                node_type_register(mod, *ntypes);
+        for (struct t2_node_type **nt = conf->ntypes; *nt != NULL; ++nt) {
+                node_type_register(mod, *nt);
         }
         next_stage(mod, true, NTYPES);
-        for (; *ttypes != NULL; ++ttypes) {
-                tree_type_register(mod, *ttypes);
+        for (struct t2_tree_type **tt = conf->ttypes; *tt != NULL; ++tt) {
+                tree_type_register(mod, *tt);
         }
         next_stage(mod, true, TTYPES);
         for (int i = 0; i < ARRAY_SIZE(p->free); ++i) {
                 NEXT_STAGE(mod, -pthread_mutex_init(&p->free[i].lock, NULL), 0);
                 NEXT_STAGE(mod, -pthread_cond_init(&p->free[i].got, NULL), 0);
                 CDS_INIT_LIST_HEAD(&p->free[i].head);
-                p->free[i].avail = p->free[i].total = 1 << max_32(cshift - i, 0);
+                p->free[i].avail = p->free[i].total = 1 << max_32(conf->cshift - i, 0);
         }
         next_stage(mod, true, POOL);
-        NEXT_STAGE(mod, ht_init(&mod->ht, hshift), HT_INIT);
+        NEXT_STAGE(mod, ht_init(&mod->ht, conf->hshift), HT_INIT);
         NEXT_STAGE(mod, SCALL(mod, init), STORAGE_INIT);
         ca->mod = mod;
         ca->idx = 0;
@@ -1117,7 +1116,7 @@ struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int
                 ca->idx = c->sh_nr;
                 NEXT_STAGE(mod, -pthread_create(&c->sh[c->sh_nr].thread, NULL, &shepherd, ca), 0);
         }
-        NEXT_STAGE(mod, TXCALL(te, init(te, mod)), TX_INIT);
+        NEXT_STAGE(mod, TXCALL(conf->te, init(conf->te, mod)), TX_INIT);
         return mod;
 }
 
@@ -7438,6 +7437,8 @@ static struct t2_tree_type *ttypes[] = {
         NULL
 };
 
+#define T2_INIT(s, t, h, c, tt, nt) t2_init(&(struct t2_conf) { .storage = s, .te = t, .hshift = h, .cshift = c, .ttypes = tt, .ntypes = nt })
+
 static void traverse_ut() {
         taddr_t addr = taddr_make(0x100000, ntype.shift);
         struct node n = {
@@ -7474,7 +7475,7 @@ static void traverse_ut() {
         int result;
         usuite("traverse");
         utest("t2_init");
-        struct t2 *mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         ttype.mod = mod;
         buf_init_str(&key, key0);
@@ -7538,7 +7539,7 @@ static void insert_ut() {
         struct t2_tree t = {
                 .ttype = &ttype
         };
-        struct t2 *mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         struct t2_rec r = {
                 .key = &key,
                 .val = &val
@@ -7578,7 +7579,7 @@ static void tree_ut() {
         uint64_t k64;
         uint64_t v64;
         int result;
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
@@ -7647,7 +7648,7 @@ static void stress_ut() {
         int     result;
         usuite("stress");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
@@ -7737,7 +7738,7 @@ static void delete_ut() {
         int     result;
         usuite("delete");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
@@ -7847,7 +7848,7 @@ static void next_ut() {
         };
         usuite("next");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
@@ -7978,7 +7979,7 @@ void seq_ut() {
         struct t2_tree *t;
         usuite("seq");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
@@ -8120,7 +8121,7 @@ void mt_ut() {
         int     result;
         usuite("mt");
         utest("init");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
@@ -8191,7 +8192,7 @@ static void open_ut() {
         uint64_t bolt;
         usuite("open");
         utest("populate");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
@@ -8207,7 +8208,7 @@ static void open_ut() {
         t2_tree_close(t);
         t2_fini(mod);
         utest("open");
-        mod = t2_init(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         bn_file_free_set(&file_storage.gen, free);
         mod->cache.bolt = bolt;
@@ -8301,13 +8302,13 @@ static void wal_ut() {
         utest("init");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         t2_fini(mod);
         utest("tree-create");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
@@ -8322,7 +8323,7 @@ static void wal_ut() {
         utest("replay-ops");
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP);
         ASSERT(EISOK(engine));
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
@@ -8359,7 +8360,7 @@ static void wal_ut() {
         engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS);
         ASSERT(EISOK(engine));
         free0 = free;
-        mod = t2_init(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ASSERT(EISOK(mod));
         mod->cache.bolt = bolt;
         t = t2_tree_open(&ttype, root);

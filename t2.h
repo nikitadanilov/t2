@@ -1,5 +1,6 @@
 /* -*- C -*- */
 
+/* Copyright 2023 Nikita Danilov <danilov@gmail.com> */
 /* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licencing information. */
 
 #include <inttypes.h>
@@ -24,6 +25,18 @@ struct t2_tree_type;
 struct t2_cursor;
 struct t2_cursor_op;
 struct t2_node;
+
+struct t2_conf {
+        struct t2_storage    *storage;
+        struct t2_te         *te;
+        int                   hshift;
+        int                   cshift;
+        struct t2_tree_type **ttypes;
+        struct t2_node_type **ntypes;
+};
+
+struct t2_param {
+};
 
 struct t2_tree_type {
         struct t2             *mod;
@@ -155,8 +168,10 @@ enum t2_node_type_flags {
         T2_NT_LEAF     = 1ull << 3
 };
 
-struct t2 *t2_init(struct t2_storage *storage, struct t2_te *te, int hshift, int cshift,
-                   struct t2_tree_type **ttypes, struct t2_node_type **ntypes);
+#define T2_FILL(flags, ...) t2_fill((flags), &(struct t2_conf){ __VA_ARGS__ })
+
+struct t2 *t2_init_with(uint64_t flags, struct t2_param *param);
+struct t2 *t2_init(const struct t2_conf *conf);
 void       t2_fini(struct t2 *mod);
 
 void t2_thread_register(void);

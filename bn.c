@@ -692,7 +692,12 @@ static void t_mount(struct benchmark *b) {
                 &bn_ttype,
                 NULL
         };
-        mod = b->kv.u.t2.mod = t2_init(bn_storage, engine, ht_shift, cache_shift, ttypes, ntypes);
+        mod = b->kv.u.t2.mod = t2_init(&(struct t2_conf) { .storage = bn_storage,
+                                                           .te = engine,
+                                                           .hshift = ht_shift,
+                                                           .cshift = cache_shift,
+                                                           .ttypes = ttypes,
+                                                           .ntypes = ntypes});
         if (b->kv.u.t2.free != 0) {
                 bn_file_free_set(bn_storage, b->kv.u.t2.free);
         }
