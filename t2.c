@@ -968,6 +968,7 @@ static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_print   (struct t2_te *engine);
 static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags);
 static void wal_pulse   (struct t2 *mod);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
@@ -1056,23 +1057,94 @@ static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stag
 })
 
 enum {
-        DEFAULT_HSHIFT = 22,
-        DEFAULT_CSHIFT = 22,
-        DEFAULT_MIN_RADIX_LEVEL = 2
+        DEFAULT_CSHIFT                  =         22,
+        DEFAULT_MIN_RADIX_LEVEL         =          2,
+        DEFAULT_WAL_NR_BUFS             =        200,
+        DEFAULT_WAL_BUF_SIZE            = 1ull << 20,
+        DEFAULT_WAL_FLAGS               =          0,
+        DEFAULT_WAL_WORKERS             =         16,
+        DEFAULT_WAL_LOG_NR              = 1ull <<  8,
+        DEFAULT_WAL_SYNC_NOB            = 1ull <<  9,
+        DEFAULT_WAL_PAGE_SYNC_NOB       = 1ull <<  5,
+        DEFAULT_WAL_MAX_LOG             = 1ull << 14,
+        DEFAULT_WAL_RESERVE_QUANTUM     =         64,
+        DEFAULT_WAL_THRESHOLD_PAGED     =        512,
+        DEFAULT_WAL_THRESHOLD_PAGE      =        128,
+        DEFAULT_WAL_THRESHOLD_LOG_SYNCD =         64,
+        DEFAULT_WAL_THRESHOLD_LOG_SYNC  =         32
 };
 
+const double DEFAULT_WAL_LOG_SLEEP   =     1.0;
+const double DEFAULT_WAL_AGE_LIMIT   =     2.0;
+const double DEFAULT_WAL_IDLE_LIMIT  =     0.1;
+const double DEFAULT_WAL_SYNC_AGE    =     1.0;
+
+#define DECIDE(flags, ...) do {                                 \
+        if (flags & (T2_INIT_EXPLAIN|T2_INIT_VERBOSE)) {        \
+                printf(__VA_ARGS__);                            \
+        }                                                       \
+} while (0)
+
+#define CONFLICT(flags, ...) ({ DECIDE(flags, __VA_ARGS__); return EPTR(-EINVAL); })
+#define SET(flags, obj, field, val, fmt, reason) ({ (obj)->field = (val); DECIDE(flags, "Set %-40s to: %20" fmt " (" reason ").\n", #field, (obj)->field); })
+#define SETIF0(flags, obj, field, val, fmt, reason) ({ ((obj)->field == 0) ? SET(flags, obj, field, val, fmt, reason) : (void)0; })
+#define SETIF0DEFAULT(flags, obj, field, val, fmt) SETIF0(flags, obj, field, val, fmt, "default")
+
 struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
-        if (param->conf.hshift == 0) {
-                param->conf.hshift = DEFAULT_HSHIFT;
+        if (param->no_te != (param->conf.te == NULL && param->te_type == NULL)) {
+                CONFLICT(flags, "no_te and te are specified.");
         }
-        if (param->conf.cshift == 0) {
-                param->conf.cshift = DEFAULT_CSHIFT;
+        if ((param->conf.te != NULL || param->te_type == NULL || strcmp(param->te_type, "wal")) &&
+            (param->wal_logname != NULL || param->wal_nr_bufs != 0 || param->wal_buf_size != 0 || param->wal_flags != 0 ||
+             param->wal_workers != 0 || param->wal_log_nr != 0 || param->wal_log_sleep != 0 ||
+             param->wal_age_limit != 0 || param->wal_idle_limit != 0 || param->wal_sync_age != 0 || param->wal_sync_nob != 0 ||
+             param->wal_page_sync_nob != 0 || param->wal_max_log != 0 || param->wal_reserve_quantum != 0 ||
+             param->wal_threshold_paged != 0 || param->wal_threshold_page != 0 || param->wal_threshold_log_syncd != 0 || param->wal_threshold_log_sync)) {
+                CONFLICT(flags, "wal parameters set, but transaction engine is not wal or pre-configured.");
         }
-        if (param->conf.min_radix_level == 0) {
-                param->conf.min_radix_level = DEFAULT_MIN_RADIX_LEVEL;
+        if (param->conf.te != NULL) {
+                if (param->te_type != NULL) {
+                        CONFLICT(flags, "Both te type and te are specified.");
+                }
+        } else if (!param->no_te) {
+                SETIF0DEFAULT(flags, param, te_type, "wal", "s");
+                if (!strcmp(param->te_type, "wal")) {
+                        struct t2_te *te;
+                        SETIF0DEFAULT(flags, param, wal_logname,              "log",                             "s");
+                        SETIF0DEFAULT(flags, param, wal_nr_bufs,              DEFAULT_WAL_NR_BUFS,               "d");
+                        SETIF0DEFAULT(flags, param, wal_buf_size,             DEFAULT_WAL_BUF_SIZE,              "d");
+                        SETIF0DEFAULT(flags, param, wal_flags,                DEFAULT_WAL_FLAGS,                 "d");
+                        SETIF0DEFAULT(flags, param, wal_workers,              DEFAULT_WAL_WORKERS,               "d");
+                        SETIF0DEFAULT(flags, param, wal_log_nr,               DEFAULT_WAL_LOG_NR,                "d");
+                        SETIF0DEFAULT(flags, param, wal_log_sleep,            DEFAULT_WAL_LOG_SLEEP,             "f");
+                        SETIF0DEFAULT(flags, param, wal_age_limit,            DEFAULT_WAL_AGE_LIMIT,             "f");
+                        SETIF0DEFAULT(flags, param, wal_idle_limit,           DEFAULT_WAL_IDLE_LIMIT,            "f");
+                        SETIF0DEFAULT(flags, param, wal_sync_age,             DEFAULT_WAL_SYNC_AGE,              "f");
+                        SETIF0DEFAULT(flags, param, wal_sync_nob,             DEFAULT_WAL_SYNC_NOB,              PRId64);
+                        SETIF0DEFAULT(flags, param, wal_page_sync_nob,        DEFAULT_WAL_PAGE_SYNC_NOB,         PRId64);
+                        SETIF0DEFAULT(flags, param, wal_max_log,              DEFAULT_WAL_MAX_LOG,               PRId64);
+                        SETIF0DEFAULT(flags, param, wal_reserve_quantum,      DEFAULT_WAL_RESERVE_QUANTUM,       "d");
+                        SETIF0DEFAULT(flags, param, wal_threshold_paged,      DEFAULT_WAL_THRESHOLD_PAGED,       "d");
+                        SETIF0DEFAULT(flags, param, wal_threshold_page,       DEFAULT_WAL_THRESHOLD_PAGE,        "d");
+                        SETIF0DEFAULT(flags, param, wal_threshold_log_syncd,  DEFAULT_WAL_THRESHOLD_LOG_SYNCD,   "d");
+                        SETIF0DEFAULT(flags, param, wal_threshold_log_sync,   DEFAULT_WAL_THRESHOLD_LOG_SYNC,    "d");
+                        te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags);
+                        if (EISERR(te)) {
+                                return EPTR(te);
+                        }
+                        SET(flags, param, conf.te, te, "p", "wal_prep()");
+                }
         }
+        SETIF0DEFAULT(flags, param, conf.cshift,          DEFAULT_CSHIFT,          "d");
+        SETIF0       (flags, param, conf.hshift,          param->conf.cshift,      "d", "sized to cache");
+        SETIF0DEFAULT(flags, param, conf.min_radix_level, DEFAULT_MIN_RADIX_LEVEL, "d");
         return t2_init(&param->conf);
 }
+
+#undef DECIDE
+#undef CONFLICT
+#undef SET
+#undef SETIF0
 
 struct t2 *t2_init(const struct t2_conf *conf) {
         int                result;
@@ -3349,7 +3421,7 @@ static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mut
         struct cds_hlist_node *link;
         CINC(scan_locked);
         mutex_lock(lock);
-	cds_hlist_for_each(link, head) {
+        cds_hlist_for_each(link, head) {
                 struct node *n = COF(link, struct node, hash);
                 int8_t L __attribute__((unused)) = level(n);
                 if (UNLIKELY(n->ref != 0)) {
@@ -7469,7 +7541,7 @@ static struct t2_tree_type *ttypes[] = {
         NULL
 };
 
-#define T2_INIT(s, t, h, c, tt, nt) t2_init_with(0, &(struct t2_param) { .conf = { .storage = s, .te = t, .hshift = h, .cshift = c, .ttypes = tt, .ntypes = nt } })
+#define T2_INIT(s, t, h, c, tt, nt) t2_init_with(T2_INIT_VERBOSE, &(struct t2_param) { .conf = { .storage = s, .te = t, .hshift = h, .cshift = c, .ttypes = tt, .ntypes = nt }, .no_te = ((t) == NULL) })
 
 static void traverse_ut() {
         taddr_t addr = taddr_make(0x100000, ntype.shift);

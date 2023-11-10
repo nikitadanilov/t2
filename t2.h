@@ -48,21 +48,25 @@ struct t2_param {
         const char    *file_storage_path;
         int32_t        file_storage_frag_nr;
         const char    *te_type;
+        bool           no_te;
         const char    *wal_logname;
         int            wal_nr_bufs;
         int            wal_buf_size;
         int32_t        wal_flags;
-        int            wal_max_buf_seg;
         int            wal_workers;
         int            wal_log_nr;
         double         wal_log_sleep;
         double         wal_age_limit;
-        double         wal_idle_liit;
+        double         wal_idle_limit;
         double         wal_sync_age;
         int64_t        wal_sync_nob;
         int64_t        wal_page_sync_nob;
         int64_t        wal_max_log;
         int            wal_reserve_quantum;
+        int            wal_threshold_paged;
+        int            wal_threshold_page;
+        int            wal_threshold_log_syncd;
+        int            wal_threshold_log_sync;
         const char    *policy_leaf;
         const char    *policy_twig;
         const char    *policy_internal;
@@ -196,6 +200,11 @@ enum t2_node_type_flags {
         T2_NT_VARVAL   = 1ull << 1,
         T2_NT_INTERNAL = 1ull << 2,
         T2_NT_LEAF     = 1ull << 3
+};
+
+enum {
+        T2_INIT_EXPLAIN = 1ull << 0,
+        T2_INIT_VERBOSE = 1ull << 0
 };
 
 #define T2_INIT_WITH(flags, ...) t2_init_with((flags), &(struct t2_conf){ __VA_ARGS__ })
