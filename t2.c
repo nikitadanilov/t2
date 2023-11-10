@@ -373,8 +373,10 @@ struct cache {
         bool                                   want_page;
         alignas(MAX_CACHELINE) struct pool     pool;
         pthread_t                              md;
+        int                                    max_cluster;
+        int                                    sh_shift;
         int                                    sh_nr;
-        struct shepherd                        sh[CACHE_SHEPHERD_NR];
+        struct shepherd                       *sh;
 };
 
 struct slot;
@@ -1107,7 +1109,12 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         }
         NEXT_STAGE(mod, -pthread_mutex_init(&mod->cache.cleanlock, NULL), SHEPHERD);
         NEXT_STAGE(mod, -pthread_cond_init(&mod->cache.wantclean, NULL), 0);
-        for (c->sh_nr = 0; c->sh_nr < CACHE_SHEPHERD_NR; ++c->sh_nr) {
+        c->sh_shift = conf->cache_shepherd_shift;
+        c->sh = mem_alloc((1 << c->sh_shift) * sizeof c->sh[0]);
+        if (next_stage(mod, c->sh != NULL, 0)) {
+                        return EPTR(-ENOMEM);
+        }
+        for (c->sh_nr = 0; c->sh_nr < (1 << c->sh_shift); ++c->sh_nr) {
                 ca = mem_alloc(sizeof *ca);
                 if (next_stage(mod, ca != NULL, 0)) {
                         return EPTR(-ENOMEM);
@@ -1139,12 +1146,13 @@ void t2_fini(struct t2 *mod) {
                 TXCALL(mod->te, fini(mod->te));
                 __attribute__((fallthrough));
         case SHEPHERD:
-                NOFAIL(pthread_cond_broadcast(&mod->cache.wantclean));
-                for (int i = 0; i < mod->cache.sh_nr; ++i) {
-                        NOFAIL(pthread_join(mod->cache.sh[i].thread, NULL));
+                NOFAIL(pthread_cond_broadcast(&c->wantclean));
+                for (int i = 0; i < c->sh_nr; ++i) {
+                        NOFAIL(pthread_join(c->sh[i].thread, NULL));
                 }
-                NOFAIL(pthread_cond_destroy(&mod->cache.wantclean));
-                NOFAIL(pthread_mutex_destroy(&mod->cache.cleanlock));
+                mem_free(c->sh);
+                NOFAIL(pthread_cond_destroy(&c->wantclean));
+                NOFAIL(pthread_mutex_destroy(&c->cleanlock));
                 __attribute__((fallthrough));
         case MAXWELLD:
                 cache_clean(mod);
@@ -1218,7 +1226,7 @@ void t2_stats_print(struct t2 *mod) {
         }
         printf("\n%15s", "rate:");
         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %8"PRId64, krate(&c->pool.rate[i], mod->cache.bolt >> BOLT_EPOCH_SHIFT));
+                printf(" %8"PRId64, krate(&c->pool.rate[i], c->bolt >> BOLT_EPOCH_SHIFT));
         }
         printf("\n%15s ", "pressure:");
         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
@@ -1226,12 +1234,14 @@ void t2_stats_print(struct t2 *mod) {
                 bool underpressure = stress(&c->pool.free[i], &pressure);
                 printf(" %7i%s", pressure, underpressure ? "*" : " ");
         }
-        printf("\nshepherd: ");
-        for (int i = 0; i < ARRAY_SIZE(mod->cache.sh); ++i) {
-                struct shepherd *sh = &mod->cache.sh[i];
-                printf("[%6"PRId64" : %6"PRId64"] ", sh->lim, sh->min);
-                if ((i & 7) == 7) {
-                        printf("\n          ");
+        if (false) { /* Not really interesting. */
+                printf("\nshepherd: ");
+                for (int i = 0; i < c->sh_nr; ++i) {
+                        struct shepherd *sh = &c->sh[i];
+                        printf("[%6"PRId64" : %6"PRId64"] ", sh->lim, sh->min);
+                        if ((i & 7) == 7) {
+                                printf("\n          ");
+                        }
                 }
         }
         printf("\n%15s bolt: %8"PRId64"\n", "cache:", c->bolt);
@@ -3174,8 +3184,9 @@ enum {
 #define TXA(n, ...) ((n)->mod->te != NULL ? (__VA_ARGS__) : true)
 static int pageout(struct node *n) {
         struct t2    *mod = n->mod;
-        struct node  *c[MAX_CLUSTER];
-        struct iovec  vec[MAX_CLUSTER + 1];
+        int           max_cluster = mod->cache.max_cluster;
+        struct node  *c[max_cluster];          /* VLA */
+        struct iovec  vec[max_cluster + 1];    /* VLA */
         int           nr;
         taddr_t       cur;
         taddr_t       next;
@@ -3496,7 +3507,7 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
         struct t2         *mod          = ca->mod;
         struct cache      *c            = &mod->cache;
         int                sector       = ca->idx;
-        int32_t            sector_shift = mod->ht.shift - CACHE_SHEPHERD_SHIFT;
+        int32_t            sector_shift = mod->ht.shift - c->sh_shift;
         int32_t            sector_start = sector << sector_shift;
         int32_t            sector_size  = 1 << sector_shift;
         struct shepherd   *self         = &c->sh[sector];
@@ -5879,8 +5890,6 @@ struct wal_te {
 enum {
         WAL_LOG_SLEEP_SEC    = 1,
         WAL_LOG_SLEEP_NSEC   = 0,
-        WAL_CACHE_SLEEP_SEC  = 1,
-        WAL_CACHE_SLEEP_NSEC = 0,
         WAL_AGE_LIMIT        = 2 * BILLION,
         WAL_IDLE_LIMIT       = BILLION / 10,
         WAL_SYNC_AGE         = BILLION, /* Nanoseconds. */
@@ -6301,7 +6310,7 @@ static bool wal_need(struct t2_te *engine, struct shepherd *sh) {
 
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned) {
         struct wal_te *en  = COF(engine, struct wal_te, base);
-        lsn_t          min = FOLD(i, m, ARRAY_SIZE(en->mod->cache.sh), en->max_persistent, min_64(m, en->mod->cache.sh[i].min));
+        lsn_t          min = FOLD(i, m, en->mod->cache.sh_nr, en->max_persistent, min_64(m, en->mod->cache.sh[i].min));
         wal_lock(en);
         en->dirty_nr -= cleaned;
         ASSERT(en->dirty_nr >= 0);
