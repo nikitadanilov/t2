@@ -1068,7 +1068,6 @@ enum {
         DEFAULT_WAL_WORKERS             =         16,
         DEFAULT_WAL_LOG_NR              = 1ull <<  8,
         DEFAULT_WAL_SYNC_NOB            = 1ull <<  9,
-        DEFAULT_WAL_PAGE_SYNC_NOB       = 1ull <<  5,
         DEFAULT_WAL_MAX_LOG             = 1ull << 14,
         DEFAULT_WAL_RESERVE_QUANTUM     =         64,
         DEFAULT_WAL_THRESHOLD_PAGED     =        512,
@@ -1100,7 +1099,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
             (param->wal_logname != NULL || param->wal_nr_bufs != 0 || param->wal_buf_size != 0 || param->wal_flags != 0 ||
              param->wal_workers != 0 || param->wal_log_nr != 0 || param->wal_log_sleep != 0 ||
              param->wal_age_limit != 0 || param->wal_sync_age != 0 || param->wal_sync_nob != 0 ||
-             param->wal_page_sync_nob != 0 || param->wal_max_log != 0 || param->wal_reserve_quantum != 0 ||
+             param->wal_max_log != 0 || param->wal_reserve_quantum != 0 ||
              param->wal_threshold_paged != 0 || param->wal_threshold_page != 0 || param->wal_threshold_log_syncd != 0 || param->wal_threshold_log_sync)) {
                 CONFLICT(flags, "wal parameters set, but transaction engine is not wal or pre-configured.");
         }
@@ -1122,7 +1121,6 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SETIF0DEFAULT(flags, param, wal_age_limit,            DEFAULT_WAL_AGE_LIMIT,             "f");
                         SETIF0DEFAULT(flags, param, wal_sync_age,             DEFAULT_WAL_SYNC_AGE,              "f");
                         SETIF0DEFAULT(flags, param, wal_sync_nob,             DEFAULT_WAL_SYNC_NOB,              PRId64);
-                        SETIF0DEFAULT(flags, param, wal_page_sync_nob,        DEFAULT_WAL_PAGE_SYNC_NOB,         PRId64);
                         SETIF0DEFAULT(flags, param, wal_max_log,              DEFAULT_WAL_MAX_LOG,               PRId64);
                         SETIF0DEFAULT(flags, param, wal_reserve_quantum,      DEFAULT_WAL_RESERVE_QUANTUM,       "d");
                         SETIF0DEFAULT(flags, param, wal_threshold_paged,      DEFAULT_WAL_THRESHOLD_PAGED,       "d");
@@ -5986,7 +5984,6 @@ struct wal_te {
 };
 
 enum {
-        WAL_PAGE_SYNC_NOB    = 1ull << 5,
         WAL_MAX_LOG          = 1ull << 14, /* Measured in buffers. TODO: Make this a parameter. */
         WAL_RESERVE_QUANTUM  = 64
 };
