@@ -104,7 +104,7 @@ extern uint64_t bn_bolt(const struct t2 *mod);
 extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
 extern void bn_counters_print(struct t2 *mod);
 extern void bn_counters_fold(void);
-extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift);
+extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep);
 
 static struct kv kv[KVNR];
 static enum kvtype kvt = T2;
@@ -668,8 +668,10 @@ enum {
         WORKERS    = 16,
         LOG_SHIFT  = 8,
         MIN_RADIX_LEVEL = 2,
-        MAX_CLUSTER = 256
+        MAX_CLUSTER = 256,
 };
+
+const double LOG_SLEEP = 1.0;
 
 enum {
         STEAL = 1 << 0, /* Undo needed. */
@@ -682,7 +684,7 @@ static const char logname[] = "./log/l";
 static bool transactions = false;
 
 static void t_mount(struct benchmark *b) {
-        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WORKERS, LOG_SHIFT) : NULL;
+        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WORKERS, LOG_SHIFT, LOG_SLEEP) : NULL;
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
         bn_ntype_twig     = t2_node_type_init(1, "simple-bn-twig",     shift_twig,     0);
         bn_ntype_leaf     = t2_node_type_init(0, "simple-bn-leaf",     shift_leaf,     0);
