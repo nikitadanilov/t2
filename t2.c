@@ -3449,31 +3449,45 @@ static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mut
 static void scan_bucket(struct t2 *mod, int32_t pos) {
         struct ht             *ht   = &mod->ht;
         struct cds_hlist_head *head = ht_head(ht, pos);
-        struct cds_hlist_node *link;
+        struct cds_hlist_node *link = rcu_dereference(head->next);
+        struct node           *n;
+        int8_t                 L __attribute__((unused));
         CINC(scan_bucket);
-        for (link = rcu_dereference(head->next); link != NULL; link = rcu_dereference(link->next)) {
-                struct node *n = COF(link, struct node, hash);
-                int8_t L __attribute__((unused)) = level(n);
-                node_state_print(n, 's');
-                if (UNLIKELY(n->ref != 0)) {
-                        CINC(l[L].scan_skip_busy);
-                } else if (n->flags & DIRTY) {
-                        CINC(l[L].scan_skip_dirty);
-                        if (UNLIKELY(!mod->cache.want_page)) {
-                                mutex_lock(&mod->cache.cleanlock);
-                                mod->cache.want_page = true;
-                                NOFAIL(pthread_cond_broadcast(&mod->cache.wantclean));
-                                mutex_unlock(&mod->cache.cleanlock);
-                        }
-                } else if (is_hot(n, mod->cache.shift)) {
-                        CINC(l[L].scan_skip_hot);
-                } else {
-                        rcu_unlock();
-                        scan_locked(mod, head, ht_lock(ht, pos));
-                        rcu_lock();
-                        break;
-                }
+#define CHAINLINK do {                                                  \
+        if (LIKELY(link == NULL)) {                                     \
+                return;                                                 \
+        }                                                               \
+        n = COF(link, struct node, hash);                               \
+        L = level(n);                                                   \
+        node_state_print(n, 's');                                       \
+        if (UNLIKELY(n->ref != 0)) {                                    \
+                CINC(l[L].scan_skip_busy);                              \
+        } else if (n->flags & DIRTY) {                                  \
+                CINC(l[L].scan_skip_dirty);                             \
+                if (UNLIKELY(!mod->cache.want_page)) {                  \
+                        mutex_lock(&mod->cache.cleanlock);              \
+                        mod->cache.want_page = true;                    \
+                        NOFAIL(pthread_cond_broadcast(&mod->cache.wantclean)); \
+                        mutex_unlock(&mod->cache.cleanlock);            \
+                }                                                       \
+        } else if (is_hot(n, mod->cache.shift)) {                       \
+                CINC(l[L].scan_skip_hot);                               \
+        } else {                                                        \
+                rcu_unlock();                                           \
+                scan_locked(mod, head, ht_lock(ht, pos));               \
+                rcu_lock();                                             \
+                return;                                                 \
+        }                                                               \
+        link = rcu_dereference(link->next);                             \
+} while (0)
+        CHAINLINK;
+        CHAINLINK;
+        CHAINLINK;
+        CHAINLINK;
+        while (true) {
+                CHAINLINK;
         }
+#undef CHAINLINK
 }
 
 static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr) {
@@ -6848,7 +6862,7 @@ static int wal_recover(struct wal_te *en) {
         }
         index = mem_alloc(sizeof index[0] * buf_nr);
         if (index != NULL) {
-                struct rbuf last;
+                struct rbuf last = {};
                 result = wal_index_build(en, &buf_nr, index, size, &last);
                 if (result == 0) {
                         void *buf = mem_alloc(en->buf_size);
