@@ -970,7 +970,7 @@ static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_print   (struct t2_te *engine);
 static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob);
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log);
 static void wal_pulse   (struct t2 *mod);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
@@ -1068,7 +1068,7 @@ enum {
         DEFAULT_WAL_WORKERS             =         16,
         DEFAULT_WAL_LOG_NR              = 1ull <<  8,
         DEFAULT_WAL_SYNC_NOB            = 1ull <<  9,
-        DEFAULT_WAL_MAX_LOG             = 1ull << 14,
+        DEFAULT_WAL_LOG_SIZE            = 1ull << 14,
         DEFAULT_WAL_RESERVE_QUANTUM     =         64,
         DEFAULT_WAL_THRESHOLD_PAGED     =        512,
         DEFAULT_WAL_THRESHOLD_PAGE      =        128,
@@ -1099,7 +1099,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
             (param->wal_logname != NULL || param->wal_nr_bufs != 0 || param->wal_buf_size != 0 || param->wal_flags != 0 ||
              param->wal_workers != 0 || param->wal_log_nr != 0 || param->wal_log_sleep != 0 ||
              param->wal_age_limit != 0 || param->wal_sync_age != 0 || param->wal_sync_nob != 0 ||
-             param->wal_max_log != 0 || param->wal_reserve_quantum != 0 ||
+             param->wal_log_size != 0 || param->wal_reserve_quantum != 0 ||
              param->wal_threshold_paged != 0 || param->wal_threshold_page != 0 || param->wal_threshold_log_syncd != 0 || param->wal_threshold_log_sync)) {
                 CONFLICT(flags, "wal parameters set, but transaction engine is not wal or pre-configured.");
         }
@@ -1121,7 +1121,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SETIF0DEFAULT(flags, param, wal_age_limit,            DEFAULT_WAL_AGE_LIMIT,             "f");
                         SETIF0DEFAULT(flags, param, wal_sync_age,             DEFAULT_WAL_SYNC_AGE,              "f");
                         SETIF0DEFAULT(flags, param, wal_sync_nob,             DEFAULT_WAL_SYNC_NOB,              PRId64);
-                        SETIF0DEFAULT(flags, param, wal_max_log,              DEFAULT_WAL_MAX_LOG,               PRId64);
+                        SETIF0DEFAULT(flags, param, wal_log_size,             DEFAULT_WAL_LOG_SIZE,              PRId64);
                         SETIF0DEFAULT(flags, param, wal_reserve_quantum,      DEFAULT_WAL_RESERVE_QUANTUM,       "d");
                         SETIF0DEFAULT(flags, param, wal_threshold_paged,      DEFAULT_WAL_THRESHOLD_PAGED,       "d");
                         SETIF0DEFAULT(flags, param, wal_threshold_page,       DEFAULT_WAL_THRESHOLD_PAGE,        "d");
@@ -1130,8 +1130,11 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         if (param->wal_log_nr & (param->wal_log_nr - 1)) {
                                 CONFLICT(flags, "wal_log_nr is not a power of 2.");
                         }
+                        if (param->wal_log_size & (param->wal_log_size - 1)) {
+                                CONFLICT(flags, "wal_log_size is not a power of 2.");
+                        }
                         te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags, param->wal_workers,
-                                      ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age, param->wal_sync_nob);
+                                      ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age, param->wal_sync_nob, param->wal_log_size);
                         if (EISERR(te)) {
                                 return EPTR(te);
                         }
@@ -5984,8 +5987,7 @@ struct wal_te {
 };
 
 enum {
-        WAL_MAX_LOG          = 1ull << 14, /* Measured in buffers. TODO: Make this a parameter. */
-        WAL_RESERVE_QUANTUM  = 64
+        WAL_RESERVE_QUANTUM = 64
 };
 
 static lsn_t wal_log_free(const struct wal_te *en) {
@@ -6583,7 +6585,7 @@ static void wal_fini(struct t2_te *engine) {
         mem_free(en);
 }
 
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob) {
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t log_size) {
         struct wal_te *en     = mem_alloc(sizeof *en);
         pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
         int           *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
@@ -6598,13 +6600,6 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                 mem_free(fd);
                 return EPTR(-ENOMEM);
         }
-        en->worker       = ws;
-        en->nr_workers   = workers;
-        en->fd           = fd;
-        en->log_shift    = log_shift;
-        en->log_sleep    = log_sleep;
-        en->sync_age     = sync_age;
-        en->sync_nob     = sync_nob;
         en->base.ante    = &wal_ante;
         en->base.init    = &wal_init;
         en->base.post    = &wal_post;
@@ -6626,9 +6621,17 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         NOFAIL(pthread_cond_init(&en->bufwait, NULL));
         NOFAIL(pthread_cond_init(&en->bufwrite, NULL));
         en->flags               = flags;
+        en->worker              = ws;
+        en->nr_workers          = workers;
+        en->fd                  = fd;
+        en->log_shift           = log_shift;
+        en->log_sleep           = log_sleep;
+        en->sync_age            = sync_age;
+        en->age_limit           = age_limit;
+        en->sync_nob            = sync_nob;
+        en->log_size            = log_size;
         en->buf_size            = buf_size;
         en->buf_size_shift      = ilog2(buf_size);
-        en->log_size            = WAL_MAX_LOG;
         en->logname             = logname;
         en->threshold_paged     = 512;
         en->threshold_page      = 128;
@@ -7028,7 +7031,7 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
 }
 
 #else /* TRANSACTIONS */
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob) {
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t log_size) {
         return NULL; /* TODO: For bn.c. */
 }
 #endif /* TRANSACTIONS */
@@ -7560,7 +7563,12 @@ static struct t2_tree_type *ttypes[] = {
         NULL
 };
 
-#define T2_INIT(s, t, h, c, tt, nt) t2_init_with(0, &(struct t2_param) { .conf = { .storage = s, .te = t, .hshift = h, .cshift = c, .ttypes = tt, .ntypes = nt }, .no_te = ((t) == NULL) })
+#define T2_INIT(s, t, h, c, tt, nt) ({                                  \
+        struct t2_te *_te = (t);                                        \
+        struct t2 *_mod = t2_init_with(0, &(struct t2_param) { .conf = { .storage = s, .te = _te, .hshift = h, .cshift = c, .ttypes = tt, .ntypes = nt }, .no_te = (_te == NULL) }); \
+        ASSERT(EISOK(_mod));                                            \
+        _mod;                                                           \
+})
 
 static void traverse_ut() {
         taddr_t addr = taddr_make(0x100000, ntype.shift);
@@ -7599,7 +7607,6 @@ static void traverse_ut() {
         usuite("traverse");
         utest("t2_init");
         struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         ttype.mod = mod;
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
@@ -7669,7 +7676,6 @@ static void insert_ut() {
         };
         int result;
         struct cap m = {};
-        ASSERT(EISOK(mod));
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         struct node *n = alloc(&t, 0, &m);
@@ -7703,7 +7709,6 @@ static void tree_ut() {
         uint64_t v64;
         int result;
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         buf_init_str(&key, key0);
@@ -7772,7 +7777,6 @@ static void stress_ut() {
         usuite("stress");
         utest("init");
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         utest("probe");
@@ -7862,7 +7866,6 @@ static void delete_ut() {
         usuite("delete");
         utest("init");
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         utest("1K*1K");
@@ -7972,7 +7975,6 @@ static void next_ut() {
         usuite("next");
         utest("init");
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         struct t2_cursor_op cop = {
@@ -8103,7 +8105,6 @@ void seq_ut() {
         usuite("seq");
         utest("init");
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         utest("populate");
@@ -8245,7 +8246,6 @@ void mt_ut() {
         usuite("mt");
         utest("init");
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         utest("populate");
@@ -8316,7 +8316,6 @@ static void open_ut() {
         usuite("open");
         utest("populate");
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
         for (long i = 0; i < 4*OPS; ++i) {
@@ -8332,7 +8331,6 @@ static void open_ut() {
         t2_fini(mod);
         utest("open");
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         bn_file_free_set(&file_storage.gen, free);
         mod->cache.bolt = bolt;
         t = t2_tree_open(&ttype, root);
@@ -8417,14 +8415,20 @@ enum {
         WAL_LOG_SHIFT = 8,
         WAL_AGE_LIMIT = BILLION,
         WAL_SYNC_AGE  = BILLION,
-        WAL_SYNC_NOB  = 1ull << 9
+        WAL_SYNC_NOB  = 1ull << 9,
+        WAL_LOG_SIZE  = 1ull << 14
 };
 
 const double WAL_LOG_SLEEP = 1.0;
 
+static struct t2_te *wprep(int32_t flags) {
+        struct t2_te *engine = wal_prep(logname, NR_BUFS, BUF_SIZE, flags, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB, WAL_LOG_SIZE);
+        ASSERT(EISOK(engine));
+        return engine;
+}
+
 static void wal_ut() {
         struct t2 *mod;
-        struct t2_te *engine;
         struct t2_tx *tx;
         struct t2_tree *t;
         taddr_t root;
@@ -8433,16 +8437,10 @@ static void wal_ut() {
         int result;
         usuite("wal");
         utest("init");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB);
-        ASSERT(EISOK(engine));
-        mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
+        mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         t2_fini(mod);
         utest("tree-create");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB);
-        ASSERT(EISOK(engine));
-        mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
+        mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
         result = t2_tx_open(mod, tx);
@@ -8454,10 +8452,7 @@ static void wal_ut() {
         t2_tx_done(mod, tx);
         t2_fini(mod);
         utest("replay-ops");
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE|KEEP, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB);
-        ASSERT(EISOK(engine));
-        mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
+        mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE|KEEP), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
         result = t2_tx_open(mod, tx);
@@ -8490,11 +8485,8 @@ static void wal_ut() {
         t2_fini(mod);
         bn_file_truncate(&file_storage.gen, 0);
         bn_file_truncate(&file_storage.gen, free + (1 << 20));
-        engine = wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB);
-        ASSERT(EISOK(engine));
         free0 = free;
-        mod = T2_INIT(ut_storage, engine, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
+        mod = T2_INIT(ut_storage, wprep(FLAGS), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         mod->cache.bolt = bolt;
         t = t2_tree_open(&ttype, root);
         ASSERT(EISOK(t));
