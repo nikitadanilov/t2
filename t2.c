@@ -5307,7 +5307,7 @@ struct piece {
 };
 
 struct collect {
-        struct node *node; /* To avoid using non-standard qsort_r(). */
+        void        *orig; /* To avoid using non-standard qsort_r(). */
         struct piece key;
         struct piece val;
 };
@@ -5328,13 +5328,6 @@ static int32_t lvlen(struct lrec *rec) {
 
 static struct lrec *lnext(struct lrec *rec) {
         return (void *)(rec + 1) + lvlen(rec);
-}
-
-static int lcmp(const void *a0, const void *a1) {
-        const struct collect *c0   = a0;
-        const struct collect *c1   = a1;
-        int16_t               size = min_16(c0->key.len, c1->key.len);
-        return memcmp(c0->node->data + c0->key.off, c0->node->data + c1->key.off, size) ?: int32_cmp(c0->key.len, c1->key.len);
 }
 
 enum {
@@ -5381,6 +5374,54 @@ static bool lazy_invariant(const struct node *n) {
         return d->nr == nr && d->vend == vcur && d->kend == kcur;
 }
 
+/* Heapsort implementation. */
+
+static int lcmp(void *orig, const struct collect *c0, const struct collect *c1) {
+        int16_t size = min_16(c0->key.len, c1->key.len);
+        return memcmp(orig + c0->key.off, orig + c1->key.off, size) ?: int32_cmp(c0->key.len, c1->key.len);
+}
+
+static int lqcmp(const void *a0, const void *a1) {
+        const struct collect *c0 = a0;
+        const struct collect *c1 = a1;
+        return lcmp(c0->orig, c0, c1);
+}
+
+static void lswap(struct collect *tweedledum, struct collect *tweedledee) {
+        struct collect tmp = *tweedledum;
+        *tweedledum = *tweedledee;
+        *tweedledee = tmp;
+}
+
+static void heapify(void *orig, struct collect *coll, int32_t n, int32_t idx) {
+        int32_t max   = idx;
+        int32_t left  = 2 * idx + 1;
+        int32_t right = 2 * idx + 2;
+
+        if (left < n && lcmp(orig, &coll[left], &coll[max]) > 0) {
+                max = left;
+        }
+        if (right < n && lcmp(orig, &coll[right], &coll[max]) > 0) {
+                max = right;
+        }
+        if (max != idx) {
+                lswap(&coll[max], &coll[idx]);
+                heapify(orig, coll, n, max);
+        }
+}
+
+static void heapsort(void *orig, struct collect *coll, int32_t n) {
+        for (int32_t i = n / 2 - 1; i >= 0; i--) {
+                heapify(orig, coll, n, i);
+        }
+        for (int32_t i = n - 1; i > 0; i--) {
+                lswap(&coll[0], &coll[i]);
+                heapify(orig, coll, i, 0);
+        }
+}
+
+enum { USE_HEAPSORT = false };
+
 static int lazy_parse(struct node *n, const struct t2_node_type *nt) {
         int32_t         size = 1 << nt->shift;
         int32_t         free = size - HSIZE;
@@ -5406,7 +5447,7 @@ static int lazy_parse(struct node *n, const struct t2_node_type *nt) {
                         vcur += RSIZE;
                         if (rec->vlen >= 0) {
                                 set[here++] = (struct collect){
-                                        .node = n,
+                                        .orig = n->data,
                                         .val  = { .len = rec->vlen, .off = vcur },
                                         .key  = { .len = rec->klen, .off = kcur }
                                 };
@@ -5414,7 +5455,12 @@ static int lazy_parse(struct node *n, const struct t2_node_type *nt) {
                         }
                         vcur += lvlen(rec);
                 }
-                qsort(set, here, sizeof set[0], &lcmp);
+                if (USE_HEAPSORT) {
+                        heapsort(n->data, set, here);
+                } else {
+                        qsort(set, here, sizeof set[0], &lqcmp);
+                }
+                EXPENSIVE_ASSERT(here > 0 ? FORALL(i, here - 1, lcmp(n->data, &set[i], &set[i + 1]) < 0) : true);
                 dir->cap  = cap;
                 dir->nr   = here;
                 dir->free = free;
