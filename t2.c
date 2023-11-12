@@ -249,7 +249,7 @@ enum {
 })
 
 #define HAS_DEFAULT_FORMAT (1)
-#define DEFAULT_FORMAT lazy
+#define DEFAULT_FORMAT simple
 
 #if HAS_DEFAULT_FORMAT
 #define NCALL(n, ...) ((void)(n), CONCAT(CONCAT(DEFAULT_FORMAT, _), __VA_ARGS__))
@@ -3585,22 +3585,34 @@ static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthr
 static int32_t shepherd_bucket(struct t2 *mod, int32_t pos, struct shepherd *sh) {
         struct ht             *ht    = &mod->ht;
         struct cds_hlist_head *head  = ht_head(ht, pos);
-        struct cds_hlist_node *link;
+        struct cds_hlist_node *link  = rcu_dereference(head->next);
         int32_t                nr    = 0;
+        struct node           *n;
         CINC(shepherd_bucket);
-        for (link = rcu_dereference(head->next); link != NULL; link = rcu_dereference(link->next)) {
-                struct node *n = COF(link, struct node, hash);
-                node_state_print(n, 'S');
-                if (canpage(n, sh->lim)) {
-                        rcu_unlock();
-                        nr = shepherd_locked(mod, head, ht_lock(ht, pos), sh);
-                        rcu_lock();
-                        break;
-                } else {
-                        CINC(shepherd_skip);
-                }
+#define CHAINLINK do {                                                  \
+        if (LIKELY(link == NULL)) {                                     \
+                return nr;                                              \
+        }                                                               \
+        n = COF(link, struct node, hash);                               \
+        node_state_print(n, 'S');                                       \
+        if (canpage(n, sh->lim)) {                                      \
+                rcu_unlock();                                           \
+                nr = shepherd_locked(mod, head, ht_lock(ht, pos), sh);  \
+                rcu_lock();                                             \
+                return nr;                                              \
+        } else {                                                        \
+                CINC(shepherd_skip);                                    \
+        }                                                               \
+        link = rcu_dereference(link->next);                             \
+} while (0)
+        CHAINLINK;
+        CHAINLINK;
+        CHAINLINK;
+        CHAINLINK;
+        while (true) {
+                CHAINLINK;
         }
-        return nr;
+#undef CHAINLINK
 }
 
 static int32_t shepherd_scan(struct t2 *mod, struct shepherd *sh, int32_t pos, int32_t nr) {
