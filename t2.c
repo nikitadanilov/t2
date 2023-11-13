@@ -1080,6 +1080,8 @@ static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stag
 enum {
         DEFAULT_CSHIFT                  =         22,
         DEFAULT_MIN_RADIX_LEVEL         =          2,
+        DEFAULT_SHEPHERD_RATIO          =         16,
+        DEFAULT_SHEPHERD_SHIFT          =          4,
         DEFAULT_MAX_CLUSTER             =        256,
         DEFAULT_WAL_NR_BUFS             =        200,
         DEFAULT_WAL_BUF_SIZE            = 1ull << 20,
@@ -1161,10 +1163,11 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SET(flags, param, conf.te, te, "p", "wal_prep()");
                 }
         }
-        SETIF0DEFAULT(flags, param, conf.max_cluster,     DEFAULT_MAX_CLUSTER,     "d");
-        SETIF0DEFAULT(flags, param, conf.cshift,          DEFAULT_CSHIFT,          "d");
-        SETIF0       (flags, param, conf.hshift,          param->conf.cshift,      "d", "sized to cache");
-        SETIF0DEFAULT(flags, param, conf.min_radix_level, DEFAULT_MIN_RADIX_LEVEL, "d");
+        SETIF0DEFAULT(flags, param, conf.max_cluster,           DEFAULT_MAX_CLUSTER,     "d");
+        SETIF0DEFAULT(flags, param, conf.cshift,                DEFAULT_CSHIFT,          "d");
+        SETIF0       (flags, param, conf.hshift,                param->conf.cshift,      "d", "sized to cache");
+        SETIF0DEFAULT(flags, param, conf.min_radix_level,       DEFAULT_MIN_RADIX_LEVEL, "d");
+        SETIF0       (flags, param, conf.cache_shepherd_shift,  MAX(param->conf.cshift - DEFAULT_SHEPHERD_RATIO, DEFAULT_SHEPHERD_SHIFT), "d", "sized to cache");
         return t2_init(&param->conf);
 }
 
@@ -1998,7 +2001,7 @@ static void radixmap_update(struct node *n) {
 
 /* @policy */
 
-#define USE_PREFIX_SEPARATORS (1)
+#define USE_PREFIX_SEPARATORS (0)
 
 static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r, int level) {
         ASSERT(buf_cmp(l, r) < 0);
@@ -5590,7 +5593,9 @@ static int lazy_insert(struct slot *s, struct cap *cap) {
         int          result;
         ASSERT(idx <= d->nr);
         ASSERT(lazy_invariant(n));
+        CINC(l[level(n)].insert);
         if (d->free < incr) {
+                CINC(l[level(n)].nospc);
                 return -ENOSPC;
         }
         if (d->kend - d->vend < incr) {
@@ -5636,6 +5641,7 @@ static void lazy_delete(struct slot *s, struct cap *cap) {
         struct lrec *rec = n->data + d->val[idx].off - RSIZE;
         ASSERT(s->idx < d->nr);
         ASSERT(lazy_invariant(n));
+        CINC(l[level(n)].delete);
         d->free += d->val[idx].len + d->key[idx].len + RSIZE;
         rec->vlen = LREC_FREE - d->val[idx].len;
         ext_merge(&cap->ext[VAL], (void *)rec - n->data, (void *)rec - n->data + sizeof rec->vlen);
@@ -5665,6 +5671,7 @@ static void lazy_get(struct slot *s) {
         s->rec.val->addr = n->data + d->val[idx].off;
         s->rec.val->len  = d->val[idx].len;
         rcu_unlock();
+        CINC(l[level(n)].recget);
 }
 
 static int lazy_load(struct node *n, const struct t2_node_type *nt) {
@@ -5684,6 +5691,7 @@ static void lazy_make(struct node *n, struct cap *cap) {
         int result = lazy_parse(n, n->ntype); /* TODO: Handle errors properly. */
         ASSERT(result == 0);
         ASSERT(lazy_invariant(n));
+        CINC(l[level(n)].make);
 }
 
 static void lazy_print(struct node *n) {
@@ -6024,7 +6032,9 @@ static int odir_insert(struct slot *s, struct cap *cap) {
         int             result;
         ASSERT(idx <= oh->nr);
         ASSERT(odir_invariant(n));
+        CINC(l[level(n)].insert);
         if (odir_free(n) < incr) {
+                CINC(l[level(n)].nospc);
                 return -ENOSPC;
         }
         if (dend - end < incr) {
@@ -6061,6 +6071,7 @@ static void odir_delete(struct slot *s, struct cap *cap) {
         int32_t         len  = olen(rec);
         ASSERT(s->idx < oh->nr);
         ASSERT(odir_invariant(n));
+        CINC(l[level(n)].delete);
         oh->used -= len + ORSIZE;
         if (oh->end == rec->off + len) {
                 oh->end -= len;
@@ -6080,6 +6091,7 @@ static void odir_get(struct slot *s) {
         s->rec.key->len  = rec->klen;
         s->rec.val->addr = n->data + rec->off + rec->klen;
         s->rec.val->len  = rec->vlen;
+        CINC(l[level(n)].recget);
 }
 
 static int odir_load(struct node *n, const struct t2_node_type *nt) {
@@ -6099,6 +6111,7 @@ static void odir_make(struct node *n, struct cap *cap) {
                 cap->ext[HDR].end = OHSIZE;
         }
         ASSERT(odir_invariant(n));
+        CINC(l[level(n)].make);
 }
 
 static void odir_print(struct node *n) {
