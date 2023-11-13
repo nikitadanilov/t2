@@ -249,7 +249,7 @@ enum {
 })
 
 #define HAS_DEFAULT_FORMAT (1)
-#define DEFAULT_FORMAT simple
+#define DEFAULT_FORMAT odir
 
 #if HAS_DEFAULT_FORMAT
 #define NCALL(n, ...) ((void)(n), CONCAT(CONCAT(DEFAULT_FORMAT, _), __VA_ARGS__))
@@ -763,6 +763,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t delete;
                 int64_t recget;
                 int64_t moves;
+                int64_t compact;
+                int64_t reclaim;
                 int64_t make;
                 int64_t shift;
                 int64_t shift_one;
@@ -942,6 +944,20 @@ static int32_t lazy_used(const struct node *n);
 static bool lazy_can_merge(const struct node *n0, const struct node *n1);
 static int lazy_can_insert(const struct slot *s);
 static int32_t lazy_nr (const struct node *n);
+static int odir_insert(struct slot *s, struct cap *cap);
+static void odir_delete(struct slot *s, struct cap *cap);
+static void odir_get(struct slot *s);
+static int odir_load(struct node *n, const struct t2_node_type *nt);
+static bool odir_check(struct node *n);
+static void odir_make(struct node *n, struct cap *cap);
+static void odir_print(struct node *n);
+static void odir_fini(struct node *n);
+static bool odir_search(struct node *n, struct path *p, struct slot *out);
+static int32_t odir_free(const struct node *n);
+static int32_t odir_used(const struct node *n);
+static bool odir_can_merge(const struct node *n0, const struct node *n1);
+static int odir_can_insert(const struct slot *s);
+static int32_t odir_nr (const struct node *n);
 static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 static int shift(struct page *d, struct page *s, const struct slot *insert, enum dir dir);
 static int merge(struct page *d, struct page *s, enum dir dir);
@@ -1038,6 +1054,7 @@ static __thread volatile struct {
 } addr_check = {};
 static struct node_type_ops simple_ops;
 static struct node_type_ops lazy_ops;
+static struct node_type_ops odir_ops;
 static char *argv0;
 
 static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stage stage) {
@@ -1404,9 +1421,10 @@ struct t2_node_type *t2_node_type_init(int16_t id, const char *name, int shift, 
                 nt->id    = id;
                 nt->name  = name;
                 nt->shift = shift;
-                nt->ops   = &lazy_ops;
+                nt->ops   = &odir_ops;
                 (void)simple_ops;
                 (void)lazy_ops;
+                (void)odir_ops;
         }
         return nt;
 }
@@ -4123,6 +4141,8 @@ static void counters_print() {
         COUNTER_PRINT(make);
         COUNTER_PRINT(shift);
         COUNTER_PRINT(shift_one);
+        COUNTER_PRINT(compact);
+        COUNTER_PRINT(reclaim);
         COUNTER_PRINT(merge);
         COUNTER_PRINT(page_node);
         COUNTER_PRINT(page_cached);
@@ -5532,6 +5552,7 @@ static int lazy_compact(struct node *n, struct cap *cap) {
         int32_t      vcur    = HSIZE;
         int32_t      kcur    = size;
         ASSERT(lazy_invariant(n));
+        CINC(l[level(n)].compact);
         if (scratch != NULL) {
                 for (int32_t i = 0; i < d->nr; ++i) {
                         *(struct lrec *)(scratch + vcur) = (struct lrec){ .vlen = d->val[i].len, .klen = d->key[i].len };
@@ -5547,10 +5568,9 @@ static int lazy_compact(struct node *n, struct cap *cap) {
                 mem_free(scratch);  /* We could just replaced n->data with scratch, but let's keep ->data constant. */
                 d->vend = vcur;
                 d->kend = kcur;
-                ext_merge(&cap->ext[VAL], HSIZE, vcur);
-                ext_merge(&cap->ext[KEY], kcur, nsize(n));
+                ext_merge(&cap->ext[KEY], kcur, size);
                 lheader(n)->nr = d->nr;
-                ext_merge(&cap->ext[HDR], offsetof(struct lheader, nr), HSIZE);
+                ext_merge(&cap->ext[HDR], offsetof(struct lheader, nr), vcur);
                 ASSERT(lazy_invariant(n));
                 return 0;
         } else {
@@ -5624,6 +5644,7 @@ static void lazy_delete(struct slot *s, struct cap *cap) {
                 d->vend -= d->val[idx].len + RSIZE;
                 --lheader(n)->nr;
                 ext_merge(&cap->ext[HDR], offsetof(struct lheader, nr), HSIZE);
+                CINC(l[level(n)].reclaim);
         }
         memmove(&d->key[idx], &d->key[idx + 1], (d->nr - idx - 1) * sizeof d->key[0]);
         memmove(&d->val[idx], &d->val[idx + 1], (d->nr - idx - 1) * sizeof d->val[0]);
@@ -5849,7 +5870,7 @@ static int lazy_can_insert(const struct slot *s) {
         return lazy_free(s->node) >= rec_len(&s->rec) + RSIZE;
 }
 
-static int32_t lazy_nr (const struct node *n) {
+static int32_t lazy_nr(const struct node *n) {
         int32_t nr;
         rcu_lock();
         nr = LDIR(n)->nr;
@@ -5870,7 +5891,383 @@ static struct node_type_ops lazy_ops = {
         .can_merge  = &lazy_can_merge,
         .can_insert = &lazy_can_insert,
         .nr         = &lazy_nr,
-        .free       = &lazy_free,
+        .free       = &lazy_free
+};
+
+/* @odir */
+
+struct oheader {
+        struct header head;
+        int32_t       nr;
+        int32_t       end;
+        int32_t       used;
+};
+
+struct orec {
+        int32_t off;
+        int16_t klen;
+        int16_t vlen;
+};
+
+enum {
+        OHSIZE = SOF(struct oheader),
+        ORSIZE = SOF(struct orec)
+};
+
+static struct oheader *oheader(struct node *n) {
+        return n->data;
+}
+
+static int32_t onr(const struct node *n) {
+        return oheader((void *)n)->nr;
+}
+
+static int32_t olen(const struct orec *rec) {
+        return rec->klen + rec->vlen;
+}
+
+static struct orec *oat_with(void *terminus, int32_t idx) {
+        return &((struct orec *)terminus)[-idx - 1];
+}
+
+static struct orec *oat(const struct node *n, int32_t idx) {
+        return oat_with(n->data + nsize(n), idx);
+}
+
+static int32_t oend(const struct node *n) {
+        return oheader((void *)n)->end;
+}
+
+static int32_t odirend(const struct node *n) {
+        return nsize(n) - onr(n) * ORSIZE;
+}
+
+static int32_t odir_used(const struct node *n) {
+        return oheader((void *)n)->used;
+}
+
+static int32_t odir_free(const struct node *n) {
+        return nsize(n) - odir_used(n);
+}
+
+static bool odir_invariant(const struct node *n) {
+        struct oheader *oh = n->data;
+        int32_t max  = OHSIZE;
+        int32_t used = OHSIZE;
+        for (int32_t i = 0; i < oh->nr; ++i) {
+                struct orec *rec = oat(n, i);
+                int32_t len = olen(rec);
+                if (rec->klen < 0 || rec->vlen < 0) {
+                        printf("Negative len at %d.\n", i);
+                        return false;
+                }
+                if (rec->off < OHSIZE || rec->off + len > odirend(n)) {
+                        printf("Wrong rec at %d.\n", i);
+                        return false;
+                }
+                max = max_32(max, rec->off + len);
+                used += len + ORSIZE;
+                for (int32_t j = 0; j < i; ++j) {
+                        struct orec *other = oat(n, j);
+                        if (max_32(rec->off, other->off) < min_32(rec->off + olen(rec), other->off + olen(other))) {
+                                printf("Overlap at %d %d.\n", j, i);
+                                return false;
+                        }
+                }
+        }
+        if (max > oh->end) {
+                printf("Wrong end: %d > %d.\n", max, oh->end);
+                return false;
+        }
+        if (used != oh->used) {
+                printf("Wrong used %d != %d.\n", used, oh->used);
+                return false;
+        }
+        return true;
+}
+
+static int odir_compact(struct node *n, struct cap *cap) {
+        int32_t      size    = nsize(n);
+        void        *scratch = mem_alloc(size);
+        int32_t      nr      = onr(n);
+        CINC(l[level(n)].compact);
+        if (scratch != NULL) {
+                int32_t off = OHSIZE;
+                for (int32_t i = 0; i < nr; ++i) {
+                        struct orec *old = oat(n, i);
+                        *oat_with(scratch + size, i) = (struct orec){ .off = off, .klen = old->klen, .vlen = old->vlen };
+                        memcpy(scratch + off, n->data + old->off, olen(old));
+                        off += olen(old);
+                }
+                memcpy(n->data + OHSIZE, scratch + OHSIZE, size - OHSIZE);
+                mem_free(scratch);
+                oheader(n)->end = off;
+                ext_merge(&cap->ext[VAL], offsetof(struct oheader, end), off);
+                ext_merge(&cap->ext[KEY], odirend(n), size);
+                ASSERT(odir_invariant(n));
+                return 0;
+        } else {
+                return ERROR(-ENOMEM);
+        }
+}
+
+static int odir_insert(struct slot *s, struct cap *cap) {
+        int             idx  = s->idx;
+        struct node    *n    = s->node;
+        struct oheader *oh   = oheader(n);
+        int32_t         end  = oend(n);
+        int32_t         dend = odirend(n);
+        int32_t         klen = buf_len(s->rec.key);
+        int32_t         vlen = buf_len(s->rec.val);
+        int16_t         incr = klen + vlen + ORSIZE;
+        struct orec    *rec  = oat(n, idx);
+        int             result;
+        ASSERT(idx <= oh->nr);
+        ASSERT(odir_invariant(n));
+        if (odir_free(n) < incr) {
+                return -ENOSPC;
+        }
+        if (dend - end < incr) {
+                result = odir_compact(n, cap);
+                if (UNLIKELY(result != 0)) {
+                        return ERROR(result);
+                }
+                end  = oend(n);
+        }
+        ASSERT(dend - end >= incr);
+        lmove(n->data + dend, rec + 1, -ORSIZE);
+        *rec = (struct orec){ .off = end, .klen = klen, .vlen = vlen };
+        memcpy(n->data + end,        s->rec.key->addr, klen);
+        memcpy(n->data + end + klen, s->rec.val->addr, vlen);
+        ext_merge(&cap->ext[DIR], dend - ORSIZE, nsize(n) - idx * ORSIZE);
+        ext_merge(&cap->ext[VAL], end, end + klen + vlen);
+        ++oh->nr;
+        oh->used += incr;
+        oh->end += klen + vlen;
+        ext_merge(&cap->ext[HDR], SOF(struct header), OHSIZE);
+        ASSERT(oend(n) == end + klen + vlen);
+        ASSERT(odirend(n) == dend - ORSIZE);
+        ASSERT(odir_invariant(n));
+        return 0;
+}
+
+static void odir_delete(struct slot *s, struct cap *cap) {
+        int             idx  = s->idx;
+        struct node    *n    = s->node;
+        struct oheader *oh   = oheader(n);
+        int32_t         off  = nsize(n) - idx * ORSIZE;
+        int32_t         dend = odirend(n);
+        struct orec    *rec  = oat(n, idx);
+        int32_t         len  = olen(rec);
+        ASSERT(s->idx < oh->nr);
+        ASSERT(odir_invariant(n));
+        oh->used -= len + ORSIZE;
+        if (oh->end == rec->off + len) {
+                oh->end -= len;
+                CINC(l[level(n)].reclaim);
+        }
+        move(n->data, dend, off - ORSIZE, ORSIZE);
+        ext_merge(&cap->ext[DIR], dend + ORSIZE, off);
+        --oheader(n)->nr;
+        ext_merge(&cap->ext[HDR], SOF(struct header), OHSIZE);
+        ASSERT(odir_invariant(n));
+}
+
+static void odir_get(struct slot *s) {
+        struct node *n   = s->node;
+        struct orec *rec = oat(n, s->idx);
+        s->rec.key->addr = n->data + rec->off;
+        s->rec.key->len  = rec->klen;
+        s->rec.val->addr = n->data + rec->off + rec->klen;
+        s->rec.val->len  = rec->vlen;
+}
+
+static int odir_load(struct node *n, const struct t2_node_type *nt) {
+        return 0;
+}
+
+static bool odir_check(struct node *n) {
+        return ncheck(n);
+}
+
+static void odir_make(struct node *n, struct cap *cap) {
+        oheader(n)->nr   = 0;
+        oheader(n)->used = OHSIZE;
+        oheader(n)->end  = OHSIZE;
+        if (TRANSACTIONS) {
+                cap->ext[HDR].start = 0;
+                cap->ext[HDR].end = OHSIZE;
+        }
+        ASSERT(odir_invariant(n));
+}
+
+static void odir_print(struct node *n) {
+        int32_t         size = nsize(n);
+        struct header  *head = nheader(n);
+        int32_t         i;
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u used: %u end: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64"\n",
+               n->addr, head->treeid, head->level, head->ntype,
+               onr(n), odir_used(n), oend(n), size, n, n->ref, n->flags, n->lsn);
+        for (i = 0; i < onr(n); ++i) {
+                struct orec *rec = oat(n, i);
+                printf("        %4d %4d %4d %4d: ", i, rec->off, rec->klen, rec->vlen);
+                        range_print(n->data, size, n->data + rec->off, rec->klen);
+                        printf(" ");
+                        range_print(n->data, size, n->data + rec->off + rec->klen, rec->vlen);
+                printf("\n");
+        }
+}
+
+static void odir_fini(struct node *n) {
+        SET0(nheader(n));
+}
+
+static int okeycmp(struct node *n, int32_t idx, int32_t prefix, void *key, int32_t klen, uint32_t mask) {
+        struct orec *rec = oat(n, idx);
+        int32_t koff  = (rec->off + prefix) & mask;
+        int16_t ksize = min_32((rec->klen - prefix) & mask, mask + 1 - koff);
+        klen -= prefix;
+        return memcmp(n->data + koff, key + prefix, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
+}
+
+static bool odir_search(struct node *n, struct path *p, struct slot *out) {
+        struct t2_rec  *rec   = p->rec;
+        bool            found = false;
+        int             l     = -1;
+        void           *kaddr = rec->key->addr;
+        int32_t         klen  = rec->key->len;
+        int             cmp   = -1;
+        uint32_t        mask  = nsize(n) - 1;
+        int32_t         plen  = 0;
+        int32_t         nr    = onr(n);
+        int             delta = nr + 1;
+        int32_t         span;
+        uint8_t __attribute__((unused)) lev = level(n);
+        ASSERT((nsize(n) & mask) == 0);
+        ASSERT(((uint64_t)n->data & mask) == 0);
+        EXPENSIVE_ASSERT(scheck(sh, n->ntype));
+        CINC(l[lev].search);
+        CMOD(l[lev].free,        odir_free(n));
+        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
+        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
+        CMOD(l[lev].nr, nr);
+        if (UNLIKELY(nr == 0)) {
+                goto here;
+        } else if (LIKELY(n->radix != NULL && n->radix->prefix.len != -1)) {
+                int16_t ch;
+                plen = n->radix->prefix.len;
+                cmp = memcmp(n->radix->prefix.addr, kaddr, min_32(plen, klen)) ?: klen < plen ? +1 : 0;
+                if (UNLIKELY(cmp != 0)) {
+                        l = cmp > 0 ? -1 : nr - 1;
+                        goto here;
+                }
+                ch = LIKELY(klen > plen) ? ((uint8_t *)kaddr)[plen] : -1;
+                l     = n->radix->idx[ch].l;
+                delta = n->radix->idx[ch].delta;
+                CMOD(l[lev].radixmap_left,  l + 1);
+                CMOD(l[lev].radixmap_right, nr - l - delta);
+                if (UNLIKELY(l < 0)) {
+                        goto here;
+                }
+                cmp = okeycmp(n, l, plen, kaddr, klen, mask);
+                if (cmp > 0) {
+                        l--;
+                } else if (cmp == 0) {
+                        found = true;
+                        goto here;
+                }
+                l = max_32(min_32(nr - 1, l), -1);
+                delta = min_32(delta, nr - l);
+        }
+        CMOD(l[lev].search_span, delta);
+        span = 1 << ilog2(delta);
+        if (span != delta && okeycmp(n, l + span, plen, kaddr, klen, mask) <= 0) {
+                l += delta - span;
+        }
+#define RANGE(x, prefetchp)                                                  \
+        case 1 << (x):                                                       \
+                span >>= 1;                                                  \
+                if (prefetchp) {                                             \
+                        __builtin_prefetch(oat(n, l + span + (span >> 1)));  \
+                        __builtin_prefetch(oat(n, l + span - (span >> 1)));  \
+                }                                                            \
+                cmp = okeycmp(n, l + span, plen, kaddr, klen, mask);         \
+                if (cmp <= 0) {                                              \
+                        l += span;                                           \
+                        if (cmp == 0) {                                      \
+                                found = true;                                \
+                                goto here;                                   \
+                        }                                                    \
+                }                                                            \
+                __attribute__((fallthrough));
+        switch (span) {
+        default:
+                IMMANENTISE("Impossible span: %i.", span);
+                RANGE(16,  true)
+                RANGE(15,  true)
+                RANGE(14,  true)
+                RANGE(13,  true)
+                RANGE(12,  true)
+                RANGE(11,  true)
+                RANGE(10,  true)
+                RANGE( 9,  true)
+                RANGE( 8,  true)
+                RANGE( 7,  true)
+                RANGE( 6,  true)
+                RANGE( 5,  true)
+                RANGE( 4, false)
+                RANGE( 3, false)
+                RANGE( 2, false)
+                RANGE( 1, false)
+        case 1:
+                ;
+        }
+#undef RANGE
+ here:
+        out->idx = l;
+        if (0 <= l && l < nr) {
+                struct t2_buf *key  = out->rec.key;
+                struct t2_buf *val  = out->rec.val;
+                void          *orig = n->data;
+                struct orec   *rec  = oat(n, l);
+                key->addr = orig + rec->off;
+                key->len  = rec->klen;
+                buf_clip(key, mask, orig);
+                val->addr = orig + rec->off + rec->klen;
+                val->len  = rec->vlen;
+                buf_clip(val, mask, orig);
+                CMOD(l[lev].keysize, key->len);
+                CMOD(l[lev].valsize, val->len);
+        }
+        return found;
+}
+
+static bool odir_can_merge(const struct node *n0, const struct node *n1) {
+        return odir_used(n0) + odir_used(n1) <= nsize(n0) - OHSIZE;
+}
+
+static int odir_can_insert(const struct slot *s) {
+        return odir_free(s->node) >= rec_len(&s->rec) + ORSIZE;
+}
+
+static int32_t odir_nr(const struct node *n) {
+        return onr(n);
+}
+
+static struct node_type_ops odir_ops = {
+        .insert     = &odir_insert,
+        .delete     = &odir_delete,
+        .get        = &odir_get,
+        .load       = &odir_load,
+        .check      = &odir_check,
+        .make       = &odir_make,
+        .print      = &odir_print,
+        .fini       = &odir_fini,
+        .search     = &odir_search,
+        .can_merge  = &odir_can_merge,
+        .can_insert = &odir_can_insert,
+        .nr         = &odir_nr,
+        .free       = &odir_free
 };
 
 /* @wal */
