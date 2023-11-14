@@ -677,7 +677,7 @@ enum {
         WAL_AGE_LIMIT           =    BILLION,
         WAL_SYNC_AGE            =    BILLION,
         WAL_SYNC_NOB            = 1ull <<  9,
-        WAL_LOG_SIZE            = 1ull << 14,
+        WAL_LOG_SIZE            = 1ull << 15,
         WAL_RESERVE_QUANTUM     =         64,
         WAL_THRESHOLD_PAGED     =        512,
         WAL_THRESHOLD_PAGE      =        128,
