@@ -5447,7 +5447,7 @@ static void heapify(void *orig, struct collect *coll, int32_t n, int32_t idx) {
         }
 }
 
-static void heapsort(void *orig, struct collect *coll, int32_t n) {
+static void heap_sort(void *orig, struct collect *coll, int32_t n) {
         for (int32_t i = n / 2 - 1; i >= 0; i--) {
                 heapify(orig, coll, n, i);
         }
@@ -5493,7 +5493,7 @@ static int lazy_parse(struct node *n, const struct t2_node_type *nt) {
                         vcur += lvlen(rec);
                 }
                 if (USE_HEAPSORT) {
-                        heapsort(n->data, set, here);
+                        heap_sort(n->data, set, here);
                 } else {
                         qsort(set, here, sizeof set[0], &lqcmp);
                 }
