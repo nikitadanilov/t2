@@ -112,7 +112,7 @@ function run() {
 function setup_prereq() {
     case "$distro" in
 	(ubuntu)
-	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev
+	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev liblmdb0 liblmdb-dev
     ;;  (darwin)
 	    run brew install automake autoconf libtool gcc gperftools
     ;;  (*)
