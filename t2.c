@@ -7129,7 +7129,6 @@ static void wal_fini(struct t2_te *engine) {
                 }
         }
         mem_free(en->fd);
-        writeout(en->mod);
         ASSERT(cds_list_empty(&en->ready));
         NOFAIL(pthread_cond_destroy(&en->bufwrite));
         NOFAIL(pthread_cond_destroy(&en->bufwait));
