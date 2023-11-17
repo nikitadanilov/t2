@@ -6836,6 +6836,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         int32_t         size;
         int             added = 0;
         int             blks  = 0;
+        bool            slow;
         struct node    *nodes[nr]; /* VLA */
         ASSERT(en->recovered);
         rec = space = wal_space(en, tx, nr, nob, &size);
@@ -6874,7 +6875,8 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 }
         }
         mutex_lock(&en->curlock);
-        if (UNLIKELY(en->cur == NULL || !wal_fits(en, en->cur, size))) {
+        slow = UNLIKELY(en->cur == NULL || !wal_fits(en, en->cur, size));
+        if (slow) {
                 mutex_unlock(&en->curlock);
                 wal_lock(en);
                 if (en->ready_nr <= en->ready_lo) {
@@ -6882,7 +6884,6 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 }
                 mutex_lock(&en->curlock);
                 wal_get(en, size);
-                wal_unlock(en);
         }
         tx->id = en->lsn;
         ASSERT(en->cur != NULL && wal_fits(en, en->cur, size));
@@ -6896,6 +6897,9 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                 t2_lsnset((void *)nodes[i], tx->id);
         }
         mutex_unlock(&en->curlock);
+        if (slow) {
+                wal_unlock(en);
+        }
         ASSERT(tx->reserved > 0);
         tx->reserved--;
         ASSERT(FORALL(i, nr, node_locked_invariant((void *)txr[i].node, WRITE)));
@@ -7480,21 +7484,22 @@ static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
         struct wal_te *en    = COF(engine, struct wal_te, base);
         struct wal_tx *tx    = COF(trax, struct wal_tx, base);
         uint64_t       start = READ_ONCE(en->mod->tick);
+        int            delta = en->reserve_quantum;
         if (tx->reserved == 0) {
-                if (UNLIKELY(en->log_size < wal_log_need(en) + en->reserve_quantum)) {
+                if (UNLIKELY(en->log_size < wal_log_need(en) + delta)) {
                         return ERROR_INFO(-EAGAIN, "Concurrency is too high. Increase the log size", 0, 0);
                 }
-                tx->reserved = en->reserve_quantum;
+                tx->reserved = delta;
                 wal_lock(en);
                 mutex_lock(&en->curlock);
-                while (wal_log_free(en) < wal_log_need(en) + en->reserve_quantum) {
+                while (wal_log_free(en) < wal_log_need(en) + delta) {
                         mutex_unlock(&en->curlock);
                         if (!wal_progress(en, LOG_WRITE|LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, INT_MAX, 0)) {
                                 wal_cond_wait(en, &en->logwait);
                         }
                         mutex_lock(&en->curlock);
                 }
-                en->reserved += en->reserve_quantum;
+                en->reserved += delta;
                 mutex_unlock(&en->curlock);
                 wal_unlock(en);
         }
