@@ -2311,7 +2311,6 @@ static void path_dirty(struct path *p) {
 
 static void path_lock(struct path *p) {
         /* Top to bottom, left to right. */
-        /* TODO: This can deadlock, because lockless path is not descending. */
         if (UNLIKELY(p->newroot.node != NULL)) {
                 lock(p->newroot.node, WRITE);
         }
@@ -2319,6 +2318,7 @@ static void path_lock(struct path *p) {
                 struct rung *r = &p->rung[i];
                 struct page *left  = brother(r, LEFT);
                 struct page *right = brother(r, RIGHT);
+                ASSERT(i > 0 ? level(r->page.node) + 1 == level((r - 1)->page.node) : true);
                 if (left->node != NULL) {
                         lock(left->node, left->lm);
                 }
@@ -2462,6 +2462,11 @@ static bool rung_is_valid(const struct path *p, int i) {
         return is_valid;
 }
 
+static bool rung_precheck(const struct rung *r, int idx) {
+        struct node *n = r->page.node; /* Check that the path is descending before locking it. */
+        return node_seq_is_valid(n, r->page.seq) && (idx > 0 ? level(n) + 1 == level((r - 1)->page.node) : true);
+}
+
 static void cap_init(struct cap *cap, uint32_t size) {
         for (int i = 0; i < ARRAY_SIZE(cap->ext); ++i) {
                 struct ext *e = &cap->ext[i];
@@ -2563,6 +2568,10 @@ static int insert_prep(struct path *p) {
                 if (can_insert(r->page.node, rec) && !should_split(r->page.node)) {
                         break;
                 } else {
+                        if (!rung_precheck(r, idx)) {
+                                result = -ESTALE;
+                                break;
+                        }
                         r->pd.id = policy_select(p, idx);
                         result = dispatch[r->pd.id].plan_insert(p, idx);
                         if (result > 0) {
@@ -2598,6 +2607,10 @@ static int delete_prep(struct path *p) {
                 if (keep(r->page.node)) {
                         break;
                 } else {
+                        if (!rung_precheck(r, idx)) {
+                                result = -ESTALE;
+                                break;
+                        }
                         r->pd.id = policy_select(p, idx);
                         result = dispatch[r->pd.id].plan_delete(p, idx);
                         if (result > 0) {
