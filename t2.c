@@ -2305,6 +2305,7 @@ static void path_dirty(struct path *p) {
 
 static void path_lock(struct path *p) {
         /* Top to bottom, left to right. */
+        /* TODO: This can deadlock, because lockless path is not descending. */
         if (UNLIKELY(p->newroot.node != NULL)) {
                 lock(p->newroot.node, WRITE);
         }
@@ -2316,11 +2317,11 @@ static void path_lock(struct path *p) {
                         lock(left->node, left->lm);
                 }
                 lock(r->page.node, r->page.lm);
-                if (right->node != NULL) {
-                        lock(right->node, right->lm);
-                }
                 if (r->allocated.node != NULL) {
                         lock(r->allocated.node, WRITE);
+                }
+                if (right->node != NULL) {
+                        lock(right->node, right->lm);
                 }
         }
 }
@@ -3671,6 +3672,9 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
                 CINC(shepherd_iter);
                 while (LIKELY(!mod->shutdown) && need_cleaning(mod, self)) {
                         int64_t cleaned = shepherd_scan(mod, self, sector_start, sector_size);
+                        if (UNLIKELY(mod->shutdown)) {
+                                break;
+                        }
                         self->min = self->cur_min;
                         TXCALL(mod->te, scan_end(mod->te, cleaned));
                         CADD(shepherd_clean, cleaned);
@@ -6258,7 +6262,7 @@ static bool odir_search(struct node *n, struct path *p, struct slot *out) {
 }
 
 static bool odir_can_merge(const struct node *n0, const struct node *n1) {
-        return odir_used(n0) + odir_used(n1) <= nsize(n0) - OHSIZE;
+        return odir_used(n0) + odir_used(n1) <= nsize(n0) + OHSIZE;
 }
 
 static int odir_can_insert(const struct slot *s) {
@@ -9125,6 +9129,8 @@ int main(int argc, char **argv) {
  * - avoid dynamic allocations in *_balance(), pre-allocate in *_prepare()
  *
  * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
+ *
+ * - cursor benchmark
  *
  * Done:
  *
