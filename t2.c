@@ -1588,6 +1588,9 @@ static bool node_locked_invariant(struct node *n, enum lock_mode mode) {
         if (!TRANSACTIONS || n->mod->te == NULL) {
                 return true;
         }
+        if ((n->flags & HEARD_BANSHEE) != 0) {
+                return true;
+        }
         if ((n->flags & DIRTY) == (n->lsn == 0)) {
                 return false;
         }
@@ -1826,6 +1829,9 @@ static struct node *tryget(struct t2 *mod, taddr_t addr) {
         }
         if (n == NULL) {
                 n = get(mod, addr);
+                if (UNLIKELY(n->flags & HEARD_BANSHEE)) {
+                        return EPTR(-ESTALE);
+                }
         }
         return n;
 }
