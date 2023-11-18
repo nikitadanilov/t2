@@ -1829,7 +1829,8 @@ static struct node *tryget(struct t2 *mod, taddr_t addr) {
         }
         if (n == NULL) {
                 n = get(mod, addr);
-                if (UNLIKELY(n->flags & HEARD_BANSHEE)) {
+                if (UNLIKELY(EISOK(n) && (n->flags & HEARD_BANSHEE))) {
+                        put(n);
                         return EPTR(-ESTALE);
                 }
         }
