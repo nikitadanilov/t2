@@ -399,6 +399,8 @@ static int shift_internal = 9;
 static int shift_twig     = 9;
 static int shift_leaf     = 9;
 static int report_interval = 10;
+static bool keep = false;
+static bool make = true;
 
 static struct t2_node_type *bn_ntype_internal;
 static struct t2_node_type *bn_ntype_twig;
@@ -610,7 +612,7 @@ static void bphase_report(struct bphase *ph, bool final) {
         uint64_t duration = now() - (final ? ph->begin : ph->last);
         for (int i = 0; i < ph->nr; ++i) {
                 struct bthread *bt = &ph->group[i].thread;
-                uint64_t total = REDUCE(i, bt->nr, 0, + bt->choice[i].option.var.nr);
+                uint64_t total = REDUCE(i, bt->nr, 0ULL, + bt->choice[i].option.var.nr);
 
                 for (int k = 0; k < bt->nr; ++k) {
                         const double M = 1000000.0;
@@ -701,7 +703,7 @@ static const char logname[] = "./log/l";
 static bool transactions = false;
 
 static void t_mount(struct benchmark *b) {
-        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|MAKE, WAL_WORKERS, WAL_LOG_SHIFT, LOG_SLEEP, WAL_AGE_LIMIT,
+        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|(make ? MAKE : 0)|(keep ? KEEP : 0), WAL_WORKERS, WAL_LOG_SHIFT, LOG_SLEEP, WAL_AGE_LIMIT,
                                                        WAL_SYNC_AGE, WAL_SYNC_NOB, WAL_LOG_SIZE, WAL_RESERVE_QUANTUM,
                                                        WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO) : NULL;
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
@@ -1015,7 +1017,7 @@ int main(int argc, char **argv) {
 #if USE_MAP
         kv[MAP] = mapkv;
 #endif
-        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:C:")) != -1) {
+        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:C:KM")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -1060,6 +1062,13 @@ int main(int argc, char **argv) {
                                 printf("Unknown kv: %s\n", optarg);
                                 return 1;
                         }
+                        break;
+                case 'K':
+                        keep = true;
+                        break;
+                case 'M':
+                        make = false;
+                        break;
                 }
         }
         if (total != NULL) {
