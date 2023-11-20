@@ -351,11 +351,6 @@ enum {
         DAEMON = 1 << 0
 };
 
-enum {
-        CACHE_SHEPHERD_SHIFT = 4,
-        CACHE_SHEPHERD_NR    = 1 << CACHE_SHEPHERD_SHIFT
-};
-
 struct shepherd {
         alignas(MAX_CACHELINE) lsn_t     lim;
         lsn_t                            min;
@@ -769,6 +764,9 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t shift;
                 int64_t shift_one;
                 int64_t merge;
+                int64_t page_out;
+                int64_t page_noent;
+                int64_t page_trylock;
                 int64_t page_node;
                 int64_t page_cached;
                 int64_t page_busy;
@@ -790,16 +788,15 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var modified;
                 struct counter_var keysize;
                 struct counter_var valsize;
-                struct counter_var repage;
                 struct counter_var sepcut;
                 struct counter_var radixmap_left;
                 struct counter_var radixmap_right;
                 struct counter_var search_span;
                 struct counter_var recpos;
                 struct counter_var prefix;
-                struct counter_var pageout_cluster;
                 struct counter_var radixmap_builds;
                 struct counter_var page_dirty_nr;
+                struct counter_var pageout_cluster;
                 struct counter_var tx_add[M_NR];
         } l[MAX_TREE_HEIGHT];
 };
@@ -1080,8 +1077,9 @@ static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stag
 enum {
         DEFAULT_CSHIFT                  =         22,
         DEFAULT_MIN_RADIX_LEVEL         =          2,
-        DEFAULT_SHEPHERD_RATIO          =         16,
-        DEFAULT_SHEPHERD_SHIFT          =          4,
+        DEFAULT_SHEPHERD_RATIO          =         20,
+        DEFAULT_SHEPHERD_MIN            =          0,
+        DEFAULT_SHEPHERD_MAX            =          9,
         DEFAULT_MAX_CLUSTER             =        256,
         DEFAULT_WAL_NR_BUFS             =        200,
         DEFAULT_WAL_BUF_SIZE            = 1ull << 20,
@@ -1169,7 +1167,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
         SETIF0DEFAULT(flags, param, conf.cshift,                DEFAULT_CSHIFT,          "d");
         SETIF0       (flags, param, conf.hshift,                param->conf.cshift,      "d", "sized to cache");
         SETIF0DEFAULT(flags, param, conf.min_radix_level,       DEFAULT_MIN_RADIX_LEVEL, "d");
-        SETIF0       (flags, param, conf.cache_shepherd_shift,  MAX(param->conf.cshift - DEFAULT_SHEPHERD_RATIO, DEFAULT_SHEPHERD_SHIFT), "d", "sized to cache");
+        SETIF0       (flags, param, conf.cache_shepherd_shift,  MIN(MAX(param->conf.cshift - DEFAULT_SHEPHERD_RATIO, DEFAULT_SHEPHERD_MIN), DEFAULT_SHEPHERD_MAX), "d", "sized to cache");
         return t2_init(&param->conf);
 }
 
@@ -1363,12 +1361,14 @@ void t2_stats_print(struct t2 *mod) {
                 bool underpressure = stress(&c->pool.free[i], &pressure);
                 printf(" %7i%s", pressure, underpressure ? "*" : " ");
         }
-        printf("\nshepherd: ");
-        for (int i = 0; i < c->sh_nr; ++i) {
-                struct shepherd *sh = &c->sh[i];
-                printf("[%6"PRId64" : %6"PRId64"] ", sh->lim, sh->min);
-                if ((i & 7) == 7) {
-                        printf("\n          ");
+        if (false) {
+                printf("\nshepherd: ");
+                for (int i = 0; i < c->sh_nr; ++i) {
+                        struct shepherd *sh = &c->sh[i];
+                        printf("[%6"PRId64" : %6"PRId64"] ", sh->lim, sh->min);
+                        if ((i & 7) == 7) {
+                                printf("\n          ");
+                        }
                 }
         }
         printf("\n%15s bolt: %8"PRId64"\n", "cache:", c->bolt);
@@ -1798,7 +1798,6 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                         if (LIKELY(result == 0)) {
                                 if (LIKELY(NCALL(n, check(n)) && addr != 0)) {
                                         struct header *h = nheader(n);
-                                        CMOD(l[level(n)].repage, bolt(n) - h->kelvin.cur);
                                         node_seq_increase(n);
                                         NCALL(n, load(n, mod->ntypes[h->ntype])); /* TODO: Handle errors. */
                                         EXPENSIVE_ASSERT(is_sorted(n));
@@ -3340,6 +3339,8 @@ static int pageout(struct node *n) {
         int           shift;
         int           towrite;
         int           bshift = taddr_sshift(n->addr);
+        __attribute__((unused)) uint8_t lev = level(n);
+        CINC(l[lev].page_out);
         ASSERT((n->flags & DIRTY) && TXA(n, n->lsn != 0));
         node_iovec(n, &vec[0]);
         c[0] = n;
@@ -3347,11 +3348,11 @@ static int pageout(struct node *n) {
                 struct node *right; /* This makes a lot of assumptions about taddr_t semantics. */
                 next = taddr_make(taddr_saddr(cur) + taddr_ssize(cur), bshift);
                 right = look(mod, next);
-                if (right != NULL) {
+                if (right != NULL) { /* Write lock, because other shepherd seeth thy neighbour. */
                         result = pthread_rwlock_trywrlock(&right->lock);
                         ASSERT(result == 0 || result == EBUSY);
                         if (result == EBUSY) {
-                                ;
+                                CINC(l[lev].page_trylock);
                         } else if (nstate(right, mod->cache.shift, 1) == PAGE) {
                                 ASSERT(TXA(right, right->lsn != 0));
                                 c[nr] = right;
@@ -3362,6 +3363,8 @@ static int pageout(struct node *n) {
                                 NOFAIL(pthread_rwlock_unlock(&right->lock));
                         }
                         put(right);
+                } else {
+                        CINC(l[lev].page_noent);
                 }
                 break;
         }
@@ -3378,7 +3381,7 @@ static int pageout(struct node *n) {
                 node_state_print(c[i], 'W');
         }
         result = SCALL(mod, write, whole, towrite, vec);
-        CMOD(l[level(n)].pageout_cluster, nr);
+        CMOD(l[lev].pageout_cluster, nr);
         if (LIKELY(result == 0)) {
                 CINC(write);
                 CADD(write_bytes, taddr_ssize(whole));
@@ -3394,7 +3397,7 @@ static int pageout(struct node *n) {
                 LOG("Pageout failure: %"PRIx64": %i/%i.", n->addr, result, errno);
         }
         for (int i = 1; i < towrite; ++i) {
-                assert(node_locked_invariant(c[i], WRITE));
+                assert(node_locked_invariant(c[i], i == 0 ? WRITE : READ));
                 NOFAIL(pthread_rwlock_unlock(&c[i]->lock));
                 put(c[i]);
         }
@@ -3603,11 +3606,11 @@ static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthr
                         if (LIKELY(canpage(n, lim))) {
                                 ref(n);
                                 mutex_unlock(mut);
-                                lock(n, WRITE);
+                                lock(n, READ);
                                 if (LIKELY(canpage(n, lim))) {
                                         nr += pageout(n);
                                 }
-                                unlock(n, WRITE);
+                                unlock(n, READ);
                                 if (n->lsn != 0) {
                                         sh->cur_min = min_64(sh->cur_min, n->lsn);
                                 }
@@ -4155,7 +4158,6 @@ static void counters_print() {
         COUNTER_PRINT(traverse_miss);
         COUNTER_PRINT(allocated);
         COUNTER_PRINT(insert_balance);
-        COUNTER_PRINT(insert_balance);
         COUNTER_PRINT(delete_balance);
         COUNTER_PRINT(get);
         COUNTER_PRINT(search);
@@ -4171,6 +4173,9 @@ static void counters_print() {
         COUNTER_PRINT(compact);
         COUNTER_PRINT(reclaim);
         COUNTER_PRINT(merge);
+        COUNTER_PRINT(page_out);
+        COUNTER_PRINT(page_noent);
+        COUNTER_PRINT(page_trylock);
         COUNTER_PRINT(page_node);
         COUNTER_PRINT(page_cached);
         COUNTER_PRINT(page_busy);
@@ -4198,7 +4203,6 @@ static void counters_print() {
         COUNTER_VAR_PRINT(modified);
         COUNTER_VAR_PRINT(keysize);
         COUNTER_VAR_PRINT(valsize);
-        COUNTER_VAR_PRINT(repage);
         COUNTER_VAR_PRINT(sepcut);
         COUNTER_VAR_PRINT(prefix);
         COUNTER_VAR_PRINT(pageout_cluster);
@@ -6758,7 +6762,10 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
 }
 
 static bool wal_fits(struct wal_te *en, struct wal_buf *buf, int32_t size) {
+#pragma GCC diagnostic push /* gcc complains that "size" may be used uninitialized in wal_diff(). */
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
         return buf->nob + size <= en->buf_size && buf->used < ARRAY_SIZE(buf->seg) - 1;
+#pragma GCC diagnostic pop
 }
 
 static void wal_buf_start(struct wal_te *en) {

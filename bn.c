@@ -1,5 +1,6 @@
 /* -*- C -*- */
 
+/* Copyright 2023 Nikita Danilov <danilov@gmail.com> */
 /* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licencing information. */
 
 #include <math.h>
@@ -670,14 +671,15 @@ enum {
         FLAGS      = 0, /* noforce-nosteal == redo only. */
         MIN_RADIX_LEVEL = 2,
         MAX_CLUSTER = 256,
-        SHEPHERD_RATIO = 16,
-        SHEPHERD_SHIFT = 4,
+        SHEPHERD_RATIO          =         20,
+        SHEPHERD_MIN            =          0,
+        SHEPHERD_MAX            =          9,
         WAL_WORKERS             =         16,
-        WAL_LOG_SHIFT           =          3,
+        WAL_LOG_SHIFT           =          8,
         WAL_AGE_LIMIT           =    BILLION,
         WAL_SYNC_AGE            =    BILLION,
         WAL_SYNC_NOB            = 1ull <<  9,
-        WAL_LOG_SIZE            = 1ull << 15,
+        WAL_LOG_SIZE            = 1ull << 18,
         WAL_RESERVE_QUANTUM     =         64,
         WAL_THRESHOLD_PAGED     =        512,
         WAL_THRESHOLD_PAGE      =        128,
@@ -719,7 +721,7 @@ static void t_mount(struct benchmark *b) {
                                                            .te = engine,
                                                            .hshift = ht_shift,
                                                            .cshift = cache_shift,
-                                                           .cache_shepherd_shift = SHEPHERD_SHIFT,
+                                                           .cache_shepherd_shift = MIN(MAX(cache_shift - SHEPHERD_RATIO, SHEPHERD_MIN), SHEPHERD_MAX),
                                                            .min_radix_level = MIN_RADIX_LEVEL,
                                                            .max_cluster = MAX_CLUSTER,
                                                            .ttypes = ttypes,
