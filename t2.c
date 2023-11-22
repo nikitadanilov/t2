@@ -1091,7 +1091,7 @@ enum {
         DEFAULT_WAL_FLAGS               =          0,
         DEFAULT_WAL_WORKERS             =         16,
         DEFAULT_WAL_LOG_NR              = 1ull <<  8,
-        DEFAULT_WAL_SYNC_NOB            = 1ull <<  9,
+        DEFAULT_WAL_SYNC_NOB            = 1ull <<  6,
         DEFAULT_WAL_LOG_SIZE            = 1ull << 14,
         DEFAULT_WAL_RESERVE_QUANTUM     =         64,
         DEFAULT_WAL_THRESHOLD_PAGED     =        512,
@@ -1101,9 +1101,9 @@ enum {
         DEFAULT_WAL_READY_LO            =          2
 };
 
-const double DEFAULT_WAL_LOG_SLEEP   =     1.0;
-const double DEFAULT_WAL_AGE_LIMIT   =     2.0;
-const double DEFAULT_WAL_SYNC_AGE    =     1.0;
+const double DEFAULT_WAL_LOG_SLEEP = 1.0;
+const double DEFAULT_WAL_AGE_LIMIT = 2.0;
+const double DEFAULT_WAL_SYNC_AGE  = 0.1;
 
 #define DECIDE(flags, ...) do {                                 \
         if (flags & (T2_INIT_EXPLAIN|T2_INIT_VERBOSE)) {        \
@@ -5584,7 +5584,7 @@ static int lazy_parse(struct node *n, const struct t2_node_type *nt) {
 }
 
 static void lmove(void *start, void *end, int32_t shift) {
-        memmove(start + shift, start, end - start);
+        memmove(start + shift, start, end - start); /* TODO: Update 'moves' counters. */
 }
 
 static int lazy_grow(struct node *n, int32_t idx) {
@@ -6488,7 +6488,7 @@ struct wal_te {
         lsn_t                                  start_written;
         lsn_t                                  start_synced;
         lsn_t                                  start_persistent;
-        lsn_t                                  min_want;
+        lsn_t                                  min_want; /* TODO: Useless, get rid of. */
         uint64_t                               last_log_sync;
         uint64_t                               last_page_sync;
         uint64_t                               cur_age;
