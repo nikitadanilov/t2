@@ -786,8 +786,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
-                struct counter_var keysize;
-                struct counter_var valsize;
                 struct counter_var sepcut;
                 struct counter_var radixmap_left;
                 struct counter_var radixmap_right;
@@ -4210,8 +4208,6 @@ static void counters_print() {
         COUNTER_VAR_PRINT(free);
         COUNTER_VAR_PRINT(recpos);
         COUNTER_VAR_PRINT(modified);
-        COUNTER_VAR_PRINT(keysize);
-        COUNTER_VAR_PRINT(valsize);
         COUNTER_VAR_PRINT(sepcut);
         COUNTER_VAR_PRINT(prefix);
         COUNTER_VAR_PRINT(pageout_cluster);
@@ -4847,7 +4843,6 @@ static int skeycmp(struct sheader *sh, int pos, int32_t prefix, void *key, int32
         int32_t koff = (skeyoff(sh, pos, &ksize) + prefix) & mask;
         __builtin_prefetch((void *)sh + koff);
         ksize = min_32((ksize - prefix) & mask, mask + 1 - koff);
-        CMOD(l[sh->head.level].keysize, ksize);
         return mcmp((void *)sh + koff, ksize, key + prefix, klen - prefix);
 }
 
@@ -4865,6 +4860,20 @@ static void buf_clip_node(struct t2_buf *b, const struct node *n) {
         buf_clip(b, nsize(n) - 1, n->data);
 }
 
+static void node_counters(struct node *n, struct path *p, struct t2_rec *rec, int32_t free, int32_t nr, int l, int delta) {
+        if (COUNTERS) {
+                uint8_t lev = level(n);
+                CINC(l[lev].search);
+                CMOD(l[lev].nr,             nr);
+                CMOD(l[lev].free,           free);
+                CMOD(l[lev].modified,       !!(n->flags & DIRTY));
+                DMOD(l[lev].temperature,    (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
+                CMOD(l[lev].search_span,    delta);
+                CMOD(l[lev].radixmap_left,  l + 1);
+                CMOD(l[lev].radixmap_right, nr - l - delta);
+        }
+}
+
 static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         struct t2_rec  *rec   = p->rec;
         bool            found = false;
@@ -4878,14 +4887,8 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         uint32_t        mask  = nsize(n) - 1;
         int32_t         plen  = 0;
         int32_t         span;
-        uint8_t __attribute__((unused)) lev = level(n);
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)sh & mask) == 0);
-        CINC(l[lev].search);
-        CMOD(l[lev].nr,          nr);
-        CMOD(l[lev].free,        simple_free(n));
-        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
-        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
         if (UNLIKELY(nr == 0)) {
                 goto here;
         } else if (LIKELY(n->radix != NULL && n->radix->prefix.len != -1)) {
@@ -4899,8 +4902,6 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                 ch = LIKELY(klen > plen) ? ((uint8_t *)kaddr)[plen] : -1;
                 l     = n->radix->idx[ch].l;
                 delta = n->radix->idx[ch].delta;
-                CMOD(l[lev].radixmap_left,  l + 1);
-                CMOD(l[lev].radixmap_right, nr - l - delta);
                 if (UNLIKELY(l < 0)) {
                         goto here;
                 }
@@ -4914,7 +4915,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                 l = max_32(min_32(nr - 1, l), -1);
                 delta = min_32(delta, nr - l);
         }
-        CMOD(l[lev].search_span, delta);
+        node_counters(n, p, &out->rec, simple_free(n), nr, l, delta);
         span = 1 << ilog2(delta);
         if (span != delta && skeycmp(sh, l + span, plen, kaddr, klen, mask) <= 0) {
                 l += delta - span;
@@ -4967,8 +4968,6 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
                 buf_clip(key, mask, sh);
                 val->addr = sval(sh, l, &val->len);
                 buf_clip(val, mask, sh);
-                CMOD(l[lev].keysize, key->len);
-                CMOD(l[lev].valsize, val->len);
         }
         return found;
 }
@@ -5087,6 +5086,12 @@ static void simple_fini(struct node *n) {
         SET0(simple_header(n));
 }
 
+static void update_utmost(struct node *n, int32_t nr, int32_t idx) {
+        if (LIKELY(n->radix != NULL)) {
+                n->radix->utmost |= (idx == 0 || idx >= nr - 1);
+        }
+}
+
 static int simple_insert(struct slot *s, struct cap *cap) {
         struct t2_buf       buf;
         struct sheader     *sh   = simple_header(s->node);
@@ -5130,9 +5135,7 @@ static int simple_insert(struct slot *s, struct cap *cap) {
         ASSERT(buf.len == vlen);
         buf_copy(&buf, s->rec.val);
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
-        if (LIKELY(s->node->radix != NULL)) {
-                s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node) - 1);
-        }
+        update_utmost(s->node, simple_nr(s->node), s->idx);
         if (TRANSACTIONS) {
                 cap->ext[HDR].start = 0;
                 cap->ext[HDR].end = sizeof *sh;
@@ -5165,9 +5168,7 @@ static void simple_delete(struct slot *s, struct cap *cap) {
                   sh->dir_off + sh->nr * sizeof *piv);
         --sh->nr;
         EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
-        if (LIKELY(s->node->radix != NULL)) {
-                s->node->radix->utmost |= (s->idx == 0 || s->idx == nr(s->node));
-        }
+        update_utmost(s->node, simple_nr(s->node), s->idx);
         if (TRANSACTIONS) {
                 cap->ext[HDR].start = 0;
                 cap->ext[HDR].end = sizeof *sh;
@@ -5652,6 +5653,7 @@ static int lazy_insert(struct slot *s, struct cap *cap) {
         d->free -= incr;
         ++lheader(n)->nr;
         ext_merge(&cap->ext[HDR], offsetof(struct lheader, nr), HSIZE);
+        update_utmost(n, d->nr, idx);
         ASSERT(lazy_invariant(n));
         return 0;
 }
@@ -5677,6 +5679,7 @@ static void lazy_delete(struct slot *s, struct cap *cap) {
         memmove(&d->key[idx], &d->key[idx + 1], (d->nr - idx - 1) * sizeof d->key[0]);
         memmove(&d->val[idx], &d->val[idx + 1], (d->nr - idx - 1) * sizeof d->val[0]);
         --d->nr;
+        update_utmost(n, d->nr, idx);
         ASSERT(lazy_invariant(n));
 }
 
@@ -5774,18 +5777,12 @@ static bool lazy_search(struct node *n, struct path *p, struct slot *out) {
         int32_t         nr;
         int             delta;
         struct ldir    *d;
-        uint8_t __attribute__((unused)) lev = level(n);
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)n->data & mask) == 0);
-        CINC(l[lev].search);
-        CMOD(l[lev].free,        lazy_free(n));
-        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
-        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
         rcu_lock();
         d = LDIR(n);
         nr = d->nr;
         delta = nr + 1;
-        CMOD(l[lev].nr, nr);
         if (UNLIKELY(nr == 0)) {
                 goto here;
         } else if (LIKELY(n->radix != NULL && n->radix->prefix.len != -1)) {
@@ -5799,8 +5796,6 @@ static bool lazy_search(struct node *n, struct path *p, struct slot *out) {
                 ch = LIKELY(klen > plen) ? ((uint8_t *)kaddr)[plen] : -1;
                 l     = n->radix->idx[ch].l;
                 delta = n->radix->idx[ch].delta;
-                CMOD(l[lev].radixmap_left,  l + 1);
-                CMOD(l[lev].radixmap_right, nr - l - delta);
                 if (UNLIKELY(l < 0)) {
                         goto here;
                 }
@@ -5814,7 +5809,7 @@ static bool lazy_search(struct node *n, struct path *p, struct slot *out) {
                 l = max_32(min_32(nr - 1, l), -1);
                 delta = min_32(delta, nr - l);
         }
-        CMOD(l[lev].search_span, delta);
+        node_counters(n, p, &out->rec, lazy_free(n), nr, l, delta);
         span = 1 << ilog2(delta);
         if (span != delta && lkeycmp(n, d, l + span, plen, kaddr, klen, mask) <= 0) {
                 l += delta - span;
@@ -5870,8 +5865,6 @@ static bool lazy_search(struct node *n, struct path *p, struct slot *out) {
                 val->addr = orig + d->val[l].off;
                 val->len  = d->val[l].len;
                 buf_clip(val, mask, orig);
-                CMOD(l[lev].keysize, key->len);
-                CMOD(l[lev].valsize, val->len);
         }
         rcu_unlock();
         return found;
@@ -6077,6 +6070,7 @@ static int odir_insert(struct slot *s, struct cap *cap) {
         oh->used += incr;
         oh->end += klen + vlen;
         ext_merge(&cap->ext[HDR], SOF(struct header), OHSIZE);
+        update_utmost(n, onr(n), idx);
         ASSERT(oend(n) == end + klen + vlen);
         ASSERT(odirend(n) == dend - ORSIZE);
         ASSERT(odir_invariant(n));
@@ -6103,6 +6097,7 @@ static void odir_delete(struct slot *s, struct cap *cap) {
         ext_merge(&cap->ext[DIR], dend + ORSIZE, off);
         --oheader(n)->nr;
         ext_merge(&cap->ext[HDR], SOF(struct header), OHSIZE);
+        update_utmost(n, onr(n), idx);
         ASSERT(odir_invariant(n));
 }
 
@@ -6176,14 +6171,8 @@ static bool odir_search(struct node *n, struct path *p, struct slot *out) {
         int32_t         nr    = onr(n);
         int             delta = nr + 1;
         int32_t         span;
-        uint8_t __attribute__((unused)) lev = level(n);
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)n->data & mask) == 0);
-        CINC(l[lev].search);
-        CMOD(l[lev].free,        odir_free(n));
-        CMOD(l[lev].modified,    !!(n->flags & DIRTY));
-        DMOD(l[lev].temperature, (float)temperature(n) / (1ull << (63 - BOLT_EPOCH_SHIFT + taddr_sbits(n->addr))));
-        CMOD(l[lev].nr, nr);
         if (UNLIKELY(nr == 0)) {
                 goto here;
         } else if (LIKELY(n->radix != NULL && n->radix->prefix.len != -1)) {
@@ -6197,8 +6186,6 @@ static bool odir_search(struct node *n, struct path *p, struct slot *out) {
                 ch = LIKELY(klen > plen) ? ((uint8_t *)kaddr)[plen] : -1;
                 l     = n->radix->idx[ch].l;
                 delta = n->radix->idx[ch].delta;
-                CMOD(l[lev].radixmap_left,  l + 1);
-                CMOD(l[lev].radixmap_right, nr - l - delta);
                 if (UNLIKELY(l < 0)) {
                         goto here;
                 }
@@ -6212,7 +6199,7 @@ static bool odir_search(struct node *n, struct path *p, struct slot *out) {
                 l = max_32(min_32(nr - 1, l), -1);
                 delta = min_32(delta, nr - l);
         }
-        CMOD(l[lev].search_span, delta);
+        node_counters(n, p, &out->rec, odir_free(n), nr, l, delta);
         span = 1 << ilog2(delta);
         if (span != delta && okeycmp(n, l + span, plen, kaddr, klen, mask) <= 0) {
                 l += delta - span;
@@ -6269,8 +6256,6 @@ static bool odir_search(struct node *n, struct path *p, struct slot *out) {
                 val->addr = orig + rec->off + rec->klen;
                 val->len  = rec->vlen;
                 buf_clip(val, mask, orig);
-                CMOD(l[lev].keysize, key->len);
-                CMOD(l[lev].valsize, val->len);
         }
         return found;
 }
