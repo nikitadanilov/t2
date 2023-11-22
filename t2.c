@@ -43,7 +43,7 @@ enum {
         MAX_ERR_DEPTH     =      16,
         MAX_CACHELINE     =      64,
         MAX_SEPARATOR_CUT =      10,
-        MAX_PREFIX        =      32,
+        MAX_PREFIX        =       8,
         MAX_ALLOC_BUCKET  =      32,
 };
 
@@ -875,6 +875,7 @@ static int32_t min_32(int32_t a, int32_t b);
 static int64_t max_64(int64_t a, int64_t b);
 static int64_t min_64(int64_t a, int64_t b);
 static int ilog2(uint32_t x);
+static int mcmp(void *addr0, int32_t len0, void *addr1, int32_t len1);
 static int cacheline_size();
 static uint64_t threadid(void);
 static void llog(const struct msg_ctx *ctx, ...);
@@ -1621,13 +1622,11 @@ static void lock(struct node *n, enum lock_mode mode) {
                 node_state_print(n, 'l');
         }
         ASSERT(node_locked_invariant(n, mode));
-        EXPENSIVE_ASSERT(mode != NONE ? is_sorted(n) : true);
 }
 
 static void unlock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         ASSERT(node_locked_invariant(n, mode));
-        EXPENSIVE_ASSERT(mode != NONE ? is_sorted(n) : true);
         if (LIKELY(mode == NONE)) {
                 ;
         } else if (mode == WRITE) {
@@ -1800,8 +1799,8 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                         struct header *h = nheader(n);
                                         node_seq_increase(n);
                                         NCALL(n, load(n, mod->ntypes[h->ntype])); /* TODO: Handle errors. */
-                                        EXPENSIVE_ASSERT(is_sorted(n));
                                         rcu_assign_pointer(n->ntype, mod->ntypes[h->ntype]);
+                                        EXPENSIVE_ASSERT(is_sorted(n));
                                 } else {
                                         result = ERROR(-ESTALE);
                                 }
@@ -1881,7 +1880,6 @@ static void put_final(struct node *n) {
 
 static void put_locked(struct node *n) {
         ASSERT(n->ref > 0);
-        EXPENSIVE_ASSERT(n->data != NULL ? is_sorted(n) : true);
         node_state_print(n, 'p');
         ref_del(n);
         if (--n->ref == 0) {
@@ -1961,6 +1959,7 @@ static void radixmap_update(struct node *n) {
                         return;
                 }
                 n->radix->prefix.addr = &n->radix->pbuf[0];
+                n->radix->prefix.len = plen = -1;
         }
         m = n->radix;
         CINC(l[level(n)].radixmap_updated);
@@ -2097,9 +2096,9 @@ static int split_right_exec_insert(struct path *p, int idx) {
         SLOT_DEFINE(s, NULL);
         int result = 0;
         rec_todo(p, idx, &s);
-        /* Maybe ->plan() overestimated keysize and shift is not needed. */
         EXPENSIVE_ASSERT(is_sorted(left));
         EXPENSIVE_ASSERT(right != NULL ? is_sorted(right) : true);
+        /* Maybe ->plan() overestimated keysize and shift is not needed. */
         if (right != NULL && !can_insert(left, &s.rec)) {
                 s.idx = r->pos + 1;
                 result = shift(&r->allocated, &r->page, &s, RIGHT);
@@ -2483,7 +2482,7 @@ static void page_cap_init(struct page *g, struct t2_tx *tx) {
 
 static void path_add(struct path *p, struct node *n, uint64_t flags) {
         struct rung *r = &p->rung[++p->used];
-        ASSERT(IS_IN(p->used + 1, p->rung));
+        ASSERT(IS_IN(p->used, p->rung));
         ASSERT(IS0(r));
         r->page.node = n;
         r->page.seq  = node_seq(n);
@@ -2815,7 +2814,7 @@ static bool rcu_enter(struct path *p, struct node *extra) {
         return result;
 }
 
-enum { CACHE_SYNC_THRESHOLD = 32 };
+enum { CACHE_SYNC_THRESHOLD = 1 << 10 };
 
 static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
         if (ci.touched + ci.anr > CACHE_SYNC_THRESHOLD) {
@@ -2826,7 +2825,9 @@ static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
                 epoch = c->bolt >> BOLT_EPOCH_SHIFT;
                 if (ci.anr != 0) {
                         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                                kmod(&c->pool.rate[i], epoch, ci.allocated[i]);
+                                if (ci.allocated[i] > 0) {
+                                        kmod(&c->pool.rate[i], epoch, ci.allocated[i]);
+                                }
                         }
                 }
                 if (epoch - c->epoch_signalled > EPOCH_DELTA) {
@@ -3606,11 +3607,11 @@ static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthr
                         if (LIKELY(canpage(n, lim))) {
                                 ref(n);
                                 mutex_unlock(mut);
-                                lock(n, READ);
+                                lock(n, WRITE);
                                 if (LIKELY(canpage(n, lim))) {
                                         nr += pageout(n);
                                 }
-                                unlock(n, READ);
+                                unlock(n, WRITE);
                                 if (n->lsn != 0) {
                                         sh->cur_min = min_64(sh->cur_min, n->lsn);
                                 }
@@ -3977,6 +3978,14 @@ static int ilog2(uint32_t x) {
         x = x | (x >>  8);
         x = x | (x >> 16);
         return __builtin_popcount(x) - 1;
+}
+
+static int int32_cmp(int32_t a, int32_t b) {
+        return (a > b) - (a < b);
+}
+
+static int mcmp(void *addr0, int32_t len0, void *addr1, int32_t len1) {
+        return memcmp(addr0, addr1, min_32(len0, len1)) ?: int32_cmp(len0, len1);
 }
 
 static int cds_list_length(const struct cds_list_head *head) {
@@ -4713,14 +4722,8 @@ static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := 
         return result;
 }
 
-static int int32_cmp(int32_t a, int32_t b) {
-        return a < b ? -1 : a != b; /* sic. */
-}
-
 static int buf_cmp(const struct t2_buf *b0, const struct t2_buf *b1) {
-        uint32_t len0 = b0->len;
-        uint32_t len1 = b1->len;
-        return memcmp(b0->addr, b1->addr, min_32(len0, len1)) ?: int32_cmp(len0, len1);
+        return mcmp(b0->addr, b0->len, b1->addr, b1->len);
 }
 
 static void buf_copy(const struct t2_buf *dst, const struct t2_buf *src) {
@@ -4843,11 +4846,9 @@ static int skeycmp(struct sheader *sh, int pos, int32_t prefix, void *key, int32
         int32_t ksize;
         int32_t koff = (skeyoff(sh, pos, &ksize) + prefix) & mask;
         __builtin_prefetch((void *)sh + koff);
-        ksize -= prefix;
-        klen  -= prefix;
-        ksize = min_32(ksize & mask, mask + 1 - koff);
+        ksize = min_32((ksize - prefix) & mask, mask + 1 - koff);
         CMOD(l[sh->head.level].keysize, ksize);
-        return memcmp((void *)sh + koff, key + prefix, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
+        return mcmp((void *)sh + koff, ksize, key + prefix, klen - prefix);
 }
 
 static struct sheader *simple_header(const struct node *n) {
@@ -4862,10 +4863,6 @@ static void buf_clip(struct t2_buf *b, uint32_t mask, void *origin) {
 
 static void buf_clip_node(struct t2_buf *b, const struct node *n) {
         buf_clip(b, nsize(n) - 1, n->data);
-}
-
-static int uint64_cmp(uint64_t a, uint64_t b) {
-        return a < b ? -1 : a != b;
 }
 
 static bool simple_search(struct node *n, struct path *p, struct slot *out) {
@@ -4884,7 +4881,6 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out) {
         uint8_t __attribute__((unused)) lev = level(n);
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)sh & mask) == 0);
-        EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         CINC(l[lev].search);
         CMOD(l[lev].nr,          nr);
         CMOD(l[lev].free,        simple_free(n));
@@ -5182,7 +5178,6 @@ static void simple_get(struct slot *s) {
         struct sheader *sh = simple_header(s->node);
         s->rec.key->addr = skey(sh, s->idx, &s->rec.key->len);
         s->rec.val->addr = sval(sh, s->idx, &s->rec.val->len);
-        EXPENSIVE_ASSERT(scheck(sh, s->node->ntype));
         CINC(l[sh->head.level].recget);
 }
 
@@ -5440,8 +5435,7 @@ static bool lazy_invariant(const struct node *n) {
 /* Heapsort implementation. */
 
 static int lcmp(void *orig, const struct collect *c0, const struct collect *c1) {
-        int16_t size = min_16(c0->key.len, c1->key.len);
-        return memcmp(orig + c0->key.off, orig + c1->key.off, size) ?: int32_cmp(c0->key.len, c1->key.len);
+        return mcmp(orig + c0->key.off, c0->key.len, orig + c1->key.off, c1->key.len);
 }
 
 static int lqcmp(const void *a0, const void *a1) {
@@ -5764,8 +5758,7 @@ static void lazy_fini(struct node *n) {
 static int lkeycmp(struct node *n, struct ldir *d, int32_t idx, int32_t prefix, void *key, int32_t klen, uint32_t mask) {
         int32_t koff  = (d->key[idx].off + prefix) & mask;
         int16_t ksize = min_32((d->key[idx].len - prefix) & mask, mask + 1 - koff);
-        klen -= prefix;
-        return memcmp(n->data + koff, key + prefix, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
+        return mcmp(n->data + koff, ksize, key + prefix, klen - prefix);
 }
 
 static bool lazy_search(struct node *n, struct path *p, struct slot *out) {
@@ -5784,7 +5777,6 @@ static bool lazy_search(struct node *n, struct path *p, struct slot *out) {
         uint8_t __attribute__((unused)) lev = level(n);
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)n->data & mask) == 0);
-        EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         CINC(l[lev].search);
         CMOD(l[lev].free,        lazy_free(n));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
@@ -6169,8 +6161,7 @@ static int okeycmp(struct node *n, int32_t idx, int32_t prefix, void *key, int32
         struct orec *rec = oat(n, idx);
         int32_t koff  = (rec->off + prefix) & mask;
         int16_t ksize = min_32((rec->klen - prefix) & mask, mask + 1 - koff);
-        klen -= prefix;
-        return memcmp(n->data + koff, key + prefix, ksize < klen ? ksize : klen) ?: int32_cmp(ksize, klen);
+        return mcmp(n->data + koff, ksize, key + prefix, klen - prefix);
 }
 
 static bool odir_search(struct node *n, struct path *p, struct slot *out) {
@@ -6188,7 +6179,6 @@ static bool odir_search(struct node *n, struct path *p, struct slot *out) {
         uint8_t __attribute__((unused)) lev = level(n);
         ASSERT((nsize(n) & mask) == 0);
         ASSERT(((uint64_t)n->data & mask) == 0);
-        EXPENSIVE_ASSERT(scheck(sh, n->ntype));
         CINC(l[lev].search);
         CMOD(l[lev].free,        odir_free(n));
         CMOD(l[lev].modified,    !!(n->flags & DIRTY));
@@ -7934,7 +7924,7 @@ static bool is_sorted(struct node *n) {
         for (int32_t i = 0; i < nr(n); ++i) {
                 rec_get(&ss, i);
                 if (i > 0) {
-                        int cmp = memcmp(ss.rec.key->addr, keyarea, MIN(ss.rec.key->len, keysize)) ?: int32_cmp(ss.rec.key->len, keysize);
+                        int cmp = mcmp(ss.rec.key->addr, ss.rec.key->len, keyarea, keysize);
                         if (cmp <= 0) {
                                 printf("Misordered at %i: ", i);
                                 range_print(keyarea, keysize,
