@@ -1502,16 +1502,16 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx) {
         eclear();
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (LIKELY(t != NULL)) {
-                struct page p = { .lm = WRITE };
+                struct page g = { .lm = WRITE };
                 t->ttype = ttype;
-                struct node *root = p.node = alloc(t, 0, &p.cap);
+                struct node *root = g.node = alloc(t, 0, &g.cap);
                 if (EISOK(root)) {
                         int result;
                         if (TRANSACTIONS && tx != NULL) {
                                 struct t2_txrec txr[M_NR];
                                 int32_t         nob = 0;
                                 struct t2_te   *te  = ttype->mod->te;
-                                int             nr  = txadd(&p, txr, &nob);
+                                int             nr  = txadd(&g, txr, &nob);
                                 TXCALL(te, post(te, tx, nob, nr, txr));
                         }
                         t->root = root->addr;
