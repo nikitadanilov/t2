@@ -748,6 +748,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t traverse_hit;
                 int64_t traverse_miss;
                 int64_t allocated;
+                int64_t allocated_unused;
                 int64_t insert_balance;
                 int64_t delete_balance;
                 int64_t get;
@@ -993,6 +994,9 @@ static void counters_check();
 static void counters_print();
 static void counters_clear();
 static void counters_fold();
+static void path_print(struct path *p);
+static void nprint(struct node *n);
+static void buf_print(const struct t2_buf *buf);
 static bool is_sorted(struct node *n);
 static void *pulse(void *arg);
 static int signal_init(void);
@@ -2105,20 +2109,20 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 r->flags |= ALUSED;
         }
         if (LIKELY(result == 0)) {
-                struct page *p;
+                struct page *g;
                 if (r->pos < nr(left)) {
                         s.node = left;
                         s.idx  = r->pos;
-                        p = &r->page;
+                        g = &r->page;
                 } else {
                         ASSERT(right != NULL);
                         s.node = right;
                         s.idx  = r->pos - nr(left);
-                        p = &r->allocated;
+                        g = &r->allocated;
                 }
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
-                NOFAIL(NCALL(s.node, insert(&s, &p->cap)));
+                NOFAIL(NCALL(s.node, insert(&s, &g->cap)));
                 EXPENSIVE_ASSERT(is_sorted(s.node));
                 if (r->flags & ALUSED) {
                         struct t2_buf lkey = {};
@@ -2356,6 +2360,7 @@ static void path_fini(struct path *p) {
                                 put(r->allocated.node);
                         } else {
                                 dealloc(r->allocated.node);
+                                CINC(l[level(r->allocated.node)].allocated_unused);
                         }
                 }
                 buf_free(&r->scratch);
@@ -2383,6 +2388,38 @@ static void path_pin(struct path *p) {
                         r->flags |= PINNED;
                 }
         }
+}
+
+static void page_print(struct page *g) {
+        printf("seq: %"PRId64" lm: %i ", g->seq, g->lm);
+        if (g->node != NULL) {
+                nprint(g->node);
+        } else {
+                printf("none");
+        }
+}
+
+static void path_print(struct path *p) {
+        printf("path used: %i opt: %i next: %"PRIx64" tx: %p @%p\n", p->used, p->opt, p->next, p->tx, p);
+        printf("key: ");
+        buf_print(p->rec->key);
+        printf("\nval: ");
+        buf_print(p->rec->val);
+        printf("\nnew root: ");
+        page_print(&p->newroot);
+        for (int i = 0; i <= p->used; ++i) {
+                struct rung *r = &p->rung[i];
+                printf("\nrung[%i]: flags: %"PRIx64" pos: %i", i, r->flags, r->pos);
+                printf("\n        left:      ");
+                page_print(&p->rung[i].brother[0]);
+                printf("\n        node:      ");
+                page_print(&p->rung[i].page);;
+                printf("\n        allocated: ");
+                page_print(&p->rung[i].brother[0]);
+                printf("\n        right:     ");
+                page_print(&p->rung[i].brother[0]);
+        }
+        puts("");
 }
 
 static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
@@ -4164,6 +4201,7 @@ static void counters_print() {
         COUNTER_PRINT(traverse_hit);
         COUNTER_PRINT(traverse_miss);
         COUNTER_PRINT(allocated);
+        COUNTER_PRINT(allocated_unused);
         COUNTER_PRINT(insert_balance);
         COUNTER_PRINT(delete_balance);
         COUNTER_PRINT(get);
@@ -4862,7 +4900,7 @@ static void buf_clip_node(struct t2_buf *b, const struct node *n) {
 
 static void node_counters(struct node *n, struct path *p, struct t2_rec *rec, int32_t free, int32_t nr, int l, int delta) {
         if (COUNTERS) {
-                uint8_t lev = level(n);
+                uint8_t __attribute__((unused)) lev = level(n);
                 CINC(l[lev].search);
                 CMOD(l[lev].nr,             nr);
                 CMOD(l[lev].free,           free);
