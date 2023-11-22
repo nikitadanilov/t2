@@ -677,7 +677,7 @@ enum {
         SHEPHERD_MIN            =          0,
         SHEPHERD_MAX            =          9,
         WAL_WORKERS             =         16,
-        WAL_LOG_SHIFT           =          8,
+        WAL_LOG_SHIFT           =          3,
         WAL_AGE_LIMIT           =    BILLION,
         WAL_SYNC_AGE            =    BILLION,
         WAL_SYNC_NOB            = 1ull <<  9,

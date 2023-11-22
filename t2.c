@@ -234,9 +234,9 @@ enum {
 #define CVAL(cnt)    ((void)0)
 #define GVAL(cnt)    ((void)0)
 #define GDVAL(cnt)   ((void)0)
-#define CADD(cnt, d) ((void)(d))
-#define CMOD(cnt, d) ((void)(d))
-#define DMOD(cnt, d) ((void)(d))
+#define CADD(cnt, d) ((void)0)
+#define CMOD(cnt, d) ((void)0)
+#define DMOD(cnt, d) ((void)0)
 #define COUNTERS_ASSERT(expr)
 #define TIMED(expr, mod, counter) (expr)
 #define TIMED_VOID(expr, mod, counter) (expr)
@@ -743,6 +743,8 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_full;
         struct counter_var wal_inflight;
         struct counter_var wal_redirty_lsn;
+        struct counter_var wal_log_sync_time;
+        struct counter_var wal_page_sync_time;
         struct counter_var stash_used;
         struct level_counters {
                 int64_t traverse_hit;
@@ -4170,6 +4172,8 @@ static void counters_print() {
         printf("wal.dirty_clean:     %10"PRId64"\n", GVAL(wal_dirty_clean));
         printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
         counter_var_print1(&GVAL(wal_redirty_lsn),    "wal.redirty_lsn:");
+        counter_var_print1(&GVAL(wal_log_sync_time),  "wal.log_sync_time:");
+        counter_var_print1(&GVAL(wal_page_sync_time),  "wal.page_sync_time:");
         printf("shepherd.iter:       %10"PRId64"\n", GVAL(shepherd_iter));
         printf("shepherd.scan:       %10"PRId64"\n", GVAL(shepherd_scan));
         printf("shepherd.bucket:     %10"PRId64"\n", GVAL(shepherd_bucket));
@@ -6944,6 +6948,7 @@ static void wal_log_sync(struct wal_te *en) {
                 int rc = (en->use_barrier ? fd_barrier : fd_sync)(en->fd[i]);
                 result = result ?: rc;
         }
+        CMOD(wal_log_sync_time, READ_ONCE(en->mod->tick) - en->last_log_sync);
         CINC(wal_write_sync);
         wal_lock(en);
         if (LIKELY(result == 0)) {
@@ -6967,6 +6972,7 @@ static void wal_page_sync(struct wal_te *en) {
         en->page_syncing = true;
         wal_unlock(en);
         result = SCALL(en->mod, sync, en->use_barrier);
+        CMOD(wal_page_sync_time, READ_ONCE(en->mod->tick) - en->last_page_sync);
         wal_lock(en);
         CINC(wal_page_sync);
         if (LIKELY(result == 0)) {
@@ -7504,7 +7510,7 @@ static int wal_wait(struct t2_te *engine, struct t2_tx *trax, const struct times
 static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
         struct wal_te *en    = COF(engine, struct wal_te, base);
         struct wal_tx *tx    = COF(trax, struct wal_tx, base);
-        uint64_t       start = READ_ONCE(en->mod->tick);
+        uint64_t       start = COUNTERS ? READ_ONCE(en->mod->tick) : 0;
         int            delta = en->reserve_quantum;
         if (tx->reserved == 0) {
                 if (UNLIKELY(en->log_size < wal_log_need(en) + delta)) {
@@ -7526,6 +7532,7 @@ static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
         }
         CMOD(wal_open_wait_time, READ_ONCE(en->mod->tick) - start);
         ASSERT(en->reserved > 0); /* No locking is needed. */
+        (void)start;
         return 0;
 }
 
