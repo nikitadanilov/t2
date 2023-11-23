@@ -493,7 +493,8 @@ struct node {
         void                      *typedata;
         struct cds_list_head       free;
         struct radixmap           *radix;
-        lsn_t                      lsn;
+        lsn_t                      lsn_lo;
+        lsn_t                      lsn_hi;
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
         struct rcu_head            rcu;
@@ -797,6 +798,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var prefix;
                 struct counter_var radixmap_builds;
                 struct counter_var page_dirty_nr;
+                struct counter_var page_lsn_diff;
                 struct counter_var pageout_cluster;
                 struct counter_var tx_add[M_NR];
         } l[MAX_TREE_HEIGHT];
@@ -1586,22 +1588,6 @@ static bool is_stable(const struct node *n) {
         return (n->seq & 1) == 0;
 }
 
-static bool node_locked_invariant(struct node *n, enum lock_mode mode) {
-        if (mode == NONE) {
-                return true;
-        }
-        if (!TRANSACTIONS || n->mod->te == NULL) {
-                return true;
-        }
-        if ((n->flags & HEARD_BANSHEE) != 0) {
-                return true;
-        }
-        if ((n->flags & DIRTY) == (n->lsn == 0)) {
-                return false;
-        }
-        return true;
-}
-
 enum { NODE_LOGGING = false };
 
 static void node_state_print(struct node *n, char state) {
@@ -1625,12 +1611,10 @@ static void lock(struct node *n, enum lock_mode mode) {
                 CINC(rlock);
                 node_state_print(n, 'l');
         }
-        ASSERT(node_locked_invariant(n, mode));
 }
 
 static void unlock(struct node *n, enum lock_mode mode) {
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
-        ASSERT(node_locked_invariant(n, mode));
         if (LIKELY(mode == NONE)) {
                 ;
         } else if (mode == WRITE) {
@@ -1748,12 +1732,12 @@ static void ref(struct node *n) {
 static void ndelete(struct node *n) {
         struct t2       *mod  = n->mod;
         pthread_mutex_t *lock = ht_lock(&mod->ht, ht_bucket(&mod->ht, n->addr));
-        mutex_lock(lock);
-        n->flags |= NOCACHE | HEARD_BANSHEE;
         if (LIKELY(n->flags & DIRTY)) {
                 n->flags &= ~DIRTY;
-                n->lsn = 0;
+                n->lsn_lo = n->lsn_hi = 0;
         }
+        mutex_lock(lock);
+        n->flags |= NOCACHE | HEARD_BANSHEE;
         put_locked(n);
         mutex_unlock(lock);
 }
@@ -3379,7 +3363,7 @@ static int pageout(struct node *n) {
         int           bshift = taddr_sshift(n->addr);
         __attribute__((unused)) uint8_t lev = level(n);
         CINC(l[lev].page_out);
-        ASSERT((n->flags & DIRTY) && TXA(n, n->lsn != 0));
+        ASSERT((n->flags & DIRTY) && TXA(n, n->lsn_lo != 0 && n->lsn_hi != 0));
         node_iovec(n, &vec[0]);
         c[0] = n;
         for (cur = n->addr, nr = 1; nr < ARRAY_SIZE(c); ++nr, cur = next) {
@@ -3392,12 +3376,11 @@ static int pageout(struct node *n) {
                         if (result == EBUSY) {
                                 CINC(l[lev].page_trylock);
                         } else if (nstate(right, mod->cache.shift, 1) == PAGE) {
-                                ASSERT(TXA(right, right->lsn != 0));
+                                ASSERT(TXA(right, right->lsn_lo != 0 && right->lsn_hi != 0));
                                 c[nr] = right;
                                 node_iovec(right, &vec[nr]);
                                 continue;
                         } else {
-                                ASSERT(node_locked_invariant(right, READ));
                                 NOFAIL(pthread_rwlock_unlock(&right->lock));
                         }
                         put(right);
@@ -3409,7 +3392,6 @@ static int pageout(struct node *n) {
         shift = ilog2(nr);
         towrite = 1 << shift;
         for (int i = towrite; i < nr; ++i) {
-                ASSERT(node_locked_invariant(c[i], WRITE));
                 NOFAIL(pthread_rwlock_unlock(&c[i]->lock));
                 put(c[i]);
         }
@@ -3425,17 +3407,18 @@ static int pageout(struct node *n) {
                 CADD(write_bytes, taddr_ssize(whole));
                 TXCALL(mod->te, clean(mod->te, (struct t2_node **)c, towrite));
                 for (int i = 0; i < towrite; ++i) {
-                        c[i]->flags &= ~DIRTY;
-                        c[i]->lsn = 0;
-                        node_state_print(c[i], 'C');
-                        CMOD(l[level(c[i])].page_dirty_nr, c[i]->flags >> 40);
-                        c[i]->flags &= ~(~0ull << 40);
+                        struct node *nn = c[i];
+                        node_state_print(nn, 'C');
+                        CMOD(l[level(nn)].page_dirty_nr, nn->flags >> 40);
+                        CMOD(l[level(nn)].page_lsn_diff, nn->lsn_hi - nn->lsn_lo);
+                        nn->flags &= ~DIRTY;
+                        nn->lsn_lo = nn->lsn_hi = 0;
+                        nn->flags &= ~(~0ull << 40);
                 }
         } else {
                 LOG("Pageout failure: %"PRIx64": %i/%i.", n->addr, result, errno);
         }
         for (int i = 1; i < towrite; ++i) {
-                assert(node_locked_invariant(c[i], i == 0 ? WRITE : READ));
                 NOFAIL(pthread_rwlock_unlock(&c[i]->lock));
                 put(c[i]);
         }
@@ -3629,7 +3612,7 @@ static void *maxwelld(void *data) {
 }
 
 static bool canpage(const struct node *n, lsn_t target) {
-        return !TRANSACTIONS || (!pinned(n) && 0 < n->lsn && n->lsn < target);
+        return !TRANSACTIONS || (!pinned(n) && 0 < n->lsn_lo && n->lsn_lo < target);
 }
 
 static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *mut, struct shepherd *sh) {
@@ -3649,15 +3632,15 @@ static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthr
                                         nr += pageout(n);
                                 }
                                 unlock(n, WRITE);
-                                if (n->lsn != 0) {
-                                        sh->cur_min = min_64(sh->cur_min, n->lsn);
+                                if (n->lsn_lo != 0) {
+                                        sh->cur_min = min_64(sh->cur_min, n->lsn_lo);
                                 }
                                 mutex_lock(mut);
                                 put_locked(n);
                                 break;
                         }
-                        if (n->lsn != 0) {
-                                sh->cur_min = min_64(sh->cur_min, n->lsn);
+                        if (n->lsn_lo != 0) {
+                                sh->cur_min = min_64(sh->cur_min, n->lsn_lo);
                         }
                 }
         } while (link != NULL);
@@ -4234,6 +4217,7 @@ static void counters_print() {
         COUNTER_PRINT(page_pageout);
         COUNTER_PRINT(page_cold);
         COUNTER_VAR_PRINT(page_dirty_nr);
+        COUNTER_VAR_PRINT(page_lsn_diff);
         COUNTER_PRINT(scan_skip_busy);
         COUNTER_PRINT(scan_skip_dirty);
         COUNTER_PRINT(scan_skip_hot);
@@ -5268,9 +5252,8 @@ static void range_print(void *orig, int32_t nsize, void *start, int32_t nob) {
 
 static void header_print(struct node *n) {
         struct header *h = nheader(n);
-        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64"\n",
-               n->addr, h->treeid, h->level, h->ntype,
-               nr(n), nsize(n), n, n->ref, n->flags, n->lsn);
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64" ... %"PRIx64"\n",
+               n->addr, h->treeid, h->level, h->ntype, nr(n), nsize(n), n, n->ref, n->flags, n->lsn_lo, n->lsn_hi);
 }
 
 static void simple_print(struct node *n) {
@@ -5764,14 +5747,12 @@ static void lazy_make(struct node *n, struct cap *cap) {
 static void lazy_print(struct node *n) {
         int32_t         size = nsize(n);
         struct ldir    *d    = n->typedata;
-        struct header  *head = nheader(n);
         int32_t         i;
         struct lrec    *rec;
         int32_t         vcur;
         int32_t         kcur;
-        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u vend: %u kend: %u free: %u cap: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64"\n",
-               n->addr, head->treeid, head->level, head->ntype,
-               lnr(n), size, d->vend, d->kend, d->free, d->cap, n, n->ref, n->flags, n->lsn);
+        header_print(n);
+        printf("    vend: %u kend: %u free: %u cap: %u\n", d->vend, d->kend, d->free, d->cap);
         vcur = HSIZE;
         kcur = size;
         for (rec = (void *)(lheader(n) + 1), i = 0; i < lnr(n); rec = lnext(rec), ++i) {
@@ -6175,11 +6156,8 @@ static void odir_make(struct node *n, struct cap *cap) {
 
 static void odir_print(struct node *n) {
         int32_t         size = nsize(n);
-        struct header  *head = nheader(n);
         int32_t         i;
-        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u used: %u end: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64"\n",
-               n->addr, head->treeid, head->level, head->ntype,
-               onr(n), odir_used(n), oend(n), size, n, n->ref, n->flags, n->lsn);
+        header_print(n);
         for (i = 0; i < onr(n); ++i) {
                 struct orec *rec = oat(n, i);
                 printf("        %4d %4d %4d %4d: ", i, rec->off, rec->klen, rec->vlen);
@@ -6368,16 +6346,19 @@ static int fd_barrier(int fd) {
 
 void t2_lsnset(struct t2_node *node, lsn_t lsn) {
         struct node *n = (void *)node;
-        ASSERT(lsn >= n->lsn);
+        ASSERT(lsn >= n->lsn_hi);
+        ASSERT(lsn >= n->lsn_lo);
         ASSERT(lsn != 0);
-        if (n->lsn == 0) {
-                n->lsn = lsn;
+        n->lsn_hi = lsn;
+        if (n->lsn_lo == 0) {
+                n->lsn_lo = lsn;
         }
+        ASSERT(n->lsn_lo <= n->lsn_hi);
 }
 
 lsn_t t2_lsnget(const struct t2_node *node) {
         struct node *n = (void *)node;
-        return n->lsn;
+        return n->lsn_hi;
 }
 
 taddr_t t2_addr(const struct t2_node *node) {
@@ -6859,10 +6840,8 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         struct node    *prev = NULL;
         void           *space;
         int32_t         size;
-        int             added = 0;
         int             blks  = 0;
         bool            slow;
-        struct node    *nodes[nr]; /* VLA */
         ASSERT(en->recovered);
         rec = space = wal_space(en, tx, nr, nob, &size);
         if (UNLIKELY(rec == NULL)) {
@@ -6888,14 +6867,13 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         for (int i = 0; i < nr; ++i, prev = n) {
                 n = (void *)txr[i].node;
                 if (!(n->flags & DIRTY)) {
-                        ASSERT(n->lsn == 0);
+                        ASSERT(n->lsn_lo == 0 && n->lsn_hi == 0);
                         n->flags |= DIRTY;
-                        nodes[added++] = n;
                         blks += 1 << taddr_sbits(n->addr);
                         CINC(wal_dirty_clean);
                 } else if (COUNTERS && prev != n) {
                         CINC(wal_redirty);
-                        CMOD(wal_redirty_lsn, en->lsn - n->lsn);
+                        CMOD(wal_redirty_lsn, en->lsn - n->lsn_hi);
                         n->flags += 1ull << 40;
                 }
         }
@@ -6917,9 +6895,8 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         ASSERT(en->reserved > 0);
         --en->reserved;
         en->dirty_nr += blks;
-        for (int i = 0; i < added; ++i) {
-                ASSERT(nodes[i]->lsn == 0);
-                t2_lsnset((void *)nodes[i], tx->id);
+        for (int i = 0; i < nr; ++i) {
+                t2_lsnset(txr[i].node, tx->id);
         }
         mutex_unlock(&en->curlock);
         if (slow) {
@@ -6927,7 +6904,6 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         }
         ASSERT(tx->reserved > 0);
         tx->reserved--;
-        ASSERT(FORALL(i, nr, node_locked_invariant((void *)txr[i].node, WRITE)));
         return 0;
 }
 
@@ -7104,7 +7080,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
         return done > 0;
 }
 
-static void wal_pulse(struct t2 *mod) {
+static void wal_pulse(struct t2 *mod) { /* TODO: Periodically check that lsn is not about to overflow. */
 }
 
 static void wal_quiesce(struct t2_te *engine) {
