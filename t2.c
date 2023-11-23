@@ -996,7 +996,7 @@ static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
 static void page_cap_init(struct page *g, struct t2_tx *tx);
 static void counters_check();
-static void counters_print();
+static void counters_print(uint64_t flags);
 static void counters_clear();
 static void counters_fold();
 static void path_print(struct path *p);
@@ -1166,7 +1166,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         }
                         te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags, param->wal_workers,
                                       ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age, param->wal_sync_nob, param->wal_log_size, param->wal_reserve_quantum,
-                                      param->wal_threshold_paged, param->wal_threshold_page, param->wal_threshold_log_syncd, param->wal_threshold_log_sync, param->wal_ready_lo, param->node_throttle);
+                                      param->wal_threshold_paged, param->wal_threshold_page, param->wal_threshold_log_syncd, param->wal_threshold_log_sync, param->wal_ready_lo, param->wal_node_throttle);
                         if (EISERR(te)) {
                                 return EPTR(te);
                         }
@@ -1343,35 +1343,62 @@ void t2_fini(struct t2 *mod) {
         }
 }
 
-void t2_stats_print(struct t2 *mod) {
+uint64_t t2_stats_flags_parse(const char *s) {
+        static const uint64_t bits[256] = {
+                ['t'] = T2_SF_TREE,
+                ['m'] = T2_SF_MAXWELL,
+                ['s'] = T2_SF_SHEPHERD,
+                ['i'] = T2_SF_IO,
+                ['M'] = T2_SF_MALLOC,
+                ['S'] = T2_SF_STASH,
+                ['p'] = T2_SF_POOL,
+                ['x'] = T2_SF_TX,
+                ['o'] = T2_SF_OS,
+                ['c'] = T2_SF_COUNTERS,
+                ['h'] = T2_SF_HASH,
+                ['*'] = ~0ull
+        };
+        uint64_t flags = 0;
+        for (; *s != 0; ++s) {
+                flags |= bits[(uint8_t)*s];
+        }
+        return flags;
+}
+
+void t2_stats_print(struct t2 *mod, uint64_t flags) {
         struct cache *c = &mod->cache;
-        printf("\n%15s", "free-lists:");
-        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %8i", i);
+        if (flags & T2_SF_TREE) {
+                printf("\n%15s bolt: %8"PRId64, "cache:", c->bolt);
         }
-        printf("\n%15s", "avail:");
-        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %8"PRId64, c->pool.free[i].avail);
+        if (flags & T2_SF_POOL) {
+                printf("\n%15s", "free-lists:");
+                for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                        printf(" %8i", i);
+                }
+                printf("\n%15s", "avail:");
+                for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                        printf(" %8"PRId64, c->pool.free[i].avail);
+                }
+                printf("\n%15s", "used:");
+                for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                        printf(" %8"PRId64, c->pool.free[i].total - c->pool.free[i].avail);
+                }
+                printf("\n%15s", "free:");
+                for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                        printf(" %8"PRId64, c->pool.free[i].nr);
+                }
+                printf("\n%15s", "rate:");
+                for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                        printf(" %8"PRId64, krate(&c->pool.rate[i], c->bolt >> BOLT_EPOCH_SHIFT));
+                }
+                printf("\n%15s ", "pressure:");
+                for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
+                        int pressure = 0;
+                        bool underpressure = stress(&c->pool.free[i], &pressure);
+                        printf(" %7i%s", pressure, underpressure ? "*" : " ");
+                }
         }
-        printf("\n%15s", "used:");
-        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %8"PRId64, c->pool.free[i].total - c->pool.free[i].avail);
-        }
-        printf("\n%15s", "free:");
-        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %8"PRId64, c->pool.free[i].nr);
-        }
-        printf("\n%15s", "rate:");
-        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                printf(" %8"PRId64, krate(&c->pool.rate[i], c->bolt >> BOLT_EPOCH_SHIFT));
-        }
-        printf("\n%15s ", "pressure:");
-        for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                int pressure = 0;
-                bool underpressure = stress(&c->pool.free[i], &pressure);
-                printf(" %7i%s", pressure, underpressure ? "*" : " ");
-        }
-        if (false) {
+        if (flags & T2_SF_SHEPHERD) {
                 printf("\nshepherd: ");
                 for (int i = 0; i < c->sh_nr; ++i) {
                         struct shepherd *sh = &c->sh[i];
@@ -1381,12 +1408,15 @@ void t2_stats_print(struct t2 *mod) {
                         }
                 }
         }
-        printf("\n%15s bolt: %8"PRId64"\n", "cache:", c->bolt);
-        if (TRANSACTIONS && mod->te != NULL) {
+        if (TRANSACTIONS && (flags & T2_SF_TX) && mod->te != NULL) {
                 TXCALL(mod->te, print(mod->te));
         }
-        os_stats_print();
-        counters_print();
+        if (flags & T2_SF_OS) {
+                os_stats_print();
+        }
+        if (flags & T2_SF_COUNTERS) {
+                counters_print(flags);
+        }
 }
 
 static void tree_type_register(struct t2 *mod, struct t2_tree_type *ttype) {
@@ -4096,156 +4126,180 @@ static void double_var_print(int offset, const char *label) {
 #define DOUBLE_VAR_PRINT(counter) \
         double_var_print(offsetof(struct double_level_counters, counter), #counter)
 
-static void counters_print() {
+static void counters_print(uint64_t flags) {
         counters_fold();
-        printf("peek:                %10"PRId64"\n", GVAL(peek));
-        printf("alloc:               %10"PRId64"\n", GVAL(alloc));
-        printf("alloc.pool:          %10"PRId64"\n", GVAL(alloc_pool));
-        printf("alloc.wait:          %10"PRId64"\n", GVAL(alloc_wait));
-        printf("alloc.fresh:         %10"PRId64"\n", GVAL(alloc_fresh));
-        printf("traverse:            %10"PRId64"\n", GVAL(traverse));
-        printf("traverse.restart:    %10"PRId64"\n", GVAL(traverse_restart));
-        printf("traverse.iter:       %10"PRId64"\n", GVAL(traverse_iter));
-        printf("chain:               %10"PRId64"\n", GVAL(chain));
-        printf("cookie.miss:         %10"PRId64"\n", GVAL(cookie_miss));
-        printf("cookie.hit:          %10"PRId64"\n", GVAL(cookie_hit));
-        printf("read:                %10"PRId64"\n", GVAL(read));
-        printf("read.bytes:          %10"PRId64"\n", GVAL(read_bytes));
-        printf("write:               %10"PRId64"\n", GVAL(write));
-        printf("write.bytes:         %10"PRId64"\n", GVAL(write_bytes));
-        printf("maxwell.iter:        %10"PRId64"\n", GVAL(maxwell_iter));
-        printf("maxwell.wake:        %10"PRId64"\n", GVAL(maxwell_wake));
-        printf("maxwell.to:          %10"PRId64"\n", GVAL(maxwell_to));
-        printf("scan:                %10"PRId64"\n", GVAL(scan));
-        printf("scan.bucket:         %10"PRId64"\n", GVAL(scan_bucket));
-        printf("scan.locked:         %10"PRId64"\n", GVAL(scan_locked));
-        printf("wal.space:           %10"PRId64"\n", GVAL(wal_space));
-        counter_var_print1(&GVAL(wal_space_nr),  "wal.space_nr:");
-        counter_var_print1(&GVAL(wal_space_nob), "wal.space_nob:");
-        printf("wal.progress:        %10"PRId64"\n", GVAL(wal_progress));
-        printf("wal.write:           %10"PRId64"\n", GVAL(wal_write));
-        printf("wal.write_sync:      %10"PRId64"\n", GVAL(wal_write_sync));
-        counter_var_print1(&GVAL(wal_write_seg), "wal.write_seg:");
-        counter_var_print1(&GVAL(wal_write_nob), "wal.write_nob:");
-        printf("wal.cur_aged:        %10"PRId64"\n", GVAL(wal_cur_aged));
-        printf("wal.cur_aged_skip:   %10"PRId64"\n", GVAL(wal_cur_aged_skip));
-        printf("wal.snapshot:        %10"PRId64"\n", GVAL(wal_snapshot));
-        printf("wal.sync_log_skip:   %10"PRId64"\n", GVAL(wal_sync_log_skip));
-        printf("wal.get_ready:       %10"PRId64"\n", GVAL(wal_get_ready));
-        printf("wal.get_wait:        %10"PRId64"\n", GVAL(wal_get_wait));
-        counter_var_print1(&GVAL(wal_get_wait_time),  "wal.get_wait_time:");
-        counter_var_print1(&GVAL(wal_open_wait_time), "wal.open_wait_time:");
-        counter_var_print1(&GVAL(wal_ready),          "wal.ready:");
-        counter_var_print1(&GVAL(wal_full),           "wal.full:");
-        counter_var_print1(&GVAL(wal_inflight),       "wal.inflight:");
-        printf("wal.page_write:      %10"PRId64"\n", GVAL(wal_page_write));
-        printf("wal.page_put:        %10"PRId64"\n", GVAL(wal_page_put));
-        printf("wal.page_clean:      %10"PRId64"\n", GVAL(wal_page_clean));
-        printf("wal.page_none:       %10"PRId64"\n", GVAL(wal_page_none));
-        printf("wal.page_done:       %10"PRId64"\n", GVAL(wal_page_done));
-        printf("wal.page_sync:       %10"PRId64"\n", GVAL(wal_page_sync));
-        printf("wal.log_already:     %10"PRId64"\n", GVAL(wal_log_already));
-        printf("wal.sync_log_head:   %10"PRId64"\n", GVAL(wal_sync_log_head));
-        printf("wal.sync_log_lo:     %10"PRId64"\n", GVAL(wal_sync_log_lo));
-        printf("wal.sync_log_time:   %10"PRId64"\n", GVAL(wal_sync_log_time));
-        printf("wal.page_already:    %10"PRId64"\n", GVAL(wal_page_already));
-        printf("wal.page_wal:        %10"PRId64"\n", GVAL(wal_page_wal));
-        printf("wal.page_empty:      %10"PRId64"\n", GVAL(wal_page_empty));
-        printf("wal.page_lo:         %10"PRId64"\n", GVAL(wal_page_lo));
-        printf("wal.page_cache:      %10"PRId64"\n", GVAL(wal_page_cache));
-        printf("wal.sync_page_nob:   %10"PRId64"\n", GVAL(wal_sync_page_nob));
-        printf("wal.sync_page_time:  %10"PRId64"\n", GVAL(wal_sync_page_time));
-        printf("wal.dirty_clean:     %10"PRId64"\n", GVAL(wal_dirty_clean));
-        printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
-        printf("wal.throttle:        %10"PRId64"\n", GVAL(wal_throttle));
-        counter_var_print1(&GVAL(wal_redirty_lsn),    "wal.redirty_lsn:");
-        counter_var_print1(&GVAL(wal_log_sync_time),  "wal.log_sync_time:");
-        counter_var_print1(&GVAL(wal_page_sync_time),  "wal.page_sync_time:");
-        printf("shepherd.iter:       %10"PRId64"\n", GVAL(shepherd_iter));
-        printf("shepherd.scan:       %10"PRId64"\n", GVAL(shepherd_scan));
-        printf("shepherd.bucket:     %10"PRId64"\n", GVAL(shepherd_bucket));
-        printf("shepherd.skip:       %10"PRId64"\n", GVAL(shepherd_skip));
-        printf("shepherd.locked:     %10"PRId64"\n", GVAL(shepherd_locked));
-        printf("shepherd.wake:       %10"PRId64"\n", GVAL(shepherd_wake));
-        printf("shepherd.to:         %10"PRId64"\n", GVAL(shepherd_to));
-        printf("shepherd.clean:      %10"PRId64"\n", GVAL(shepherd_clean));
-        printf("throttle.clean:      %10"PRId64"\n", GVAL(throttle_clean));
-        printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
-        printf("stash.miss:          %10"PRId64"\n", GVAL(stash_miss));
-        counter_var_print1(&GVAL(stash_used),         "stash.used:");
-        printf("stash.mags:          %10"PRId64"\n", GVAL(stash_mags));
-        printf("stash.units:         %10"PRId64"\n", GVAL(stash_units));
-        for (int i = 0; i < MAX_ALLOC_BUCKET; ++i) {
-                printf("malloc[%02d]:          %10"PRId64"\n", i, GVAL(malloc[i]));
+        if (flags & T2_SF_TREE) {
+                printf("peek:                %10"PRId64"\n", GVAL(peek));
+                printf("alloc:               %10"PRId64"\n", GVAL(alloc));
+                printf("alloc.pool:          %10"PRId64"\n", GVAL(alloc_pool));
+                printf("alloc.wait:          %10"PRId64"\n", GVAL(alloc_wait));
+                printf("alloc.fresh:         %10"PRId64"\n", GVAL(alloc_fresh));
+                printf("traverse:            %10"PRId64"\n", GVAL(traverse));
+                printf("traverse.restart:    %10"PRId64"\n", GVAL(traverse_restart));
+                printf("traverse.iter:       %10"PRId64"\n", GVAL(traverse_iter));
+                printf("cookie.miss:         %10"PRId64"\n", GVAL(cookie_miss));
+                printf("cookie.hit:          %10"PRId64"\n", GVAL(cookie_hit));
+                counter_var_print1(&GVAL(time_traverse), "time.traverse:");
+                counter_var_print1(&GVAL(time_prepare),  "time.prepare:");
+                counter_var_print1(&GVAL(time_complete), "time.complete:");
+                counter_var_print1(&GVAL(time_get),      "time.get:");
+                counter_var_print1(&GVAL(time_open),     "time.open:");
+                counter_var_print1(&GVAL(time_pool_get), "time.pool_get:");
         }
-        counter_var_print1(&GVAL(time_traverse), "time.traverse:");
-        counter_var_print1(&GVAL(time_prepare),  "time.prepare:");
-        counter_var_print1(&GVAL(time_complete), "time.complete:");
-        counter_var_print1(&GVAL(time_get),      "time.get:");
-        counter_var_print1(&GVAL(time_open),     "time.open:");
-        counter_var_print1(&GVAL(time_pool_get), "time.pool_get:");
+        if (flags & T2_SF_HASH) {
+                printf("chain:               %10"PRId64"\n", GVAL(chain));
+        }
+        if (flags & T2_SF_MAXWELL) {
+                printf("maxwell.iter:        %10"PRId64"\n", GVAL(maxwell_iter));
+                printf("maxwell.wake:        %10"PRId64"\n", GVAL(maxwell_wake));
+                printf("maxwell.to:          %10"PRId64"\n", GVAL(maxwell_to));
+                printf("scan:                %10"PRId64"\n", GVAL(scan));
+                printf("scan.bucket:         %10"PRId64"\n", GVAL(scan_bucket));
+                printf("scan.locked:         %10"PRId64"\n", GVAL(scan_locked));
+        }
+        if (flags & T2_SF_TX) {
+                printf("wal.space:           %10"PRId64"\n", GVAL(wal_space));
+                counter_var_print1(&GVAL(wal_space_nr),  "wal.space_nr:");
+                counter_var_print1(&GVAL(wal_space_nob), "wal.space_nob:");
+                printf("wal.progress:        %10"PRId64"\n", GVAL(wal_progress));
+                printf("wal.write:           %10"PRId64"\n", GVAL(wal_write));
+                printf("wal.write_sync:      %10"PRId64"\n", GVAL(wal_write_sync));
+                counter_var_print1(&GVAL(wal_write_seg), "wal.write_seg:");
+                counter_var_print1(&GVAL(wal_write_nob), "wal.write_nob:");
+                printf("wal.cur_aged:        %10"PRId64"\n", GVAL(wal_cur_aged));
+                printf("wal.cur_aged_skip:   %10"PRId64"\n", GVAL(wal_cur_aged_skip));
+                printf("wal.snapshot:        %10"PRId64"\n", GVAL(wal_snapshot));
+                printf("wal.sync_log_skip:   %10"PRId64"\n", GVAL(wal_sync_log_skip));
+                printf("wal.get_ready:       %10"PRId64"\n", GVAL(wal_get_ready));
+                printf("wal.get_wait:        %10"PRId64"\n", GVAL(wal_get_wait));
+                counter_var_print1(&GVAL(wal_get_wait_time),  "wal.get_wait_time:");
+                counter_var_print1(&GVAL(wal_open_wait_time), "wal.open_wait_time:");
+                counter_var_print1(&GVAL(wal_ready),          "wal.ready:");
+                counter_var_print1(&GVAL(wal_full),           "wal.full:");
+                counter_var_print1(&GVAL(wal_inflight),       "wal.inflight:");
+                printf("wal.page_write:      %10"PRId64"\n", GVAL(wal_page_write));
+                printf("wal.page_put:        %10"PRId64"\n", GVAL(wal_page_put));
+                printf("wal.page_clean:      %10"PRId64"\n", GVAL(wal_page_clean));
+                printf("wal.page_none:       %10"PRId64"\n", GVAL(wal_page_none));
+                printf("wal.page_done:       %10"PRId64"\n", GVAL(wal_page_done));
+                printf("wal.page_sync:       %10"PRId64"\n", GVAL(wal_page_sync));
+                printf("wal.log_already:     %10"PRId64"\n", GVAL(wal_log_already));
+                printf("wal.sync_log_head:   %10"PRId64"\n", GVAL(wal_sync_log_head));
+                printf("wal.sync_log_lo:     %10"PRId64"\n", GVAL(wal_sync_log_lo));
+                printf("wal.sync_log_time:   %10"PRId64"\n", GVAL(wal_sync_log_time));
+                printf("wal.page_already:    %10"PRId64"\n", GVAL(wal_page_already));
+                printf("wal.page_wal:        %10"PRId64"\n", GVAL(wal_page_wal));
+                printf("wal.page_empty:      %10"PRId64"\n", GVAL(wal_page_empty));
+                printf("wal.page_lo:         %10"PRId64"\n", GVAL(wal_page_lo));
+                printf("wal.page_cache:      %10"PRId64"\n", GVAL(wal_page_cache));
+                printf("wal.sync_page_nob:   %10"PRId64"\n", GVAL(wal_sync_page_nob));
+                printf("wal.sync_page_time:  %10"PRId64"\n", GVAL(wal_sync_page_time));
+                printf("wal.dirty_clean:     %10"PRId64"\n", GVAL(wal_dirty_clean));
+                printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
+                printf("wal.throttle:        %10"PRId64"\n", GVAL(wal_throttle));
+                counter_var_print1(&GVAL(wal_redirty_lsn),    "wal.redirty_lsn:");
+                counter_var_print1(&GVAL(wal_log_sync_time),  "wal.log_sync_time:");
+                counter_var_print1(&GVAL(wal_page_sync_time),  "wal.page_sync_time:");
+        }
+        if (flags & T2_SF_SHEPHERD) {
+                printf("shepherd.iter:       %10"PRId64"\n", GVAL(shepherd_iter));
+                printf("shepherd.scan:       %10"PRId64"\n", GVAL(shepherd_scan));
+                printf("shepherd.bucket:     %10"PRId64"\n", GVAL(shepherd_bucket));
+                printf("shepherd.skip:       %10"PRId64"\n", GVAL(shepherd_skip));
+                printf("shepherd.locked:     %10"PRId64"\n", GVAL(shepherd_locked));
+                printf("shepherd.wake:       %10"PRId64"\n", GVAL(shepherd_wake));
+                printf("shepherd.to:         %10"PRId64"\n", GVAL(shepherd_to));
+                printf("shepherd.clean:      %10"PRId64"\n", GVAL(shepherd_clean));
+                printf("throttle.clean:      %10"PRId64"\n", GVAL(throttle_clean));
+        }
+        if (flags & T2_SF_STASH) {
+                printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
+                printf("stash.miss:          %10"PRId64"\n", GVAL(stash_miss));
+                counter_var_print1(&GVAL(stash_used),         "stash.used:");
+                printf("stash.mags:          %10"PRId64"\n", GVAL(stash_mags));
+                printf("stash.units:         %10"PRId64"\n", GVAL(stash_units));
+        }
+        if (flags & T2_SF_IO) {
+                printf("read:                %10"PRId64"\n", GVAL(read));
+                printf("read.bytes:          %10"PRId64"\n", GVAL(read_bytes));
+                printf("write:               %10"PRId64"\n", GVAL(write));
+                printf("write.bytes:         %10"PRId64"\n", GVAL(write_bytes));
+        }
+        if (flags & T2_SF_MALLOC) {
+                for (int i = 0; i < MAX_ALLOC_BUCKET; ++i) {
+                        printf("malloc[%02d]:          %10"PRId64"\n", i, GVAL(malloc[i]));
+                }
+        }
         printf("%20s ", "");
         for (int i = 0; i < ARRAY_SIZE(CVAL(l)); ++i) {
                 printf("%10i ", i);
         }
         puts("");
-        COUNTER_PRINT(traverse_hit);
-        COUNTER_PRINT(traverse_miss);
-        COUNTER_PRINT(allocated);
-        COUNTER_PRINT(allocated_unused);
-        COUNTER_PRINT(insert_balance);
-        COUNTER_PRINT(delete_balance);
-        COUNTER_PRINT(get);
-        COUNTER_PRINT(search);
-        COUNTER_PRINT(insert);
-        COUNTER_PRINT(delete);
-        COUNTER_PRINT(nospc);
-        COUNTER_PRINT(dirmove);
-        COUNTER_PRINT(recget);
-        COUNTER_PRINT(moves);
-        COUNTER_PRINT(make);
-        COUNTER_PRINT(shift);
-        COUNTER_PRINT(shift_one);
-        COUNTER_PRINT(compact);
-        COUNTER_PRINT(reclaim);
-        COUNTER_PRINT(merge);
-        COUNTER_PRINT(page_out);
-        COUNTER_PRINT(page_noent);
-        COUNTER_PRINT(page_trylock);
-        COUNTER_PRINT(page_node);
-        COUNTER_PRINT(page_cached);
-        COUNTER_PRINT(page_busy);
-        COUNTER_PRINT(page_tx_busy);
-        COUNTER_PRINT(page_hot);
-        COUNTER_PRINT(page_tx_want);
-        COUNTER_PRINT(page_pageout);
-        COUNTER_PRINT(page_cold);
-        COUNTER_VAR_PRINT(page_dirty_nr);
-        COUNTER_VAR_PRINT(page_lsn_diff);
-        COUNTER_PRINT(scan_skip_busy);
-        COUNTER_PRINT(scan_skip_dirty);
-        COUNTER_PRINT(scan_skip_hot);
-        COUNTER_PRINT(scan_busy);
-        COUNTER_PRINT(scan_dirty);
-        COUNTER_PRINT(scan_hot);
-        COUNTER_PRINT(scan_put);
-        COUNTER_PRINT(radixmap_updated);
-        COUNTER_VAR_PRINT(radixmap_builds);
-        COUNTER_VAR_PRINT(search_span);
-        COUNTER_VAR_PRINT(radixmap_left);
-        COUNTER_VAR_PRINT(radixmap_right);
-        COUNTER_VAR_PRINT(nr);
-        COUNTER_VAR_PRINT(free);
-        COUNTER_VAR_PRINT(recpos);
-        COUNTER_VAR_PRINT(modified);
-        COUNTER_VAR_PRINT(sepcut);
-        COUNTER_VAR_PRINT(prefix);
-        COUNTER_VAR_PRINT(pageout_cluster);
-        COUNTER_VAR_PRINT(tx_add[HDR]);
-        COUNTER_VAR_PRINT(tx_add[KEY]);
-        COUNTER_VAR_PRINT(tx_add[DIR]);
-        COUNTER_VAR_PRINT(tx_add[VAL]);
-        DOUBLE_VAR_PRINT(temperature);
+        if (flags & T2_SF_TREE) {
+                COUNTER_PRINT(traverse_hit);
+                COUNTER_PRINT(traverse_miss);
+                COUNTER_PRINT(allocated);
+                COUNTER_PRINT(allocated_unused);
+                COUNTER_PRINT(insert_balance);
+                COUNTER_PRINT(delete_balance);
+                COUNTER_PRINT(get);
+                COUNTER_PRINT(search);
+                COUNTER_PRINT(insert);
+                COUNTER_PRINT(delete);
+                COUNTER_PRINT(nospc);
+                COUNTER_PRINT(dirmove);
+                COUNTER_PRINT(recget);
+                COUNTER_PRINT(moves);
+                COUNTER_PRINT(make);
+                COUNTER_PRINT(shift);
+                COUNTER_PRINT(shift_one);
+                COUNTER_PRINT(compact);
+                COUNTER_PRINT(reclaim);
+                COUNTER_PRINT(merge);
+                COUNTER_PRINT(radixmap_updated);
+                COUNTER_VAR_PRINT(radixmap_builds);
+                COUNTER_VAR_PRINT(search_span);
+                COUNTER_VAR_PRINT(radixmap_left);
+                COUNTER_VAR_PRINT(radixmap_right);
+                COUNTER_VAR_PRINT(nr);
+                COUNTER_VAR_PRINT(free);
+                COUNTER_VAR_PRINT(recpos);
+                COUNTER_VAR_PRINT(modified);
+                COUNTER_VAR_PRINT(sepcut);
+                COUNTER_VAR_PRINT(prefix);
+                DOUBLE_VAR_PRINT(temperature);
+        }
+        if (flags & T2_SF_SHEPHERD) {
+                COUNTER_PRINT(page_out);
+                COUNTER_PRINT(page_noent);
+                COUNTER_PRINT(page_trylock);
+                COUNTER_PRINT(page_node);
+                COUNTER_PRINT(page_cached);
+                COUNTER_PRINT(page_busy);
+                COUNTER_PRINT(page_tx_busy);
+                COUNTER_PRINT(page_hot);
+                COUNTER_PRINT(page_tx_want);
+                COUNTER_PRINT(page_pageout);
+                COUNTER_PRINT(page_cold);
+                COUNTER_VAR_PRINT(page_dirty_nr);
+                COUNTER_VAR_PRINT(page_lsn_diff);
+                COUNTER_VAR_PRINT(pageout_cluster);
+        }
+        if (flags & T2_SF_MAXWELL) {
+                COUNTER_PRINT(scan_skip_busy);
+                COUNTER_PRINT(scan_skip_dirty);
+                COUNTER_PRINT(scan_skip_hot);
+                COUNTER_PRINT(scan_busy);
+                COUNTER_PRINT(scan_dirty);
+                COUNTER_PRINT(scan_hot);
+                COUNTER_PRINT(scan_put);
+        }
+        if (flags & T2_SF_TX) {
+                COUNTER_VAR_PRINT(tx_add[HDR]);
+                COUNTER_VAR_PRINT(tx_add[KEY]);
+                COUNTER_VAR_PRINT(tx_add[DIR]);
+                COUNTER_VAR_PRINT(tx_add[VAL]);
+        }
 }
 
 static void counters_clear() {
@@ -4276,7 +4330,7 @@ static void counters_fold() {
 static void counters_check() {
 }
 
-static void counters_print() {
+static void counters_print(uint64_t flags) {
 }
 
 static void counters_clear() {
@@ -7933,15 +7987,6 @@ void bn_bolt_set(struct t2 *mod, uint64_t bolt) {
         mod->cache.bolt = bolt;
 }
 
-void bn_counters_print(struct t2 *mod) {
-        if (mod != NULL) {
-                t2_stats_print(mod);
-        } else {
-                counters_print();
-        }
-        counters_clear();
-}
-
 void bn_counters_fold(void) {
         counters_fold();
 }
@@ -8352,10 +8397,10 @@ static void tree_ut() {
                 ASSERT(v64 == ht_hash(i + 1));
         }
         utest("fini");
-        t2_stats_print(mod);
+        t2_stats_print(mod, 0);
         t2_fini(mod);
         utestdone();
-        counters_print();
+        counters_print(~0ull);
 }
 
 static void fill(char *x, int nr) {
@@ -8449,7 +8494,7 @@ static void stress_ut() {
         utest("fini");
         t2_fini(mod);
         utestdone();
-        counters_print();
+        counters_print(~0ull);
 }
 
 static void delete_ut() {
@@ -8726,7 +8771,7 @@ void seq_ut() {
         utest("fini");
         t2_fini(mod);
         utestdone();
-        counters_print();
+        counters_print(~0ull);
         counters_clear();
 }
 
@@ -8904,7 +8949,7 @@ void mt_ut() {
         utest("fini");
         t2_fini(mod);
         utestdone();
-        counters_print();
+        counters_print(~0ull);
 }
 
 static void open_ut() {
@@ -8960,7 +9005,7 @@ static void open_ut() {
         utest("fini");
         t2_fini(mod);
         utestdone();
-        counters_print();
+        counters_print(~0ull);
 }
 
 #if TRANSACTIONS
@@ -9028,14 +9073,15 @@ enum {
         WAL_THRESHOLD_PAGE      =        128,
         WAL_THRESHOLD_LOG_SYNCD =         64,
         WAL_THRESHOLD_LOG_SYNC  =         32,
-        WAL_READY_LO            =          2
+        WAL_READY_LO            =          2,
+        WAL_NODE_THROTTLE       =        750
 };
 
 const double WAL_LOG_SLEEP = 1.0;
 
 static struct t2_te *wprep(int32_t flags) {
         struct t2_te *engine = wal_prep(logname, NR_BUFS, BUF_SIZE, flags, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB, WAL_LOG_SIZE, WAL_RESERVE_QUANTUM,
-                                        WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO);
+                                        WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO, WAL_NODE_THROTTLE);
         ASSERT(EISOK(engine));
         return engine;
 }
@@ -9105,11 +9151,11 @@ static void wal_ut() {
         ASSERT(EISOK(t));
         wal_ut_verify(t);
         t2_tree_close(t);
-        t2_stats_print(mod);
+        t2_stats_print(mod, 0);
         t2_fini(mod);
         free0 = 512;
         utestdone();
-        counters_print();
+        counters_print(~0ull);
 }
 
 #else

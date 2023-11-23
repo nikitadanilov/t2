@@ -249,6 +249,26 @@ bool  t2_is_err (void *ptr);
 int   t2_errcode(void *ptr);
 void *t2_errptr (int errcode);
 
+enum t2_stats_flags {
+        T2_SF_TREE       = 1ull <<  0, /* t */
+        T2_SF_MAXWELL    = 1ull <<  1, /* m */
+        T2_SF_SHEPHERD   = 1ull <<  2, /* s */
+        T2_SF_IO         = 1ull <<  3, /* i */
+        T2_SF_MALLOC     = 1ull <<  4, /* M */
+        T2_SF_STASH      = 1ull <<  5, /* S */
+        T2_SF_POOL       = 1ull <<  6, /* p */
+        T2_SF_TX         = 1ull <<  7, /* x */
+        T2_SF_OS         = 1ull <<  8, /* o */
+        T2_SF_COUNTERS   = 1ull <<  9, /* c */
+        T2_SF_HASH       = 1ull << 10, /* h */
+
+        T2_SF_SCAN       = T2_SF_MAXWELL | T2_SF_SHEPHERD,
+        T2_SF_ALLOC      = T2_SF_MALLOC | T2_SF_STASH
+};
+
+void t2_stats_print(struct t2 *mod, uint64_t flags);
+uint64_t t2_stats_flags_parse(const char *s);
+
 int t2_lookup_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize);
 int t2_insert_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize, struct t2_tx *tx);
 int t2_delete_ptr(struct t2_tree *t, void *key, int32_t ksize, struct t2_tx *tx);

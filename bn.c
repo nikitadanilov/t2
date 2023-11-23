@@ -103,7 +103,6 @@ extern uint64_t bn_file_free(struct t2_storage *storage);
 extern void bn_file_free_set(struct t2_storage *storage, uint64_t free);
 extern uint64_t bn_bolt(const struct t2 *mod);
 extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
-extern void bn_counters_print(struct t2 *mod);
 extern void bn_counters_fold(void);
 extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                               uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
@@ -401,6 +400,7 @@ static int shift_leaf     = 9;
 static int report_interval = 10;
 static bool keep = false;
 static bool make = true;
+static uint64_t stats_flags = ~0ull;
 
 static struct t2_node_type *bn_ntype_internal;
 static struct t2_node_type *bn_ntype_twig;
@@ -555,7 +555,7 @@ static void *breport_thread(void *arg) {
                 sleep(report_interval);
                 bphase_report(ph, false);
                 if (counters_level > 1) {
-                        bn_counters_print(mod);
+                        t2_stats_print(mod, stats_flags);
                 }
                 pthread_testcancel();
         }
@@ -590,7 +590,7 @@ static void bphase(struct bphase *ph, int i) {
         }
         blog(BINFO, "    Phase %2i done.\n", i);
         if (counters_level > 0) {
-                bn_counters_print(mod);
+                t2_stats_print(mod, stats_flags);
         }
         NOFAIL(pthread_cancel(reporter));
         NOFAIL(pthread_cond_destroy(&ph->start));
@@ -1018,7 +1018,7 @@ int main(int argc, char **argv) {
 #if USE_MAP
         kv[MAP] = mapkv;
 #endif
-        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:C:KM")) != -1) {
+        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:C:KMF:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -1069,6 +1069,9 @@ int main(int argc, char **argv) {
                         break;
                 case 'M':
                         make = false;
+                        break;
+                case 'F':
+                        stats_flags = t2_stats_flags_parse(optarg);
                         break;
                 }
         }
