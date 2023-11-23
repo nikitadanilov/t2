@@ -66,6 +66,7 @@ struct t2_param {
         int            wal_threshold_log_syncd;
         int            wal_threshold_log_sync;
         int            wal_ready_lo;
+        int            wal_node_throttle;
         const char    *policy_leaf;
         const char    *policy_twig;
         const char    *policy_internal;
@@ -96,7 +97,7 @@ struct t2_te { /* Transaction engine. */
         struct t2_tx *(*make)    (struct t2_te *te);
         int           (*open)    (struct t2_te *te, struct t2_tx *tx);
         void          (*close)   (struct t2_te *te, struct t2_tx *tx);
-        int           (*wait)    (struct t2_te *te, struct t2_tx *tx, const struct timespec *deadline, bool force);
+        int           (*wait)    (struct t2_te *te, struct t2_tx *tx, bool force);
         void          (*done)    (struct t2_te *te, struct t2_tx *tx);
         bool          (*pinned)  (struct t2_te *te, struct t2_node *n);
         bool          (*wantout) (struct t2_te *te, struct t2_node *n);
@@ -233,7 +234,7 @@ int  t2_cursor_next(struct t2_cursor *c);
 struct t2_tx *t2_tx_make (struct t2 *mod);
 int           t2_tx_open (struct t2 *mod, struct t2_tx *tx);
 void          t2_tx_close(struct t2 *mod, struct t2_tx *tx);
-int           t2_tx_wait (struct t2 *mod, struct t2_tx *tx, const struct timespec *deadline, bool force);
+int           t2_tx_wait (struct t2 *mod, struct t2_tx *tx, bool force);
 void          t2_tx_done (struct t2 *mod, struct t2_tx *tx);
 
 void    t2_release(struct t2_node *n);

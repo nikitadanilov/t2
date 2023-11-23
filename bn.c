@@ -107,7 +107,7 @@ extern void bn_counters_print(struct t2 *mod);
 extern void bn_counters_fold(void);
 extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                               uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                              int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo);
+                              int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle);
 
 static struct kv kv[KVNR];
 static enum kvtype kvt = T2;
@@ -687,7 +687,8 @@ enum {
         WAL_THRESHOLD_PAGE      =        128,
         WAL_THRESHOLD_LOG_SYNCD =         64,
         WAL_THRESHOLD_LOG_SYNC  =         32,
-        WAL_READY_LO            =          2
+        WAL_READY_LO            =          2,
+        WAL_NODE_THROTTLE       =        750
 };
 
 const double LOG_SLEEP = 1.0;
@@ -705,7 +706,7 @@ static bool transactions = false;
 static void t_mount(struct benchmark *b) {
         struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|(make ? MAKE : 0)|(keep ? KEEP : 0), WAL_WORKERS, WAL_LOG_SHIFT, LOG_SLEEP, WAL_AGE_LIMIT,
                                                        WAL_SYNC_AGE, WAL_SYNC_NOB, WAL_LOG_SIZE, WAL_RESERVE_QUANTUM,
-                                                       WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO) : NULL;
+                                                       WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO, WAL_NODE_THROTTLE) : NULL;
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
         bn_ntype_twig     = t2_node_type_init(1, "simple-bn-twig",     shift_twig,     0);
         bn_ntype_leaf     = t2_node_type_init(0, "simple-bn-leaf",     shift_leaf,     0);

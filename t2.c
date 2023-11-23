@@ -714,6 +714,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_sync_page_time;
         int64_t wal_dirty_clean;
         int64_t wal_redirty;
+        int64_t wal_throttle;
         int64_t shepherd_iter;
         int64_t shepherd_scan;
         int64_t shepherd_bucket;
@@ -979,7 +980,7 @@ static int  wal_ante    (struct t2_te *engine, struct t2_tx *trax, int32_t nob, 
 static int  wal_post    (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr);
 static int  wal_open    (struct t2_te *engine, struct t2_tx *trax);
 static void wal_close   (struct t2_te *engine, struct t2_tx *trax);
-static int  wal_wait    (struct t2_te *engine, struct t2_tx *trax, const struct timespec *deadline, bool force);
+static int  wal_wait    (struct t2_te *engine, struct t2_tx *trax, bool force);
 static void wal_done    (struct t2_te *engine, struct t2_tx *trax);
 static bool wal_pinned  (struct t2_te *engine, struct t2_node *n);
 static bool wal_wantout (struct t2_te *engine, struct t2_node *n);
@@ -989,7 +990,7 @@ static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
 struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                        uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo);
+                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int wal_prep);
 static void wal_pulse   (struct t2 *mod);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
@@ -1100,7 +1101,8 @@ enum {
         DEFAULT_WAL_THRESHOLD_PAGE      =        128,
         DEFAULT_WAL_THRESHOLD_LOG_SYNCD =         64,
         DEFAULT_WAL_THRESHOLD_LOG_SYNC  =         32,
-        DEFAULT_WAL_READY_LO            =          2
+        DEFAULT_WAL_READY_LO            =          2,
+        DEFAULT_WAL_NODE_THROTTLE       =        750
 };
 
 const double DEFAULT_WAL_LOG_SLEEP = 1.0;
@@ -1155,6 +1157,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SETIF0DEFAULT(flags, param, wal_threshold_log_syncd,  DEFAULT_WAL_THRESHOLD_LOG_SYNCD,   "d");
                         SETIF0DEFAULT(flags, param, wal_threshold_log_sync,   DEFAULT_WAL_THRESHOLD_LOG_SYNC,    "d");
                         SETIF0DEFAULT(flags, param, wal_ready_lo,             DEFAULT_WAL_READY_LO,              "d");
+                        SETIF0DEFAULT(flags, param, wal_node_throttle,        DEFAULT_WAL_NODE_THROTTLE,         "d");
                         if (param->wal_log_nr & (param->wal_log_nr - 1)) {
                                 CONFLICT(flags, "wal_log_nr is not a power of 2.");
                         }
@@ -1163,7 +1166,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         }
                         te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags, param->wal_workers,
                                       ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age, param->wal_sync_nob, param->wal_log_size, param->wal_reserve_quantum,
-                                      param->wal_threshold_paged, param->wal_threshold_page, param->wal_threshold_log_syncd, param->wal_threshold_log_sync, param->wal_ready_lo);
+                                      param->wal_threshold_paged, param->wal_threshold_page, param->wal_threshold_log_syncd, param->wal_threshold_log_sync, param->wal_ready_lo, param->node_throttle);
                         if (EISERR(te)) {
                                 return EPTR(te);
                         }
@@ -3202,8 +3205,8 @@ void t2_tx_close(struct t2 *mod, struct t2_tx *tx) {
         TXCALL(mod->te, close(mod->te, tx));
 }
 
-int t2_tx_wait(struct t2 *mod, struct t2_tx *tx, const struct timespec *deadline, bool force) {
-        return TXCALL(mod->te, wait(mod->te, tx, deadline, force));
+int t2_tx_wait(struct t2 *mod, struct t2_tx *tx, bool force) {
+        return TXCALL(mod->te, wait(mod->te, tx, force));
 }
 
 void t2_tx_done(struct t2 *mod, struct t2_tx *tx) {
@@ -4154,6 +4157,7 @@ static void counters_print() {
         printf("wal.sync_page_time:  %10"PRId64"\n", GVAL(wal_sync_page_time));
         printf("wal.dirty_clean:     %10"PRId64"\n", GVAL(wal_dirty_clean));
         printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
+        printf("wal.throttle:        %10"PRId64"\n", GVAL(wal_throttle));
         counter_var_print1(&GVAL(wal_redirty_lsn),    "wal.redirty_lsn:");
         counter_var_print1(&GVAL(wal_log_sync_time),  "wal.log_sync_time:");
         counter_var_print1(&GVAL(wal_page_sync_time),  "wal.page_sync_time:");
@@ -6487,6 +6491,7 @@ struct wal_te {
         int                                    threshold_log_sync;
         int                                    threshold_paged;
         int                                    threshold_page;
+        int                                    node_throttle;
         bool                                   log_syncing;
         bool                                   page_syncing;
         bool                                   use_barrier;
@@ -6832,6 +6837,26 @@ enum {
 
 static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t flags);
 
+static bool wal_tx_stable(struct wal_te *en, lsn_t tx) {
+        return ((en->flags & FORCE) ? en->start_persistent : en->max_persistent) > tx;
+}
+
+static void wal_wait_for(struct wal_te *en, lsn_t lsn, bool force) {
+        ASSERT(lsn != 0);
+        wal_lock(en);
+        if (force && en->cur != NULL && en->cur->lsn <= lsn) {
+                wal_buf_end(en);
+        }
+        while (!wal_tx_stable(en, lsn)) {
+                wal_cond_wait(en, &en->logwait);
+        }
+        wal_unlock(en);
+}
+
+static bool wal_throttle(struct wal_te *en, struct node *n) {
+        return en->lsn - n->lsn_lo > (en->node_throttle * en->log_size) >> 10;
+}
+
 static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype) {
         struct wal_te  *en  = COF(engine, struct wal_te, base);
         struct wal_tx  *tx  = COF(trax, struct wal_tx, base);
@@ -6842,6 +6867,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         int32_t         size;
         int             blks  = 0;
         bool            slow;
+        bool            throttle = false;
         ASSERT(en->recovered);
         rec = space = wal_space(en, tx, nr, nob, &size);
         if (UNLIKELY(rec == NULL)) {
@@ -6871,10 +6897,13 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                         n->flags |= DIRTY;
                         blks += 1 << taddr_sbits(n->addr);
                         CINC(wal_dirty_clean);
-                } else if (COUNTERS && prev != n) {
-                        CINC(wal_redirty);
-                        CMOD(wal_redirty_lsn, en->lsn - n->lsn_hi);
-                        n->flags += 1ull << 40;
+                } else {
+                        if (COUNTERS && prev != n) {
+                                CINC(wal_redirty);
+                                CMOD(wal_redirty_lsn, en->lsn - n->lsn_hi);
+                                n->flags += 1ull << 40;
+                        }
+                        throttle |= wal_throttle(en, n);
                 }
         }
         mutex_lock(&en->curlock);
@@ -6904,6 +6933,16 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         }
         ASSERT(tx->reserved > 0);
         tx->reserved--;
+        if (UNLIKELY(throttle)) {
+                wal_wait_for(en, tx->id, true);
+                for (int i = 0; i < nr; ++i) {
+                        n = (void *)txr[i].node;
+                        if (wal_throttle(en, n)) {
+                                pageout(n);
+                                CINC(wal_throttle);
+                        }
+                }
+        }
         return 0;
 }
 
@@ -7160,7 +7199,7 @@ static void wal_fini(struct t2_te *engine) {
 }
 
 struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo) {
+                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle) {
         struct wal_te *en     = mem_alloc(sizeof *en);
         pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
         int           *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
@@ -7215,6 +7254,7 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         en->threshold_page      = threshold_page;
         en->threshold_log_syncd = threshold_log_syncd;
         en->threshold_log_sync  = threshold_log_sync;
+        en->node_throttle       = node_throttle;
         stash_init(&en->stash, 16, 1 << 12);
         for (int i = 0; result == 0 && i < (1 << en->log_shift); ++i) {
                 if (flags & MAKE) {
@@ -7459,28 +7499,11 @@ static struct t2_tx *wal_make(struct t2_te *engine) {
         }
 }
 
-static bool wal_tx_stable(struct wal_te *en, lsn_t tx) {
-        return ((en->flags & FORCE) ? en->start_persistent : en->max_persistent) > tx;
-}
-
-static int wal_wait(struct t2_te *engine, struct t2_tx *trax, const struct timespec *deadline, bool force) {
+static int wal_wait(struct t2_te *engine, struct t2_tx *trax, bool force) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         struct wal_tx *tx = COF(trax, struct wal_tx, base);
-        int            result = 0;
-        ASSERT(tx->id != 0);
-        wal_lock(en);
-        if (force && en->cur != NULL && en->cur->lsn <= tx->id) {
-                wal_buf_end(en);
-        }
-        while (!wal_tx_stable(en, tx->id)) {
-                result = -wal_cond_timedwait(en, &en->logwait, deadline);
-                ASSERT(result == 0 || result == -ETIMEDOUT);
-                if (result != 0) {
-                        break;
-                }
-        }
-        wal_unlock(en);
-        return result;
+        wal_wait_for(en, tx->id, force);
+        return 0;
 }
 
 static int wal_open(struct t2_te *engine, struct t2_tx *trax) {
