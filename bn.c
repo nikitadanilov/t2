@@ -104,6 +104,7 @@ extern void bn_file_free_set(struct t2_storage *storage, uint64_t free);
 extern uint64_t bn_bolt(const struct t2 *mod);
 extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
 extern void bn_counters_fold(void);
+extern void bn_counters_clear(void);
 extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                               uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
                               int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle);
@@ -556,6 +557,7 @@ static void *breport_thread(void *arg) {
                 bphase_report(ph, false);
                 if (counters_level > 1) {
                         t2_stats_print(mod, stats_flags);
+                        bn_counters_clear();
                 }
                 pthread_testcancel();
         }
@@ -591,6 +593,7 @@ static void bphase(struct bphase *ph, int i) {
         blog(BINFO, "    Phase %2i done.\n", i);
         if (counters_level > 0) {
                 t2_stats_print(mod, stats_flags);
+                bn_counters_clear();
         }
         NOFAIL(pthread_cancel(reporter));
         NOFAIL(pthread_cond_destroy(&ph->start));
@@ -674,21 +677,21 @@ enum {
         MIN_RADIX_LEVEL = 2,
         MAX_CLUSTER = 256,
         SHEPHERD_RATIO          =         20,
-        SHEPHERD_MIN            =          0,
+        SHEPHERD_MIN            =          8,
         SHEPHERD_MAX            =          9,
         WAL_WORKERS             =         16,
-        WAL_LOG_SHIFT           =          3,
+        WAL_LOG_SHIFT           =          0,
         WAL_AGE_LIMIT           =    BILLION,
-        WAL_SYNC_AGE            =    BILLION / 10,
-        WAL_SYNC_NOB            = 1ull <<  6,
-        WAL_LOG_SIZE            = 1ull << 18,
+        WAL_SYNC_AGE            =    BILLION,
+        WAL_SYNC_NOB            = 1ull << 10,
+        WAL_LOG_SIZE            = 1ull << 14,
         WAL_RESERVE_QUANTUM     =         64,
         WAL_THRESHOLD_PAGED     =        512,
         WAL_THRESHOLD_PAGE      =        128,
         WAL_THRESHOLD_LOG_SYNCD =         64,
         WAL_THRESHOLD_LOG_SYNC  =         32,
         WAL_READY_LO            =          2,
-        WAL_NODE_THROTTLE       =        750
+        WAL_NODE_THROTTLE       =       1000
 };
 
 const double LOG_SLEEP = 1.0;

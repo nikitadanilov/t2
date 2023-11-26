@@ -91,6 +91,7 @@ struct shepherd;
 struct t2_te { /* Transaction engine. */
         int           (*post)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
         int           (*ante)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
+        void          (*prepare) (struct t2_te *te, struct t2_tx *tx, void *arg);
         int           (*init)    (struct t2_te *te, struct t2 *mod);
         void          (*fini)    (struct t2_te *te);
         void          (*quiesce) (struct t2_te *te);

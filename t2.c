@@ -80,7 +80,7 @@ enum {
 #else
 #define ASSERT(expr) ASSUME(expr)
 #endif
-#define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
+#define EXPENSIVE_ASSERT(expr) ASSERT(expr)
 #define SOF(x) ((int32_t)sizeof(x))
 #define ARRAY_SIZE(a)                           \
 ({                                              \
@@ -213,6 +213,9 @@ enum {
 #define CADD(cnt, d) (__t_counters.cnt += (d))
 #define CMOD(cnt, d) ({ struct counter_var *v = &(__t_counters.cnt); v->sum += (d); v->nr++; })
 #define DMOD(cnt, d) ({ struct double_var *v = &(__d_counters.cnt); v->sum += (d); v->nr++; })
+#define NINC(n, cnt) CINC(l[level(n)].cnt)
+#define NADD(n, cnt, d) CADD(l[level(n)].cnt, d)
+#define NMOD(n, cnt, d) CMOD(l[level(n)].cnt, d)
 #define COUNTERS_ASSERT(expr) ASSERT(expr)
 #define TIMED(expr, mod, counter)                       \
 ({                                                      \
@@ -237,6 +240,9 @@ enum {
 #define CADD(cnt, d) ((void)0)
 #define CMOD(cnt, d) ((void)0)
 #define DMOD(cnt, d) ((void)0)
+#define NINC(n, cnt) ((void)0)
+#define NADD(n, cnt, d) ((void)0)
+#define NMOD(n, cnt, d) ((void)0)
 #define COUNTERS_ASSERT(expr)
 #define TIMED(expr, mod, counter) (expr)
 #define TIMED_VOID(expr, mod, counter) (expr)
@@ -380,6 +386,12 @@ struct node;
 struct path;
 struct cap;
 
+struct rec_batch {
+        int32_t nr;
+        int32_t klen;
+        int32_t vlen;
+};
+
 struct node_type_ops {
         int     (*insert)    (struct slot *, struct cap *);
         void    (*delete)    (struct slot *, struct cap *);
@@ -392,6 +404,7 @@ struct node_type_ops {
         bool    (*search)    (struct node *n, struct path *p, struct slot *out);
         bool    (*can_merge) (const struct node *n0, const struct node *n1);
         int     (*can_insert)(const struct slot *s);
+        bool    (*can_fit)   (const struct node *n, const struct rec_batch *del, const struct rec_batch *add);
         int32_t (*nr)        (const struct node *n);
         int32_t (*free)      (const struct node *n);
 };
@@ -526,13 +539,14 @@ enum rung_flags {
         PINNED = 1ull << 0,
         ALUSED = 1ull << 1,
         SEPCHG = 1ull << 2,
-        DELDEX = 1ull << 3
+        DELDEX = 1ull << 3,
+        SELFSH = 1ull << 4,
+        MUSTPL = 1ull << 5
 };
 
 enum policy_id {
         SPLIT_RIGHT, /* Knuth */
-        SPLIT_LR,
-        SHIFT,       /* Try to shift to the left and right neighbours. */
+        SHIFT_RIGHT, /* Try to shift to the left and right neighbours. */
 
         POLICY_NR
 };
@@ -542,11 +556,8 @@ struct pstate {
         union {
                 struct split_right {
                 } sr;
-                struct shift {
-                        int32_t shift_le;
-                        int32_t shift_ln;
-                        int32_t shift_rn;
-                        int32_t shift_re;
+                struct shift_right {
+                        int32_t moved;
                 } sh;
         } u;
 };
@@ -703,6 +714,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_log_already;
         int64_t wal_sync_log_head;
         int64_t wal_sync_log_lo;
+        int64_t wal_sync_log_want;
         int64_t wal_sync_log_time;
         int64_t wal_sync_log_skip;
         int64_t wal_page_already;
@@ -714,7 +726,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_sync_page_time;
         int64_t wal_dirty_clean;
         int64_t wal_redirty;
-        int64_t wal_throttle;
         int64_t shepherd_iter;
         int64_t shepherd_scan;
         int64_t shepherd_bucket;
@@ -735,6 +746,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var time_get;
         struct counter_var time_open;
         struct counter_var time_pool_get;
+        struct counter_var shift_moved;
         struct counter_var wal_get_wait_time;
         struct counter_var wal_open_wait_time;
         struct counter_var wal_space_nr;
@@ -751,6 +763,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct level_counters {
                 int64_t traverse_hit;
                 int64_t traverse_miss;
+                int64_t precheck;
                 int64_t allocated;
                 int64_t allocated_unused;
                 int64_t insert_balance;
@@ -769,6 +782,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t shift;
                 int64_t shift_one;
                 int64_t merge;
+                int64_t sibling[2];
                 int64_t page_out;
                 int64_t page_noent;
                 int64_t page_trylock;
@@ -788,6 +802,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t scan_hot;
                 int64_t scan_put;
                 int64_t radixmap_updated;
+                int64_t wal_throttle;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
@@ -797,6 +812,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var search_span;
                 struct counter_var recpos;
                 struct counter_var prefix;
+                struct counter_var sibling_free[2];
                 struct counter_var radixmap_builds;
                 struct counter_var page_dirty_nr;
                 struct counter_var page_lsn_diff;
@@ -895,7 +911,7 @@ static uint64_t bolt(const struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
 static struct node *look(struct t2 *mod, taddr_t addr);
 static struct node *alloc(struct t2_tree *t, int8_t level, struct cap *cap);
-static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode);
+static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode, bool peekp);
 static void path_add(struct path *p, struct node *n, uint64_t flags);
 static bool can_insert(const struct node *n, const struct t2_rec *r);
 static bool keep(const struct node *n);
@@ -927,6 +943,7 @@ static bool simple_search(struct node *n, struct path *p, struct slot *out);
 static int32_t simple_nr(const struct node *n);
 static int32_t simple_free(const struct node *n);
 static int simple_can_insert(const struct slot *s);
+static bool simple_can_fit(const struct node *n, const struct rec_batch *del, const struct rec_batch *add);
 static int32_t simple_used(const struct node *n);
 static bool simple_can_merge(const struct node *n0, const struct node *n1);
 static void simple_fini(struct node *n);
@@ -945,6 +962,7 @@ static int32_t lazy_free(const struct node *n);
 static int32_t lazy_used(const struct node *n);
 static bool lazy_can_merge(const struct node *n0, const struct node *n1);
 static int lazy_can_insert(const struct slot *s);
+static bool lazy_can_fit(const struct node *n, const struct rec_batch *del, const struct rec_batch *add);
 static int32_t lazy_nr (const struct node *n);
 static int odir_insert(struct slot *s, struct cap *cap);
 static void odir_delete(struct slot *s, struct cap *cap);
@@ -959,9 +977,11 @@ static int32_t odir_free(const struct node *n);
 static int32_t odir_used(const struct node *n);
 static bool odir_can_merge(const struct node *n0, const struct node *n1);
 static int odir_can_insert(const struct slot *s);
+static bool odir_can_fit(const struct node *n, const struct rec_batch *del, const struct rec_batch *add);
 static int32_t odir_nr (const struct node *n);
 static void range_print(void *orig, int32_t nsize, void *start, int32_t nob);
 static int shift(struct page *d, struct page *s, const struct slot *insert, enum dir dir);
+static int shift_one(struct page *dp, struct page *sp, enum dir dir);
 static int merge(struct page *d, struct page *s, enum dir dir);
 static void tree_type_register(struct t2 *mod, struct t2_tree_type *ttype);
 static void tree_type_degister(struct t2_tree_type *ttype);
@@ -978,6 +998,7 @@ static void wal_fini    (struct t2_te *engine);
 static int  wal_diff    (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype);
 static int  wal_ante    (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr);
 static int  wal_post    (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr);
+static void wal_prepare (struct t2_te *engine, struct t2_tx *trax, void *arg);
 static int  wal_open    (struct t2_te *engine, struct t2_tx *trax);
 static void wal_close   (struct t2_te *engine, struct t2_tx *trax);
 static int  wal_wait    (struct t2_te *engine, struct t2_tx *trax, bool force);
@@ -990,7 +1011,7 @@ static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
 struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                        uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int wal_prep);
+                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle);
 static void wal_pulse   (struct t2 *mod);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
@@ -1409,12 +1430,14 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                 }
         }
         if (TRANSACTIONS && (flags & T2_SF_TX) && mod->te != NULL) {
+                puts("");
                 TXCALL(mod->te, print(mod->te));
         }
         if (flags & T2_SF_OS) {
                 os_stats_print();
         }
         if (flags & T2_SF_COUNTERS) {
+                puts("");
                 counters_print(flags);
         }
 }
@@ -1584,7 +1607,7 @@ void t2_tree_close(struct t2_tree *t) {
 }
 
 static int rec_insert(struct node *n, int32_t idx, struct t2_rec *r, struct cap *cap) {
-        CMOD(l[level(n)].recpos, 100 * idx / (nr(n) + 1));
+        NMOD(n, recpos, 100 * idx / (nr(n) + 1));
         return NCALL(n, insert(&(struct slot) { .node = n, .idx = idx, .rec  = *r }, cap));
 }
 
@@ -1676,15 +1699,18 @@ static struct node *peek(struct t2 *mod, taddr_t addr) {
 }
 
 static struct node *look(struct t2 *mod, taddr_t addr) {
-        uint32_t         bucket = ht_bucket(&mod->ht, addr);
-        pthread_mutex_t *lock   = ht_lock(&mod->ht, bucket);
-        struct node     *n;
-        mutex_lock(lock);
+        uint32_t     bucket = ht_bucket(&mod->ht, addr);
+        struct node *n;
+        rcu_lock();
         n = ht_lookup(&mod->ht, addr, bucket);
         if (n != NULL) {
-                ref(n);
+                if (LIKELY(rcu_dereference(n->ntype) != NULL)) {
+                        ref(n);
+                } else {
+                        n = NULL;
+                }
         }
-        mutex_unlock(lock);
+        rcu_unlock();
         return n;
 }
 
@@ -1835,17 +1861,13 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                         }
                 }
                 unlock(n, WRITE);
-                CINC(l[level(n)].get);
+                NINC(n, get);
         }
         return n;
 }
 
 static struct node *tryget(struct t2 *mod, taddr_t addr) {
         struct node *n = look(mod, addr);
-        if (LIKELY(n != NULL) && UNLIKELY(rcu_dereference(n->ntype) == NULL)) {
-                put(n);
-                n = NULL;
-        }
         if (n == NULL) {
                 n = get(mod, addr);
                 if (UNLIKELY(EISOK(n) && (n->flags & HEARD_BANSHEE))) {
@@ -1983,8 +2005,8 @@ static void radixmap_update(struct node *n) {
                 n->radix->prefix.len = plen = -1;
         }
         m = n->radix;
-        CINC(l[level(n)].radixmap_updated);
-        CMOD(l[level(n)].radixmap_builds, ++m->rebuild);
+        NINC(n, radixmap_updated);
+        NMOD(n, radixmap_builds, ++m->rebuild);
         if (LIKELY(nr(n) > 1)) {
                 if (m->utmost || m->prefix.len == -1) {
                         struct t2_buf l;
@@ -2003,7 +2025,7 @@ static void radixmap_update(struct node *n) {
         } else {
                 plen = m->prefix.len = 0;
         }
-        CMOD(l[level(n)].prefix, plen);
+        NMOD(n, prefix, plen);
         for (i = 0; i < nr(n); ++i) {
                 rec_get(&s, i);
                 if (LIKELY(s.rec.key->len > plen)) {
@@ -2056,6 +2078,18 @@ static void rec_todo(struct path *p, int idx, struct slot *out) {
         }
 }
 
+static bool nodes_ordered(struct node *left, struct node *right) {
+        SLOT_DEFINE(s, left);
+        struct t2_buf l;
+        struct t2_buf r;
+        rec_get(&s, utmost(left, RIGHT));
+        l = *s.rec.key;
+        s.node = right;
+        rec_get(&s, utmost(left, LEFT));
+        r = *s.rec.key;
+        return mcmp(l.addr, l.len, r.addr, r.len) < 0;
+}
+
 static void internal_parent_rec(struct path *p, int idx) {
         struct rung  *r = &p->rung[idx];
         SLOT_DEFINE(s, r->page.node);
@@ -2089,7 +2123,7 @@ static int newnode(struct path *p, int idx) {
        if (idx == 0) { /* Hodie natus est radici frater. */
                if (LIKELY(p->used + 1 < MAX_TREE_HEIGHT)) {
                        p->newroot.node = alloc(p->tree, level(r->page.node) + 1, &p->newroot.cap);
-                       if (EISERR(r->allocated.node)) {
+                       if (EISERR(p->newroot.node)) {
                                return ERROR(ERRCODE(p->newroot.node));
                        } else {
                                p->newroot.lm = WRITE;
@@ -2142,19 +2176,16 @@ static int split_right_exec_insert(struct path *p, int idx) {
                 s.idx++;
                 ASSERT(s.idx <= nr(s.node));
                 NOFAIL(NCALL(s.node, insert(&s, &g->cap)));
-                EXPENSIVE_ASSERT(is_sorted(s.node));
                 if (r->flags & ALUSED) {
-                        struct t2_buf lkey = {};
                         struct t2_buf rkey;
-                        if (is_leaf(right)) {
-                                s.node = left;
-                                rec_get(&s, nr(left) - 1);
-                                lkey = *s.rec.key;
-                        }
                         s.node = right;
                         rec_get(&s, 0);
                         rkey = *s.rec.key;
-                        if (is_leaf(right)) {
+                        if (USE_PREFIX_SEPARATORS && is_leaf(right)) {
+                                struct t2_buf lkey = {};
+                                s.node = left;
+                                rec_get(&s, nr(left) - 1);
+                                lkey = *s.rec.key;
                                 prefix_separator(&lkey, &rkey, level(left));
                         }
                         NOFAIL(buf_alloc(&r->scratch, &rkey));
@@ -2165,6 +2196,7 @@ static int split_right_exec_insert(struct path *p, int idx) {
         }
         EXPENSIVE_ASSERT(is_sorted(left));
         EXPENSIVE_ASSERT(right != NULL ? is_sorted(right) : true);
+        ASSERT(right != NULL && (r->flags & ALUSED) ? nodes_ordered(left, right) : true);
         return result;
 }
 
@@ -2174,7 +2206,7 @@ static struct page *brother(struct rung *r, enum dir d) {
 }
 
 static int split_right_plan_delete(struct path *p, int idx) {
-        struct node *right = neighbour(p, idx, RIGHT, WRITE);
+        struct node *right = neighbour(p, idx, RIGHT, WRITE, false);
         if (EISERR(right)) {
                 return ERROR(ERRCODE(right));
         } else {
@@ -2249,33 +2281,99 @@ static int split_right_exec_delete(struct path *p, int idx) {
         return result;
 }
 
-static bool can_fit(const struct node *left, const struct node *middle, const struct node *right, const struct t2_rec *rec) {
-        return true;
-}
-
-static int shift_plan_insert(struct path *p, int idx) {
+static int shift_right_plan_insert(struct path *p, int idx) {
         struct rung *r = &p->rung[idx];
-        int          result;
-        struct node *left  = neighbour(p, idx,  LEFT, WRITE);
-        struct node *right = neighbour(p, idx, RIGHT, WRITE);
-        if (UNLIKELY(EISOK(left) && EISOK(right))) {
-                if (can_fit(left, r->page.node, right, NULL)) {
-                        return 0;
-                }
-                result = newnode(p, idx);
-        } else {
-                if (EISERR(right)) {
-                        result = ERROR(ERRCODE(right));
-                }
-                if (EISERR(left)) {
-                        result = ERROR(ERRCODE(left));
+        SLOT_DEFINE(s, NULL);
+        /* Only apply shift at the leaf level and avoid the (rare) hard case of different parents. */
+        if (idx != p->used) {
+                rec_todo(p, idx, &s);
+                if (can_insert(r->page.node, &s.rec)) {
+                        return +1;
                 }
         }
-        return result;
+        if (idx == p->used && idx > 0 && (r - 1)->pos + 1 < nr((r - 1)->page.node)) {
+                struct node *right = neighbour(p, idx, RIGHT, WRITE, true);
+                if (LIKELY(EISOK(right) && right != NULL)) {
+                        struct node     *left = r->page.node;
+                        struct rec_batch one  = {};
+                        struct rec_batch none = {};
+                        struct rec_batch move = {};
+                        int32_t          pos  = r->pos + 1;
+                        s.node = left;
+                        rec_todo(p, idx, &s);
+                        one = (struct rec_batch) { .nr = 1, .klen = buf_len(s.rec.key), .vlen = buf_len(s.rec.val) };
+                        for (move.nr = 1; pos + move.nr <= nr(left); ++move.nr) {
+                                rec_get(&s, nr(left) - move.nr);
+                                move.klen += buf_len(s.rec.key);
+                                move.vlen += buf_len(s.rec.val);
+                                r->pd.u.sh.moved = move.nr;
+                                if (NCALL(right, can_fit(right, &none, &move))) {
+                                        if (NCALL(left, can_fit(left, &move, &one))) {
+                                                r->keyout = *s.rec.key;
+                                                ptr_buf(right, &r->valout);
+                                                (r - 1)->flags |= MUSTPL;
+                                                return 0;
+                                        }
+                                } else {
+                                        break;
+                                }
+                        }
+                        if (pos + r->pd.u.sh.moved == nr(left)) {
+                                struct rec_batch add = move;
+                                add.klen += one.klen;
+                                add.vlen += one.vlen;
+                                if (NCALL(right, can_fit(right, &none, &add))) {
+                                        rec_todo(p, idx, &s);
+                                        r->keyout = *s.rec.key;
+                                        ptr_buf(right, &r->valout);
+                                        r->flags |= SELFSH;
+                                        (r - 1)->flags |= MUSTPL;
+                                        return 0;
+                                }
+                        }
+                }
+        }
+        return split_right_plan_insert(p, idx); /* Fallback to split. */
 }
 
-static int shift_exec_insert(struct path *p, int idx) {
-        return 0;
+static int shift_right_exec_insert(struct path *p, int idx) {
+        struct rung *r     = &p->rung[idx];
+        struct rung *child = r + 1;
+        int32_t      pos   = r->pos + 1;
+        int32_t      moved = r->pd.u.sh.moved;
+        struct page *right = brother(r, RIGHT);
+        struct page *left  = &r->page;
+        struct page *dst;
+        if (idx == p->used && r->allocated.node == NULL) {
+                int32_t idx;
+                ASSERT(pos + moved <= nr(left->node));
+                ASSERT(right->node != NULL);
+                ASSERT(moved > 0 || (r->flags & SELFSH));
+                for (int32_t i = 0; i < moved; ++i) {
+                        NOFAIL(shift_one(right, left, RIGHT));
+                }
+                if (r->flags & SELFSH) {
+                        dst = right;
+                        idx = 0;
+                } else {
+                        dst = left;
+                        idx = pos;
+                }
+                rec_insert(dst->node, idx, p->rec, &dst->cap);
+                EXPENSIVE_ASSERT(is_sorted(dst->node));
+                ASSERT(nodes_ordered(left->node, right->node));
+                CMOD(shift_moved, moved + !!(r->flags & SELFSH));
+                return +1;
+        } else if (idx != p->used && child->allocated.node == NULL) {
+                /* Instead of inserting a new key, update the existing right neighbour key. Delete in here, split_right_exec_insert() will insert. */
+                struct node *nephew = brother(child, RIGHT)->node;
+                SLOT_DEFINE(s, nephew);
+                rec_get(&s, 0);
+                child->keyout = *s.rec.key;
+                ptr_buf(nephew, &child->valout);
+                rec_delete(left->node, pos, &left->cap);
+        }
+        return split_right_exec_insert(p, idx);
 }
 
 static const struct policy dispatch[POLICY_NR] = {
@@ -2285,17 +2383,24 @@ static const struct policy dispatch[POLICY_NR] = {
                 .exec_insert = &split_right_exec_insert,
                 .exec_delete = &split_right_exec_delete,
         },
-        [SHIFT] = {
-                .plan_insert = &shift_plan_insert,
-                .exec_insert = &shift_exec_insert
+        [SHIFT_RIGHT] = {
+                .plan_insert = &shift_right_plan_insert,
+                .plan_delete = &split_right_plan_delete, /* sic. */
+                .exec_insert = &shift_right_exec_insert,
+                .exec_delete = &split_right_exec_delete, /* sic. */
         }
 };
 
 static enum policy_id policy_select(const struct path *p, int idx) {
-        return SPLIT_RIGHT;
+        return SHIFT_RIGHT;
 }
 
 /* @tree */
+
+static bool rung_precheck(const struct rung *r, int idx) {
+        struct node *n = r->page.node; /* Check that the path is descending before locking it. */
+        return node_seq_is_valid(n, r->page.seq) && (idx > 0 ? level(n) + 1 == level((r - 1)->page.node) : true);
+}
 
 static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx, enum optype opt) {
         SASSERT(NONE == 0);
@@ -2329,7 +2434,8 @@ static void path_dirty(struct path *p) {
         dirty(p, &p->newroot);
 }
 
-static void path_lock(struct path *p) {
+static int path_lock(struct path *p) {
+        TXCALL(p->tree->ttype->mod->te, prepare(p->tree->ttype->mod->te, p->tx, p));
         /* Top to bottom, left to right. */
         if (UNLIKELY(p->newroot.node != NULL)) {
                 lock(p->newroot.node, WRITE);
@@ -2344,12 +2450,20 @@ static void path_lock(struct path *p) {
                 }
                 lock(r->page.node, r->page.lm);
                 if (r->allocated.node != NULL) {
-                        lock(r->allocated.node, WRITE);
+                        lock(r->allocated.node, r->allocated.lm);
                 }
                 if (right->node != NULL) {
                         lock(right->node, right->lm);
                 }
+                if (UNLIKELY(!rung_precheck(r, i))) {
+                        NINC(r->page.node, precheck);
+                        for (++r, ++i; i <= p->used; ++i, ++r) {
+                                brother(r, LEFT)->lm = brother(r, RIGHT)->lm = r->allocated.lm = r->page.lm = NONE;
+                        }
+                        return -ESTALE;
+                }
         }
+        return 0;
 }
 
 static void path_fini(struct path *p) {
@@ -2374,12 +2488,12 @@ static void path_fini(struct path *p) {
                         put(r->page.node);
                 }
                 if (UNLIKELY(r->allocated.node != NULL)) {
-                        touch_unlock(r->allocated.node, WRITE);
+                        touch_unlock(r->allocated.node, r->allocated.lm);
                         if (LIKELY(r->flags & ALUSED)) {
                                 put(r->allocated.node);
                         } else {
                                 dealloc(r->allocated.node);
-                                CINC(l[level(r->allocated.node)].allocated_unused);
+                                NINC(r->allocated.node, allocated_unused);
                         }
                 }
                 buf_free(&r->scratch);
@@ -2434,9 +2548,9 @@ static void path_print(struct path *p) {
                 printf("\n        node:      ");
                 page_print(&p->rung[i].page);;
                 printf("\n        allocated: ");
-                page_print(&p->rung[i].brother[0]);
+                page_print(&p->rung[i].allocated);
                 printf("\n        right:     ");
-                page_print(&p->rung[i].brother[0]);
+                page_print(&p->rung[i].brother[1]);
         }
         puts("");
 }
@@ -2462,11 +2576,11 @@ static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
                                 *nob += txr[pos].part.len;
                                 pos++;
                         }
-                        CMOD(l[level(n)].tx_add[i], max_32(end - start, 0));
+                        NMOD(n, tx_add[i], max_32(end - start, 0));
                 }
         } else if (n != NULL) {
                 for (int i = 0; i < ARRAY_SIZE(cap->ext); ++i) {
-                        CMOD(l[level(n)].tx_add[i], 0);
+                        NMOD(n, tx_add[i], 0);
                 }
         }
         return pos;
@@ -2515,11 +2629,6 @@ static bool rung_is_valid(const struct path *p, int i) {
         return is_valid;
 }
 
-static bool rung_precheck(const struct rung *r, int idx) {
-        struct node *n = r->page.node; /* Check that the path is descending before locking it. */
-        return node_seq_is_valid(n, r->page.seq) && (idx > 0 ? level(n) + 1 == level((r - 1)->page.node) : true);
-}
-
 static void cap_init(struct cap *cap, uint32_t size) {
         for (int i = 0; i < ARRAY_SIZE(cap->ext); ++i) {
                 struct ext *e = &cap->ext[i];
@@ -2560,7 +2669,7 @@ static int32_t utmost(const struct node *n, enum dir d) {
         return d == LEFT ? 0 : nr(n) - 1;
 }
 
-static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode) {
+static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mode mode, bool peekp) {
         struct node    *down = NULL;
         struct rung    *r    = &p->rung[idx];
         struct page    *br   = brother(r, d);
@@ -2581,7 +2690,7 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
         }
         ASSERT(r->page.lm == NONE || r->page.lm == mode);
         r->page.lm = mode;
-        down = internal_child(r->page.node, r->pos + d, false);
+        down = internal_child(r->page.node, r->pos + d, peekp);
         while (down != NULL && EISOK(down)) {
                 struct page *sibling;
                 r = &p->rung[++i];
@@ -2590,11 +2699,13 @@ static struct node *neighbour(struct path *p, int idx, enum dir d, enum lock_mod
                 sibling = brother(r, d);
                 *sibling = (struct page) { .node = down, .lm = mode, .seq = node_seq(down) };
                 page_cap_init(sibling, p->tx);
+                NINC(down, sibling[d > 0]);
+                NMOD(down, sibling_free[d > 0], NCALL(down, free(down)));
                 if (i == idx) {
                         break;
                 }
                 SASSERT(LEFT == -RIGHT);
-                down = internal_child(down, utmost(down, -d), false);
+                down = internal_child(down, utmost(down, -d), peekp);
         }
         return down;
 }
@@ -2618,13 +2729,9 @@ static int insert_prep(struct path *p) {
                 struct rung *r = &p->rung[idx];
                 r->page.lm = WRITE;
                 page_cap_init(&r->page, p->tx);
-                if (can_insert(r->page.node, rec) && !should_split(r->page.node)) {
+                if (can_insert(r->page.node, rec) && !should_split(r->page.node) && !(r->flags & MUSTPL)) {
                         break;
                 } else {
-                        if (!rung_precheck(r, idx)) {
-                                result = -ESTALE;
-                                break;
-                        }
                         r->pd.id = policy_select(p, idx);
                         result = dispatch[r->pd.id].plan_insert(p, idx);
                         if (result > 0) {
@@ -2636,8 +2743,7 @@ static int insert_prep(struct path *p) {
                         rec->val = &r->valout;
                 }
         } while (--idx >= 0 && LIKELY(result == 0));
-        path_lock(p);
-        return result;
+        return path_lock(p) ?: result;
 }
 
 static bool keep(const struct node *n) {
@@ -2657,13 +2763,9 @@ static int delete_prep(struct path *p) {
                 struct rung *r = &p->rung[idx];
                 r->page.lm = WRITE;
                 page_cap_init(&r->page, p->tx);
-                if (keep(r->page.node)) {
+                if (keep(r->page.node) && !(r->flags & MUSTPL)) {
                         break;
                 } else {
-                        if (!rung_precheck(r, idx)) {
-                                result = -ESTALE;
-                                break;
-                        }
                         r->pd.id = policy_select(p, idx);
                         result = dispatch[r->pd.id].plan_delete(p, idx);
                         if (result > 0) {
@@ -2672,8 +2774,7 @@ static int delete_prep(struct path *p) {
                         }
                 }
         } while (--idx >= 0 && LIKELY(result == 0));
-        path_lock(p);
-        return result;
+        return path_lock(p) ?: result;
 }
 
 SASSERT((enum dir)T2_LESS == LEFT && (enum dir)T2_MORE == RIGHT);
@@ -2689,7 +2790,7 @@ static int next_prep(struct path *p) {
         }
         r->pos = s.idx;
         r->page.lm = READ;
-        sibling = neighbour(p, p->used, (enum dir)c->dir, READ);
+        sibling = neighbour(p, p->used, (enum dir)c->dir, READ, false);
         if (EISERR(sibling)) {
                 result = ERROR(ERRCODE(sibling));
         }
@@ -2735,7 +2836,6 @@ static int root_add(struct path *p) {
         s.rec.val = ptr_buf(oldroot, &ptr);
         NOFAIL(NCALL(s.node, insert(&s, &p->newroot.cap)));
         s.idx = 1;
-        ASSERT(p->rung[0].pd.id == SPLIT_RIGHT); /* For now. */
         s.rec.key = &p->rung[0].keyout;
         s.rec.val = &p->rung[0].valout;
         NOFAIL(NCALL(s.node, insert(&s, &p->newroot.cap)));
@@ -2751,7 +2851,7 @@ static int insert_balance(struct path *p) {
         for (idx = p->used; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->page.lm == WRITE);
-                CINC(l[level(r->page.node)].insert_balance);
+                NINC(r->page.node, insert_balance);
                 result = dispatch[r->pd.id].exec_insert(p, idx);
                 if (result <= 0) {
                         break;
@@ -2784,7 +2884,7 @@ static int delete_balance(struct path *p) {
         for (idx = p->used; idx >= 0; --idx) {
                 struct rung *r = &p->rung[idx];
                 ASSERT(r->page.lm == WRITE);
-                CINC(l[level(r->page.node)].delete_balance);
+                NINC(r->page.node, delete_balance);
                 result = dispatch[r->pd.id].exec_delete(p, idx);
                 if (result <= 0) {
                         break;
@@ -2958,14 +3058,14 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else {
-                                CINC(l[level(n)].traverse_miss);
+                                NINC(n, traverse_miss);
                                 if (UNLIKELY(rcu_enter(p, n))) {
                                         continue;
                                 }
                                 flags |= PINNED;
                         }
                 } else {
-                        CINC(l[level(n)].traverse_hit);
+                        NINC(n, traverse_hit);
                         node_state_print(n, 'e');
                         if (UNLIKELY(!is_stable(n))) { /* This is racy, but OK. */
                                 rcu_leave(p, n);
@@ -3442,8 +3542,8 @@ static int pageout(struct node *n) {
                 for (int i = 0; i < towrite; ++i) {
                         struct node *nn = c[i];
                         node_state_print(nn, 'C');
-                        CMOD(l[level(nn)].page_dirty_nr, nn->flags >> 40);
-                        CMOD(l[level(nn)].page_lsn_diff, nn->lsn_hi - nn->lsn_lo);
+                        NMOD(nn, page_dirty_nr, nn->flags >> 40);
+                        NMOD(nn, page_lsn_diff, nn->lsn_hi - nn->lsn_lo);
                         nn->flags &= ~DIRTY;
                         nn->lsn_lo = nn->lsn_hi = 0;
                         nn->flags &= ~(~0ull << 40);
@@ -4137,6 +4237,7 @@ static void counters_print(uint64_t flags) {
                 printf("traverse:            %10"PRId64"\n", GVAL(traverse));
                 printf("traverse.restart:    %10"PRId64"\n", GVAL(traverse_restart));
                 printf("traverse.iter:       %10"PRId64"\n", GVAL(traverse_iter));
+                counter_var_print1(&GVAL(shift_moved), "shift.moved:");
                 printf("cookie.miss:         %10"PRId64"\n", GVAL(cookie_miss));
                 printf("cookie.hit:          %10"PRId64"\n", GVAL(cookie_hit));
                 counter_var_print1(&GVAL(time_traverse), "time.traverse:");
@@ -4186,6 +4287,7 @@ static void counters_print(uint64_t flags) {
                 printf("wal.log_already:     %10"PRId64"\n", GVAL(wal_log_already));
                 printf("wal.sync_log_head:   %10"PRId64"\n", GVAL(wal_sync_log_head));
                 printf("wal.sync_log_lo:     %10"PRId64"\n", GVAL(wal_sync_log_lo));
+                printf("wal.sync_log_want:   %10"PRId64"\n", GVAL(wal_sync_log_want));
                 printf("wal.sync_log_time:   %10"PRId64"\n", GVAL(wal_sync_log_time));
                 printf("wal.page_already:    %10"PRId64"\n", GVAL(wal_page_already));
                 printf("wal.page_wal:        %10"PRId64"\n", GVAL(wal_page_wal));
@@ -4196,7 +4298,6 @@ static void counters_print(uint64_t flags) {
                 printf("wal.sync_page_time:  %10"PRId64"\n", GVAL(wal_sync_page_time));
                 printf("wal.dirty_clean:     %10"PRId64"\n", GVAL(wal_dirty_clean));
                 printf("wal.redirty:         %10"PRId64"\n", GVAL(wal_redirty));
-                printf("wal.throttle:        %10"PRId64"\n", GVAL(wal_throttle));
                 counter_var_print1(&GVAL(wal_redirty_lsn),    "wal.redirty_lsn:");
                 counter_var_print1(&GVAL(wal_log_sync_time),  "wal.log_sync_time:");
                 counter_var_print1(&GVAL(wal_page_sync_time),  "wal.page_sync_time:");
@@ -4238,6 +4339,7 @@ static void counters_print(uint64_t flags) {
         if (flags & T2_SF_TREE) {
                 COUNTER_PRINT(traverse_hit);
                 COUNTER_PRINT(traverse_miss);
+                COUNTER_PRINT(precheck);
                 COUNTER_PRINT(allocated);
                 COUNTER_PRINT(allocated_unused);
                 COUNTER_PRINT(insert_balance);
@@ -4257,6 +4359,14 @@ static void counters_print(uint64_t flags) {
                 COUNTER_PRINT(reclaim);
                 COUNTER_PRINT(merge);
                 COUNTER_PRINT(radixmap_updated);
+                enum {
+                        LFT = 0,
+                        RGT = 1
+                };
+                COUNTER_PRINT(sibling[LFT]);
+                COUNTER_PRINT(sibling[RGT]);
+                COUNTER_VAR_PRINT(sibling_free[LFT]);
+                COUNTER_VAR_PRINT(sibling_free[RGT]);
                 COUNTER_VAR_PRINT(radixmap_builds);
                 COUNTER_VAR_PRINT(search_span);
                 COUNTER_VAR_PRINT(radixmap_left);
@@ -4295,6 +4405,7 @@ static void counters_print(uint64_t flags) {
                 COUNTER_PRINT(scan_put);
         }
         if (flags & T2_SF_TX) {
+                COUNTER_PRINT(wal_throttle);
                 COUNTER_VAR_PRINT(tx_add[HDR]);
                 COUNTER_VAR_PRINT(tx_add[KEY]);
                 COUNTER_VAR_PRINT(tx_add[DIR]);
@@ -4349,7 +4460,7 @@ static void os_stats_print() {
         struct rusage u;
         int           result = getrusage(RUSAGE_SELF, &u);
         if (LIKELY(result == 0)) {
-                printf("u: %10.4f s: %10.4f rss: %8lu min: %8lu maj: %8lu sig: %8lu vol: %8lu inv: %8lu\n",
+                printf("\nu: %10.4f s: %10.4f rss: %8lu min: %8lu maj: %8lu sig: %8lu vol: %8lu inv: %8lu\n",
                        timeval(&u.ru_utime), timeval(&u.ru_stime), u.ru_maxrss, u.ru_minflt, u.ru_majflt, u.ru_nsignals, u.ru_nvcsw, u.ru_nivcsw);
         }
 }
@@ -4682,9 +4793,8 @@ static void pool_throttle(struct t2 *mod, struct freelist *free, taddr_t addr) {
                 int32_t cookie = ht_bucket(&mod->ht, addr);
                 int32_t run    = 1 << ((pressure / 4) + 3);
                 if (UNLIKELY((cookie & MASK(rate)) == 0)) {
-                        if (true || LIKELY(cache_want_page(mod))) {
-                                struct shepherd sh       = { .lim = LLONG_MAX };
-                                int64_t         cleaned  = shepherd_scan(mod, &sh, cookie, run);
+                        if (LIKELY(cache_want_page(mod))) {
+                                int64_t cleaned = shepherd_scan(mod, &(struct shepherd){ .lim = LLONG_MAX }, cookie, run);
                                 if (cleaned > 0) {
                                         TXCALL(mod->te, scan_end(mod->te, cleaned));
                                         CADD(throttle_clean, cleaned);
@@ -5090,7 +5200,7 @@ static taddr_t internal_get(const struct node *n, int32_t pos) {
 }
 
 static struct node *internal_child(const struct node *n, int32_t pos, bool peekp) {
-        return (peekp ? peek : tryget)(n->mod, internal_get(n, pos));
+        return (peekp ? look : tryget)(n->mod, internal_get(n, pos));
 }
 
 static int leaf_search(struct node *n, struct path *p, struct slot *s) {
@@ -5153,6 +5263,10 @@ static void sdirmove(struct sheader *sh, int32_t nsize, int32_t knob, int32_t vn
 
 static int simple_can_insert(const struct slot *s) {
         return simple_free(s->node) >= rec_len(&s->rec) + SOF(struct dir_element);
+}
+
+static bool simple_can_fit(const struct node *n, const struct rec_batch *del, const struct rec_batch *add) {
+        return simple_free(n) >= add->klen + add->vlen - del->klen - del->vlen + (add->nr - del->nr) * SOF(struct dir_element);
 }
 
 static int32_t simple_used(const struct node *n) {
@@ -5310,7 +5424,7 @@ static void range_print(void *orig, int32_t nsize, void *start, int32_t nob) {
 
 static void header_print(struct node *n) {
         struct header *h = nheader(n);
-        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRIx64" ... %"PRIx64"\n",
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRId64" ... %"PRId64"\n",
                n->addr, h->treeid, h->level, h->ntype, nr(n), nsize(n), n, n->ref, n->flags, n->lsn_lo, n->lsn_hi);
 }
 
@@ -5379,7 +5493,7 @@ static int shift_one(struct page *dp, struct page *sp, enum dir dir) {
         ASSERT(nr(s) > 0);
         rec_get(&src, utmost(s, dir));
         dst.idx = dir == LEFT ? nr(d) : 0;
-        CINC(l[level(d)].shift_one);
+        NINC(d, shift_one);
         return NCALL(d, insert(&dst, &dp->cap)) ?: (NCALL(s, delete(&src, &sp->cap)), 0);
 }
 
@@ -5391,7 +5505,7 @@ static int shift(struct page *dst, struct page *src, const struct slot *point, e
         ASSERT(point->idx >= 0 && point->idx <= nr(s));
         ASSERT(NCALL(d, free(d)) > NCALL(s, free(s)));
         ASSERT(4 * rec_len(&point->rec) < min_32(nsize(d), nsize(s)));
-        CINC(l[level(d)].shift);
+        NINC(d, shift);
         while (LIKELY(result == 0)) {
                 SLOT_DEFINE(slot, s);
                 rec_get(&slot, utmost(s, dir));
@@ -5410,7 +5524,7 @@ static int merge(struct page *dst, struct page *src, enum dir dir) {
         while (LIKELY(result == 0) && nr(src->node) > 0) {
                 result = shift_one(dst, src, dir);
         }
-        CINC(l[level(dst->node)].merge);
+        NINC(dst->node, merge);
         return result;
 }
 
@@ -5423,6 +5537,7 @@ static struct node_type_ops simple_ops = {
         .search     = &simple_search,
         .can_merge  = &simple_can_merge,
         .can_insert = &simple_can_insert,
+        .can_fit    = &simple_can_fit,
         .nr         = &simple_nr,
         .free       = &simple_free
 };
@@ -5661,7 +5776,7 @@ static int lazy_compact(struct node *n, struct cap *cap) {
         int32_t      vcur    = HSIZE;
         int32_t      kcur    = size;
         ASSERT(lazy_invariant(n));
-        CINC(l[level(n)].compact);
+        NINC(n, compact);
         if (scratch != NULL) {
                 for (int32_t i = 0; i < d->nr; ++i) {
                         *(struct lrec *)(scratch + vcur) = (struct lrec){ .vlen = d->val[i].len, .klen = d->key[i].len };
@@ -5699,9 +5814,9 @@ static int lazy_insert(struct slot *s, struct cap *cap) {
         int          result;
         ASSERT(idx <= d->nr);
         ASSERT(lazy_invariant(n));
-        CINC(l[level(n)].insert);
+        NINC(n, insert);
         if (d->free < incr) {
-                CINC(l[level(n)].nospc);
+                NINC(n, nospc);
                 return -ENOSPC;
         }
         if (d->kend - d->vend < incr) {
@@ -5748,7 +5863,7 @@ static void lazy_delete(struct slot *s, struct cap *cap) {
         struct lrec *rec = n->data + d->val[idx].off - RSIZE;
         ASSERT(s->idx < d->nr);
         ASSERT(lazy_invariant(n));
-        CINC(l[level(n)].delete);
+        NINC(n, delete);
         d->free += d->val[idx].len + d->key[idx].len + RSIZE;
         rec->vlen = LREC_FREE - d->val[idx].len;
         ext_merge(&cap->ext[VAL], (void *)rec - n->data, (void *)rec - n->data + sizeof rec->vlen);
@@ -5757,7 +5872,7 @@ static void lazy_delete(struct slot *s, struct cap *cap) {
                 d->vend -= d->val[idx].len + RSIZE;
                 --lheader(n)->nr;
                 ext_merge(&cap->ext[HDR], offsetof(struct lheader, nr), HSIZE);
-                CINC(l[level(n)].reclaim);
+                NINC(n, reclaim);
         }
         memmove(&d->key[idx], &d->key[idx + 1], (d->nr - idx - 1) * sizeof d->key[0]);
         memmove(&d->val[idx], &d->val[idx + 1], (d->nr - idx - 1) * sizeof d->val[0]);
@@ -5779,7 +5894,7 @@ static void lazy_get(struct slot *s) {
         s->rec.val->addr = n->data + d->val[idx].off;
         s->rec.val->len  = d->val[idx].len;
         rcu_unlock();
-        CINC(l[level(n)].recget);
+        NINC(n, recget);
 }
 
 static int lazy_load(struct node *n, const struct t2_node_type *nt) {
@@ -5799,7 +5914,7 @@ static void lazy_make(struct node *n, struct cap *cap) {
         int result = lazy_parse(n, n->ntype); /* TODO: Handle errors properly. */
         ASSERT(result == 0);
         ASSERT(lazy_invariant(n));
-        CINC(l[level(n)].make);
+        NINC(n, make);
 }
 
 static void lazy_print(struct node *n) {
@@ -5972,6 +6087,10 @@ static int lazy_can_insert(const struct slot *s) {
         return lazy_free(s->node) >= rec_len(&s->rec) + RSIZE;
 }
 
+static bool lazy_can_fit(const struct node *n, const struct rec_batch *del, const struct rec_batch *add) {
+        return lazy_free(n) >= add->klen + add->vlen - del->klen - del->vlen + (add->nr - del->nr) * RSIZE;
+}
+
 static int32_t lazy_nr(const struct node *n) {
         int32_t nr;
         rcu_lock();
@@ -5992,6 +6111,7 @@ static struct node_type_ops lazy_ops = {
         .search     = &lazy_search,
         .can_merge  = &lazy_can_merge,
         .can_insert = &lazy_can_insert,
+        .can_fit    = &lazy_can_fit,
         .nr         = &lazy_nr,
         .free       = &lazy_free
 };
@@ -6094,7 +6214,7 @@ static int odir_compact(struct node *n, struct cap *cap) {
         int32_t      size    = nsize(n);
         void        *scratch = mem_alloc(size);
         int32_t      nr      = onr(n);
-        CINC(l[level(n)].compact);
+        NINC(n, compact);
         if (scratch != NULL) {
                 int32_t off = OHSIZE;
                 for (int32_t i = 0; i < nr; ++i) {
@@ -6128,9 +6248,9 @@ static int odir_insert(struct slot *s, struct cap *cap) {
         int             result;
         ASSERT(idx <= oh->nr);
         ASSERT(odir_invariant(n));
-        CINC(l[level(n)].insert);
+        NINC(n, insert);
         if (odir_free(n) < incr) {
-                CINC(l[level(n)].nospc);
+                NINC(n, nospc);
                 return -ENOSPC;
         }
         if (dend - end < incr) {
@@ -6155,6 +6275,7 @@ static int odir_insert(struct slot *s, struct cap *cap) {
         ASSERT(oend(n) == end + klen + vlen);
         ASSERT(odirend(n) == dend - ORSIZE);
         ASSERT(odir_invariant(n));
+        EXPENSIVE_ASSERT(is_sorted(n));
         return 0;
 }
 
@@ -6168,11 +6289,11 @@ static void odir_delete(struct slot *s, struct cap *cap) {
         int32_t         len  = olen(rec);
         ASSERT(s->idx < oh->nr);
         ASSERT(odir_invariant(n));
-        CINC(l[level(n)].delete);
+        NINC(n, delete);
         oh->used -= len + ORSIZE;
         if (oh->end == rec->off + len) {
                 oh->end -= len;
-                CINC(l[level(n)].reclaim);
+                NINC(n, reclaim);
         }
         move(n->data, dend, off - ORSIZE, ORSIZE);
         ext_merge(&cap->ext[DIR], dend + ORSIZE, off);
@@ -6180,6 +6301,7 @@ static void odir_delete(struct slot *s, struct cap *cap) {
         ext_merge(&cap->ext[HDR], SOF(struct header), OHSIZE);
         update_utmost(n, onr(n), idx);
         ASSERT(odir_invariant(n));
+        EXPENSIVE_ASSERT(is_sorted(n));
 }
 
 static void odir_get(struct slot *s) {
@@ -6189,7 +6311,7 @@ static void odir_get(struct slot *s) {
         s->rec.key->len  = rec->klen;
         s->rec.val->addr = n->data + rec->off + rec->klen;
         s->rec.val->len  = rec->vlen;
-        CINC(l[level(n)].recget);
+        NINC(n, recget);
 }
 
 static int odir_load(struct node *n, const struct t2_node_type *nt) {
@@ -6209,7 +6331,7 @@ static void odir_make(struct node *n, struct cap *cap) {
                 cap->ext[HDR].end = OHSIZE;
         }
         ASSERT(odir_invariant(n));
-        CINC(l[level(n)].make);
+        NINC(n, make);
 }
 
 static void odir_print(struct node *n) {
@@ -6346,6 +6468,10 @@ static int odir_can_insert(const struct slot *s) {
         return odir_free(s->node) >= rec_len(&s->rec) + ORSIZE;
 }
 
+static bool odir_can_fit(const struct node *n, const struct rec_batch *del, const struct rec_batch *add) {
+        return odir_free(n) >= add->klen + add->vlen - del->klen - del->vlen + (add->nr - del->nr) * ORSIZE;
+}
+
 static int32_t odir_nr(const struct node *n) {
         return onr(n);
 }
@@ -6362,6 +6488,7 @@ static struct node_type_ops odir_ops = {
         .search     = &odir_search,
         .can_merge  = &odir_can_merge,
         .can_insert = &odir_can_insert,
+        .can_fit    = &odir_can_fit,
         .nr         = &odir_nr,
         .free       = &odir_free
 };
@@ -6518,6 +6645,7 @@ struct wal_te {
         pthread_cond_t                         logwait;
         pthread_cond_t                         bufwait;
         pthread_cond_t                         bufwrite;
+        lsn_t                                  max_wait;
         lsn_t                                  max_inflight;
         lsn_t                                  max_written;
         lsn_t                                  max_synced;
@@ -6547,6 +6675,7 @@ struct wal_te {
         int                                    threshold_page;
         int                                    node_throttle;
         bool                                   log_syncing;
+        bool                                   snapshotting;
         bool                                   page_syncing;
         bool                                   use_barrier;
         struct t2                             *mod;
@@ -6712,6 +6841,7 @@ static bool wal_should_sync_log(const struct wal_te *en, uint32_t flags) {
         return  !COND(en->log_syncing, wal_log_already) &&
                 (COND(en->max_written - en->max_synced > en->sync_nob, wal_sync_log_head) ||
                  COND(wal_log_free(en) < wal_log_need(en) + ((threshold * en->log_size) >> 10), wal_sync_log_lo) ||
+                 COND(en->max_wait >= en->max_persistent, wal_sync_log_want) ||
                  COND(READ_ONCE(en->mod->tick) - en->last_log_sync > en->sync_age, wal_sync_log_time));
 }
 
@@ -6898,22 +7028,24 @@ static bool wal_tx_stable(struct wal_te *en, lsn_t tx) {
 static void wal_wait_for(struct wal_te *en, lsn_t lsn, bool force) {
         ASSERT(lsn != 0);
         wal_lock(en);
+        en->max_wait = max_64(en->max_wait, lsn);
         if (force && en->cur != NULL && en->cur->lsn <= lsn) {
                 wal_buf_end(en);
         }
         while (!wal_tx_stable(en, lsn)) {
+                NOFAIL(pthread_cond_broadcast(&en->logwait));
                 wal_cond_wait(en, &en->logwait);
         }
         wal_unlock(en);
 }
 
 static bool wal_throttle(struct wal_te *en, struct node *n) {
-        return en->lsn - n->lsn_lo > (en->node_throttle * en->log_size) >> 10;
+        return n->lsn_lo != 0 && n->lsn_hi - n->lsn_lo > (en->node_throttle * en->log_size) >> 10;
 }
 
 static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype) {
-        struct wal_te  *en  = COF(engine, struct wal_te, base);
-        struct wal_tx  *tx  = COF(trax, struct wal_tx, base);
+        struct wal_te  *en = COF(engine, struct wal_te, base);
+        struct wal_tx  *tx = COF(trax, struct wal_tx, base);
         struct wal_rec *rec;
         struct node    *n;
         struct node    *prev = NULL;
@@ -6921,7 +7053,6 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         int32_t         size;
         int             blks  = 0;
         bool            slow;
-        bool            throttle = false;
         ASSERT(en->recovered);
         rec = space = wal_space(en, tx, nr, nob, &size);
         if (UNLIKELY(rec == NULL)) {
@@ -6957,7 +7088,6 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                                 CMOD(wal_redirty_lsn, en->lsn - n->lsn_hi);
                                 n->flags += 1ull << 40;
                         }
-                        throttle |= wal_throttle(en, n);
                 }
         }
         mutex_lock(&en->curlock);
@@ -6987,16 +7117,6 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         }
         ASSERT(tx->reserved > 0);
         tx->reserved--;
-        if (UNLIKELY(throttle)) {
-                wal_wait_for(en, tx->id, true);
-                for (int i = 0; i < nr; ++i) {
-                        n = (void *)txr[i].node;
-                        if (wal_throttle(en, n)) {
-                                pageout(n);
-                                CINC(wal_throttle);
-                        }
-                }
-        }
         return 0;
 }
 
@@ -7006,6 +7126,29 @@ static int wal_ante(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
 
 static int wal_post(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr) {
         return wal_diff(engine, trax, nob, nr, txr, REDO);
+}
+
+static void wal_throttle_node(struct wal_te *en, struct page *g) {
+        struct node *n = g->node;
+        if (UNLIKELY(g->lm == WRITE && n != NULL && wal_throttle(en, n))) {
+                wal_wait_for(en, n->lsn_hi, true);
+                lock(n, WRITE);
+                pageout(n);
+                unlock(n, WRITE);
+                NINC(n, wal_throttle);
+        }
+}
+
+static void wal_prepare(struct t2_te *engine, struct t2_tx *trax, void *arg) {
+        struct path   *p  = arg;
+        struct wal_te *en = COF(engine, struct wal_te, base);
+        for (int i = p->used; i >= 0; --i) {
+                struct rung *r = &p->rung[i];
+                wal_throttle_node(en, brother(r, LEFT));
+                wal_throttle_node(en, &r->page);
+                wal_throttle_node(en, brother(r, RIGHT));
+                /* Do not bother throttling just allocated nodes. */
+        }
 }
 
 static void wal_log_sync(struct wal_te *en) {
@@ -7027,6 +7170,7 @@ static void wal_log_sync(struct wal_te *en) {
                 en->start_synced = en->start_written;
                 en->min_want = max_64(en->max_persistent - en->log_size, 0);
                 NOFAIL(pthread_cond_broadcast(&en->logwait));
+                NOFAIL(pthread_cond_broadcast(&en->mod->cache.wantclean));
         } else {
                 LOG("Cannot sync log: %i.", errno);
                 wal_print(&en->base);
@@ -7093,6 +7237,7 @@ static void wal_snapshot(struct wal_te *en) {
         lsn_t          start      = en->start;
         lsn_t          max_synced = en->max_synced;
         int            idx        = en->snapshot_hand++ & MASK(en->log_shift);
+        en->snapshotting = true;
         wal_unlock(en);
         header = (struct wal_rec) {
                 .magix = REC_MAGIX,
@@ -7125,11 +7270,13 @@ static void wal_snapshot(struct wal_te *en) {
                 en->start_synced = en->start_written;
                 en->min_want = max_64(en->max_persistent - en->log_size, 0);
                 NOFAIL(pthread_cond_broadcast(&en->logwait));
+                NOFAIL(pthread_cond_broadcast(&en->mod->cache.wantclean));
         } else {
                 LOG("Snapshot failure %s: %i/%i/%i.", en->logname, rc1, rc2, errno);
                 wal_print(&en->base);
                 wal_lock(en);
         }
+        en->snapshotting = false;
 }
 
 static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t flags) {
@@ -7145,7 +7292,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
                 if (en->max_written != en->max_synced) {
                         wal_log_sync(en);
                         ++done;
-                } else if (en->full_nr == 0 && en->inflight_nr == 0 &&
+                } else if (en->full_nr == 0 && en->inflight_nr == 0 && !en->snapshotting &&
                            (en->start != en->start_written || en->start_persistent != en->start_synced || en->start_synced != en->start_written)) {
                         wal_snapshot(en);
                         ++done;
@@ -7780,7 +7927,7 @@ static __attribute__((unused)) struct t2_storage mock_storage = {
 /* @file */
 
 enum {
-        FRAG_SHIFT = 8,
+        FRAG_SHIFT = 0,
         FRAG_NR    = 1 << FRAG_SHIFT,
         FRAG_MASK  = FRAG_NR - 1,
         BASE_SHIFT = 64 - 8 - 16
@@ -7989,6 +8136,10 @@ void bn_bolt_set(struct t2 *mod, uint64_t bolt) {
 
 void bn_counters_fold(void) {
         counters_fold();
+}
+
+void bn_counters_clear(void) {
+        counters_clear();
 }
 
 static bool is_sorted(struct node *n) {
