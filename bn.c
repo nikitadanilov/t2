@@ -642,7 +642,7 @@ static void bphase_report(struct bphase *ph, bool final) {
                                 }
                         }
                         if (var.nr != 0) {
-                                blog(lev, " %c %2i %2i %2i %s: ops: %10llu (%5.1f%%) sec: %10.4f op/sec: %9.1f op/wsec: %9.1f "
+                                blog(lev, " %c %2i %2i %2i %s: ops: %10llu (%5.1f%%) sec: %7.1f op/sec: %9.1f op/wsec: %9.1f "
                                      "[OK: %8"PRId64" ENOENT: %8"PRId64" EEXIST: %8"PRId64" OTHER: %8"PRId64"]\n",
                                      final ? '+' : '-',
                                      ph->idx, i, k, bot_name[bt->choice[k].option.opt], var.nr, 100.0 * total / ph->group[i].ops / ph->group[i].nr,
@@ -677,7 +677,7 @@ enum {
         MIN_RADIX_LEVEL = 2,
         MAX_CLUSTER = 256,
         SHEPHERD_RATIO          =         20,
-        SHEPHERD_MIN            =          8,
+        SHEPHERD_MIN            =          4,
         SHEPHERD_MAX            =          9,
         WAL_WORKERS             =         16,
         WAL_LOG_SHIFT           =          0,

@@ -1761,7 +1761,7 @@ static struct node *ninit(struct t2 *mod, taddr_t addr) {
                 pthread_mutex_t *lock   = ht_lock(&mod->ht, bucket);
                 int              sbits  = taddr_sbits(addr);
                 ++ci.anr;
-                ci.allocated[sbits]++;
+                ++ci.allocated[sbits];
                 mutex_lock(lock);
                 other = ht_lookup(&mod->ht, addr, bucket);
                 if (LIKELY(other == NULL)) {
@@ -2113,13 +2113,12 @@ static void internal_parent_rec(struct path *p, int idx) {
 
 static int newnode(struct path *p, int idx) {
        struct rung *r = &p->rung[idx];
-       if (r->allocated.node == NULL) {
-               r->allocated.node = alloc(p->tree, level(r->page.node), &r->allocated.cap);
-               if (EISERR(r->allocated.node)) {
-                       return ERROR(ERRCODE(r->allocated.node));
-               }
-               r->allocated.lm = WRITE;
+       ASSERT(r->allocated.node == NULL);
+       r->allocated.node = alloc(p->tree, level(r->page.node), &r->allocated.cap);
+       if (EISERR(r->allocated.node)) {
+               return ERROR(ERRCODE(r->allocated.node));
        }
+       r->allocated.lm = WRITE;
        if (idx == 0) { /* Hodie natus est radici frater. */
                if (LIKELY(p->used + 1 < MAX_TREE_HEIGHT)) {
                        p->newroot.node = alloc(p->tree, level(r->page.node) + 1, &p->newroot.cap);
@@ -4811,8 +4810,8 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
         struct freelist *free = &c->pool.free[idx];
         struct node     *n    = NULL;
         pool_throttle(mod, free, addr);
-        mutex_lock(&free->lock);
         if (LIKELY(free->avail == 0)) {
+                mutex_lock(&free->lock);
                 while (UNLIKELY(free->nr == 0)) {
                         NOFAIL(pthread_cond_broadcast(&c->want));
                         NOFAIL(pthread_cond_wait(&free->got, &free->lock));
@@ -4822,6 +4821,7 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
                 cds_list_del(&n->free);
                 --free->nr;
                 mutex_unlock(&free->lock);
+                ASSERT(n->ref == 0);
                 CINC(alloc_pool);
                 NCALL(n, fini(n));
                 cookie_invalidate(&n->cookie);
@@ -4832,6 +4832,7 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
                         n->radix->prefix.len = -1;
                 }
         } else {
+                mutex_lock(&free->lock);
                 --free->avail;
                 mutex_unlock(&free->lock);
         }
@@ -5946,7 +5947,7 @@ static void lazy_print(struct node *n) {
 
 static void lazy_fini(struct node *n) {
         struct ldir *d = n->typedata;
-        SET0(nheader(n));
+        SET0(lheader(n));
         if (d != NULL) {
                 n->typedata = NULL;
                 mem_free(d->val);
@@ -6349,7 +6350,7 @@ static void odir_print(struct node *n) {
 }
 
 static void odir_fini(struct node *n) {
-        SET0(nheader(n));
+        SET0(oheader(n));
 }
 
 static int okeycmp(struct node *n, int32_t idx, int32_t prefix, void *key, int32_t klen, uint32_t mask) {
@@ -7205,7 +7206,7 @@ static bool wal_need(struct t2_te *engine, struct shepherd *sh) {
         /* Lock is needed to avoid a race with wal_diff(). */
         WITH_LOCK(sh->cur_min = en->lsn, &en->curlock);
         sh->lim = target;
-        return target > en->max_paged;
+        return target > en->max_paged || (en->mod != NULL && en->dirty_nr > (128 * (1ll << en->mod->cache.shift)) >> 10); /* TODO: Make this a parameter. */
 }
 
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned) {
