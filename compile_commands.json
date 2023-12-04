@@ -1,0 +1,73 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-c",
+      "-I/usr/local/include",
+      "-g2",
+      "-fno-omit-frame-pointer",
+      "-foptimize-sibling-calls",
+      "-Wall",
+      "-Wextra",
+      "-Wno-unused-parameter",
+      "-Wno-unused-function",
+      "-Wno-sign-conversion",
+      "-O0",
+      "-DUT=1",
+      "-BN=0",
+      "-o",
+      "ut",
+      "t2.c"
+    ],
+    "directory": "/home/nikita/p/t2",
+    "file": "/home/nikita/p/t2/t2.c",
+    "output": "/home/nikita/p/t2/ut"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I/usr/local/include",
+      "-g2",
+      "-fno-omit-frame-pointer",
+      "-foptimize-sibling-calls",
+      "-Wall",
+      "-Wextra",
+      "-Wno-unused-parameter",
+      "-Wno-unused-function",
+      "-Wno-sign-conversion",
+      "-O0",
+      "-DUT=0",
+      "-DBN=1",
+      "-c",
+      "t2.c"
+    ],
+    "directory": "/home/nikita/p/t2",
+    "file": "/home/nikita/p/t2/t2.c"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-c",
+      "-I/usr/local/include",
+      "-g2",
+      "-fno-omit-frame-pointer",
+      "-foptimize-sibling-calls",
+      "-Wall",
+      "-Wextra",
+      "-Wno-unused-parameter",
+      "-Wno-unused-function",
+      "-Wno-sign-conversion",
+      "-O0",
+      "-DUSE_ROCKSDB=0",
+      "-DUSE_LMDB=0",
+      "-DUSE_MAP=0",
+      "t2.o",
+      "-o",
+      "bn",
+      "bn.c"
+    ],
+    "directory": "/home/nikita/p/t2",
+    "file": "/home/nikita/p/t2/bn.c",
+    "output": "/home/nikita/p/t2/bn"
+  }
+]
