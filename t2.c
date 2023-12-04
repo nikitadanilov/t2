@@ -806,6 +806,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
+                struct counter_var compressed;
                 struct counter_var sepcut;
                 struct counter_var radixmap_left;
                 struct counter_var radixmap_right;
@@ -906,6 +907,7 @@ static void put(struct node *n);
 static void put_locked(struct node *n);
 static void ref(struct node *n);
 static void touch(struct node *n);
+static bool is_hot(struct node *n);
 static uint64_t temperature(struct node *n);
 static uint64_t bolt(const struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
@@ -2434,7 +2436,6 @@ static void path_dirty(struct path *p) {
 }
 
 static int path_lock(struct path *p) {
-        TXCALL(p->tree->ttype->mod->te, prepare(p->tree->ttype->mod->te, p->tx, p));
         /* Top to bottom, left to right. */
         if (UNLIKELY(p->newroot.node != NULL)) {
                 lock(p->newroot.node, WRITE);
@@ -3431,7 +3432,7 @@ static void cache_fini(struct t2 *mod) {
         NOFAIL(pthread_join(mod->cache.md, NULL));
 }
 
-static bool is_hot(struct node *n, int shift) {
+static bool is_hot(struct node *n) {
         return krate(&nheader(n)->kelvin, bolt(n)) != 0;
 }
 
@@ -3450,7 +3451,7 @@ enum cachestate {
         COLD
 };
 
-static enum cachestate nstate(struct node *n, int shift, int baseref) {
+static enum cachestate nstate(struct node *n, int baseref) {
         __attribute__((unused)) uint8_t lev = level(n);
         CINC(l[lev].page_node);
         if (TRANSACTIONS && pinned(n)) {
@@ -3462,7 +3463,7 @@ static enum cachestate nstate(struct node *n, int shift, int baseref) {
         } else if (n->ref > baseref) {
                 CINC(l[lev].page_busy);
                 return BUSY;
-        } else if (is_hot(n, shift)) {
+        } else if (is_hot(n)) {
                 CINC(l[lev].page_hot);
                 return HOT;
         } else if (n->flags & DIRTY) {
@@ -3507,7 +3508,7 @@ static int pageout(struct node *n) {
                         ASSERT(result == 0 || result == EBUSY);
                         if (result == EBUSY) {
                                 CINC(l[lev].page_trylock);
-                        } else if (nstate(right, mod->cache.shift, 1) == PAGE) {
+                        } else if (nstate(right, 1) == PAGE) {
                                 ASSERT(TXA(right, right->lsn_lo != 0 && right->lsn_hi != 0));
                                 c[nr] = right;
                                 node_iovec(right, &vec[nr]);
@@ -3634,7 +3635,7 @@ static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mut
                         CINC(l[L].scan_busy);
                 } else if (n->flags & DIRTY) {
                         CINC(l[L].scan_dirty);
-                } else if (is_hot(n, mod->cache.shift)) {
+                } else if (is_hot(n)) {
                         CINC(l[L].scan_hot);
                 } else {
                         CINC(l[L].scan_put);
@@ -3668,7 +3669,7 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
                         NOFAIL(pthread_cond_broadcast(&mod->cache.wantclean)); \
                         mutex_unlock(&mod->cache.cleanlock);            \
                 }                                                       \
-        } else if (is_hot(n, mod->cache.shift)) {                       \
+        } else if (is_hot(n)) {                       \
                 CINC(l[L].scan_skip_hot);                               \
         } else {                                                        \
                 rcu_unlock();                                           \
@@ -4375,6 +4376,7 @@ static void counters_print(uint64_t flags) {
                 COUNTER_VAR_PRINT(recpos);
                 COUNTER_VAR_PRINT(modified);
                 COUNTER_VAR_PRINT(sepcut);
+                COUNTER_VAR_PRINT(compressed);
                 COUNTER_VAR_PRINT(prefix);
                 DOUBLE_VAR_PRINT(temperature);
         }
@@ -6722,6 +6724,7 @@ static bool wal_invariant(const struct wal_te *en) {
                 en->max_written      <= en->max_inflight &&
                 en->max_inflight     <= en->lsn &&
                 (en->cur != NULL ? en->lsn == en->cur->lsn : true) &&
+                en->dirty_nr >= 0 &&
                 wal_log_free(en) >= wal_log_need(en) &&
                 wal_log_need(en) <= en->log_size;
 }
@@ -7040,10 +7043,6 @@ static void wal_wait_for(struct wal_te *en, lsn_t lsn, bool force) {
         wal_unlock(en);
 }
 
-static bool wal_throttle(struct wal_te *en, struct node *n) {
-        return n->lsn_lo != 0 && n->lsn_hi - n->lsn_lo > (en->node_throttle * en->log_size) >> 10;
-}
-
 static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype) {
         struct wal_te  *en = COF(engine, struct wal_te, base);
         struct wal_tx  *tx = COF(trax, struct wal_tx, base);
@@ -7127,29 +7126,6 @@ static int wal_ante(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
 
 static int wal_post(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr) {
         return wal_diff(engine, trax, nob, nr, txr, REDO);
-}
-
-static void wal_throttle_node(struct wal_te *en, struct page *g) {
-        struct node *n = g->node;
-        if (UNLIKELY(g->lm == WRITE && n != NULL && wal_throttle(en, n))) {
-                wal_wait_for(en, n->lsn_hi, true);
-                lock(n, WRITE);
-                pageout(n);
-                unlock(n, WRITE);
-                NINC(n, wal_throttle);
-        }
-}
-
-static void wal_prepare(struct t2_te *engine, struct t2_tx *trax, void *arg) {
-        struct path   *p  = arg;
-        struct wal_te *en = COF(engine, struct wal_te, base);
-        for (int i = p->used; i >= 0; --i) {
-                struct rung *r = &p->rung[i];
-                wal_throttle_node(en, brother(r, LEFT));
-                wal_throttle_node(en, &r->page);
-                wal_throttle_node(en, brother(r, RIGHT));
-                /* Do not bother throttling just allocated nodes. */
-        }
 }
 
 static void wal_log_sync(struct wal_te *en) {
@@ -8484,6 +8460,7 @@ static void insert_ut() {
         struct node *n = alloc(&t, 0, &m);
         ASSERT(n != NULL && EISOK(n));
         t.root = n->addr;
+        n->flags |= DIRTY;
         put(n);
         utest("insert-1");
         NOFAIL(t2_insert(&t, &r, NULL));
@@ -9247,6 +9224,9 @@ static void wal_ut() {
         int64_t bolt;
         int result;
         usuite("wal");
+        /* Re-assign it in case file_storage.filename points to a device, that cannot be truncated. */
+        const char *oldfile = file_storage.filename;
+        file_storage.filename = "./pages/wp";
         utest("init");
         mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         t2_fini(mod);
@@ -9306,6 +9286,7 @@ static void wal_ut() {
         t2_stats_print(mod, 0);
         t2_fini(mod);
         free0 = 512;
+        file_storage.filename = oldfile;
         utestdone();
         counters_print(~0ull);
 }
