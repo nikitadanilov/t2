@@ -99,7 +99,7 @@ struct t2_te { /* Transaction engine. */
         void          (*close)   (struct t2_te *te, struct t2_tx *tx);
         int           (*wait)    (struct t2_te *te, struct t2_tx *tx, bool force);
         void          (*done)    (struct t2_te *te, struct t2_tx *tx);
-        bool          (*pinned)  (struct t2_te *te, struct t2_node *n);
+        bool          (*pinned)  (const struct t2_te *te, struct t2_node *n);
         bool          (*wantout) (struct t2_te *te, struct t2_node *n);
         void          (*clean)   (struct t2_te *te, struct t2_node **nodes, int nr);
         bool          (*need)    (struct t2_te *te, struct shepherd *sh);

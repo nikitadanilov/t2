@@ -61,6 +61,10 @@ enum {
 #define TRANSACTIONS (1)
 #endif
 
+#if !defined(IOCACHE)
+#define IOCACHE (0)
+#endif
+
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
@@ -381,6 +385,16 @@ struct cache {
         struct shepherd                       *sh;
 };
 
+struct ioc {
+        alignas(MAX_CACHELINE) taddr_t  addr;
+        void                           *data;
+};
+
+struct iocache {
+        int32_t              shift;
+        _Atomic(struct ioc) *entry;
+};
+
 struct slot;
 struct node;
 struct path;
@@ -428,6 +442,7 @@ enum t2_initialisation_stage {
 struct t2 {
         alignas(MAX_CACHELINE) struct ht     ht;
         alignas(MAX_CACHELINE) struct cache  cache;
+        struct iocache                       ioc;
         struct t2_te                        *te;
         uint64_t                             tick;
         uint64_t                             tick_nr;
@@ -740,6 +755,10 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t stash_mags;
         int64_t stash_units;
         int64_t malloc[MAX_ALLOC_BUCKET];
+        int64_t ioc_hit;
+        int64_t ioc_miss;
+        int64_t ioc_put;
+        int64_t ioc_conflict;
         struct counter_var time_traverse;
         struct counter_var time_complete;
         struct counter_var time_prepare;
@@ -760,6 +779,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_log_sync_time;
         struct counter_var wal_page_sync_time;
         struct counter_var stash_used;
+        struct counter_var ioc_ratio;
         struct level_counters {
                 int64_t traverse_hit;
                 int64_t traverse_miss;
@@ -802,11 +822,9 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t scan_hot;
                 int64_t scan_put;
                 int64_t radixmap_updated;
-                int64_t wal_throttle;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
-                struct counter_var compressed;
                 struct counter_var sepcut;
                 struct counter_var radixmap_left;
                 struct counter_var radixmap_right;
@@ -1005,7 +1023,7 @@ static int  wal_open    (struct t2_te *engine, struct t2_tx *trax);
 static void wal_close   (struct t2_te *engine, struct t2_tx *trax);
 static int  wal_wait    (struct t2_te *engine, struct t2_tx *trax, bool force);
 static void wal_done    (struct t2_te *engine, struct t2_tx *trax);
-static bool wal_pinned  (struct t2_te *engine, struct t2_node *n);
+static bool wal_pinned  (const struct t2_te *engine, struct t2_node *n);
 static bool wal_wantout (struct t2_te *engine, struct t2_node *n);
 static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_print   (struct t2_te *engine);
@@ -1035,6 +1053,10 @@ static void os_stats_print(void);
 static int lookup(struct t2_tree *t, struct t2_rec *r);
 static int insert(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
 static int delete(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx);
+static int iocache_init(struct iocache *ioc, int32_t shift);
+static void iocache_fini(struct iocache *ioc);
+static int iocache_put(struct iocache *ioc, struct node *n);
+static int iocache_get(struct iocache *ioc, struct node *n);
 static void *stash_get(struct stash_local *sl);
 static void stash_put(struct stash_local *sl, void *unit);
 static void stash_init(struct stash *s, int nr, int size);
@@ -1258,6 +1280,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
                 p->free[i].avail = p->free[i].total = 1 << max_32(conf->cshift - i, 0);
         }
         next_stage(mod, true, POOL);
+        NOFAIL(iocache_init(&mod->ioc, conf->cshift));
         NEXT_STAGE(mod, ht_init(&mod->ht, conf->hshift), HT_INIT);
         NEXT_STAGE(mod, SCALL(mod, init), STORAGE_INIT);
         ca->mod = mod;
@@ -1324,6 +1347,7 @@ void t2_fini(struct t2 *mod) {
         case HT_INIT:
                 ht_clean(&mod->ht);
                 ht_fini(&mod->ht);
+                iocache_fini(&mod->ioc);
                 __attribute__((fallthrough));
         case POOL:
                 pool_clean(mod);
@@ -1747,11 +1771,15 @@ static void nfini(struct node *n) {
         node_state_print(n, 'F');
         ASSERT(n->ref == 0);
         ASSERT(!(n->flags & DIRTY));
+        if (LIKELY(n->ntype != NULL)) {
+                iocache_put(&n->mod->ioc, n);
+        }
         mutex_lock(&free->lock);
         cds_list_add(&n->free, &free->head);
         ++free->nr;
         NOFAIL(pthread_cond_signal(&free->got));
         mutex_unlock(&free->lock);
+        counters_fold();
 }
 
 static struct node *ninit(struct t2 *mod, taddr_t addr) {
@@ -1814,8 +1842,12 @@ static bool ncheck(struct node *n) {
 
 static int readdata(struct node *n) {
         struct iovec io = { .iov_base = n->data, .iov_len = taddr_ssize(n->addr) };
-        node_state_print(n, 'R');
-        return SCALL(n->mod, read, n->addr, 1, &io);
+        if (n->addr == 0 || iocache_get(&n->mod->ioc, n)) {
+                node_state_print(n, 'R');
+                return SCALL(n->mod, read, n->addr, 1, &io);
+        } else {
+                return 0;
+        }
 }
 
 static struct node *take(struct t2 *mod, taddr_t addr, struct t2_node_type *ntype) {
@@ -3436,8 +3468,8 @@ static bool is_hot(struct node *n) {
         return krate(&nheader(n)->kelvin, bolt(n)) != 0;
 }
 
-static bool pinned(const struct node *n) {
-        return TXCALL(n->mod->te, pinned(n->mod->te, (void *)n));
+static bool pinned(const struct node *n, const struct t2_te *te) {
+        return TXCALL(te, pinned(te, (void *)n));
 }
 
 static bool wantout(const struct node *n) {
@@ -3454,7 +3486,7 @@ enum cachestate {
 static enum cachestate nstate(struct node *n, int baseref) {
         __attribute__((unused)) uint8_t lev = level(n);
         CINC(l[lev].page_node);
-        if (TRANSACTIONS && pinned(n)) {
+        if (TRANSACTIONS && pinned(n, n->mod->te)) {
                 CINC(l[lev].page_tx_busy);
                 return BUSY;
         } else if (TRANSACTIONS && wantout(n)) {
@@ -3483,6 +3515,7 @@ static void node_iovec(struct node *n, struct iovec *v) {
 #define TXA(n, ...) ((n)->mod->te != NULL ? (__VA_ARGS__) : true)
 static int pageout(struct node *n) {
         struct t2    *mod = n->mod;
+        struct t2_te *te  = mod->te;
         int           max_cluster = mod->cache.max_cluster;
         struct node  *c[max_cluster];          /* VLA */
         struct iovec  vec[max_cluster + 1];    /* VLA */
@@ -3529,7 +3562,7 @@ static int pageout(struct node *n) {
                 put(c[i]);
         }
         whole = taddr_make(taddr_saddr(n->addr), shift + bshift);
-        ASSERT(FORALL(i, towrite, !pinned(c[i])));
+        ASSERT(FORALL(i, towrite, !pinned(c[i], te)));
         for (int i = 0; i < towrite; ++i) {
                 node_state_print(c[i], 'W');
         }
@@ -3744,8 +3777,8 @@ static void *maxwelld(void *data) {
         return NULL;
 }
 
-static bool canpage(const struct node *n, lsn_t target) {
-        return !TRANSACTIONS || (!pinned(n) && 0 < n->lsn_lo && n->lsn_lo < target);
+static bool canpage(const struct node *n, const struct t2_te *te, lsn_t target) {
+        return !TRANSACTIONS || (!pinned(n, te) && 0 < n->lsn_lo && n->lsn_lo < target);
 }
 
 static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *mut, struct shepherd *sh) {
@@ -3757,11 +3790,11 @@ static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthr
         do {
                 cds_hlist_for_each(link, head) {
                         struct node *n = COF(link, struct node, hash);
-                        if (LIKELY(canpage(n, lim))) {
+                        if (LIKELY(canpage(n, mod->te, lim))) {
                                 ref(n);
                                 mutex_unlock(mut);
                                 lock(n, WRITE);
-                                if (LIKELY(canpage(n, lim))) {
+                                if (LIKELY(canpage(n, mod->te, lim))) {
                                         nr += pageout(n);
                                 }
                                 unlock(n, WRITE);
@@ -3794,7 +3827,7 @@ static int32_t shepherd_bucket(struct t2 *mod, int32_t pos, struct shepherd *sh)
         }                                                               \
         n = COF(link, struct node, hash);                               \
         node_state_print(n, 'S');                                       \
-        if (canpage(n, sh->lim)) {                                      \
+        if (canpage(n, mod->te, sh->lim)) {                             \
                 rcu_unlock();                                           \
                 nr = shepherd_locked(mod, head, ht_lock(ht, pos), sh);  \
                 rcu_lock();                                             \
@@ -3878,6 +3911,102 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
         }
         t2_thread_degister();
         return NULL;
+}
+
+/* @iocache */
+
+#if IOCACHE
+#include <zstd.h>
+#endif
+
+static int iocache_init(struct iocache *ioc, int32_t shift) {
+        if (IOCACHE) {
+                ioc->entry = mem_alloc(sizeof ioc->entry[0] << shift);
+                if (ioc->entry != NULL) {
+                        ioc->shift = shift;
+                        return 0;
+                } else {
+                        return ERROR(-ENOMEM);
+                }
+        } else {
+                return 0;
+        }
+}
+
+static void iocache_fini(struct iocache *ioc) {
+        if (IOCACHE) {
+                for (int32_t i = 0; i < (1 << ioc->shift); ++i) {
+                        mem_free(((struct ioc *)&ioc->entry[i])->data);
+                }
+                mem_free(ioc->entry);
+        }
+}
+
+static int iocache_put(struct iocache *ioc, struct node *n) {
+        if (IOCACHE) {
+                size_t maxsize = ZSTD_compressBound(taddr_ssize(n->addr));
+                void  *area    = alloca(maxsize);
+                size_t size    = ZSTD_compress(area, maxsize, n->data, taddr_ssize(n->addr), 1);
+                CINC(ioc_put);
+                if (LIKELY(!ZSTD_isError(size))) {
+                        void *data = mem_alloc(size + 4);
+                        if (LIKELY(data != NULL)) {
+                                struct ioc           want = { .addr = n->addr, .data = data };
+                                _Atomic(struct ioc) *slot = &ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)];
+                                struct ioc           have;
+                                memcpy(data + 4, area, size);
+                                *(int32_t *)data = (int32_t)size;
+                                have = atomic_load(slot);
+                                while (UNLIKELY(!atomic_compare_exchange_weak(slot, &have, want))) {
+                                        ; /* TODO: Is there an ABA possibility here? */
+                                }
+                                ASSERT(have.addr != n->addr);
+                                if (have.addr != 0) {
+                                        CINC(ioc_conflict);
+                                        mem_free(have.data);
+                                }
+                                CMOD(ioc_ratio, (size << 10) >> taddr_sshift(n->addr));
+                                return 0;
+                        } else {
+                                return ERROR(-ENOMEM);
+                        }
+                } else {
+                        return ERROR_INFO(-EINVAL, "ZSTD_compress() fails with %lu", (long unsigned)size, 0);
+                }
+        } else {
+                return 0;
+        }
+}
+
+static int iocache_get(struct iocache *ioc, struct node *n) {
+        if (IOCACHE) {
+                _Atomic(struct ioc) *slot = &ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)];
+                if (((struct ioc *)slot)->addr == n->addr) {
+                        struct ioc want = {};
+                        struct ioc have = atomic_load(slot);
+                        size_t     size;
+                        do {
+                                if (have.addr != n->addr) {
+                                        CINC(ioc_miss);
+                                        return +1;
+                                }
+                        } while (UNLIKELY(!atomic_compare_exchange_weak(slot, &have, want)));
+                        CINC(ioc_hit);
+                        size = ZSTD_decompress(n->data + 4, taddr_ssize(n->addr), have.data, *(int32_t *)have.data);
+                        if (LIKELY(!ZSTD_isError(size))) {
+                                ASSERT((int32_t)size == taddr_ssize(n->addr));
+                                mem_free(have.data);
+                                return 0;
+                        } else {
+                                return ERROR_INFO(-EINVAL, "ZSTD_decompress() fails with %lu", (long unsigned)size, 0);
+                        }
+                } else {
+                        CINC(ioc_miss);
+                        return +1;
+                }
+        } else {
+                return +1;
+        }
 }
 
 /* @stash */
@@ -4325,6 +4454,11 @@ static void counters_print(uint64_t flags) {
                 printf("read.bytes:          %10"PRId64"\n", GVAL(read_bytes));
                 printf("write:               %10"PRId64"\n", GVAL(write));
                 printf("write.bytes:         %10"PRId64"\n", GVAL(write_bytes));
+                printf("ioc.hit:             %10"PRId64"\n", GVAL(ioc_hit));
+                printf("ioc.miss:            %10"PRId64"\n", GVAL(ioc_miss));
+                printf("ioc.put:             %10"PRId64"\n", GVAL(ioc_put));
+                printf("ioc.conflict:        %10"PRId64"\n", GVAL(ioc_conflict));
+                counter_var_print1(&GVAL(ioc_ratio),  "ioc.ratio:");
         }
         if (flags & T2_SF_MALLOC) {
                 for (int i = 0; i < MAX_ALLOC_BUCKET; ++i) {
@@ -4376,7 +4510,6 @@ static void counters_print(uint64_t flags) {
                 COUNTER_VAR_PRINT(recpos);
                 COUNTER_VAR_PRINT(modified);
                 COUNTER_VAR_PRINT(sepcut);
-                COUNTER_VAR_PRINT(compressed);
                 COUNTER_VAR_PRINT(prefix);
                 DOUBLE_VAR_PRINT(temperature);
         }
@@ -4406,7 +4539,6 @@ static void counters_print(uint64_t flags) {
                 COUNTER_PRINT(scan_put);
         }
         if (flags & T2_SF_TX) {
-                COUNTER_PRINT(wal_throttle);
                 COUNTER_VAR_PRINT(tx_add[HDR]);
                 COUNTER_VAR_PRINT(tx_add[KEY]);
                 COUNTER_VAR_PRINT(tx_add[DIR]);
@@ -7726,8 +7858,8 @@ static void wal_done(struct t2_te *engine, struct t2_tx *trax) {
         mem_free(tx);
 }
 
-static bool wal_pinned(struct t2_te *engine, struct t2_node *n) {
-        struct wal_te *en = COF(engine, struct wal_te, base);
+static bool wal_pinned(const struct t2_te *engine, struct t2_node *n) {
+        const struct wal_te *en = COF(engine, struct wal_te, base);
         return t2_lsnget(n) >= en->max_persistent;
 }
 
