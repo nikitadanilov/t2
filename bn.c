@@ -342,7 +342,7 @@ static void bfill(char *buf, int len, uint64_t seed) {
 }
 
 static int rnd_between(int lo, int hi, uint64_t seed) {
-        return lo + (hi - lo) * (brnd(seed) % (hi - lo + 1)) / (hi - lo + 1);
+        return lo + brnd(seed) % (hi - lo + 1);
 }
 
 static int32_t bufgen(void *key, uint64_t seed0, int max, int *rndmax, int delta, struct bspec *sp) {
@@ -723,6 +723,18 @@ static void t_mount(struct benchmark *b) {
                 &bn_ttype,
                 NULL
         };
+        if (b->kv.u.t2.root == 0 && !make) {
+                FILE *seg = fopen("bn.seg", "r");
+                if (seg != NULL) {
+                        int nr = fscanf(seg, "%"SCNx64" %"SCNx64" %"SCNx64,
+                                        &b->kv.u.t2.root, &b->kv.u.t2.free, &b->kv.u.t2.bolt);
+                        assert(nr == 3);
+                        fclose(seg);
+                }
+        }
+        if (b->kv.u.t2.free != 0) {
+                bn_file_free_set(bn_storage, b->kv.u.t2.free);
+        }
         mod = b->kv.u.t2.mod = t2_init(&(struct t2_conf) { .storage = bn_storage,
                                                            .te = engine,
                                                            .hshift = ht_shift,
@@ -732,9 +744,6 @@ static void t_mount(struct benchmark *b) {
                                                            .max_cluster = MAX_CLUSTER,
                                                            .ttypes = ttypes,
                                                            .ntypes = ntypes});
-        if (b->kv.u.t2.free != 0) {
-                bn_file_free_set(bn_storage, b->kv.u.t2.free);
-        }
         if (b->kv.u.t2.bolt != 0) {
                 bn_bolt_set(b->kv.u.t2.mod, b->kv.u.t2.bolt);
         }
@@ -763,6 +772,13 @@ static void t_umount(struct benchmark *b) {
         t2_node_type_fini(bn_ntype_twig);
         t2_node_type_fini(bn_ntype_leaf);
         mod = NULL;
+        if (keep) {
+                FILE *seg = fopen("bn.seg", "w");
+                if (seg != NULL) {
+                        fprintf(seg, "%"PRIx64" %"PRIx64" %"PRIx64, b->kv.u.t2.root, b->kv.u.t2.free, b->kv.u.t2.bolt);
+                        fclose(seg);
+                }
+        }
 }
 
 static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {

@@ -7686,7 +7686,6 @@ static void rbuf_print(const struct rbuf *rbuf) {
 
 static int wal_index_replay(struct wal_te *en, int nr, struct rbuf *index, lsn_t start, lsn_t end, void *buf) {
         int result = 0;
-        LOG("Recovering: %8"PRId64" .. %8"PRId64".", start, end);
         for (int i = 0; result == 0 && i < nr; ++i) {
                 struct rbuf *r = &index[i];
                 if (start <= r->lsn && r->lsn < end) {
@@ -7738,7 +7737,6 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
         for (snapend = 0; snapend < pos && index[snapend].lsn == 0; ++snapend) {
                 ;
         }
-        LOG("Found %i snapshots.", snapend);
         for (int i = snapend + 1; i < pos; ++i) {
                 if (index[i].start < index[i - 1].start || index[i].end < index[i - 1].end) {
                         LOG("Non-monotonic records.");
@@ -7751,8 +7749,6 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
         if (snapend > 0 && index[snapend - 1].end > out->end) {
                 *out = index[snapend - 1];
         }
-        LOG("Latest record:");
-        rbuf_print(out);
         return 0;
 }
 
@@ -8069,10 +8065,12 @@ static int file_init(struct t2_storage *storage) {
         int namesize = strlen(fs->filename) + 10;
         char name[namesize]; /* VLA */
         NOFAIL(pthread_mutex_init(&fs->lock, NULL));
-        fs->free = free0;
+        if (fs->free == 0) {
+                fs->free = free0;
+        }
         fs->allsame = true;
         for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
-                fs->frag_free[i] = free0;
+                fs->frag_free[i] = fs->free;
                 snprintf(name, namesize, file_fmt, fs->filename, i);
                 fs->fd[i] = open(name, O_RDWR | O_CREAT, 0777);
                 if (fs->fd[i] < 0) {
@@ -9447,6 +9445,7 @@ static void wal_ut() {
         t2_fini(mod);
         bn_file_truncate(&file_storage.gen, 0);
         bn_file_truncate(&file_storage.gen, free + (1 << 20));
+        file_storage.free = 0;
         free0 = free;
         mod = T2_INIT(ut_storage, wprep(FLAGS), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         mod->cache.bolt = bolt;
