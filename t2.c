@@ -27,6 +27,7 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <dlfcn.h>
+#include <zstd.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -3914,10 +3915,6 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
 }
 
 /* @iocache */
-
-#if IOCACHE
-#include <zstd.h>
-#endif
 
 static int iocache_init(struct iocache *ioc, int32_t shift) {
         if (IOCACHE) {
