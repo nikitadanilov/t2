@@ -8884,7 +8884,6 @@ static void delete_ut() {
         usuite("delete");
         utest("init");
         struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         delete_ut_with(mod, NULL);
         utest("fini");
         t2_fini(mod);
@@ -8897,8 +8896,7 @@ static int cnext(struct t2_cursor *c, const struct t2_rec *rec) {
         return +1;
 }
 
-static void next_ut() {
-        struct t2      *mod;
+static void next_ut_with(struct t2 *mod, struct t2_tx *tx) {
         struct t2_tree *t;
         char key[1ul << ntype.shift];
         char val[1ul << ntype.shift];
@@ -8908,10 +8906,7 @@ static void next_ut() {
                 .key = &keyb,
                 .val = &valb
         };
-        usuite("next");
-        utest("init");
-        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        t = t2_tree_create(&ttype, NULL);
+        t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         ASSERT(EISOK(t));
         struct t2_cursor_op cop = {
                 .next = &cnext
@@ -8927,7 +8922,7 @@ static void next_ut() {
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(i);
                 valb = BUF_VAL(i);
-                NOFAIL(t2_insert(t, &r, NULL));
+                NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
         }
         utest("smoke");
         for (long i = 0, del = 0; i < U; ++i, del += 7, del %= U) {
@@ -8935,7 +8930,7 @@ static void next_ut() {
                 struct t2_buf maxkey = BUF_VAL(ulongmax);
                 keyb = BUF_VAL(del);
                 valb = BUF_VAL(del);
-                NOFAIL(t2_delete(t, &r, NULL));
+                NOFAIL(WITH_TX(mod, tx, t2_delete(t, &r, tx)));
                 c.dir = T2_MORE;
                 t2_cursor_init(&c, &zero);
                 cit = 0;
@@ -8953,6 +8948,13 @@ static void next_ut() {
                 t2_cursor_fini(&c);
                 ASSERT(cit == U - i);
         }
+}
+
+static void next_ut() {
+        usuite("next");
+        utest("init");
+        struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        next_ut_with(mod, NULL);
         utest("fini");
         t2_fini(mod);
         utestdone();
@@ -9030,18 +9032,14 @@ static void inc(char *key, int len) {
         }
 }
 
-void seq_ut() {
+void seq_ut_with(struct t2 *mod, struct t2_tx *tx) {
         char key[] = "999999999";
         char val[] = "*VALUE*";
         struct t2_buf keyb;
         struct t2_buf valb;
         struct t2_rec r = {};
-        struct t2      *mod;
         struct t2_tree *t;
-        usuite("seq");
-        utest("init");
-        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        t = t2_tree_create(&ttype, NULL);
+        t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         ASSERT(EISOK(t));
         utest("populate");
         long U = 1000000;
@@ -9050,9 +9048,15 @@ void seq_ut() {
                 valb = BUF_VAL(val);
                 r.key = &keyb;
                 r.val = &valb;
-                NOFAIL(t2_insert(t, &r, NULL));
+                NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
                 inc(key, (sizeof key) - 1);
         }
+}
+
+void seq_ut() {
+        usuite("seq");
+        utest("init");
+        struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         utest("fini");
         t2_fini(mod);
         utestdone();
@@ -9114,6 +9118,7 @@ void *lookup_worker(void *arg) {
 
 void *insert_worker(void *arg) {
         struct t2_tree *t = arg;
+        struct t2_tx *tx = t->ttype->mod->te != NULL ? t2_tx_make(t->ttype->mod) : NULL;
         char kbuf[8];
         char vbuf[MAXSIZE];
         int32_t ksize;
@@ -9122,8 +9127,11 @@ void *insert_worker(void *arg) {
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 random_buf(vbuf, sizeof vbuf, &vsize);
-                int result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, NULL);
+                int result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, tx));
                 ASSERT(result == 0 || result == -EEXIST);
+        }
+        if (tx != NULL) {
+                t2_tx_done(t->ttype->mod, tx);
         }
         t2_thread_degister();
         return NULL;
@@ -9131,13 +9139,17 @@ void *insert_worker(void *arg) {
 
 void *delete_worker(void *arg) {
         struct t2_tree *t = arg;
+        struct t2_tx *tx = t->ttype->mod->te != NULL ? t2_tx_make(t->ttype->mod) : NULL;
         char kbuf[8];
         int32_t ksize;
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
-                int result = t2_delete_ptr(t, kbuf, ksize, NULL);
+                int result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, kbuf, ksize, tx));
                 ASSERT(result == 0 || result == -ENOENT);
+        }
+        if (tx != NULL) {
+                t2_tx_done(t->ttype->mod, tx);
         }
         t2_thread_degister();
         return NULL;
@@ -9170,8 +9182,7 @@ void *next_worker(void *arg) {
         return NULL;
 }
 
-void mt_ut() {
-        struct t2      *mod;
+void mt_ut_with(struct t2 *mod, struct t2_tx *tx) {
         struct t2_tree *t;
         pthread_t tid[4*THREADS];
         char kbuf[8];
@@ -9179,16 +9190,13 @@ void mt_ut() {
         int32_t ksize;
         int32_t vsize;
         int     result;
-        usuite("mt");
-        utest("init");
-        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        t = t2_tree_create(&ttype, NULL);
+        t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         ASSERT(EISOK(t));
         utest("populate");
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 random_buf(vbuf, sizeof vbuf, &vsize);
-                result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, NULL);
+                result = WITH_TX(mod, tx, t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, tx));
                 ASSERT(result == 0 || result == -EEXIST);
         }
         utest("lookup");
@@ -9231,6 +9239,13 @@ void mt_ut() {
         for (int i = 0; i < 4*THREADS; ++i) {
                 pthread_join(tid[i], NULL);
         }
+}
+
+void mt_ut() {
+        usuite("mt");
+        utest("init");
+        struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        mt_ut_with(mod, NULL);
         utest("fini");
         t2_fini(mod);
         utestdone();
@@ -9447,27 +9462,12 @@ static void wal_ut() {
         counters_print(~0ull);
 }
 
-static void stress_ut_tx() {
-        usuite("stress-tx");
+static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *label) {
+        usuite(label);
         utest("init");
         struct t2 *mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
         struct t2_tx *tx = t2_tx_make(mod);
-        stress_ut_with(mod, tx);
-        utest("fini");
-        t2_tx_done(mod, tx);
-        t2_fini(mod);
-        utestdone();
-        counters_print(~0ull);
-}
-
-static void delete_ut_tx() {
-        usuite("delete");
-        utest("init");
-        struct t2 *mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        ASSERT(EISOK(mod));
-        struct t2_tx *tx = t2_tx_make(mod);
-        delete_ut_with(mod, NULL);
+        (*ut)(mod, tx);
         utest("fini");
         t2_tx_done(mod, tx);
         t2_fini(mod);
@@ -9475,22 +9475,35 @@ static void delete_ut_tx() {
 }
 
 #else
-static void wal_ut() {
-}
-
-static void stress_ut_tx() {
-}
-
-static void delete_ut_tx() {
+static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *label) {
 }
 
 #endif
+
+static void stress_ut_tx() {
+        ut_with_tx(&stress_ut_with, "stress-tx");
+}
+
+static void delete_ut_tx() {
+        ut_with_tx(&delete_ut_with, "delete-tx");
+}
+
+static void next_ut_tx() {
+        ut_with_tx(&next_ut_with, "next-tx");
+}
+
+static void seq_ut_tx() {
+        ut_with_tx(&seq_ut_with, "seq-tx");
+}
+
+static void mt_ut_tx() {
+        ut_with_tx(&mt_ut_with, "mt-tx");
+}
 
 int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        delete_ut_tx();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -9508,6 +9521,9 @@ int main(int argc, char **argv) {
         wal_ut();
         stress_ut_tx();
         delete_ut_tx();
+        next_ut_tx();
+        seq_ut_tx();
+        mt_ut_tx();
         return 0;
 }
 
