@@ -8667,9 +8667,21 @@ static void fill(char *x, int nr) {
         }
 }
 
-static void stress_ut() {
-        struct t2      *mod;
-        struct t2_tree *t;
+static void tx_begin(struct t2 *mod, struct t2_tx *tx) {
+        if (tx != NULL) {
+                NOFAIL(t2_tx_open(mod, tx));
+        }
+}
+
+static void tx_end(struct t2 *mod, struct t2_tx *tx) {
+        if (tx != NULL) {
+                t2_tx_close(mod, tx);
+        }
+}
+
+#define WITH_TX(mod, tx, ...) ({ tx_begin(mod, tx); typeof(__VA_ARGS__) __result = (__VA_ARGS__); tx_end(mod, tx); __result; })
+
+static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
         char key[1ul << ntype.shift];
         char val[1ul << ntype.shift];
         struct t2_buf keyb = BUF_VAL(key);
@@ -8683,10 +8695,7 @@ static void stress_ut() {
         int32_t ksize;
         int32_t vsize;
         int     result;
-        usuite("stress");
-        utest("init");
-        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        t = t2_tree_create(&ttype, NULL);
+        struct t2_tree *t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         ASSERT(EISOK(t));
         utest("probe");
         long U = 500000;
@@ -8700,7 +8709,7 @@ static void stress_ut() {
                 fill(val, vsize);
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
-                NOFAIL(t2_insert(t, &r, NULL));
+                NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
                 for (int j = 0; j < 10; ++j) {
                         long probe = rand();
                         *(long *)key = probe;
@@ -8736,7 +8745,7 @@ static void stress_ut() {
                 fill(val, vsize);
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
-                result = t2_insert(t, &r, NULL);
+                result = WITH_TX(mod, tx, t2_insert(t, &r, tx));
                 ASSERT(result == 0 || result == -EEXIST);
                 if (result == -EEXIST) {
                         exist++;
@@ -8749,14 +8758,21 @@ static void stress_ut() {
                         exist = 0;
                 }
         }
+}
+
+static void stress_ut() {
+        struct t2      *mod;
+        usuite("stress");
+        utest("init");
+        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        stress_ut_with(mod, NULL);
         utest("fini");
         t2_fini(mod);
         utestdone();
         counters_print(~0ull);
 }
 
-static void delete_ut() {
-        struct t2      *mod;
+static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
         struct t2_tree *t;
         char key[1ul << ntype.shift];
         char val[1ul << ntype.shift];
@@ -8772,10 +8788,7 @@ static void delete_ut() {
         int32_t ksize;
         int32_t vsize;
         int     result;
-        usuite("delete");
-        utest("init");
-        mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        t = t2_tree_create(&ttype, NULL);
+        t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         ASSERT(EISOK(t));
         utest("1K*1K");
         long U = 1000;
@@ -8789,7 +8802,7 @@ static void delete_ut() {
                 fill(val, vsize);
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
-                NOFAIL(t2_insert(t, &r, NULL));
+                NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
         }
         for (long i = U - 1; i >= 0; --i) {
                 for (long j = 0; j < U; ++j) {
@@ -8808,7 +8821,7 @@ static void delete_ut() {
                 *(long *)key = i;
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
-                NOFAIL(t2_delete(t, &r, NULL));
+                NOFAIL(WITH_TX(mod, tx, t2_delete(t, &r, tx)));
         }
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
@@ -8834,14 +8847,14 @@ static void delete_ut() {
                 if (rand() & 1) {
                         fill(val, vsize);
                         valb = (struct t2_buf){ .len = vsize, .addr = &val };
-                        result = t2_insert(t, &r, NULL);
+                        result = WITH_TX(mod, tx, t2_insert(t, &r, tx));
                         ASSERT(result == 0 || result == -EEXIST);
                         if (result == -EEXIST) {
                                 exist++;
                         }
                         inserts++;
                 } else {
-                        result = t2_delete(t, &r, NULL);
+                        result = WITH_TX(mod, tx, t2_delete(t, &r, tx));
                         ASSERT(result == 0 || result == -ENOENT);
                         if (result == -ENOENT) {
                                 noent++;
@@ -8859,6 +8872,14 @@ static void delete_ut() {
                         deletes = 0;
                 }
         }
+}
+
+static void delete_ut() {
+        usuite("delete");
+        utest("init");
+        struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        ASSERT(EISOK(mod));
+        delete_ut_with(mod, NULL);
         utest("fini");
         t2_fini(mod);
         utestdone();
@@ -9420,15 +9441,50 @@ static void wal_ut() {
         counters_print(~0ull);
 }
 
+static void stress_ut_tx() {
+        usuite("stress-tx");
+        utest("init");
+        struct t2 *mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        ASSERT(EISOK(mod));
+        struct t2_tx *tx = t2_tx_make(mod);
+        stress_ut_with(mod, tx);
+        utest("fini");
+        t2_tx_done(mod, tx);
+        t2_fini(mod);
+        utestdone();
+        counters_print(~0ull);
+}
+
+static void delete_ut_tx() {
+        usuite("delete");
+        utest("init");
+        struct t2 *mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
+        ASSERT(EISOK(mod));
+        struct t2_tx *tx = t2_tx_make(mod);
+        delete_ut_with(mod, NULL);
+        utest("fini");
+        t2_tx_done(mod, tx);
+        t2_fini(mod);
+        utestdone();
+}
+
 #else
 static void wal_ut() {
 }
+
+static void stress_ut_tx() {
+}
+
+static void delete_ut_tx() {
+}
+
 #endif
 
 int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
+        delete_ut_tx();
         lib_ut();
         simple_ut();
         ht_ut();
@@ -9444,6 +9500,8 @@ int main(int argc, char **argv) {
         mt_ut();
         open_ut();
         wal_ut();
+        stress_ut_tx();
+        delete_ut_tx();
         return 0;
 }
 
