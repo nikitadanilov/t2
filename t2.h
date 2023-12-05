@@ -204,7 +204,7 @@ enum t2_node_type_flags {
 
 enum {
         T2_INIT_EXPLAIN = 1ull << 0,
-        T2_INIT_VERBOSE = 1ull << 0
+        T2_INIT_VERBOSE = 1ull << 1
 };
 
 #define T2_INIT_WITH(flags, ...) t2_init_with((flags), &(struct t2_conf){ __VA_ARGS__ })

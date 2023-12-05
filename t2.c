@@ -1167,6 +1167,7 @@ const double DEFAULT_WAL_SYNC_AGE  = 0.1;
 #define SETIF0DEFAULT(flags, obj, field, val, fmt) SETIF0(flags, obj, field, val, fmt, "default")
 
 struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
+        struct t2 *mod;
         if (param->no_te != (param->conf.te == NULL && param->te_type == NULL)) {
                 CONFLICT(flags, "no_te and te are specified.");
         }
@@ -1224,7 +1225,12 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
         SETIF0       (flags, param, conf.hshift,                param->conf.cshift,      "d", "sized to cache");
         SETIF0DEFAULT(flags, param, conf.min_radix_level,       DEFAULT_MIN_RADIX_LEVEL, "d");
         SETIF0       (flags, param, conf.cache_shepherd_shift,  MIN(MAX(param->conf.cshift - DEFAULT_SHEPHERD_RATIO, DEFAULT_SHEPHERD_MIN), DEFAULT_SHEPHERD_MAX), "d", "sized to cache");
-        return t2_init(&param->conf);
+        mod = t2_init(&param->conf);
+        if (EISERR(mod) && (flags & T2_INIT_VERBOSE)) {
+                t2_error_print();
+                printf("t2_init() failed: (%s) %d.", strerror(-ERRCODE(mod)), -ERRCODE(mod));
+        }
+        return mod;
 }
 
 #undef DECIDE
