@@ -9576,8 +9576,6 @@ int main(int argc, char **argv) {
  *
  * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
  *
- * - cursor benchmark
- *
  * - preallocate log and pages
  *
  * - meta-index, call-backs for root relocation
@@ -9617,6 +9615,8 @@ int main(int argc, char **argv) {
  * + node format that avoids memmove (always add at the end, compact as needed)
  *
  * ! simple node: store key offsets separately from value offsets
+ *
+ * + cursor benchmark
  *
  * References:
  *

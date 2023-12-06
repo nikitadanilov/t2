@@ -477,36 +477,30 @@ static void *bworker(void *arg) {
                         };
                         start = now();
                         NOFAIL(nanosleep(&sleep, NULL));
-                        end = now();
                 } else if (opt->opt == BREMOUNT) {
                         start = now();
                         kv[kvt].umount(b);
                         kv[kvt].mount(b);
-                        end = now();
                 } else {
                         int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
                         if (opt->opt == BLOOKUP) {
                                 start = now();
                                 result = kv[kvt].lookup(rt, &data, key, ksize, val, maxval);
-                                end = now();
                         } else if (opt->opt == BINSERT) {
                                 int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val);
                                 start = now();
                                 result = kv[kvt].insert(rt, &data, key, ksize, val, vsize);
-                                end = now();
                         } else if (opt->opt == BDELETE) {
                                 start = now();
                                 result = kv[kvt].del(rt, &data, key, ksize);
-                                end = now();
                         } else if (opt->opt == BNEXT) {
                                 start = now();
-                                result = kv[kvt].next(rt, &data, key, ksize, brnd(seed + 3) % opt->iter,
-                                                      (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS);
-                                end = now();
+                                result = kv[kvt].next(rt, &data, key, ksize, (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS, brnd(seed + 3) % opt->iter);
                         } else {
                                 assert(false);
                         }
                 }
+                end = now();
                 uint64_t delta = end - start;
                 int rcidx = result == 0 ? OK : result == -ENOENT ? NOENT : result == -EEXIST ? EXIST : OTHER;
                 rc[ch][rcidx]++;
@@ -785,6 +779,7 @@ static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int 
         d->u.t2.tree = d->b->u.t2.tree;
         d->u.t2.cop.next = &bn_next;
         d->u.t2.c.tree = d->u.t2.tree;
+        d->u.t2.c.op = &d->u.t2.cop;
         d->u.t2.cur = mem_alloc(maxkey);
         d->u.t2.c.curkey = (struct t2_buf){ .addr = d->u.t2.cur, .len = maxkey };
         t2_thread_register();
