@@ -279,7 +279,7 @@ enum {
 #define TXCALL(te, ...) TXDO(te, (te)-> __VA_ARGS__)
 #endif
 #else
-#define TXCALL(te, ...) TXDO(NULL, (te)-> __VA_ARGS__)
+#define TXCALL(te, ...) ({ ((typeof((te)-> __VA_ARGS__))(0)); })
 #endif
 
 /* Is Parallel Programming Hard, And, If So, What Can You Do About It? */
@@ -1030,10 +1030,10 @@ static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_print   (struct t2_te *engine);
 static bool wal_need    (struct t2_te *engine, struct shepherd *sh);
 static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
-                       uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle);
 static void wal_pulse   (struct t2 *mod);
+struct t2_te *wal_prep  (const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
+                         uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
+                         int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
 static void page_cap_init(struct page *g, struct t2_tx *tx);
@@ -7945,10 +7945,16 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
 }
 
 #else /* TRANSACTIONS */
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo) {
+struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
+                       uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
+                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle) {
         return NULL; /* TODO: For bn.c. */
 }
+
+static void wal_pulse(struct t2 *mod) {
+}
+
+
 #endif /* TRANSACTIONS */
 
 #if UT || BN
@@ -9474,6 +9480,9 @@ static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *labe
 }
 
 #else
+static void wal_ut() {
+}
+
 static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *label) {
 }
 
@@ -9568,6 +9577,12 @@ int main(int argc, char **argv) {
  * - consider recording the largest key in the sub-tree rooted at an internal node. This allows separating keys at internal levels
  *
  * - cursor benchmark
+ *
+ * - preallocate log and pages
+ *
+ * - meta-index, call-backs for root relocation
+ *
+ * - record block allocation and de-allocation in the log
  *
  * Done:
  *
