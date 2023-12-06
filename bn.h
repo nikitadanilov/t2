@@ -182,6 +182,11 @@ struct kvdata {
                         struct t2_tx        *tx;
                         struct t2_cookie     kookie;
                 } t2;
+#if USE_ROCKSDB
+                struct {
+                        rocksdb_iterator_t *it;
+                } r;
+#endif
         } u;
 };
 

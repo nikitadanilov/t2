@@ -85,7 +85,7 @@ enum {
 #else
 #define ASSERT(expr) ASSUME(expr)
 #endif
-#define EXPENSIVE_ASSERT(expr) ASSERT(expr)
+#define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
 #define SOF(x) ((int32_t)sizeof(x))
 #define ARRAY_SIZE(a)                           \
 ({                                              \

@@ -860,13 +860,18 @@ static void r_mount(struct benchmark *b) {
 }
 
 static void r_umount(struct benchmark *b) {
+        rocksdb_writeoptions_destroy(b->kv.u.r.wo);
+        rocksdb_readoptions_destroy(b->kv.u.r.ro);
         rocksdb_close(b->kv.u.r.db);
 }
 
 static void r_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {
+        d->u.r.it = rocksdb_create_iterator(d->b->u.r.db, d->b->u.r.ro);
+        assert(d->u.r.it != NULL);
 }
 
 static void r_worker_fini(struct rthread *rt, struct kvdata *d) {
+        rocksdb_iter_destroy(d->u.r.it);
 }
 
 static void r_tail(const char *label, char *err) {
@@ -901,7 +906,16 @@ static int r_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) 
 }
 
 static int r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
-        assert(false);
+        char *err = NULL;
+        rocksdb_iter_seek(d->u.r.it, key, ksize);
+        for (int i = 0; i < nr && rocksdb_iter_valid(d->u.r.it); ++i) {
+                size_t len;
+                rocksdb_iter_key(d->u.r.it, &len);
+                rocksdb_iter_value(d->u.r.it, &len);
+                (dir == T2_LESS ? rocksdb_iter_prev : rocksdb_iter_next)(d->u.r.it);
+        }
+        rocksdb_iter_get_error(d->u.r.it, &err);
+        r_tail("next", err);
         return 0;
 }
 
