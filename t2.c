@@ -1287,7 +1287,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
                 p->free[i].avail = p->free[i].total = 1 << max_32(conf->cshift - i, 0);
         }
         next_stage(mod, true, POOL);
-        NOFAIL(iocache_init(&mod->ioc, conf->cshift));
+        NOFAIL(iocache_init(&mod->ioc, conf->cshift + 1));
         NEXT_STAGE(mod, ht_init(&mod->ht, conf->hshift), HT_INIT);
         NEXT_STAGE(mod, SCALL(mod, init), STORAGE_INIT);
         ca->mod = mod;
@@ -1778,9 +1778,6 @@ static void nfini(struct node *n) {
         node_state_print(n, 'F');
         ASSERT(n->ref == 0);
         ASSERT(!(n->flags & DIRTY));
-        if (LIKELY(n->ntype != NULL)) {
-                iocache_put(&n->mod->ioc, n);
-        }
         mutex_lock(&free->lock);
         cds_list_add(&n->free, &free->head);
         ++free->nr;
@@ -3692,6 +3689,7 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
         struct node           *n;
         int8_t                 L __attribute__((unused));
         CINC(scan_bucket);
+        __builtin_prefetch((head + 1)->next); /* Prefetch the next chain. */
 #define CHAINLINK do {                                                  \
         if (LIKELY(link == NULL)) {                                     \
                 return;                                                 \
@@ -3828,6 +3826,7 @@ static int32_t shepherd_bucket(struct t2 *mod, int32_t pos, struct shepherd *sh)
         int32_t                nr    = 0;
         struct node           *n;
         CINC(shepherd_bucket);
+        __builtin_prefetch((head + 1)->next);
 #define CHAINLINK do {                                                  \
         if (LIKELY(link == NULL)) {                                     \
                 return nr;                                              \
@@ -3881,8 +3880,6 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
         struct shepherd   *self         = &c->sh[sector];
         t2_thread_register();
         mem_free(ca);
-        SASSERT((SCAN_RUN & (SCAN_RUN - 1)) == 0);
-        ASSERT(SCAN_RUN <= 1 << sector_shift);
         while (true) {
                 struct timespec end;
                 int             result;
@@ -3995,10 +3992,10 @@ static int iocache_get(struct iocache *ioc, struct node *n) {
                                 }
                         } while (UNLIKELY(!atomic_compare_exchange_weak(slot, &have, want)));
                         CINC(ioc_hit);
-                        size = ZSTD_decompress(n->data + 4, taddr_ssize(n->addr), have.data, *(int32_t *)have.data);
+                        size = ZSTD_decompress(n->data, taddr_ssize(n->addr), have.data + 4, *(int32_t *)have.data);
+                        mem_free(have.data);
                         if (LIKELY(!ZSTD_isError(size))) {
                                 ASSERT((int32_t)size == taddr_ssize(n->addr));
-                                mem_free(have.data);
                                 return 0;
                         } else {
                                 return ERROR_INFO(-EINVAL, "ZSTD_decompress() fails with %lu", (long unsigned)size, 0);
@@ -4793,9 +4790,9 @@ static void debugger_attach(void) {
 /* @ht */
 
 static int ht_init(struct ht *ht, int shift) {
-        ht->shift       = shift;
-        ht->buckets     = mem_alloc_align(sizeof ht->buckets[0]     << shift, MAX_CACHELINE);
-        ht->bucketlocks = mem_alloc_align(sizeof ht->bucketlocks[0] << shift, MAX_CACHELINE);
+        ht->shift       = shift; /* Allocate an additional bucket for prefetch in scanners. */
+        ht->buckets     = mem_alloc_align(sizeof ht->buckets[0] * ((1 << shift) + 1), MAX_CACHELINE);
+        ht->bucketlocks = mem_alloc_align(sizeof ht->bucketlocks[0] * ((1 << shift) + 1), MAX_CACHELINE);
         if (ht->buckets != NULL && ht->bucketlocks != NULL) {
                 for (int i = 0; i < (1 << shift); ++i) {
                         NOFAIL(pthread_mutex_init(&ht->bucketlocks[i].lock, NULL));
@@ -4964,6 +4961,9 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
                 cookie_invalidate(&n->cookie);
                 n->seq   = 0;
                 n->flags = 0;
+                if (LIKELY(n->ntype != NULL)) {
+                        iocache_put(&mod->ioc, n);
+                }
                 n->ntype = NULL;
                 if (n->radix != NULL) {
                         n->radix->prefix.len = -1;
@@ -9581,6 +9581,8 @@ int main(int argc, char **argv) {
  * - meta-index, call-backs for root relocation
  *
  * - record block allocation and de-allocation in the log
+ *
+ * - asynchronous pageout
  *
  * Done:
  *
