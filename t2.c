@@ -353,9 +353,27 @@ struct pool {
         struct ewma     rate[TADDR_SIZE_MASK + 1];
 };
 
+enum {
+        BOLT_EPOCH_SHIFT =      16,
+        EPOCH_DELTA      =       1,
+        SCAN_RUN         = 1 << 10,
+        WINDOW_SHIFT     =      16,
+        CRIT_FRAC_SHIFT  =      30
+};
+
+struct maxwell_data {
+        int32_t   pos;
+        int32_t   delta;
+        int32_t   histogram[1 << BOLT_EPOCH_SHIFT];
+        int32_t   window[1 << WINDOW_SHIFT];
+        int32_t   crittemp;
+        int32_t   critfrac;
+        pthread_t thread;
+};
+
 struct daemon_arg {
-        struct t2 *mod;
-        int        idx;
+        struct t2           *mod;
+        int                  idx;
 };
 
 enum {
@@ -379,7 +397,7 @@ struct cache {
         pthread_cond_t                         wantclean;
         bool                                   want_page;
         alignas(MAX_CACHELINE) struct pool     pool;
-        pthread_t                              md;
+        struct maxwell_data                   *md;
         int                                    max_cluster;
         int                                    sh_shift;
         int                                    sh_nr;
@@ -435,6 +453,7 @@ enum t2_initialisation_stage {
         POOL,
         HT_INIT,
         STORAGE_INIT,
+        IOCACHE_INIT,
         MAXWELLD,
         SHEPHERD,
         TX_INIT
@@ -820,7 +839,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t scan_skip_hot;
                 int64_t scan_busy;
                 int64_t scan_dirty;
-                int64_t scan_hot;
                 int64_t scan_put;
                 int64_t radixmap_updated;
                 struct counter_var nr;
@@ -926,7 +944,7 @@ static void put(struct node *n);
 static void put_locked(struct node *n);
 static void ref(struct node *n);
 static void touch(struct node *n);
-static bool is_hot(struct node *n);
+static bool is_hot(struct node *n, int32_t crit);
 static uint64_t temperature(struct node *n);
 static uint64_t bolt(const struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
@@ -1075,7 +1093,7 @@ static void cache_clean(struct t2 *mod);
 static void *maxwelld(void *data);
 static void *shepherd(void *data);
 static void writeout(struct t2 *mod);
-static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr);
+static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr, int32_t crit, int32_t frac);
 static void cache_fini(struct t2 *mod);
 static void cache_sync(struct t2 *mod);
 static void cache_pulse(struct t2 *mod);
@@ -1239,11 +1257,12 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
 #undef SETIF0
 
 struct t2 *t2_init(const struct t2_conf *conf) {
-        int                result;
-        struct t2         *mod;
-        struct daemon_arg *ca;
-        struct cache      *c;
-        struct pool       *p;
+        int                  result;
+        struct t2           *mod;
+        struct daemon_arg   *ca;
+        struct maxwell_data *dd;
+        struct cache        *c;
+        struct pool         *p;
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
         if (conf->hshift <= 0 || conf->cshift <= 0 || conf->min_radix_level < 0 || conf->cache_shepherd_shift < 0 || conf->cache_shepherd_shift > conf->hshift ||
             conf->max_cluster <= 0 || conf->scan_run < 0) {
@@ -1251,9 +1270,11 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         }
         mod = mem_alloc(sizeof *mod);
         ca  = mem_alloc(sizeof *ca);
-        if (mod == NULL || ca == NULL) {
-                mem_free(mod);
+        dd  = mem_alloc(sizeof *dd);
+        if (mod == NULL || ca == NULL || dd == NULL) {
+                mem_free(dd);
                 mem_free(ca);
+                mem_free(mod);
                 return EPTR(-ENOMEM);
         }
         mod->stage = ALLOCATED;
@@ -1263,6 +1284,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         NEXT_STAGE(mod, signal_init(), SIGNAL_INIT);
         c = &mod->cache;
         p = &c->pool;
+        c->md = dd;
         mod->cache.shift = conf->cshift;
         NEXT_STAGE(mod, -pthread_mutex_init(&c->lock, NULL), 0);
         NEXT_STAGE(mod, -pthread_create(&mod->pulse, NULL, &pulse, mod), 0);
@@ -1287,13 +1309,14 @@ struct t2 *t2_init(const struct t2_conf *conf) {
                 p->free[i].avail = p->free[i].total = 1 << max_32(conf->cshift - i, 0);
         }
         next_stage(mod, true, POOL);
-        NOFAIL(iocache_init(&mod->ioc, conf->cshift + 1));
         NEXT_STAGE(mod, ht_init(&mod->ht, conf->hshift), HT_INIT);
         NEXT_STAGE(mod, SCALL(mod, init), STORAGE_INIT);
+        NEXT_STAGE(mod, iocache_init(&mod->ioc, conf->cshift), IOCACHE_INIT);
         ca->mod = mod;
         ca->idx = 0;
-        result = pthread_create(&c->md, NULL, &maxwelld, ca);
+        result = pthread_create(&c->md->thread, NULL, &maxwelld, ca);
         if (next_stage(mod, result == 0, MAXWELLD)) {
+                mem_free(dd);
                 mem_free(ca);
                 return EPTR(-result);
         }
@@ -1316,11 +1339,6 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         NEXT_STAGE(mod, TXCALL(conf->te, init(conf->te, mod)), TX_INIT);
         return mod;
 }
-
-enum {
-        BOLT_EPOCH_SHIFT = 16,
-        EPOCH_DELTA      =  1
-};
 
 void t2_fini(struct t2 *mod) {
         struct cache *c = &mod->cache;
@@ -1348,13 +1366,15 @@ void t2_fini(struct t2 *mod) {
                 cache_clean(mod);
                 cache_fini(mod);
                 __attribute__((fallthrough));
+        case IOCACHE_INIT:
+                iocache_fini(&mod->ioc);
+                __attribute__((fallthrough));
         case STORAGE_INIT:
                 SCALL(mod, fini);
                 __attribute__((fallthrough));
         case HT_INIT:
                 ht_clean(&mod->ht);
                 ht_fini(&mod->ht);
-                iocache_fini(&mod->ioc);
                 __attribute__((fallthrough));
         case POOL:
                 pool_clean(mod);
@@ -1425,6 +1445,9 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                 printf("\n%15s bolt: %8"PRId64, "cache:", c->bolt);
         }
         if (flags & T2_SF_POOL) {
+                enum {
+                        HIST_BUCKETS = 16,
+                };
                 printf("\n%15s", "free-lists:");
                 for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
                         printf(" %8i", i);
@@ -1451,6 +1474,19 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                         bool underpressure = stress(&c->pool.free[i], &pressure);
                         printf(" %7i%s", pressure, underpressure ? "*" : " ");
                 }
+                printf("\n\n%15s %8i", "temperature:", 0);
+                for (int i = 0; i < HIST_BUCKETS; ++i) {
+                        printf(" %8i", 1 << i);
+                }
+                printf("\n%15s %8i", "count:", c->md->histogram[0]);
+                for (int i = 0, pos = 1; i < HIST_BUCKETS; ++i) {
+                        int32_t sum = 0;
+                        while (pos <= (1 << i)) {
+                                sum += c->md->histogram[pos++];
+                        }
+                        printf(" %8i", sum);
+                }
+                printf("\n%15s %16.8f", "crit-temp:", c->md->crittemp + 1.0 * c->md->critfrac / (1 << CRIT_FRAC_SHIFT));
         }
         if (flags & T2_SF_SHEPHERD) {
                 printf("\nshepherd: ");
@@ -1473,6 +1509,7 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                 puts("");
                 counters_print(flags);
         }
+        puts("");
 }
 
 static void tree_type_register(struct t2 *mod, struct t2_tree_type *ttype) {
@@ -3465,11 +3502,11 @@ static bool cache_invariant(struct cache *c) {
 
 static void cache_fini(struct t2 *mod) {
         NOFAIL(pthread_cond_signal(&mod->cache.want));
-        NOFAIL(pthread_join(mod->cache.md, NULL));
+        NOFAIL(pthread_join(mod->cache.md->thread, NULL));
 }
 
-static bool is_hot(struct node *n) {
-        return krate(&nheader(n)->kelvin, bolt(n)) != 0;
+static bool is_hot(struct node *n, int32_t crit) {
+        return krate(&nheader(n)->kelvin, bolt(n)) > (uint64_t)crit;
 }
 
 static bool pinned(const struct node *n, const struct t2_te *te) {
@@ -3499,7 +3536,7 @@ static enum cachestate nstate(struct node *n, int baseref) {
         } else if (n->ref > baseref) {
                 CINC(l[lev].page_busy);
                 return BUSY;
-        } else if (is_hot(n)) {
+        } else if (is_hot(n, n->mod->cache.md->crittemp)) {
                 CINC(l[lev].page_hot);
                 return HOT;
         } else if (n->flags & DIRTY) {
@@ -3661,7 +3698,11 @@ static bool enough(struct cache *c, int i) {
                 !stress(free, &dummy);
 }
 
-static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *lock) {
+static bool is_hotter(int32_t t, int32_t crit, int32_t frac, int32_t pos) {
+        return t > crit || (t == crit && (pos & MASK(CRIT_FRAC_SHIFT)) > frac);
+}
+
+static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *lock, int32_t t, int32_t crit, int32_t frac) {
         struct cds_hlist_node *link;
         CINC(scan_locked);
         mutex_lock(lock);
@@ -3672,8 +3713,6 @@ static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mut
                         CINC(l[L].scan_busy);
                 } else if (n->flags & DIRTY) {
                         CINC(l[L].scan_dirty);
-                } else if (is_hot(n)) {
-                        CINC(l[L].scan_hot);
                 } else {
                         CINC(l[L].scan_put);
                         put_final(n);
@@ -3682,12 +3721,14 @@ static void scan_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mut
         mutex_unlock(lock);
 }
 
-static void scan_bucket(struct t2 *mod, int32_t pos) {
+static void scan_bucket(struct t2 *mod, int32_t pos, int32_t crit, int32_t frac) {
         struct ht             *ht   = &mod->ht;
         struct cds_hlist_head *head = ht_head(ht, pos);
         struct cds_hlist_node *link = rcu_dereference(head->next);
         struct node           *n;
         int8_t                 L __attribute__((unused));
+        int32_t                t;
+        static int             fracpos = 0; /* Only a hint, so races are okay. */
         CINC(scan_bucket);
         __builtin_prefetch((head + 1)->next); /* Prefetch the next chain. */
 #define CHAINLINK do {                                                  \
@@ -3697,6 +3738,8 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
         n = COF(link, struct node, hash);                               \
         L = level(n);                                                   \
         node_state_print(n, 's');                                       \
+        t = krate(&nheader(n)->kelvin, bolt(n));                        \
+        mod->cache.md->window[mod->cache.md->pos++ & MASK(WINDOW_SHIFT)] = t; \
         if (UNLIKELY(n->ref != 0)) {                                    \
                 CINC(l[L].scan_skip_busy);                              \
         } else if (n->flags & DIRTY) {                                  \
@@ -3707,11 +3750,11 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
                         NOFAIL(pthread_cond_broadcast(&mod->cache.wantclean)); \
                         mutex_unlock(&mod->cache.cleanlock);            \
                 }                                                       \
-        } else if (is_hot(n)) {                       \
+        } else if (is_hotter(t, crit, frac, ++fracpos)) {               \
                 CINC(l[L].scan_skip_hot);                               \
         } else {                                                        \
                 rcu_unlock();                                           \
-                scan_locked(mod, head, ht_lock(ht, pos));               \
+                scan_locked(mod, head, ht_lock(ht, pos), t, crit, frac); \
                 rcu_lock();                                             \
                 return;                                                 \
         }                                                               \
@@ -3727,26 +3770,47 @@ static void scan_bucket(struct t2 *mod, int32_t pos) {
 #undef CHAINLINK
 }
 
-static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr) {
+static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr, int32_t crit, int32_t frac) {
         CINC(scan);
         rcu_lock();
         while (nr-- > 0) {
-                scan_bucket(mod, pos);
+                scan_bucket(mod, pos, crit, frac);
                 pos = (pos + 1) & MASK(mod->ht.shift);
         }
         rcu_unlock();
         return pos;
 }
 
-enum { SCAN_RUN = 1 << 10 };
+static void crit_temp(struct maxwell_data *md) {
+        int32_t sum = 0;
+        int32_t t;
+        if (md->pos >= ARRAY_SIZE(md->window)) {
+                memset(md->histogram, 0, SOF(md->histogram));
+                for (int32_t i = 0; i < ARRAY_SIZE(md->window); ++i) {
+                        ++md->histogram[md->window[i]];
+                }
+                for (t = 0; t < ARRAY_SIZE(md->histogram); ++t) {
+                        int32_t nr = md->histogram[t];
+                        if (sum + nr > md->delta) {
+                                md->critfrac = (((int64_t)md->delta - sum) << CRIT_FRAC_SHIFT) / nr;
+                                break;
+                        }
+                        sum += nr;
+                }
+                md->crittemp = t;
+                md->pos = 0;
+        }
+}
 
 static void *maxwelld(void *data) {
-        struct daemon_arg *arg = data;
-        struct t2         *mod = arg->mod;
-        struct cache      *c   = &mod->cache;
-        int32_t            pos = arg->idx;
+        struct daemon_arg   *arg = data;
+        struct t2           *mod = arg->mod;
+        struct cache        *c   = &mod->cache;
+        struct maxwell_data *md  = c->md;
+        int32_t              pos = arg->idx;
         t2_thread_register();
         mem_free(arg);
+        md->delta = ARRAY_SIZE(md->window) >> 4;
         while (true) {
                 struct timespec end;
                 int             result;
@@ -3754,7 +3818,8 @@ static void *maxwelld(void *data) {
                 CINC(maxwell_iter);
                 while (true) {
                         if (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!mod->shutdown)) {
-                                pos = scan(mod, pos, SCAN_RUN);
+                                crit_temp(md);
+                                pos = scan(mod, pos, SCAN_RUN, md->crittemp, md->critfrac);
                                 cache_sync(mod);
                                 counters_fold();
                                 if (UNLIKELY(pos == start)) {
@@ -4535,7 +4600,6 @@ static void counters_print(uint64_t flags) {
                 COUNTER_PRINT(scan_skip_hot);
                 COUNTER_PRINT(scan_busy);
                 COUNTER_PRINT(scan_dirty);
-                COUNTER_PRINT(scan_hot);
                 COUNTER_PRINT(scan_put);
         }
         if (flags & T2_SF_TX) {
@@ -4790,11 +4854,12 @@ static void debugger_attach(void) {
 /* @ht */
 
 static int ht_init(struct ht *ht, int shift) {
+        int nr = 1 << shift;
         ht->shift       = shift; /* Allocate an additional bucket for prefetch in scanners. */
-        ht->buckets     = mem_alloc_align(sizeof ht->buckets[0] * ((1 << shift) + 1), MAX_CACHELINE);
-        ht->bucketlocks = mem_alloc_align(sizeof ht->bucketlocks[0] * ((1 << shift) + 1), MAX_CACHELINE);
+        ht->buckets     = mem_alloc_align(sizeof ht->buckets[0]     * (nr + 1), MAX_CACHELINE);
+        ht->bucketlocks = mem_alloc_align(sizeof ht->bucketlocks[0] * (nr + 1), MAX_CACHELINE);
         if (ht->buckets != NULL && ht->bucketlocks != NULL) {
-                for (int i = 0; i < (1 << shift); ++i) {
+                for (int i = 0; i < nr; ++i) {
                         NOFAIL(pthread_mutex_init(&ht->bucketlocks[i].lock, NULL));
                 }
                 return 0;
@@ -4933,7 +4998,7 @@ static void pool_throttle(struct t2 *mod, struct freelist *free, taddr_t addr) {
                                         CADD(throttle_clean, cleaned);
                                 }
                         }
-                        scan(mod, cookie, run);
+                        scan(mod, cookie, run, mod->cache.md->crittemp, mod->cache.md->critfrac);
                 }
         }
 }
