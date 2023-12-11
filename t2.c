@@ -28,6 +28,7 @@
 #include <sys/resource.h>
 #include <dlfcn.h>
 #include <zstd.h>
+#include "liburing.h"
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -380,10 +381,25 @@ enum {
         DAEMON = 1 << 0
 };
 
+struct pageout_ctx {
+        struct t2_io_ctx   *ctx;
+        int                 avail;
+        int                 used;
+        struct pageout_req *free;
+        struct t2          *mod;
+};
+
+struct pageout_req {
+        struct node        *node;
+        struct pageout_req *next;
+        taddr_t             addr;
+};
+
 struct shepherd {
         alignas(MAX_CACHELINE) lsn_t     lim;
         lsn_t                            min;
         lsn_t                            cur_min;
+        struct pageout_ctx               ctx;
         pthread_t                        thread;
 };
 
@@ -517,7 +533,7 @@ struct radixmap {
 enum node_flags {
         HEARD_BANSHEE = 1ull << 0,
         NOCACHE       = 1ull << 1,
-        DIRTY         = 1ull << 2
+        DIRTY         = 1ull << 2,
 };
 
 enum ext_id {
@@ -855,6 +871,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 struct counter_var page_dirty_nr;
                 struct counter_var page_lsn_diff;
                 struct counter_var pageout_cluster;
+                struct counter_var pageout_queue;
                 struct counter_var tx_add[M_NR];
         } l[MAX_TREE_HEIGHT];
 };
@@ -1051,7 +1068,7 @@ static void wal_scan_end(struct t2_te *engine, int64_t cleaned);
 static void wal_pulse   (struct t2 *mod);
 struct t2_te *wal_prep  (const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                          uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                         int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle);
+                         int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
 static void page_cap_init(struct page *g, struct t2_tx *tx);
@@ -1098,7 +1115,7 @@ static void cache_fini(struct t2 *mod);
 static void cache_sync(struct t2 *mod);
 static void cache_pulse(struct t2 *mod);
 static bool cache_want_page(struct t2 *mod);
-static int pageout(struct node *n);
+static int pageout(struct node *n, struct pageout_ctx *ctx);
 static void kmod(struct ewma *a, uint32_t t, int32_t nr);
 static uint64_t kavg(struct ewma *a, uint32_t t);
 static uint64_t krate(struct ewma *a, uint32_t t);
@@ -1222,7 +1239,6 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SETIF0DEFAULT(flags, param, wal_threshold_log_syncd,  DEFAULT_WAL_THRESHOLD_LOG_SYNCD,   "d");
                         SETIF0DEFAULT(flags, param, wal_threshold_log_sync,   DEFAULT_WAL_THRESHOLD_LOG_SYNC,    "d");
                         SETIF0DEFAULT(flags, param, wal_ready_lo,             DEFAULT_WAL_READY_LO,              "d");
-                        SETIF0DEFAULT(flags, param, wal_node_throttle,        DEFAULT_WAL_NODE_THROTTLE,         "d");
                         if (param->wal_log_nr & (param->wal_log_nr - 1)) {
                                 CONFLICT(flags, "wal_log_nr is not a power of 2.");
                         }
@@ -1231,7 +1247,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         }
                         te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags, param->wal_workers,
                                       ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age, param->wal_sync_nob, param->wal_log_size, param->wal_reserve_quantum,
-                                      param->wal_threshold_paged, param->wal_threshold_page, param->wal_threshold_log_syncd, param->wal_threshold_log_sync, param->wal_ready_lo, param->wal_node_throttle);
+                                      param->wal_threshold_paged, param->wal_threshold_page, param->wal_threshold_log_syncd, param->wal_threshold_log_sync, param->wal_ready_lo);
                         if (EISERR(te)) {
                                 return EPTR(te);
                         }
@@ -3553,81 +3569,173 @@ static void node_iovec(struct node *n, struct iovec *v) {
         v->iov_len  = nsize(n);
 }
 
+static struct pageout_req *req_get(struct pageout_ctx *ctx) {
+        struct pageout_req *req;
+        if (LIKELY(ctx->free != NULL)) {
+                req = ctx->free;
+                ctx->free = req->next;
+                req->next = NULL;
+        } else {
+                req = mem_alloc(sizeof *req);
+        }
+        return req;
+}
+
+static void req_put(struct pageout_ctx *ctx, struct pageout_req *req) {
+        req->next = ctx->free;
+        ctx->free = req;
+}
+
+static int pageout_ctx_init(struct pageout_ctx *ctx, struct t2 *mod, int queue) {
+        ctx->ctx = SCALL(mod, create, queue);
+        if (EISOK(ctx->ctx)) {
+                ctx->avail = queue;
+                ctx->mod = mod;
+                return 0;
+        } else {
+                ctx->ctx = NULL;
+                return ERROR(ERRCODE(ctx->ctx));
+        }
+}
+
+static void pageout_node_done(struct node *n) {
+        TXCALL(n->mod->te, clean(n->mod->te, (struct t2_node **)&n, 1));
+        node_state_print(n, 'C');
+        NMOD(n, page_dirty_nr, n->flags >> 40);
+        NMOD(n, page_lsn_diff, n->lsn_hi - n->lsn_lo);
+        n->flags &= ~(DIRTY|(~0ull << 40));
+        n->lsn_lo = n->lsn_hi = 0;
+        NOFAIL(pthread_rwlock_unlock(&n->lock));
+        put(n);
+}
+
+static void pageout_done(struct pageout_req *req, int32_t nob) {
+        if (LIKELY(nob == taddr_ssize(req->addr))) {
+                CINC(write);
+                CADD(write_bytes, taddr_ssize(req->addr));
+                for (; req != NULL; req = req->next) {
+                        pageout_node_done(req->node);
+                }
+        } else {
+                LOG("Pageout failure: %"PRIx64": %i.", req->node->addr, nob);
+        }
+}
+
+static void pageout_complete_req(struct pageout_ctx *ctx, struct pageout_req *req, int32_t nob) {
+        if (EISOK(req)) {
+                pageout_done(req, nob);
+                --ctx->used;
+                ++ctx->avail;
+                ASSERT(ctx->used >= 0);
+        } else {
+                LOG("Error waiting for io completion: %i.", ERRCODE(req));
+        }
+}
+
+static void pageout_complete(struct pageout_ctx *ctx) {
+        int32_t             nob;
+        struct pageout_req *req = SCALL(ctx->mod, end, ctx->ctx, &nob, true);
+        pageout_complete_req(ctx, req, nob);
+}
+
+static void pageout_complete_pending(struct pageout_ctx *ctx) {
+        int32_t             nob;
+        struct pageout_req *req;
+        while ((req = SCALL(ctx->mod, end, ctx->ctx, &nob, false)) != NULL) {
+                pageout_complete_req(ctx, req, nob);
+        }
+}
+
+static void pageout_drain(struct pageout_ctx *ctx) {
+        while (ctx->used > 0) {
+                pageout_complete(ctx);
+        }
+}
+
+static void pageout_ctx_fini(struct pageout_ctx *ctx) {
+        pageout_drain(ctx);
+        SCALL(ctx->mod, done, ctx->ctx);
+        while (ctx->free != NULL) {
+                mem_free(req_get(ctx));
+        }
+}
+
+
 #define TXA(n, ...) ((n)->mod->te != NULL ? (__VA_ARGS__) : true)
-static int pageout(struct node *n) {
-        struct t2    *mod = n->mod;
-        struct t2_te *te  = mod->te;
-        int           max_cluster = mod->cache.max_cluster;
-        struct node  *c[max_cluster];          /* VLA */
-        struct iovec  vec[max_cluster + 1];    /* VLA */
-        int           nr;
-        taddr_t       cur;
-        taddr_t       next;
-        taddr_t       whole;
-        int           result;
-        int           shift;
-        int           towrite;
-        int           bshift = taddr_sshift(n->addr);
-        __attribute__((unused)) uint8_t lev = level(n);
-        CINC(l[lev].page_out);
+static int pageout(struct node *n, struct pageout_ctx *ctx) {
+        struct t2          *mod         = n->mod;
+        struct t2_te       *te          = mod->te;
+        int                 max_cluster = mod->cache.max_cluster;
+        struct pageout_req *req;
+        struct pageout_req *scan;
+        struct iovec        vec[max_cluster];    /* VLA */
+        int                 nr;
+        taddr_t             cur;
+        taddr_t             next;
+        taddr_t             whole;
+        int                 result;
+        int                 shift;
+        int                 towrite;
+        int                 bshift = taddr_sshift(n->addr);
+        NINC(n, page_out);
         ASSERT((n->flags & DIRTY) && TXA(n, n->lsn_lo != 0 && n->lsn_hi != 0));
         node_iovec(n, &vec[0]);
-        c[0] = n;
-        for (cur = n->addr, nr = 1; nr < ARRAY_SIZE(c); ++nr, cur = next) {
-                struct node *right; /* This makes a lot of assumptions about taddr_t semantics. */
+        req = req_get(ctx); /* TODO: Handle errors. */
+        req->node = n;
+        for (cur = n->addr, nr = 1; nr < ARRAY_SIZE(vec); ++nr, cur = next) {
+                struct node *right; /* TODO: This makes a lot of assumptions about taddr_t semantics, move into storage ops. */
                 next = taddr_make(taddr_saddr(cur) + taddr_ssize(cur), bshift);
                 right = look(mod, next);
                 if (right != NULL) { /* Write lock, because other shepherd seeth thy neighbour. */
                         result = pthread_rwlock_trywrlock(&right->lock);
                         ASSERT(result == 0 || result == EBUSY);
                         if (result == EBUSY) {
-                                CINC(l[lev].page_trylock);
+                                NINC(right, page_trylock);
                         } else if (nstate(right, 1) == PAGE) {
+                                scan = req_get(ctx); /* TODO: Handle errors. */
                                 ASSERT(TXA(right, right->lsn_lo != 0 && right->lsn_hi != 0));
-                                c[nr] = right;
                                 node_iovec(right, &vec[nr]);
+                                scan->next = req;
+                                scan->node = right;
+                                req = scan;
                                 continue;
                         } else {
                                 NOFAIL(pthread_rwlock_unlock(&right->lock));
                         }
                         put(right);
                 } else {
-                        CINC(l[lev].page_noent);
+                        NINC(n, page_noent);
                 }
                 break;
         }
         shift = ilog2(nr);
         towrite = 1 << shift;
-        for (int i = towrite; i < nr; ++i) {
-                NOFAIL(pthread_rwlock_unlock(&c[i]->lock));
-                put(c[i]);
+        for (int i = towrite; i < nr; ++i, req = scan) {
+                scan = req->next;
+                NOFAIL(pthread_rwlock_unlock(&req->node->lock));
+                put(req->node);
+                req_put(ctx, req);
         }
         whole = taddr_make(taddr_saddr(n->addr), shift + bshift);
-        ASSERT(FORALL(i, towrite, !pinned(c[i], te)));
-        for (int i = 0; i < towrite; ++i) {
-                node_state_print(c[i], 'W');
+        req->addr = whole;
+        scan = req;
+        for (int i = 0; i < towrite; ++i, scan = scan->next) {
+                ASSERT(!pinned(scan->node, te));
+                node_state_print(scan->node, 'W');
         }
-        result = SCALL(mod, write, whole, towrite, vec);
-        CMOD(l[lev].pageout_cluster, nr);
-        if (LIKELY(result == 0)) {
-                CINC(write);
-                CADD(write_bytes, taddr_ssize(whole));
-                TXCALL(mod->te, clean(mod->te, (struct t2_node **)c, towrite));
-                for (int i = 0; i < towrite; ++i) {
-                        struct node *nn = c[i];
-                        node_state_print(nn, 'C');
-                        NMOD(nn, page_dirty_nr, nn->flags >> 40);
-                        NMOD(nn, page_lsn_diff, nn->lsn_hi - nn->lsn_lo);
-                        nn->flags &= ~DIRTY;
-                        nn->lsn_lo = nn->lsn_hi = 0;
-                        nn->flags &= ~(~0ull << 40);
-                }
-        } else {
-                LOG("Pageout failure: %"PRIx64": %i/%i.", n->addr, result, errno);
+        result = SCALL(mod, write, whole, towrite, vec, ctx->ctx, req);
+        ASSERT(ctx->avail >= 0);
+        NMOD(n, pageout_cluster, nr);
+        NMOD(n, pageout_queue, ctx->used);
+        if (result == 0) {
+                ++ctx->used;
+                --ctx->avail;
+        } else { /* Sync IO. */
+                pageout_done(req, taddr_ssize(whole));
+                result = 0;
         }
-        for (int i = 1; i < towrite; ++i) {
-                NOFAIL(pthread_rwlock_unlock(&c[i]->lock));
-                put(c[i]);
+        if (UNLIKELY(result != 0)) {
+                LOG("Cannot submit pageout: %"PRIx64": %i.", n->addr, result);
         }
         ASSERT(result == 0);
         return towrite << taddr_sbits(n->addr);
@@ -3637,15 +3745,58 @@ static void cache_clean(struct t2 *mod) {
         writeout(mod);
 }
 
+static int pageout_prep(struct node *n, struct pageout_ctx *ctx) {
+        int trylock;
+        pageout_complete_pending(ctx);
+        if (UNLIKELY(ctx->avail == 0 && ctx->ctx != NULL)) {
+                pageout_complete(ctx);
+        }
+        ASSERT(ctx->avail > 0);
+        trylock = pthread_rwlock_trywrlock(&n->lock);
+        ASSERT(trylock == 0 || trylock == EBUSY);
+        if (UNLIKELY(trylock != 0)) {
+                NINC(n, page_trylock);
+                put(n);
+        }
+        return trylock;
+}
+
+static bool canpage(const struct node *n, const struct t2_te *te, lsn_t target) {
+        return (!TRANSACTIONS && (n->flags&DIRTY)) || (!pinned(n, te) && 0 < n->lsn_lo && n->lsn_lo < target);
+}
+
+static int pageout_node(struct node *n, struct t2 *mod, struct pageout_ctx *ctx, lsn_t limit) {
+        int nr = 0;
+        if (LIKELY(pageout_prep(n, ctx) == 0)) {
+                if (LIKELY(canpage(n, mod->te, limit))) {
+                        nr = pageout(n, ctx);
+                } else {
+                        pthread_rwlock_unlock(&n->lock);
+                        put(n);
+                }
+        }
+        return nr;
+}
+
 static void writeout(struct t2 *mod) {
-        int32_t scan = 0;
+        int32_t            scan = 0;
+        struct pageout_ctx ctx  = {};
+        int                result = pageout_ctx_init(&ctx, mod, 1024);
+        ASSERT(result == 0); /* TODO: Handle errors. */
         do {
                 struct cds_hlist_head *head = ht_head(&mod->ht, scan);
                 struct node           *n;
                 cds_hlist_for_each_entry_2(n, head, hash) {
-                        if (n->flags & DIRTY) {
-                                pageout(n);
-                        }
+                        ref(n);
+                        pageout_node(n, mod, &ctx, INT64_MAX);
+                }
+                scan = (scan + 1) & MASK(mod->ht.shift);
+        } while (scan != 0);
+        pageout_ctx_fini(&ctx);
+        do { /* Scan again and check that all nodes are clean. */
+                struct cds_hlist_head *head = ht_head(&mod->ht, scan);
+                struct node           *n;
+                cds_hlist_for_each_entry_2(n, head, hash) {
                         ASSERT(!(n->flags & DIRTY));
                 }
                 scan = (scan + 1) & MASK(mod->ht.shift);
@@ -3847,41 +3998,25 @@ static void *maxwelld(void *data) {
         return NULL;
 }
 
-static bool canpage(const struct node *n, const struct t2_te *te, lsn_t target) {
-        return !TRANSACTIONS || (!pinned(n, te) && 0 < n->lsn_lo && n->lsn_lo < target);
-}
+enum {
+        SHEPHERD_IO_QUEUE = 16 * 1024
+};
 
 static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *mut, struct shepherd *sh) {
         struct cds_hlist_node *link;
-        int32_t                nr  = 0;
         lsn_t                  lim = sh->lim;
         CINC(shepherd_locked);
         mutex_lock(mut);
-        do {
-                cds_hlist_for_each(link, head) {
-                        struct node *n = COF(link, struct node, hash);
-                        if (LIKELY(canpage(n, mod->te, lim))) {
-                                ref(n);
-                                mutex_unlock(mut);
-                                lock(n, WRITE);
-                                if (LIKELY(canpage(n, mod->te, lim))) {
-                                        nr += pageout(n);
-                                }
-                                unlock(n, WRITE);
-                                if (n->lsn_lo != 0) {
-                                        sh->cur_min = min_64(sh->cur_min, n->lsn_lo);
-                                }
-                                mutex_lock(mut);
-                                put_locked(n);
-                                break;
-                        }
-                        if (n->lsn_lo != 0) {
-                                sh->cur_min = min_64(sh->cur_min, n->lsn_lo);
-                        }
+        cds_hlist_for_each(link, head) {
+                struct node *n = COF(link, struct node, hash);
+                if (LIKELY(canpage(n, mod->te, lim))) {
+                        ref(n);
+                        mutex_unlock(mut);
+                        return pageout_node(n, mod, &sh->ctx, lim);
                 }
-        } while (link != NULL);
+        }
         mutex_unlock(mut);
-        return nr;
+        return 0;
 }
 
 static int32_t shepherd_bucket(struct t2 *mod, int32_t pos, struct shepherd *sh) {
@@ -3898,6 +4033,9 @@ static int32_t shepherd_bucket(struct t2 *mod, int32_t pos, struct shepherd *sh)
         }                                                               \
         n = COF(link, struct node, hash);                               \
         node_state_print(n, 'S');                                       \
+        if (n->lsn_lo != 0) {                                           \
+                sh->cur_min = min_64(sh->cur_min, n->lsn_lo);           \
+        }                                                               \
         if (canpage(n, mod->te, sh->lim)) {                             \
                 rcu_unlock();                                           \
                 nr = shepherd_locked(mod, head, ht_lock(ht, pos), sh);  \
@@ -3927,6 +4065,7 @@ static int32_t shepherd_scan(struct t2 *mod, struct shepherd *sh, int32_t pos, i
                 cleaned += shepherd_bucket(mod, pos++ & MASK(mod->ht.shift), sh);
         }
         rcu_unlock();
+        pageout_drain(&sh->ctx);
         return cleaned;
 }
 
@@ -3945,6 +4084,7 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
         struct shepherd   *self         = &c->sh[sector];
         t2_thread_register();
         mem_free(ca);
+        NOFAIL(pageout_ctx_init(&self->ctx, mod, SHEPHERD_IO_QUEUE)); /* TODO: Handle errors. */
         while (true) {
                 struct timespec end;
                 int             result;
@@ -3978,6 +4118,7 @@ static void *shepherd(void *data) { /* Matthew 25:32 */
                 cache_sync(mod);
                 counters_fold();
         }
+        pageout_ctx_fini(&self->ctx);
         t2_thread_degister();
         return NULL;
 }
@@ -4593,6 +4734,7 @@ static void counters_print(uint64_t flags) {
                 COUNTER_VAR_PRINT(page_dirty_nr);
                 COUNTER_VAR_PRINT(page_lsn_diff);
                 COUNTER_VAR_PRINT(pageout_cluster);
+                COUNTER_VAR_PRINT(pageout_queue);
         }
         if (flags & T2_SF_MAXWELL) {
                 COUNTER_PRINT(scan_skip_busy);
@@ -4992,7 +5134,8 @@ static void pool_throttle(struct t2 *mod, struct freelist *free, taddr_t addr) {
                 int32_t run    = 1 << ((pressure / 4) + 3);
                 if (UNLIKELY((cookie & MASK(rate)) == 0)) {
                         if (LIKELY(cache_want_page(mod))) {
-                                int64_t cleaned = shepherd_scan(mod, &(struct shepherd){ .lim = LLONG_MAX }, cookie, run);
+                                struct shepherd me = { .lim = INT64_MAX, .ctx = { .mod = mod } };
+                                int64_t cleaned = shepherd_scan(mod, &me, cookie, run);
                                 if (cleaned > 0) {
                                         TXCALL(mod->te, scan_end(mod->te, cleaned));
                                         CADD(throttle_clean, cleaned);
@@ -7577,7 +7720,7 @@ static void wal_fini(struct t2_te *engine) {
 }
 
 struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle) {
+                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo) {
         struct wal_te *en     = mem_alloc(sizeof *en);
         pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
         int           *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
@@ -7632,7 +7775,6 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         en->threshold_page      = threshold_page;
         en->threshold_log_syncd = threshold_log_syncd;
         en->threshold_log_sync  = threshold_log_sync;
-        en->node_throttle       = node_throttle;
         stash_init(&en->stash, 16, 1 << 12);
         for (int i = 0; result == 0 && i < (1 << en->log_shift); ++i) {
                 if (flags & MAKE) {
@@ -8012,7 +8154,7 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
 #else /* TRANSACTIONS */
 struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                        uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, int node_throttle) {
+                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo) {
         return NULL; /* TODO: For bn.c. */
 }
 
@@ -8069,7 +8211,11 @@ static int mso_read(struct t2_storage *storage, taddr_t addr, int nr, struct iov
         }
 }
 
-static int mso_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src) {
+static struct t2_io_ctx *mso_create(struct t2_storage *storage, int queue) {
+        return NULL;
+}
+
+static int mso_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ctx, void *arg) {
         void *dst = (void *)taddr_saddr(addr);
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
         for (int i = 0; i < nr; ++i) {
@@ -8077,6 +8223,13 @@ static int mso_write(struct t2_storage *storage, taddr_t addr, int nr, struct io
                 dst += src[i].iov_len;
         }
         return 0;
+}
+
+static void *mso_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_t *nob, bool wait) {
+        return NULL;
+}
+
+static void mso_done(struct t2_storage *storage, struct t2_io_ctx *ctx) {
 }
 
 static int mso_sync(struct t2_storage *storage, bool barrier) {
@@ -8091,10 +8244,13 @@ static struct t2_storage_op mock_storage_op = {
         .name     = "mock-storage-op",
         .init     = &mso_init,
         .fini     = &mso_fini,
+        .create   = &mso_create,
+        .done     = &mso_done,
         .alloc    = &mso_alloc,
         .free     = &mso_free,
         .read     = &mso_read,
         .write    = &mso_write,
+        .end      = &mso_end,
         .sync     = &mso_sync,
         .same     = &mso_same
 };
@@ -8106,10 +8262,11 @@ static __attribute__((unused)) struct t2_storage mock_storage = {
 /* @file */
 
 enum {
-        FRAG_SHIFT = 0,
-        FRAG_NR    = 1 << FRAG_SHIFT,
-        FRAG_MASK  = FRAG_NR - 1,
-        BASE_SHIFT = 64 - 8 - 16
+        FRAG_SHIFT  = 0,
+        FRAG_NR     = 1 << FRAG_SHIFT,
+        FRAG_MASK   = FRAG_NR - 1,
+        BASE_SHIFT  = 64 - 8 - 16,
+        URING_FLAGS = 0
 };
 
 SASSERT(FRAG_SHIFT <= 16);
@@ -8223,10 +8380,35 @@ static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct io
         }
 }
 
-static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src) {
+struct file_ctx {
+        struct io_uring ring;
+};
+
+static struct t2_io_ctx *file_create(struct t2_storage *storage, int queue) {
+        struct file_ctx *ctx = mem_alloc(sizeof *ctx);
+        if (ctx != NULL) {
+                int result = io_uring_queue_init(queue, &ctx->ring, URING_FLAGS);
+                if (result < 0) {
+                        return EPTR(result);
+                } else {
+                        return (void *)ctx;
+                }
+        } else {
+                return EPTR(-ENOMEM);
+        }
+}
+
+static void file_done(struct t2_storage *storage, struct t2_io_ctx *arg) {
+        struct file_ctx *ctx = (void *)arg;
+        io_uring_queue_exit(&ctx->ring);
+        mem_free(ctx);
+}
+
+static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
         struct file_storage *fs    = COF(storage, struct file_storage, gen);
         uint64_t             off   = frag_off(taddr_saddr(addr));
         int                  fr    = frag(fs, addr);
+        struct file_ctx     *ctx   = (void *)ioctx;
         int                  result;
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
         if (UNLIKELY(fr > FRAG_NR)) {
@@ -8235,13 +8417,45 @@ static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct i
         if (UNLIKELY(off >= fs->frag_free[fr])) {
                 return -ESTALE;
         }
-        result = pwritev(fs->fd[fr], src, nr, off);
-        if (LIKELY(result == taddr_ssize(addr))) {
-                return 0;
-        } else if (result < 0) {
-                return ERROR(result);
+        if (UNLIKELY(ctx == NULL)) {
+                result = pwritev(fs->fd[fr], src, nr, off);
+                if (LIKELY(result == taddr_ssize(addr))) {
+                        return +1; /* Sync IO. */
+                } else if (result < 0) {
+                        return ERROR(result);
+                } else {
+                        return ERROR(-EIO);
+                }
         } else {
-                return ERROR(-EIO);
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+                if (LIKELY(sqe != NULL)) {
+                        io_uring_prep_writev(sqe, fs->fd[fr], src, nr, off);
+                        io_uring_sqe_set_data(sqe, arg);
+                        io_uring_submit(&ctx->ring);
+                        return 0;
+                } else {
+                        return ERROR(-EAGAIN);
+                }
+        }
+}
+
+static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_t *nob, bool wait) {
+        struct io_uring_cqe *cqe;
+        struct file_ctx     *ctx = (void *)ioctx;
+        int                  result;
+        if (ctx == NULL) {
+                return NULL;
+        }
+        result = (wait ? io_uring_wait_cqe : io_uring_peek_cqe)(&ctx->ring, &cqe);
+        if (LIKELY(result == 0)) {
+                void *arg = io_uring_cqe_get_data(cqe);
+                *nob = cqe->res;
+                io_uring_cqe_seen(&ctx->ring, cqe);
+                return arg;
+        } else if (result == -EAGAIN) {
+                return NULL;
+        } else {
+                return EPTR(result);
         }
 }
 
@@ -8266,10 +8480,13 @@ static struct t2_storage_op file_storage_op = {
         .name     = "file-storage-op",
         .init     = &file_init,
         .fini     = &file_fini,
+        .create   = &file_create,
+        .done     = &file_done,
         .alloc    = &file_alloc,
         .free     = &file_free,
         .read     = &file_read,
         .write    = &file_write,
+        .end      = &file_end,
         .sync     = &file_sync,
         .same     = &file_same
 };
@@ -9442,15 +9659,14 @@ enum {
         WAL_THRESHOLD_PAGE      =        128,
         WAL_THRESHOLD_LOG_SYNCD =         64,
         WAL_THRESHOLD_LOG_SYNC  =         32,
-        WAL_READY_LO            =          2,
-        WAL_NODE_THROTTLE       =        750
+        WAL_READY_LO            =          2
 };
 
 const double WAL_LOG_SLEEP = 1.0;
 
 static struct t2_te *wprep(int32_t flags) {
         struct t2_te *engine = wal_prep(logname, NR_BUFS, BUF_SIZE, flags, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB, WAL_LOG_SIZE, WAL_RESERVE_QUANTUM,
-                                        WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO, WAL_NODE_THROTTLE);
+                                        WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO);
         ASSERT(EISOK(engine));
         return engine;
 }

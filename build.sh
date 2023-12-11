@@ -30,7 +30,7 @@ case "$platform" in ####################### Linux #############################
         ROCKSDB_LDFLAGS="-lrocksdb -lsnappy -lz -lbz2 -lzstd -llz4 -ldl -lstdc++"
         LMDB_LDFLAGS="-L/usr/local/lib -llmdb"
         MAP_LDFLAGS="-lstdc++"
-        LDFLAGS="$LDFLAGS -lm -latomic -lunwind"
+        LDFLAGS="$LDFLAGS -lm -latomic -lunwind -luring"
         cadd '#define ON_LINUX  (1)'
         cadd '#define ON_DARWIN (0)'
         cadd '#include "os-linux.h"'
@@ -112,7 +112,7 @@ function run() {
 function setup_prereq() {
     case "$distro" in
 	(ubuntu)
-	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev
+	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev
     ;;  (darwin)
 	    run brew install automake autoconf libtool gcc gperftools zstd
     ;;  (*)

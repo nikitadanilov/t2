@@ -66,7 +66,6 @@ struct t2_param {
         int            wal_threshold_log_syncd;
         int            wal_threshold_log_sync;
         int            wal_ready_lo;
-        int            wal_node_throttle;
         const char    *policy_leaf;
         const char    *policy_twig;
         const char    *policy_internal;
@@ -138,17 +137,20 @@ struct t2_te { /* Transaction engine. */
  * instance.
  */
 typedef uint64_t taddr_t;
-
+struct t2_io_ctx;
 struct t2_storage_op {
         const char *name;
-        int      (*init) (struct t2_storage *storage);
-        void     (*fini) (struct t2_storage *storage);
-        taddr_t  (*alloc)(struct t2_storage *storage, int shift_min, int shift_max);
-        void     (*free) (struct t2_storage *storage, taddr_t addr);
-        int      (*read) (struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst);
-        int      (*write)(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src);
-        int      (*sync) (struct t2_storage *storage, bool barrier);
-        bool     (*same) (struct t2_storage *storage, int fd);
+        int               (*init)  (struct t2_storage *storage);
+        void              (*fini)  (struct t2_storage *storage);
+        struct t2_io_ctx *(*create)(struct t2_storage *storage, int queue);
+        void              (*done)  (struct t2_storage *storage, struct t2_io_ctx *arg);
+        taddr_t           (*alloc) (struct t2_storage *storage, int shift_min, int shift_max);
+        void              (*free)  (struct t2_storage *storage, taddr_t addr);
+        int               (*read)  (struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst);
+        int               (*write) (struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ctx, void *arg);
+        void             *(*end)   (struct t2_storage *storage, struct t2_io_ctx *ctx, int32_t *nob, bool wait);
+        int               (*sync)  (struct t2_storage *storage, bool barrier);
+        bool              (*same)  (struct t2_storage *storage, int fd);
 };
 
 struct t2_buf {
