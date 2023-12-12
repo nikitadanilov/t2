@@ -924,7 +924,7 @@ static pthread_mutex_t *ht_lock(struct ht *ht, uint32_t bucket);
 static struct node *ht_lookup(struct ht *ht, taddr_t addr, uint32_t bucket);
 static void ht_insert(struct ht *ht, struct node *n, uint32_t bucket);
 static void ht_delete(struct node *n);
-static uint64_t ht_hash(taddr_t addr);
+static uint32_t ht_hash(taddr_t addr);
 static void pool_clean(struct t2 *mod);
 static int64_t pool_used(struct t2 *mod);
 static struct node *pool_get(struct t2 *mod, taddr_t addr);
@@ -1614,7 +1614,7 @@ void t2_thread_degister() {
 }
 
 static bool taddr_is_valid(taddr_t addr) {
-        return (addr & (TADDR_LOW0_MASK | TADDR_LOW0_MASK)) == 0;
+        return (addr & TADDR_LOW0_MASK) == 0;
 }
 
 static uint64_t taddr_saddr(taddr_t addr) {
@@ -3762,7 +3762,7 @@ static int pageout_prep(struct node *n, struct pageout_ctx *ctx) {
 }
 
 static bool canpage(const struct node *n, const struct t2_te *te, lsn_t target) {
-        return (!TRANSACTIONS && (n->flags&DIRTY)) || (!pinned(n, te) && 0 < n->lsn_lo && n->lsn_lo < target);
+        return ((!TRANSACTIONS || te == NULL) && (n->flags&DIRTY)) || (!pinned(n, te) && 0 < n->lsn_lo && n->lsn_lo < target);
 }
 
 static int pageout_node(struct node *n, struct t2 *mod, struct pageout_ctx *ctx, lsn_t limit) {
@@ -3961,7 +3961,7 @@ static void *maxwelld(void *data) {
         int32_t              pos = arg->idx;
         t2_thread_register();
         mem_free(arg);
-        md->delta = ARRAY_SIZE(md->window) >> 4;
+        md->delta = ARRAY_SIZE(md->window) >> 1;
         while (true) {
                 struct timespec end;
                 int             result;
@@ -5034,8 +5034,7 @@ static void ht_clean(struct ht *ht) {
         }
 }
 
-static uint64_t ht_hash(taddr_t addr) {
-        uint64_t x = addr;             /* ChatGPT made me do it. */
+static uint64_t ht_hash64(uint64_t x) { /* ChatGPT made me do it. */
         x = (~x) + (x << 21);          /* x = (x << 21) - x - 1; */
         x = x ^ (x >> 24);
         x = (x + (x << 3)) + (x << 8); /* x * 265 */
@@ -5044,6 +5043,10 @@ static uint64_t ht_hash(taddr_t addr) {
         x = x ^ (x >> 28);
         x = x + (x << 31);
         return x;
+}
+
+static uint32_t ht_hash(taddr_t addr) {
+        return ht_hash64(addr >> TADDR_MIN_SHIFT) >> 11;
 }
 
 static uint32_t ht_bucket(struct ht *ht, taddr_t addr) {
@@ -8715,34 +8718,50 @@ static struct node *node_alloc_ut(struct t2 *mod, uint64_t blk) {
 
 static void ht_ut() {
         const uint64_t N = 10000;
+        const int shift = 24;
         struct t2 mod = {};
+        int *table;
+        int c1 = 0;
+        int c2 = 0;
+        taddr_t addr;
         usuite("ht");
         utest("collision");
         for (uint64_t i = 0; i < N; ++i) {
                 for (uint64_t j = 0; j < i; ++j) {
-                        ASSERT(ht_hash(i) != ht_hash(j));
-                        ASSERT(ht_hash(2 * N + i * i * i) != ht_hash(2 * N + j * j * j));
+                        uint64_t I = i << TADDR_MIN_SHIFT;
+                        uint64_t J = j << TADDR_MIN_SHIFT;
+                        c1 += ht_hash(I) == ht_hash(J);
+                        c2 += ht_hash(2 * N + I * I * I) == ht_hash(2 * N + J * J * J);
                 }
         }
+        printf("%i/%i ", c1, c2);
         ht_init(&mod.ht, 10);
         utest("insert");
         for (uint64_t i = 0; i < N; ++i) {
-                struct node *n = node_alloc_ut(&mod, ht_hash(i));
+                struct node *n = node_alloc_ut(&mod, ht_hash64(i));
                 ht_insert(&mod.ht, n, ht_bucket(&mod.ht, n->addr));
         }
         utest("lookup");
         for (uint64_t i = 0; i < N; ++i) {
-                taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
+                taddr_t blk = taddr_make(ht_hash64(i) & TADDR_ADDR_MASK, 9);
                 struct node *n = ht_lookup(&mod.ht, blk, ht_bucket(&mod.ht, blk));
                 ASSERT(n != NULL);
                 ASSERT(n->addr == blk);
         }
         utest("delete");
         for (uint64_t i = 0; i < N; ++i) {
-                taddr_t blk = taddr_make(ht_hash(i) & TADDR_ADDR_MASK, 9);
+                taddr_t blk = taddr_make(ht_hash64(i) & TADDR_ADDR_MASK, 9);
                 struct node *n = ht_lookup(&mod.ht, blk, ht_bucket(&mod.ht, blk));
                 ht_delete(n);
         }
+        utest("uniform");
+        table = mem_alloc(sizeof table[0] << shift);
+        addr = 0;
+        for (int i = 0; i < (10 << shift); ++i, addr += 1 << TADDR_MIN_SHIFT) {
+                ++table[ht_hash(addr) & MASK(shift)];
+        }
+        printf("zeroes: %i/%i ", COUNT(i, 1 << shift, table[i] == 0), 1 << shift);
+        mem_free(table);
         utest("fini");
         ht_fini(&mod.ht);
         utestdone();
@@ -8929,22 +8948,22 @@ static void tree_ut() {
         key = BUF_VAL(k64);
         val = BUF_VAL(v64);
         for (int i = 0; i < 20000; ++i) {
-                k64 = ht_hash(i);
-                v64 = ht_hash(i + 1);
+                k64 = ht_hash64(i);
+                v64 = ht_hash64(i + 1);
                 NOFAIL(t2_insert(t, &r, NULL));
         }
         utest("50K");
         for (int i = 0; i < 50000; ++i) {
-                k64 = ht_hash(i);
-                v64 = ht_hash(i + 1);
+                k64 = ht_hash64(i);
+                v64 = ht_hash64(i + 1);
                 result = t2_insert(t, &r, NULL);
                 ASSERT(result == (i < 20000 ? -EEXIST : 0));
         }
         utest("check");
         for (int i = 0; i < 50000; ++i) {
-                k64 = ht_hash(i);
+                k64 = ht_hash64(i);
                 NOFAIL(t2_lookup(t, &r));
-                ASSERT(v64 == ht_hash(i + 1));
+                ASSERT(v64 == ht_hash64(i + 1));
         }
         utest("fini");
         t2_stats_print(mod, 0);
