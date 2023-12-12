@@ -764,6 +764,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_page_done;
         int64_t wal_log_already;
         int64_t wal_sync_log_head;
+        int64_t wal_sync_log_head2;
         int64_t wal_sync_log_lo;
         int64_t wal_sync_log_want;
         int64_t wal_sync_log_time;
@@ -1508,8 +1509,8 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                 printf("\nshepherd: ");
                 for (int i = 0; i < c->sh_nr; ++i) {
                         struct shepherd *sh = &c->sh[i];
-                        printf("[%6"PRId64" : %6"PRId64"] ", sh->lim, sh->min);
-                        if ((i & 7) == 7) {
+                        printf("[%6"PRId64" : %6"PRId64" : %6d] ", sh->lim, sh->min, sh->ctx.used);
+                        if ((i & 3) == 3) {
                                 printf("\n          ");
                         }
                 }
@@ -3762,7 +3763,7 @@ static int pageout_prep(struct node *n, struct pageout_ctx *ctx) {
 }
 
 static bool canpage(const struct node *n, const struct t2_te *te, lsn_t target) {
-        return ((!TRANSACTIONS || te == NULL) && (n->flags&DIRTY)) || (!pinned(n, te) && 0 < n->lsn_lo && n->lsn_lo < target);
+        return (n->flags&DIRTY) && (!TRANSACTIONS || te == NULL || (!pinned(n, te) && 0 < n->lsn_lo && n->lsn_lo < target));
 }
 
 static int pageout_node(struct node *n, struct t2 *mod, struct pageout_ctx *ctx, lsn_t limit) {
@@ -3999,7 +4000,7 @@ static void *maxwelld(void *data) {
 }
 
 enum {
-        SHEPHERD_IO_QUEUE = 16 * 1024
+        SHEPHERD_IO_QUEUE = 32 * 1024
 };
 
 static int32_t shepherd_locked(struct t2 *mod, struct cds_hlist_head *head, pthread_mutex_t *mut, struct shepherd *sh) {
@@ -4621,6 +4622,7 @@ static void counters_print(uint64_t flags) {
                 printf("wal.page_sync:       %10"PRId64"\n", GVAL(wal_page_sync));
                 printf("wal.log_already:     %10"PRId64"\n", GVAL(wal_log_already));
                 printf("wal.sync_log_head:   %10"PRId64"\n", GVAL(wal_sync_log_head));
+                printf("wal.sync_log_head2:  %10"PRId64"\n", GVAL(wal_sync_log_head2));
                 printf("wal.sync_log_lo:     %10"PRId64"\n", GVAL(wal_sync_log_lo));
                 printf("wal.sync_log_want:   %10"PRId64"\n", GVAL(wal_sync_log_want));
                 printf("wal.sync_log_time:   %10"PRId64"\n", GVAL(wal_sync_log_time));
@@ -7190,6 +7192,7 @@ static bool wal_should_sync_log(const struct wal_te *en, uint32_t flags) {
         int threshold = (flags & DAEMON) ? en->threshold_log_syncd : en->threshold_log_sync;
         return  !COND(en->log_syncing, wal_log_already) &&
                 (COND(en->max_written - en->max_synced > en->sync_nob, wal_sync_log_head) ||
+                 COND(en->max_synced - en->max_persistent > en->sync_nob, wal_sync_log_head2) ||
                  COND(wal_log_free(en) < wal_log_need(en) + ((threshold * en->log_size) >> 10), wal_sync_log_lo) ||
                  COND(en->max_wait >= en->max_persistent, wal_sync_log_want) ||
                  COND(READ_ONCE(en->mod->tick) - en->last_log_sync > en->sync_age, wal_sync_log_time));
@@ -7524,7 +7527,7 @@ static void wal_page_sync(struct wal_te *en) {
 static bool wal_need(struct t2_te *engine, struct shepherd *sh) {
         struct wal_te  *en     = COF(engine, struct wal_te, base);
         lsn_t           delta  = (2 * en->threshold_paged * en->log_size) >> 10;
-        lsn_t           target = min_64(en->start + delta, en->max_persistent);
+        lsn_t           target = min_64(sh->lim + delta, en->max_persistent);
         /* Lock is needed to avoid a race with wal_diff(). */
         WITH_LOCK(sh->cur_min = en->lsn, &en->curlock);
         sh->lim = target;
