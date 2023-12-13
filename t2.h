@@ -87,7 +87,9 @@ struct t2_tx { /* Transaction. */
 
 typedef int64_t lsn_t;
 struct shepherd;
+struct path;
 struct t2_te { /* Transaction engine. */
+        void          (*prepare) (struct t2_te *te, struct t2_tx *tx, struct path *path);
         int           (*post)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
         int           (*ante)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
         int           (*init)    (struct t2_te *te, struct t2 *mod);
@@ -102,6 +104,7 @@ struct t2_te { /* Transaction engine. */
         bool          (*wantout) (struct t2_te *te, struct t2_node *n);
         void          (*clean)   (struct t2_te *te, struct t2_node **nodes, int nr);
         bool          (*need)    (struct t2_te *te, struct shepherd *sh);
+        lsn_t         (*limit)   (struct t2_te *te, struct shepherd *sh);
         void          (*scan_end)(struct t2_te *te, int64_t cleaned);
         void          (*print)   (struct t2_te *te);
         const char     *name;
