@@ -89,7 +89,6 @@ typedef int64_t lsn_t;
 struct shepherd;
 struct path;
 struct t2_te { /* Transaction engine. */
-        void          (*prepare) (struct t2_te *te, struct t2_tx *tx, struct path *path);
         int           (*post)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
         int           (*ante)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
         int           (*init)    (struct t2_te *te, struct t2 *mod);
@@ -99,13 +98,14 @@ struct t2_te { /* Transaction engine. */
         int           (*open)    (struct t2_te *te, struct t2_tx *tx);
         void          (*close)   (struct t2_te *te, struct t2_tx *tx);
         int           (*wait)    (struct t2_te *te, struct t2_tx *tx, bool force);
+        int           (*wait_for)(struct t2_te *te, lsn_t lsn, bool force);
         void          (*done)    (struct t2_te *te, struct t2_tx *tx);
         bool          (*pinned)  (const struct t2_te *te, struct t2_node *n);
+        bool          (*check)   (const struct t2_te *te, struct t2_node *n);
         bool          (*wantout) (struct t2_te *te, struct t2_node *n);
+        bool          (*stop)    (struct t2_te *te, struct t2_node *n);
+        void          (*maxpaged)(struct t2_te *te, lsn_t max);
         void          (*clean)   (struct t2_te *te, struct t2_node **nodes, int nr);
-        bool          (*need)    (struct t2_te *te, struct shepherd *sh);
-        lsn_t         (*limit)   (struct t2_te *te, struct shepherd *sh);
-        void          (*scan_end)(struct t2_te *te, int64_t cleaned);
         void          (*print)   (struct t2_te *te);
         const char     *name;
 };
