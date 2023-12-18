@@ -33,6 +33,8 @@ struct t2_conf {
         int                   cshift;
         int                   min_radix_level;
         int                   cache_shepherd_shift;
+        int                   cache_briard_shift;
+        int                   cache_buhund_shift;
         int                   max_cluster;
         int                   scan_run;
         int                   free_hi;
@@ -102,7 +104,7 @@ struct t2_te { /* Transaction engine. */
         void          (*done)    (struct t2_te *te, struct t2_tx *tx);
         bool          (*pinned)  (const struct t2_te *te, struct t2_node *n);
         bool          (*check)   (const struct t2_te *te, struct t2_node *n);
-        bool          (*wantout) (struct t2_te *te, struct t2_node *n);
+        bool          (*throttle)(const struct t2_te *te, struct t2_node *n);
         bool          (*stop)    (struct t2_te *te, struct t2_node *n);
         void          (*maxpaged)(struct t2_te *te, lsn_t max);
         void          (*clean)   (struct t2_te *te, struct t2_node **nodes, int nr);

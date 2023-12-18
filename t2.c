@@ -86,7 +86,12 @@ enum {
 #else
 #define ASSERT(expr) ASSUME(expr)
 #endif
-#define EXPENSIVE_ASSERT(expr) ((void)0) /* ASSERT(expr) */
+#define EXPENSIVE_ASSERTS_ON (1)
+#if EXPENSIVE_ASSERTS_ON
+#define EXPENSIVE_ASSERT(expr) ASSERT(expr)
+#else
+#define EXPENSIVE_ASSERT(expr) ((void)0)
+#endif
 #define SOF(x) ((int32_t)sizeof(x))
 #define ARRAY_SIZE(a)                           \
 ({                                              \
@@ -124,9 +129,9 @@ enum {
 
 #define COUNT(var, limit, ...)                                          \
 ({                                                                      \
-        int __lim;                                                      \
-        int __result;                                                   \
-        int var;                                                        \
+        typeof(limit) __lim;                                            \
+        typeof(limit) __result;                                         \
+        typeof(limit) var;                                              \
         for (__lim = (limit), __result = 0, var = 0; var < __lim; ++var) { \
                 if (__VA_ARGS__) {                                      \
                         ++__result;                                     \
@@ -135,10 +140,20 @@ enum {
         __result;                                                       \
 })
 
+#define FOR(var, limit, ...)                                    \
+({                                                              \
+        typeof(limit) __lim;                                    \
+        typeof(limit) var;                                      \
+        for (__lim = (limit), var = 0; var < __lim; ++var) {    \
+                ({ __VA_ARGS__; });                             \
+        }                                                       \
+        var == __lim;                                           \
+})
+
 #define FORALL(var, limit, ...)                                         \
 ({                                                                      \
-        int __lim;                                                      \
-        int var;                                                        \
+        typeof(limit) __lim;                                            \
+        typeof(limit) var;                                              \
         for (__lim = (limit), var = 0; var < __lim && ({ __VA_ARGS__; }); ++var) { \
                 ;                                                       \
         }                                                               \
@@ -372,11 +387,6 @@ struct maxwell_data {
         pthread_t thread;
 };
 
-struct daemon_arg {
-        struct t2           *mod;
-        int                  idx;
-};
-
 enum {
         DAEMON = 1 << 0
 };
@@ -388,6 +398,8 @@ struct pageout_ctx {
         struct cds_list_head  inflight;
         struct pageout_req   *free;
         struct t2            *mod;
+        int                   idx;
+        int                   cow_shift;
         int64_t               cleaned;
 };
 
@@ -410,7 +422,9 @@ struct pageout_req {
 struct queue { /* Multiple producers, single consumer. */
         alignas(MAX_CACHELINE) pthread_mutex_t      lock;
         struct cds_list_head                        head;
+        int                                         head_nr;
         alignas(MAX_CACHELINE) struct cds_list_head tail;
+        int                                         tail_nr;
         bool                                        unordered;
 };
 
@@ -433,14 +447,18 @@ struct cache {
         alignas(MAX_CACHELINE) struct pool     pool;
         struct maxwell_data                   *md;
         int                                    max_cluster;
-        alignas(MAX_CACHELINE) pthread_mutex_t maxlock;
-        int                                    sh_shift;
         int                                    sh_nr;
+        int                                    sh_shift;
         struct shepherd                       *sh;
-        struct shepherd                        briard;
+        int                                    briard_nr;
+        int                                    briard_shift;
+        struct shepherd                       *briard;
+        int                                    buhund_nr;
+        int                                    buhund_shift;
+        struct shepherd                       *buhund;
         struct cds_list_head                   eio;
-        pthread_mutex_t                        idlelock;
         bool                                   sh_shutdown;
+        bool                                   md_shutdown;
 };
 
 struct ioc {
@@ -493,8 +511,7 @@ enum t2_initialisation_stage {
         HT_INIT,
         STORAGE_INIT,
         IOCACHE_INIT,
-        MAXWELLD,
-        SHEPHERD,
+        CACHE_INIT,
         TX_INIT
 };
 
@@ -832,7 +849,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_page_sync_time;
         struct counter_var stash_used;
         struct counter_var ioc_ratio;
-        struct counter_var briard_queue_length;
         struct level_counters {
                 int64_t traverse_hit;
                 int64_t traverse_miss;
@@ -874,10 +890,13 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t shepherd_dequeued;
                 int64_t shepherd_cleaned;
                 int64_t briard_queued;
-                int64_t briard_queued_cow;
                 int64_t briard_dequeued;
                 int64_t briard_wait;
                 int64_t briard_wait_locked;
+                int64_t buhund_queued;
+                int64_t buhund_dequeued;
+                int64_t buhund_wait;
+                int64_t buhund_wait_locked;
                 struct counter_var nr;
                 struct counter_var free;
                 struct counter_var modified;
@@ -976,6 +995,7 @@ static void queue_fini(struct queue *q);
 static void queue_put(struct queue *q, struct cds_list_head *item);
 static void queue_put_locked(struct queue *q, struct cds_list_head *item);
 static struct cds_list_head *queue_get(struct queue *q);
+static struct cds_list_head *queue_tryget(struct queue *q);
 static bool queue_is_empty(struct queue *q);
 static void queue_steal(struct queue *q);
 static int cacheline_size();
@@ -1088,8 +1108,8 @@ static int  wal_wait    (struct t2_te *engine, struct t2_tx *trax, bool force);
 static void wal_wait_for(struct t2_te *engine, lsn_t lsn, bool force);
 static void wal_done    (struct t2_te *engine, struct t2_tx *trax);
 static bool wal_pinned  (const struct t2_te *engine, struct t2_node *n);
+static bool wal_throttle(const struct t2_te *engine, struct t2_node *n);
 static bool wal_check   (const struct t2_te *engine, struct t2_node *n);
-static bool wal_wantout (struct t2_te *engine, struct t2_node *n);
 static bool wal_stop    (struct t2_te *engine, struct t2_node *n);
 static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_maxpaged(struct t2_te *engine, lsn_t min);
@@ -1139,14 +1159,18 @@ static void mutex_unlock(pthread_mutex_t *lock);
 static void cache_clean(struct t2 *mod);
 static void *maxwelld(void *data);
 static void *shepherd(void *data);
-static void *briard(void *arg);
-static int pageout_ctx_init(struct pageout_ctx *ctx, struct t2 *mod, int queue);
+static void *briard(void *data);
+static void *buhund(void *arg);
+static int pageout_ctx_init(struct pageout_ctx *ctx, struct t2 *mod, int queue, int idx, int cow_shift);
 static void pageout_ctx_fini(struct pageout_ctx *ctx);
-static int sh_init(struct shepherd *sh, struct t2 *mod);
+static int sh_init(struct shepherd *sh, struct t2 *mod, int idx, int cow_shift);
 static void sh_fini(struct shepherd *sh);
-static void sh_add(struct node *n);
+static void sh_add(struct node **n, int nr);
 static void sh_broadcast(struct t2 *mod);
+static void sh_signal(struct shepherd *sh);
+static void sh_print(const struct shepherd *sh);
 static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr, int32_t crit, int32_t frac);
+static int cache_init(struct t2 *mod, const struct t2_conf *conf);
 static void cache_fini(struct t2 *mod);
 static void cache_sync(struct t2 *mod);
 static void cache_pulse(struct t2 *mod);
@@ -1174,6 +1198,8 @@ static __thread struct cacheinfo ci = {};
 static __thread volatile struct {
         volatile jmp_buf *buf;
 } addr_check = {};
+static __thread int shepherd_hand;
+
 static struct node_type_ops simple_ops;
 static struct node_type_ops lazy_ops;
 static struct node_type_ops odir_ops;
@@ -1202,9 +1228,9 @@ static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stag
 enum {
         DEFAULT_CSHIFT                  =         22,
         DEFAULT_MIN_RADIX_LEVEL         =          2,
-        DEFAULT_SHEPHERD_RATIO          =         20,
-        DEFAULT_SHEPHERD_MIN            =          0,
-        DEFAULT_SHEPHERD_MAX            =          9,
+        DEFAULT_SHEPHERD_SHIFT          =          2,
+        DEFAULT_BRIARD_SHIFT            =          3,
+        DEFAULT_BUHUND_SHIFT            =          3,
         DEFAULT_MAX_CLUSTER             =        256,
         DEFAULT_WAL_NR_BUFS             =        200,
         DEFAULT_WAL_BUF_SIZE            = 1ull << 20,
@@ -1290,11 +1316,19 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SET(flags, param, conf.te, te, "p", "wal_prep()");
                 }
         }
+        if (param->conf.cache_buhund_shift < param->conf.cache_briard_shift) {
+                CONFLICT(flags, "buhund shift is less than briard shift.");
+        }
+        if (param->conf.cache_briard_shift < param->conf.cache_shepherd_shift) {
+                CONFLICT(flags, "briard shift is less than shepherd shift.");
+        }
         SETIF0DEFAULT(flags, param, conf.max_cluster,           DEFAULT_MAX_CLUSTER,     "d");
         SETIF0DEFAULT(flags, param, conf.cshift,                DEFAULT_CSHIFT,          "d");
         SETIF0       (flags, param, conf.hshift,                param->conf.cshift,      "d", "sized to cache");
         SETIF0DEFAULT(flags, param, conf.min_radix_level,       DEFAULT_MIN_RADIX_LEVEL, "d");
-        SETIF0       (flags, param, conf.cache_shepherd_shift,  MIN(MAX(param->conf.cshift - DEFAULT_SHEPHERD_RATIO, DEFAULT_SHEPHERD_MIN), DEFAULT_SHEPHERD_MAX), "d", "sized to cache");
+        SETIF0DEFAULT(flags, param, conf.cache_shepherd_shift,  DEFAULT_SHEPHERD_SHIFT,  "d");
+        SETIF0DEFAULT(flags, param, conf.cache_briard_shift,    DEFAULT_BRIARD_SHIFT,    "d");
+        SETIF0DEFAULT(flags, param, conf.cache_buhund_shift,    DEFAULT_BUHUND_SHIFT,    "d");
         mod = t2_init(&param->conf);
         if (EISERR(mod) && (flags & T2_INIT_VERBOSE)) {
                 t2_error_print();
@@ -1313,23 +1347,19 @@ enum {
 };
 
 struct t2 *t2_init(const struct t2_conf *conf) {
-        int                  result;
         struct t2           *mod;
-        struct daemon_arg   *ca;
         struct maxwell_data *dd;
         struct cache        *c;
         struct pool         *p;
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
-        if (conf->hshift <= 0 || conf->cshift <= 0 || conf->min_radix_level < 0 || conf->cache_shepherd_shift < 0 || conf->cache_shepherd_shift > conf->hshift ||
-            conf->max_cluster <= 0 || conf->scan_run < 0) {
+        if (conf->hshift <= 0 || conf->cshift <= 0 || conf->min_radix_level < 0 || conf->cache_shepherd_shift < 0 || conf->cache_briard_shift < 0 ||
+            conf->cache_shepherd_shift + conf->cache_briard_shift > 32 || conf->max_cluster <= 0 || conf->scan_run < 0) {
                 return EPTR(-EINVAL);
         }
         mod = mem_alloc(sizeof *mod);
-        ca  = mem_alloc(sizeof *ca);
         dd  = mem_alloc(sizeof *dd);
-        if (mod == NULL || ca == NULL || dd == NULL) {
+        if (mod == NULL || dd == NULL) {
                 mem_free(dd);
-                mem_free(ca);
                 mem_free(mod);
                 return EPTR(-ENOMEM);
         }
@@ -1368,31 +1398,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         NEXT_STAGE(mod, ht_init(&mod->ht, conf->hshift), HT_INIT);
         NEXT_STAGE(mod, SCALL(mod, init), STORAGE_INIT);
         NEXT_STAGE(mod, iocache_init(&mod->ioc, conf->cshift), IOCACHE_INIT);
-        ca->mod = mod;
-        ca->idx = 0;
-        result = pthread_create(&c->md->thread, NULL, &maxwelld, ca);
-        if (next_stage(mod, result == 0, MAXWELLD)) {
-                mem_free(dd);
-                mem_free(ca);
-                return EPTR(-result);
-        }
-        NEXT_STAGE(mod, -pthread_mutex_init(&c->cleanlock, NULL), SHEPHERD);
-        NEXT_STAGE(mod, -pthread_mutex_init(&c->maxlock, NULL), 0);
-        NEXT_STAGE(mod, -pthread_mutex_init(&c->idlelock, NULL), 0);
-        NEXT_STAGE(mod, sh_init(&c->briard, mod), 0);
-        c->briard.queue.unordered = true;
-        CDS_INIT_LIST_HEAD(&c->eio);
-        NEXT_STAGE(mod, -pthread_create(&c->briard.thread, NULL, &briard, mod), 0);
-        c->sh_shift = conf->cache_shepherd_shift;
-        c->sh = mem_alloc(sizeof c->sh[0] << c->sh_shift);
-        if (next_stage(mod, c->sh != NULL, 0)) {
-                return EPTR(-ENOMEM);
-        }
-        for (c->sh_nr = 0; c->sh_nr < (1 << c->sh_shift); ++c->sh_nr) {
-                struct shepherd *sh = &c->sh[c->sh_nr];
-                NEXT_STAGE(mod, sh_init(sh, mod), 0);
-                NEXT_STAGE(mod, -pthread_create(&c->sh[c->sh_nr].thread, NULL, &shepherd, sh), 0);
-        }
+        NEXT_STAGE(mod, cache_init(mod, conf), CACHE_INIT);
         NEXT_STAGE(mod, TXCALL(conf->te, init(conf->te, mod)), TX_INIT);
         return mod;
 }
@@ -1410,27 +1416,7 @@ void t2_fini(struct t2 *mod) {
                 TXCALL(mod->te, quiesce(mod->te));
                 TXCALL(mod->te, fini(mod->te));
                 __attribute__((fallthrough));
-        case SHEPHERD:
-                sh_broadcast(mod);
-                c->sh_shutdown = true;
-                for (int i = 0; i < c->sh_nr; ++i) {
-                        NOFAIL(pthread_join(c->sh[i].thread, NULL));
-                        sh_fini(&c->sh[i]);
-                }
-                mem_free(c->sh);
-                mutex_lock(&c->briard.queue.lock);
-                c->sh_nr = 0;
-                NOFAIL(pthread_cond_signal(&c->briard.wantclean));
-                mutex_unlock(&c->briard.queue.lock);
-                NOFAIL(pthread_join(c->briard.thread, NULL));
-                sh_fini(&c->briard);
-                ASSERT(cds_list_empty(&c->eio));
-                NOFAIL(pthread_mutex_destroy(&c->idlelock));
-                NOFAIL(pthread_mutex_destroy(&c->cleanlock));
-                NOFAIL(pthread_mutex_destroy(&c->maxlock));
-                __attribute__((fallthrough));
-        case MAXWELLD:
-                cache_clean(mod);
+        case CACHE_INIT:
                 cache_fini(mod);
                 __attribute__((fallthrough));
         case IOCACHE_INIT:
@@ -1506,6 +1492,15 @@ uint64_t t2_stats_flags_parse(const char *s) {
         return flags;
 }
 
+static void sh_array_print(struct shepherd *sh, int nr) {
+        for (int i = 0; i < nr; ++i) {
+                sh_print(&sh[i]);
+                if ((i & 3) == 3 && i < nr - 1) {
+                        printf("\n          ");
+                }
+        }
+}
+
 void t2_stats_print(struct t2 *mod, uint64_t flags) {
         struct cache *c = &mod->cache;
         if (flags & T2_SF_TREE) {
@@ -1557,14 +1552,11 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
         }
         if (flags & T2_SF_SHEPHERD) {
                 printf("\nshepherd: ");
-                for (int i = 0; i < c->sh_nr; ++i) {
-                        struct shepherd *sh = &c->sh[i];
-                        printf("[%6"PRId64" : %6d] ", sh->min == MAX_LSN ? -1 : sh->min, sh->ctx.used);
-                        if ((i & 3) == 3) {
-                                printf("\n          ");
-                        }
-                }
-                printf("\nbriard:   [%6"PRId64" : %6d] ", c->briard.min == MAX_LSN ? -1 : c->briard.min, c->briard.ctx.used);
+                sh_array_print(c->sh, c->sh_nr);
+                printf("\nbriard:   ");
+                sh_array_print(c->briard, c->briard_nr);
+                printf("\nbuhund:   ");
+                sh_array_print(c->buhund, c->buhund_nr);
         }
         if (TRANSACTIONS && (flags & T2_SF_TX) && mod->te != NULL) {
                 puts("");
@@ -2565,7 +2557,7 @@ static void dirty(struct path *p, struct page *g) {
                 node_state_print(n, 'D');
                 if ((!TRANSACTIONS || p->tx == NULL) && !(n->flags & DIRTY)) {
                         n->flags |= DIRTY; /* Transactional nodes are dirtied in ->post(). */
-                        sh_add(n);
+                        sh_add(&n, 1);
                 }
         }
 }
@@ -3571,9 +3563,118 @@ static bool cache_invariant(struct cache *c) {
                                                              &c->pool.free[i].lock));
 }
 
+static int cache_init0(struct t2 *mod, const struct t2_conf *conf) {
+        struct cache *c = &mod->cache;
+        int           result;
+        int           sh_nr;
+        int           briard_nr;
+        int           buhund_nr;
+        if ((result = -pthread_create(&c->md->thread, NULL, &maxwelld, mod)) != 0) {
+                return ERROR(result);
+        }
+        if ((result = -pthread_mutex_init(&c->cleanlock, NULL)) != 0) {
+                return ERROR(result);
+        }
+        CDS_INIT_LIST_HEAD(&c->eio);
+        /* First allocate everything, then start all the threads. */
+        buhund_nr = 1 << conf->cache_buhund_shift;
+        c->buhund_shift = conf->cache_buhund_shift;
+        c->buhund = mem_alloc(buhund_nr * sizeof c->buhund[0]);
+        if (c->buhund == NULL) {
+                return ERROR(-ENOMEM);
+        }
+        for (c->buhund_nr = 0; c->buhund_nr < buhund_nr; ++c->buhund_nr) {
+                struct shepherd *sh = &c->buhund[c->buhund_nr];
+                if ((result = sh_init(sh, mod, c->buhund_nr, 0)) != 0) {
+                        return ERROR(result);
+                }
+                sh->queue.unordered = true;
+        }
+        briard_nr = 1 << conf->cache_briard_shift;
+        c->briard_shift = conf->cache_briard_shift;
+        c->briard = mem_alloc(briard_nr * sizeof c->briard[0]);
+        if (c->briard == NULL) {
+                return ERROR(-ENOMEM);
+        }
+        for (c->briard_nr = 0; c->briard_nr < briard_nr; ++c->briard_nr) {
+                struct shepherd *sh = &c->briard[c->briard_nr];
+                if ((result = sh_init(sh, mod, c->briard_nr, c->buhund_shift - c->briard_shift)) != 0) {
+                        return ERROR(result);
+                }
+        }
+        sh_nr = 1 << conf->cache_shepherd_shift;
+        c->sh_shift = conf->cache_shepherd_shift;
+        c->sh = mem_alloc(sh_nr * sizeof c->sh[0]);
+        if (c->sh == NULL) {
+                return ERROR(-ENOMEM);
+        }
+        for (c->sh_nr = 0; c->sh_nr < sh_nr; ++c->sh_nr) {
+                struct shepherd *sh = &c->sh[c->sh_nr];
+                if ((result = sh_init(sh, mod, c->sh_nr, c->buhund_shift - c->sh_shift)) != 0) {
+                        return ERROR(result);
+                }
+        }
+        for (int i = 0; i < buhund_nr; ++i) {
+                struct shepherd *sh = &c->buhund[i];
+                if ((result = -pthread_create(&sh->thread, NULL, &buhund, sh)) != 0) {
+                        return ERROR(result);
+                }
+        }
+        for (int i = 0; i < briard_nr; ++i) {
+                struct shepherd *sh = &c->briard[i];
+                if ((result = -pthread_create(&sh->thread, NULL, &briard, sh)) != 0) {
+                        return ERROR(result);
+                }
+        }
+        for (int i = 0; i < sh_nr; ++i) {
+                struct shepherd *sh = &c->sh[i];
+                if ((result = -pthread_create(&sh->thread, NULL, &shepherd, sh)) != 0) {
+                        return ERROR(result);
+                }
+        }
+        return 0;
+}
+
+static int cache_init(struct t2 *mod, const struct t2_conf *conf) {
+        int result = cache_init0(mod, conf);
+        if (result != 0) {
+                cache_fini(mod);
+        }
+        return result;
+}
+
 static void cache_fini(struct t2 *mod) {
-        NOFAIL(pthread_cond_signal(&mod->cache.want));
-        NOFAIL(pthread_join(mod->cache.md->thread, NULL));
+        struct cache *c = &mod->cache;
+        c->sh_shutdown = true;
+        for (int i = 0; i < c->sh_nr; ++i) {
+                sh_signal(&c->sh[i]);
+                NOFAIL(pthread_join(c->sh[i].thread, NULL));
+                sh_fini(&c->sh[i]);
+        }
+        mem_free(c->sh);
+        c->sh_nr = 0;
+        for (int i = 0; i < c->briard_nr; ++i) {
+                sh_signal(&c->briard[i]);
+                NOFAIL(pthread_join(c->briard[i].thread, NULL));
+                sh_fini(&c->briard[i]);
+        }
+        mem_free(c->briard);
+        c->briard_nr = 0;
+        for (int i = 0; i < c->buhund_nr; ++i) {
+                sh_signal(&c->buhund[i]);
+                NOFAIL(pthread_join(c->buhund[i].thread, NULL));
+                sh_fini(&c->buhund[i]);
+        }
+        mem_free(c->buhund);
+        ASSERT(cds_list_empty(&c->eio));
+        NOFAIL(pthread_mutex_destroy(&c->cleanlock));
+        cache_clean(mod);
+        if (!IS0(&c->md->thread)) {
+                c->md_shutdown = true;
+                NOFAIL(WITH_LOCK(pthread_cond_signal(&c->want), &c->lock));
+                NOFAIL(pthread_join(c->md->thread, NULL));
+        }
+        mem_free(c->md);
 }
 
 static bool is_hot(struct node *n, int32_t crit) {
@@ -3583,18 +3684,6 @@ static bool is_hot(struct node *n, int32_t crit) {
 static bool pinned(const struct node *n, const struct t2_te *te) {
         return TXCALL(te, pinned(te, (void *)n));
 }
-
-static bool wantout(const struct node *n) {
-        return TXCALL(n->mod->te, wantout(n->mod->te, (void *)n));
-}
-
-
-enum cachestate {
-        BUSY,
-        HOT,
-        PAGE,
-        COLD
-};
 
 static void node_iovec(struct node *n, struct iovec *v) {
         v->iov_base = n->data;
@@ -3645,12 +3734,14 @@ static bool pageout_ctx_invariant(const struct pageout_ctx *ctx) {
         return cds_list_length(&ctx->inflight) == ctx->used;
 }
 
-static int pageout_ctx_init(struct pageout_ctx *ctx, struct t2 *mod, int queue) {
+static int pageout_ctx_init(struct pageout_ctx *ctx, struct t2 *mod, int queue, int idx, int cow_shift) {
         ctx->ctx = SCALL(mod, create, queue);
         if (EISOK(ctx->ctx)) {
                 ctx->avail = queue;
                 ctx->mod = mod;
                 CDS_INIT_LIST_HEAD(&ctx->inflight);
+                ctx->idx = idx;
+                ctx->cow_shift = cow_shift;
                 ASSERT(pageout_ctx_invariant(ctx));
                 return 0;
         } else {
@@ -3698,10 +3789,15 @@ static int pageout_done(struct pageout_ctx *ctx, struct pageout_req *req, int32_
                         req_put(ctx, req);
                 } else {
                         if (req->lsn <= n->lsn_hi) {
+                                int              bidx   = (ctx->idx << ctx->cow_shift) + (shepherd_hand++ & MASK(ctx->cow_shift));
+                                struct cache    *c      = &ctx->mod->cache;
+                                struct shepherd *buhund = &c->buhund[bidx];
+                                ASSERT(bidx < c->buhund_nr);
                                 n->lsn_lo = req->lsn;
                                 ref(n);
-                                NINC(n, briard_queued_cow);
-                                queue_put(&n->mod->cache.briard.queue, &n->free);
+                                NINC(n, buhund_queued);
+                                queue_put(&buhund->queue, &n->free);
+                                sh_signal(buhund);
                         } else { /* COWed, but not re-dirtied. */
                                 cleaned = node_clean(n);
                         }
@@ -3845,6 +3941,8 @@ static void queue_print(const struct cds_list_head *q) {
         }
 }
 
+enum { MAX_CHECK = 200 };
+
 static bool queues_are_ordered(const struct cds_list_head *q0, const struct cds_list_head *q1) {
         lsn_t min = MAX_LSN;
         struct node *n;
@@ -3861,7 +3959,9 @@ static bool queues_are_ordered(const struct cds_list_head *q0, const struct cds_
                         return false;
                 }
                 min = n->lsn_lo;
-                ++i;
+                if (++i > MAX_CHECK) {
+                        break;
+                }
         }
         if (q1 != NULL) {
                 i = 0;
@@ -3875,7 +3975,9 @@ static bool queues_are_ordered(const struct cds_list_head *q0, const struct cds_
                                 return false;
                         }
                         min = n->lsn_lo;
-                        ++i;
+                        if (++i > MAX_CHECK) {
+                                break;
+                        }
                 }
         }
         return true;
@@ -3890,15 +3992,18 @@ static lsn_t sh_list_min(const struct cds_list_head *head) {
         return min;
 }
 
-static bool sh_invariant(const struct shepherd *sh) {
-        return pageout_ctx_invariant(&sh->ctx) && (!sh->queue.unordered ? queues_are_ordered(&sh->queue.tail, &sh->ctx.inflight) : true);
+static bool sh_invariant(struct shepherd *sh) {
+        return  pageout_ctx_invariant(&sh->ctx) && sh->min != MAX_LSN &&
+                (!sh->queue.unordered ? queues_are_ordered(&sh->queue.tail, &sh->ctx.inflight) : true) &&
+                WITH_LOCK((!sh->queue.unordered ? queues_are_ordered(&sh->queue.head, &sh->queue.tail) : true) &&
+                          (TRANSACTIONS && sh->ctx.mod->te != NULL ? sh->min <= min_64(min_64(sh_list_min(&sh->queue.head), sh_list_min(&sh->queue.tail)),
+                                                                                       sh_list_min(&sh->ctx.inflight)) : true), &sh->queue.lock);
 }
 
-static int sh_init(struct shepherd *sh, struct t2 *mod) {
+static int sh_init(struct shepherd *sh, struct t2 *mod, int idx, int cow_shift) {
         queue_init(&sh->queue);
         NOFAIL(pthread_cond_init(&sh->wantclean, NULL));
-        sh->min = MAX_LSN;
-        return pageout_ctx_init(&sh->ctx, mod, IO_QUEUE);
+        return pageout_ctx_init(&sh->ctx, mod, IO_QUEUE, idx, cow_shift);
 }
 
 static void sh_fini(struct shepherd *sh) {
@@ -3908,203 +4013,289 @@ static void sh_fini(struct shepherd *sh) {
         queue_fini(&sh->queue);
 }
 
+static void sh_signal(struct shepherd *sh) {
+        NOFAIL(WITH_LOCK(pthread_cond_signal(&sh->wantclean), &sh->queue.lock));
+}
+
 static void sh_broadcast(struct t2 *mod) {
-        for (int i = 0; i < mod->cache.sh_nr; ++i) {
-                NOFAIL(pthread_cond_signal(&mod->cache.sh[i].wantclean));
+        struct cache *c = &mod->cache;
+        for (int i = 0; i < c->sh_nr; ++i) {
+                sh_signal(&c->sh[i]);
+        }
+        for (int i = 0; i < c->briard_nr; ++i) {
+                sh_signal(&c->briard[i]);
+        }
+        for (int i = 0; i < c->buhund_nr; ++i) {
+                sh_signal(&c->buhund[i]);
         }
 }
 
-static void sh_add(struct node *n) {
-        static __thread int shepherd_hand;
-        struct cache       *c  = &n->mod->cache;
-        struct shepherd    *sh = &c->sh[shepherd_hand++ & MASK(n->mod->cache.sh_shift)];
-        ASSERT(n->flags & DIRTY);
-        ASSERT(!(n->flags & (PAGING|HEARD_BANSHEE|NOCACHE)));
-        ASSERT(cds_list_empty(&n->free));
-        ref(n);
-        NINC(n, shepherd_queued);
-        queue_put(&sh->queue, &n->free);
-        NOFAIL(pthread_cond_signal(&sh->wantclean));
+static void sh_print(const struct shepherd *sh) {
+        printf("[%6"PRId64" : %6d + %6d : %6d / %8"PRId64"] ", sh->min, sh->queue.head_nr, sh->queue.tail_nr, sh->ctx.used, sh->ctx.cleaned);
 }
 
-static void sh_min_update(struct shepherd *sh, struct t2 *mod, lsn_t min) {
+static void sh_add(struct node **nn, int nr) {
+        struct t2          *mod = nn[0]->mod;
+        struct cache       *c   = &mod->cache;
+        struct shepherd    *sh  = &c->sh[shepherd_hand++ & MASK(c->sh_shift)];
+        ASSERT(nr > 0);
+        mutex_lock(&sh->queue.lock);
+        for (int i = 0; i < nr; ++i) {
+                struct node *n = nn[i];
+                ASSERT(n->flags & DIRTY);
+                ASSERT(!(n->flags & (PAGING|HEARD_BANSHEE|NOCACHE)));
+                ASSERT(cds_list_empty(&n->free));
+                ref(n);
+                NINC(n, shepherd_queued);
+                queue_put_locked(&sh->queue, &n->free);
+        }
+        NOFAIL(pthread_cond_signal(&sh->wantclean));
+        mutex_unlock(&sh->queue.lock);
+}
+
+static lsn_t sh_min(struct cache *c) { /* TODO: sh_list_min(&c->eio). */
+        return min_64(min_64(FOLD(i, m, c->sh_nr,     MAX_LSN, min_64(m, c->sh[i].min)),
+                             FOLD(i, m, c->briard_nr, MAX_LSN, min_64(m, c->briard[i].min))),
+                             FOLD(i, m, c->buhund_nr, MAX_LSN, min_64(m, c->buhund[i].min)));
+}
+
+static void sh_min_update(struct shepherd *sh, struct t2 *mod, lsn_t min, bool tail) {
         if (TRANSACTIONS && mod->te != NULL) {
-                struct cache *c = &mod->cache;
-                if (!cds_list_empty(&sh->ctx.inflight)) {
+                if (tail && !cds_list_empty(&sh->ctx.inflight)) {
                         struct node *n = COF(sh->ctx.inflight.prev, struct node, free);
                         ASSERT(n->lsn_lo <= min);
                         min = n->lsn_lo;
                 }
-                ASSERT(min >= sh->min || sh->min == MAX_LSN);
-                if (min > sh->min || sh->min == MAX_LSN) {
-                        mutex_lock(&c->maxlock);
+                ASSERT(min >= sh->min || min == MAX_LSN);
+                if (min > sh->min && min != MAX_LSN) {
                         sh->min = min;
-                        min = FOLD(i, m, c->sh_nr, c->briard.min, min_64(m, c->sh[i].min));
-                        TXCALL(mod->te, maxpaged(mod->te, min));
-                        mutex_unlock(&c->maxlock);
+                        TXCALL(mod->te, maxpaged(mod->te, sh_min(&mod->cache)));
                 }
         }
 }
 
-static bool sh_is_idle(struct shepherd *sh) {
-        return WITH_LOCK(sh->idle && cds_list_empty(&sh->queue.head), &sh->queue.lock);
+static void sh_wait_idle_one(struct shepherd *sh) {
+        mutex_lock(&sh->queue.lock);
+        while (!sh->idle) {
+                NOFAIL(pthread_cond_wait(&sh->wantclean, &sh->queue.lock));
+        }
+        mutex_unlock(&sh->queue.lock);
 }
 
 static void sh_wait_idle(struct t2 *mod) {
         struct cache *c = &mod->cache;
-        mutex_lock(&c->idlelock);
-        while (EXISTS(i, c->sh_nr, !sh_is_idle(&c->sh[i])) || !sh_is_idle(&c->briard)) {
-                NOFAIL(pthread_cond_wait(&c->want, &c->idlelock));
+        for (int i = 0; i < c->sh_nr; ++i) {
+                sh_wait_idle_one(&c->sh[i]);
         }
-        mutex_unlock(&c->idlelock);
+        for (int i = 0; i < c->briard_nr; ++i) {
+                sh_wait_idle_one(&c->briard[i]);
+        }
+        for (int i = 0; i < c->buhund_nr; ++i) {
+                sh_wait_idle_one(&c->buhund[i]);
+        }
 }
 
 static void sh_wait(struct shepherd *sh) {
-        struct cache *c = &sh->ctx.mod->cache;
         ASSERT(cds_list_empty(&sh->ctx.inflight));
-        EXPENSIVE_ASSERT(sh_invariant(sh));
-        mutex_lock(&c->idlelock);
         sh->idle = true;
-        NOFAIL(pthread_cond_broadcast(&c->want));
-        mutex_unlock(&c->idlelock);
-        mutex_lock(&sh->queue.lock);
-        while (queue_is_empty(&sh->queue) && !c->sh_shutdown) {
-                NOFAIL(pthread_cond_wait(&sh->wantclean, &sh->queue.lock));
+        NOFAIL(pthread_cond_broadcast(&sh->wantclean));
+        pthread_cond_wait(&sh->wantclean, &sh->queue.lock);
+        sh->idle = false;
+}
+
+static bool sh_wait_next(struct shepherd *sh, bool update_min) {
+        struct queue *q = &sh->queue;
+        if (UNLIKELY(sh->ctx.used == 0 && !sh->ctx.mod->cache.sh_shutdown)) {
+                sh_wait(sh);
+                mutex_unlock(&q->lock);
+        } else {
+                mutex_unlock(&q->lock);
+                if (UNLIKELY(sh->ctx.mod->cache.sh_shutdown)) {
+                        return false;
+                }
+                ASSERT(sh->ctx.used != 0);
+                if (update_min) {
+                        sh_min_update(sh, sh->ctx.mod, MAX_LSN, true);
+                }
+                pageout_complete(&sh->ctx);
         }
-        mutex_unlock(&sh->queue.lock);
-        WITH_LOCK(sh->idle = false, &c->lock);
+        return true;
+}
+
+static struct node *sh_next(struct shepherd *sh) {
+        struct queue         *q    = &sh->queue;
+        struct cds_list_head *item = queue_tryget(q);
+        struct node          *n;
+        while (UNLIKELY(item == NULL)) {
+                mutex_lock(&q->lock);
+                queue_steal(q);
+                item = queue_tryget(q);
+                if (UNLIKELY(item == NULL)) {
+                        if (UNLIKELY(!sh_wait_next(sh, true))) {
+                                return NULL;
+                        }
+                        continue;
+                }
+                mutex_unlock(&q->lock);
+        }
+        n = COF(item, struct node, free);
+        ASSERT((n->flags & DIRTY) && !(n->flags & PAGING));
+        sh_min_update(sh, sh->ctx.mod, n->lsn_lo, true);
+        EXPENSIVE_ASSERT(sh_invariant(sh));
+        return n;
 }
 
 static void *shepherd(void *arg) { /* Matthew 25:32, but a dog. */
         struct shepherd    *self = arg;
         struct pageout_ctx *ctx  = &self->ctx;
         struct t2          *mod  = ctx->mod;
-        struct t2_te       *te   = mod->te;
         struct cache       *c    = &mod->cache;
+        struct queue       *q    = &self->queue;
+        int                 dlt  = c->briard_shift - c->sh_shift;
         t2_thread_register();
         while (true) {
-                struct cds_list_head *item;
-                while (LIKELY((item = queue_get(&self->queue)) != NULL)) {
-                        struct node *n = COF(item, struct node, free);
-                        int          result;
-                        EXPENSIVE_ASSERT(sh_invariant(self));
-                        ASSERT((n->flags & DIRTY) && !(n->flags & PAGING));
-                        sh_min_update(self, mod, n->lsn_lo);
-                        if (TXCALL(te, stop(te, (void *)n))) {
-                                NINC(n, shepherd_stopped);
-                                break;
-                        }
-                        NINC(n, shepherd_dequeued);
-                        cds_list_del_init(&n->free);
-                        if (LIKELY(canpage(n, te))) {
-                                result = pageout_node(n, te, ctx);
-                                if (LIKELY(result == 0)) {
-                                        NINC(n, shepherd_cleaned);
-                                        continue;
-                                }
-                        } else {
-                                result = +1;
-                        }
-                        mutex_lock(&c->briard.queue.lock);
-                        if (result > 0) {
-                                NINC(n, briard_queued);
-                                queue_put_locked(&c->briard.queue, &n->free);
-                        } else {
-                                cds_list_add(&n->free, &c->eio);
-                        }
-                        NOFAIL(pthread_cond_signal(&c->briard.wantclean));
-                        mutex_unlock(&c->briard.queue.lock);
-                        cache_sync(mod);
-                        counters_fold();
-                }
-                EXPENSIVE_ASSERT(sh_invariant(self));
-                if (ctx->used > 0) {
-                        sh_min_update(self, mod, MAX_LSN);
-                        pageout_complete(ctx);
-                        continue;
-                }
-                if (UNLIKELY(c->sh_shutdown)) { /* TODO: This can exit too early. */
-                        ASSERT(queue_get(&self->queue) == NULL);
+                struct t2_te *te = mod->te;
+                struct node  *n  = sh_next(self);
+                int           result;
+                if (UNLIKELY(n == NULL)) {
                         break;
                 }
-                sh_wait(self);
+                while (TXCALL(te, stop(te, (void *)n))) {
+                        NINC(n, shepherd_stopped); /* TODO: Race window. */
+                        ASSERT(!c->sh_shutdown);
+                        mutex_lock(&q->lock);
+                        sh_wait_next(self, true);
+                }
+                NINC(n, shepherd_dequeued);
+                cds_list_del_init(&n->free);
+                --self->queue.tail_nr;
+                if (LIKELY(canpage(n, te))) {
+                        result = pageout_node(n, te, ctx);
+                        if (LIKELY(result == 0)) {
+                                NINC(n, shepherd_cleaned);
+                                continue;
+                        }
+                } else {
+                        result = +1;
+                }
+                if (LIKELY(result > 0)) {
+                        struct shepherd *br = &c->briard[(self->ctx.idx << dlt) + (shepherd_hand++ & MASK(dlt))];
+                        mutex_lock(&br->queue.lock);
+                        queue_put_locked(&br->queue, &n->free);
+                        NOFAIL(pthread_cond_signal(&br->wantclean));
+                        mutex_unlock(&br->queue.lock);
+                        NINC(n, briard_queued);
+                } else {
+                        WITH_LOCK_VOID(cds_list_move(&n->free, &c->eio), &c->buhund[0].queue.lock);
+                }
+                cache_sync(mod);
+                counters_fold();
         }
         t2_thread_degister();
         return NULL;
 }
 
-/*
- * This handles nodes that shepherds cannot hadle for whatever reason:
- *
- *     - nodes that cannot be written due to WAL (!canpage(n, en))
- *
- *     - nodes for which pageout() returned an error (in cache->eio list)
- *
- *     - COWed nodes re-filed from from pageout_done().
- *
- * briard incoming and inflight queues are not ordered by n->lsn_lo.
- */
+enum { MAX_WAIT = 3 };
+
 static void *briard(void *arg) {
-        struct t2       *mod  = arg;
-        struct cache    *c    = &mod->cache;
-        struct t2_te    *te   = mod->te;
-        struct shepherd *self = &c->briard;
+        struct shepherd    *self = arg;
+        struct pageout_ctx *ctx  = &self->ctx;
+        struct t2          *mod  = ctx->mod;
+        struct queue       *q    = &self->queue;
+        struct cache       *c    = &mod->cache;
         t2_thread_register();
         while (true) {
-                struct cds_list_head *item;
-                struct node          *n;
-                while ((item = queue_get(&self->queue)) != NULL) {
-                        lsn_t min;
-                        lsn_t shmin;
-                        int   result;
-                        EXPENSIVE_ASSERT(sh_invariant(self));
-                        n = COF(item, struct node, free);
-                        NINC(n, briard_dequeued);
-                        cds_list_del_init(&n->free);
-                        if (!canpage(n, te)) {
-                                NINC(n, briard_wait);
-                                TXCALL(te, wait_for(te, n->lsn_hi, false));
-                        }
-                        pageout_prep(&self->ctx);
-                        node_lock(n);
-                        if (!canpage(n, te)) {
-                                NINC(n, briard_wait_locked);
-                                TXCALL(te, wait_for(te, n->lsn_hi, false));
-                        }
-                        result = pageout_locked(n, te, &self->ctx);
-                        ASSERT(result <= 0);
-                        mutex_lock(&self->queue.lock);
-                        if (UNLIKELY(result < 0)) {
-                                cds_list_move(&n->free, &c->eio);
-                        }
-                        queue_steal(&self->queue);
-                        /*
-                         * Maintaining monotonic self->min is tricky, because briard's queue and,
-                         * hence, inflight are not sorted by lsn.
-                         */
-                        shmin = min_64(FOLD(i, m, c->sh_nr, n->lsn_lo, min_64(m, c->sh[i].min)), sh_list_min(&c->eio));
-                        mutex_unlock(&self->queue.lock);
-                        CMOD(briard_queue_length, cds_list_length(&self->queue.tail));
-                        if (TRANSACTIONS && te != NULL) {
-                                min = min_64(shmin, min_64(sh_list_min(&self->ctx.inflight), sh_list_min(&self->queue.tail)));
-                                if (min > self->min || self->min == MAX_LSN) {
-                                        self->min = min;
-                                        TXCALL(te, maxpaged(te, min));
-                                }
-                        }
-                        cache_sync(mod);
-                        counters_fold();
-                }
-                EXPENSIVE_ASSERT(sh_invariant(self));
-                if (self->ctx.used > 0) {
-                        pageout_complete(&self->ctx);
-                        continue;
-                }
-                if (c->sh_shutdown && c->sh_nr == 0) {
+                struct t2_te *te = mod->te;
+                struct node  *n  = sh_next(self);
+                int           result;
+                if (UNLIKELY(n == NULL && c->sh_nr == 0)) {
                         break; /* Exit only after all shepherds did. */
                 }
-                self->min = MAX_LSN;
-                sh_wait(self);
+                while (!canpage(n, te) && !TXCALL(te, throttle(te, (void *)n)) && LIKELY(!c->sh_shutdown)) {
+                        mutex_lock(&q->lock);
+                        sh_wait_next(self, true);
+                }
+                NINC(n, briard_dequeued);
+                cds_list_del_init(&n->free);
+                --self->queue.tail_nr;
+                for (int i = 0; !canpage(n, te) && i < MAX_WAIT; ++i) {
+                        NINC(n, briard_wait);
+                        TXCALL(te, wait_for(te, n->lsn_hi, false));
+                }
+                pageout_prep(&self->ctx);
+                node_lock(n);
+                if (!canpage(n, te)) {
+                        NINC(n, briard_wait_locked);
+                        TXCALL(te, wait_for(te, n->lsn_hi, false));
+                }
+                result = pageout_locked(n, te, &self->ctx);
+                ASSERT(result <= 0);
+                if (UNLIKELY(result < 0)) {
+                        WITH_LOCK_VOID(cds_list_move(&n->free, &c->eio), &c->buhund[0].queue.lock);
+                }
+                cache_sync(mod);
+                counters_fold();
+        }
+        t2_thread_degister();
+        return NULL;
+}
+
+static void *buhund(void *arg) { /* For cows and eio. */
+        struct shepherd *self = arg;
+        struct t2       *mod  = self->ctx.mod;
+        struct cache    *c    = &mod->cache;
+        struct queue    *q    = &self->queue;
+        int              idx  = self->ctx.idx;
+        t2_thread_register();
+        while (true) {
+                struct t2_te         *te = mod->te;
+                struct node          *n;
+                struct cds_list_head *item;
+                lsn_t                 shmin;
+                int                   result;
+                /*
+                 * Maintaining monotonic self->min is tricky, because buhund's queue and,
+                 * hence, inflight are not sorted by lsn.
+                 *
+                 * Take the minimum across the canines that can punt cows to this one (see pageout_done()).
+                 */
+                shmin = min_64(c->sh    [idx >> (c->buhund_shift - c->sh_shift)].min,
+                               c->briard[idx >> (c->buhund_shift - c->briard_shift)].min);
+                /* This must go after shmin calculation to win races with cows. */
+                WITH_LOCK_VOID(queue_steal(q), &q->lock);
+                item = queue_tryget(q);
+                sh_min_update(self, mod, min_64(shmin, min_64(sh_list_min(&self->ctx.inflight),
+                                                              sh_list_min(&q->tail))), false);
+                if (item == NULL) {
+                        if (c->sh_shutdown && c->sh_nr == 0) {
+                                break; /* Exit only after all shepherds did. */
+                        }
+                        mutex_lock(&q->lock);
+                        sh_wait_next(self, false);
+                        continue;
+                }
+                n = COF(q->tail.prev, struct node, free);
+                NINC(n, buhund_dequeued);
+                cds_list_del_init(&n->free);
+                --self->queue.tail_nr;
+                EXPENSIVE_ASSERT(sh_invariant(self));
+                for (int i = 0; !canpage(n, te) && i < MAX_WAIT; ++i) {
+                        NINC(n, buhund_wait);
+                        TXCALL(te, wait_for(te, n->lsn_hi, false));
+                }
+                pageout_prep(&self->ctx);
+                node_lock(n);
+                if (!canpage(n, te)) {
+                        NINC(n, buhund_wait_locked);
+                        TXCALL(te, wait_for(te, n->lsn_hi, false));
+                }
+                result = pageout_locked(n, te, &self->ctx);
+                ASSERT(result <= 0);
+                if (UNLIKELY(result < 0)) {
+                        WITH_LOCK_VOID(cds_list_move(&n->free, &c->eio), &q->lock);
+                }
+                cache_sync(mod);
+                counters_fold();
         }
         t2_thread_degister();
         return NULL;
@@ -4254,14 +4445,12 @@ static void crit_temp(struct maxwell_data *md) {
         }
 }
 
-static void *maxwelld(void *data) {
-        struct daemon_arg   *arg = data;
-        struct t2           *mod = arg->mod;
+static void *maxwelld(void *arg) {
+        struct t2           *mod = arg;
         struct cache        *c   = &mod->cache;
         struct maxwell_data *md  = c->md;
-        int32_t              pos = arg->idx;
+        int32_t              pos = 0;
         t2_thread_register();
-        mem_free(arg);
         md->delta = ARRAY_SIZE(md->window) >> 1;
         while (true) {
                 struct timespec end;
@@ -4269,7 +4458,7 @@ static void *maxwelld(void *data) {
                 int32_t         start = pos;
                 CINC(maxwell_iter);
                 while (true) {
-                        if (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!mod->shutdown)) {
+                        if (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!c->md_shutdown)) {
                                 crit_temp(md);
                                 pos = scan(mod, pos, SCAN_RUN, md->crittemp, md->critfrac);
                                 cache_sync(mod);
@@ -4281,7 +4470,7 @@ static void *maxwelld(void *data) {
                                 break;
                         }
                 }
-                if (UNLIKELY(mod->shutdown)) {
+                if (UNLIKELY(c->md_shutdown)) {
                         break;
                 }
                 result = WITH_LOCK(pthread_cond_timedwait(&c->want, &c->lock, deadline(0, PULSE_TICK, &end)), &c->lock);
@@ -4685,6 +4874,7 @@ static void queue_fini(struct queue *q) {
 static void queue_put_locked(struct queue *q, struct cds_list_head *item) {
         ASSERT(cds_list_empty(item));
         cds_list_add(item, &q->head);
+        ++q->head_nr;
         EXPENSIVE_ASSERT(!q->unordered ? queues_are_ordered(&q->head, NULL) : true);
 }
 
@@ -4695,18 +4885,24 @@ static void queue_put(struct queue *q, struct cds_list_head *item) {
 static void queue_steal(struct queue *q) {
         cds_list_splice(&q->head, &q->tail);
         CDS_INIT_LIST_HEAD(&q->head);
+        q->tail_nr += q->head_nr;
+        q->head_nr = 0;
         EXPENSIVE_ASSERT(!q->unordered ? queues_are_ordered(&q->head, &q->tail) : true);
+}
+
+static struct cds_list_head *queue_tryget(struct queue *q) {
+        if (cds_list_empty(&q->tail)) {
+                return NULL;
+        } else {
+                return q->tail.prev;
+        }
 }
 
 static struct cds_list_head *queue_get(struct queue *q) {
         if (cds_list_empty(&q->tail)) {
                 WITH_LOCK_VOID(queue_steal(q), &q->lock);
         }
-        if (cds_list_empty(&q->tail)) {
-                return NULL;
-        } else {
-                return q->tail.prev;
-        }
+        return queue_tryget(q);
 }
 
 static bool queue_is_empty(struct queue *q) {
@@ -4867,7 +5063,6 @@ static void counters_print(uint64_t flags) {
                 counter_var_print1(&GVAL(wal_page_sync_time),  "wal.page_sync_time:");
         }
         if (flags & T2_SF_SHEPHERD) {
-                counter_var_print1(&GVAL(briard_queue_length),  "briard.queue_len:");
         }
         if (flags & T2_SF_STASH) {
                 printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
@@ -4952,10 +5147,13 @@ static void counters_print(uint64_t flags) {
                 COUNTER_PRINT(shepherd_dequeued);
                 COUNTER_PRINT(shepherd_cleaned);
                 COUNTER_PRINT(briard_queued);
-                COUNTER_PRINT(briard_queued_cow);
                 COUNTER_PRINT(briard_dequeued);
                 COUNTER_PRINT(briard_wait);
                 COUNTER_PRINT(briard_wait_locked);
+                COUNTER_PRINT(buhund_queued);
+                COUNTER_PRINT(buhund_dequeued);
+                COUNTER_PRINT(buhund_wait);
+                COUNTER_PRINT(buhund_wait_locked);
                 COUNTER_VAR_PRINT(page_dirty_nr);
                 COUNTER_VAR_PRINT(page_lsn_diff);
                 COUNTER_VAR_PRINT(page_queue);
@@ -7608,6 +7806,11 @@ static bool wal_is_old(struct wal_te *en, const struct node *n) {
         return n->lsn_lo != 0 && n->lsn_hi - n->lsn_lo > (en->log_size >> 1); /* TODO: Make this a parameter. */
 }
 
+static lsn_t logsize(struct t2_te *te) {
+        struct wal_te *en = COF(te, struct wal_te, base);
+        return en->log_size;
+}
+
 static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype) {
         struct wal_te  *en = COF(engine, struct wal_te, base);
         struct wal_tx  *tx = COF(trax, struct wal_tx, base);
@@ -7676,8 +7879,8 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         for (int i = 0; i < nr; ++i) {
                 t2_lsnset(txr[i].node, tx->id);
         }
-        for (int i = 0; i < added; ++i) {
-                sh_add(add[i]);
+        if (LIKELY(added > 0)) {
+                sh_add(add, added);
         }
         mutex_unlock(&en->curlock);
         if (slow) {
@@ -7918,8 +8121,8 @@ static void wal_fini(struct t2_te *engine) {
         NOFAIL(pthread_mutex_destroy(&en->lock));
         NOFAIL(pthread_mutex_destroy(&en->curlock));
         stash_fini(&en->stash);
+        en->mod->te = NULL;
         mem_free(en);
-        en->mod = NULL;
 }
 
 struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
@@ -7938,18 +8141,18 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                 mem_free(fd);
                 return EPTR(-ENOMEM);
         }
-        en->base.ante    = &wal_ante;
-        en->base.init    = &wal_init;
-        en->base.post    = &wal_post;
-        en->base.quiesce = &wal_quiesce;
-        en->base.fini    = &wal_fini;
-        en->base.make    = &wal_make;
-        en->base.wait    = &wal_wait;
-        en->base.done    = &wal_done;
-        en->base.pinned  = &wal_pinned;
-        en->base.wantout = &wal_wantout;
-        en->base.print   = &wal_print;
-        en->base.name    = "wal";
+        en->base.ante     = &wal_ante;
+        en->base.init     = &wal_init;
+        en->base.post     = &wal_post;
+        en->base.quiesce  = &wal_quiesce;
+        en->base.fini     = &wal_fini;
+        en->base.make     = &wal_make;
+        en->base.wait     = &wal_wait;
+        en->base.done     = &wal_done;
+        en->base.pinned   = &wal_pinned;
+        en->base.throttle = &wal_throttle;
+        en->base.print    = &wal_print;
+        en->base.name     = "wal";
 
         CDS_INIT_LIST_HEAD(&en->ready);
         CDS_INIT_LIST_HEAD(&en->full);
@@ -8046,7 +8249,7 @@ static int wal_buf_replay(struct wal_te *en, void *space, int len) {
                                 if (!(n->flags & DIRTY)) {
                                         n->flags |= DIRTY;
                                         t2_lsnset((void *)n, lsn);
-                                        sh_add(n);
+                                        sh_add(&n, 1);
                                 }
                                 ASSERT(ncheck(n));
                                 unlock(n, WRITE);
@@ -8274,10 +8477,11 @@ static bool wal_pinned(const struct t2_te *engine, struct t2_node *n) {
         return t2_lsnget(n) >= en->max_persistent;
 }
 
-static bool wal_wantout(struct t2_te *engine, struct t2_node *n) {
-        struct wal_te *en = COF(engine, struct wal_te, base);
-        lsn_t lsn = t2_lsnget(n);
-        return lsn != 0 && lsn < en->min_want;
+static bool wal_throttle(const struct t2_te *engine, struct t2_node *nn) {
+        const struct wal_te *en     = COF(engine, struct wal_te, base);
+        struct node         *n      = (void *)nn;
+        lsn_t                spread = n->lsn_hi - n->lsn_lo;
+        return spread >= (en->log_size >> 1) || (n->lsn_lo == en->start && spread >= (en->log_size >> 2));
 }
 
 static bool wal_stop(struct t2_te *engine, struct t2_node *nn) {
@@ -8299,7 +8503,7 @@ static void wal_maxpaged(struct t2_te *te, lsn_t min) {
         struct wal_te *en = COF(te, struct wal_te, base);
         wal_lock(en);
         min = min_64(min, en->max_persistent);
-        ASSERT(min >= en->max_paged);
+        ASSERT(min >= en->max_paged || min == 0);
         if (min > en->max_paged) {
                 en->max_paged = min;
                 NOFAIL(pthread_cond_broadcast(&en->logwait));
@@ -9132,7 +9336,7 @@ static void insert_ut() {
         ASSERT(n != NULL && EISOK(n));
         t.root = n->addr;
         n->flags |= DIRTY;
-        sh_add(n);
+        sh_add(&n, 1);
         put(n);
         utest("insert-1");
         NOFAIL(t2_insert(&t, &r, NULL));
