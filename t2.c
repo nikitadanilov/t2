@@ -64,7 +64,7 @@ enum {
 #endif
 
 #if !defined(IOCACHE)
-#define IOCACHE (0)
+#define IOCACHE (1)
 #endif
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -370,7 +370,9 @@ struct pool {
 };
 
 enum {
-        BOLT_EPOCH_SHIFT =      16,
+        BOLT_EPOCH_SHIFT =      30,
+        MAXWELL_SHIFT    =      16,
+        MAX_TEMP         =    1024,
         EPOCH_DELTA      =       1,
         SCAN_RUN         = 1 << 10,
         WINDOW_SHIFT     =      16,
@@ -379,11 +381,11 @@ enum {
 
 struct maxwell_data {
         int32_t   pos;
-        int32_t   delta;
-        int32_t   histogram[1 << BOLT_EPOCH_SHIFT];
-        int32_t   window[1 << WINDOW_SHIFT];
-        int32_t   crittemp;
-        int32_t   critfrac;
+        uint32_t  delta;
+        uint32_t  histogram[MAX_TEMP];
+        uint32_t  window[1 << WINDOW_SHIFT];
+        uint32_t  crittemp;
+        uint32_t  critfrac;
         pthread_t thread;
 };
 
@@ -469,6 +471,8 @@ struct ioc {
 struct iocache {
         int32_t              shift;
         _Atomic(struct ioc) *entry;
+        int                  level;
+        size_t               bound[32];
 };
 
 struct slot;
@@ -841,6 +845,7 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_space_nob;
         struct counter_var wal_write_seg;
         struct counter_var wal_write_nob;
+        struct counter_var wal_write_rate;
         struct counter_var wal_ready;
         struct counter_var wal_full;
         struct counter_var wal_inflight;
@@ -879,7 +884,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
                 int64_t page_cached;
                 int64_t page_cow;
                 int64_t scan_skip_busy;
-                int64_t scan_skip_dirty;
                 int64_t scan_skip_hot;
                 int64_t scan_busy;
                 int64_t scan_dirty;
@@ -1008,7 +1012,6 @@ static void put(struct node *n);
 static void put_locked(struct node *n);
 static void ref(struct node *n);
 static void touch(struct node *n);
-static bool is_hot(struct node *n, int32_t crit);
 static uint64_t temperature(struct node *n);
 static uint64_t bolt(const struct node *n);
 static struct node *peek(struct t2 *mod, taddr_t addr);
@@ -1143,6 +1146,8 @@ static int iocache_init(struct iocache *ioc, int32_t shift);
 static void iocache_fini(struct iocache *ioc);
 static int iocache_put(struct iocache *ioc, struct node *n);
 static int iocache_get(struct iocache *ioc, struct node *n);
+static void iocache_thread_init(void);
+static void iocache_thread_fini(void);
 static void *stash_get(struct stash_local *sl);
 static void stash_put(struct stash_local *sl, void *unit);
 static void stash_init(struct stash *s, int nr, int size);
@@ -1157,13 +1162,14 @@ static void cookie_load(uint64_t *addr, struct t2_cookie *k);
 static void mutex_lock(pthread_mutex_t *lock);
 static void mutex_unlock(pthread_mutex_t *lock);
 static void cache_clean(struct t2 *mod);
+static int64_t cache_used(struct cache *c);
 static void *maxwelld(void *data);
 static void *shepherd(void *data);
 static void *briard(void *data);
 static void *buhund(void *arg);
 static int pageout_ctx_init(struct pageout_ctx *ctx, struct t2 *mod, int queue, int idx, int cow_shift);
 static void pageout_ctx_fini(struct pageout_ctx *ctx);
-static int sh_init(struct shepherd *sh, struct t2 *mod, int idx, int cow_shift);
+static int sh_init(struct shepherd *sh, struct t2 *mod, int idx, int cow_shift, int queue);
 static void sh_fini(struct shepherd *sh);
 static void sh_add(struct node **n, int nr);
 static void sh_broadcast(struct t2 *mod);
@@ -1177,7 +1183,7 @@ static void cache_pulse(struct t2 *mod);
 static int pageout(struct node *n, struct pageout_ctx *ctx);
 static void kmod(struct ewma *a, uint32_t t, int32_t nr);
 static uint64_t kavg(struct ewma *a, uint32_t t);
-static uint64_t krate(struct ewma *a, uint32_t t);
+static uint32_t krate(struct ewma *a, uint32_t t);
 static void ref_add(struct node *n);
 static void ref_del(struct node *n);
 static void ref_print(void);
@@ -1325,6 +1331,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
         SETIF0DEFAULT(flags, param, conf.max_cluster,           DEFAULT_MAX_CLUSTER,     "d");
         SETIF0DEFAULT(flags, param, conf.cshift,                DEFAULT_CSHIFT,          "d");
         SETIF0       (flags, param, conf.hshift,                param->conf.cshift,      "d", "sized to cache");
+        SETIF0       (flags, param, conf.ishift,                param->conf.cshift,      "d", "sized to cache");
         SETIF0DEFAULT(flags, param, conf.min_radix_level,       DEFAULT_MIN_RADIX_LEVEL, "d");
         SETIF0DEFAULT(flags, param, conf.cache_shepherd_shift,  DEFAULT_SHEPHERD_SHIFT,  "d");
         SETIF0DEFAULT(flags, param, conf.cache_briard_shift,    DEFAULT_BRIARD_SHIFT,    "d");
@@ -1352,7 +1359,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         struct cache        *c;
         struct pool         *p;
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
-        if (conf->hshift <= 0 || conf->cshift <= 0 || conf->min_radix_level < 0 || conf->cache_shepherd_shift < 0 || conf->cache_briard_shift < 0 ||
+        if (conf->hshift <= 0 || conf->cshift <= 0 || conf->ishift < 0 || conf->min_radix_level < 0 || conf->cache_shepherd_shift < 0 || conf->cache_briard_shift < 0 ||
             conf->cache_shepherd_shift + conf->cache_briard_shift > 32 || conf->max_cluster <= 0 || conf->scan_run < 0) {
                 return EPTR(-EINVAL);
         }
@@ -1397,7 +1404,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         next_stage(mod, true, POOL);
         NEXT_STAGE(mod, ht_init(&mod->ht, conf->hshift), HT_INIT);
         NEXT_STAGE(mod, SCALL(mod, init), STORAGE_INIT);
-        NEXT_STAGE(mod, iocache_init(&mod->ioc, conf->cshift), IOCACHE_INIT);
+        NEXT_STAGE(mod, iocache_init(&mod->ioc, conf->ishift), IOCACHE_INIT);
         NEXT_STAGE(mod, cache_init(mod, conf), CACHE_INIT);
         NEXT_STAGE(mod, TXCALL(conf->te, init(conf->te, mod)), TX_INIT);
         return mod;
@@ -1507,9 +1514,7 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                 printf("\n%15s bolt: %8"PRId64, "cache:", c->bolt);
         }
         if (flags & T2_SF_POOL) {
-                enum {
-                        HIST_BUCKETS = 16,
-                };
+                int hist_buckets = ilog2(ARRAY_SIZE(c->md->histogram)) + 1;
                 printf("\n%15s", "free-lists:");
                 for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
                         printf(" %8i", i);
@@ -1528,7 +1533,7 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                 }
                 printf("\n%15s", "rate:");
                 for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
-                        printf(" %8"PRId64, krate(&c->pool.rate[i], c->bolt >> BOLT_EPOCH_SHIFT));
+                        printf(" %8"PRId32, krate(&c->pool.rate[i], c->bolt >> MAXWELL_SHIFT));
                 }
                 printf("\n%15s ", "pressure:");
                 for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
@@ -1537,11 +1542,11 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                         printf(" %7i%s", pressure, underpressure ? "*" : " ");
                 }
                 printf("\n\n%15s %8i", "temperature:", 0);
-                for (int i = 0; i < HIST_BUCKETS; ++i) {
+                for (int i = 0; i < hist_buckets; ++i) {
                         printf(" %8i", 1 << i);
                 }
                 printf("\n%15s %8i", "count:", c->md->histogram[0]);
-                for (int i = 0, pos = 1; i < HIST_BUCKETS; ++i) {
+                for (int i = 0, pos = 1; i < hist_buckets; ++i) {
                         int32_t sum = 0;
                         while (pos <= (1 << i)) {
                                 sum += c->md->histogram[pos++];
@@ -1648,10 +1653,12 @@ void t2_thread_register() {
         ASSERT(!thread_registered);
         urcu_memb_register_thread();
         thread_registered = true;
+        iocache_thread_init();
 }
 
 void t2_thread_degister() {
         ASSERT(thread_registered);
+        iocache_thread_fini();
         urcu_memb_unregister_thread();
         counters_fold();
         thread_registered = false;
@@ -3112,7 +3119,7 @@ static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
                 uint64_t epoch;
                 mutex_lock(&c->lock);
                 c->bolt += ci.touched;
-                epoch = c->bolt >> BOLT_EPOCH_SHIFT;
+                epoch = c->bolt >> MAXWELL_SHIFT;
                 if (ci.anr != 0) {
                         for (int i = 0; i < ARRAY_SIZE(c->pool.free); ++i) {
                                 if (ci.allocated[i] > 0) {
@@ -3585,7 +3592,7 @@ static int cache_init0(struct t2 *mod, const struct t2_conf *conf) {
         }
         for (c->buhund_nr = 0; c->buhund_nr < buhund_nr; ++c->buhund_nr) {
                 struct shepherd *sh = &c->buhund[c->buhund_nr];
-                if ((result = sh_init(sh, mod, c->buhund_nr, 0)) != 0) {
+                if ((result = sh_init(sh, mod, c->buhund_nr, 0, IO_QUEUE)) != 0) {
                         return ERROR(result);
                 }
                 sh->queue.unordered = true;
@@ -3598,7 +3605,7 @@ static int cache_init0(struct t2 *mod, const struct t2_conf *conf) {
         }
         for (c->briard_nr = 0; c->briard_nr < briard_nr; ++c->briard_nr) {
                 struct shepherd *sh = &c->briard[c->briard_nr];
-                if ((result = sh_init(sh, mod, c->briard_nr, c->buhund_shift - c->briard_shift)) != 0) {
+                if ((result = sh_init(sh, mod, c->briard_nr, c->buhund_shift - c->briard_shift, IO_QUEUE)) != 0) {
                         return ERROR(result);
                 }
         }
@@ -3609,8 +3616,8 @@ static int cache_init0(struct t2 *mod, const struct t2_conf *conf) {
                 return ERROR(-ENOMEM);
         }
         for (c->sh_nr = 0; c->sh_nr < sh_nr; ++c->sh_nr) {
-                struct shepherd *sh = &c->sh[c->sh_nr];
-                if ((result = sh_init(sh, mod, c->sh_nr, c->buhund_shift - c->sh_shift)) != 0) {
+                struct shepherd *sh = &c->sh[c->sh_nr]; /* Shepherds do most writes, give them larger queue. */
+                if ((result = sh_init(sh, mod, c->sh_nr, c->buhund_shift - c->sh_shift, 8 * IO_QUEUE)) != 0) {
                         return ERROR(result);
                 }
         }
@@ -3677,10 +3684,6 @@ static void cache_fini(struct t2 *mod) {
         mem_free(c->md);
 }
 
-static bool is_hot(struct node *n, int32_t crit) {
-        return krate(&nheader(n)->kelvin, bolt(n)) > (uint64_t)crit;
-}
-
 static bool pinned(const struct node *n, const struct t2_te *te) {
         return TXCALL(te, pinned(te, (void *)n));
 }
@@ -3745,8 +3748,9 @@ static int pageout_ctx_init(struct pageout_ctx *ctx, struct t2 *mod, int queue, 
                 ASSERT(pageout_ctx_invariant(ctx));
                 return 0;
         } else {
+                int err = ERROR(ERRCODE(ctx->ctx));
                 ctx->ctx = NULL;
-                return ERROR(ERRCODE(ctx->ctx));
+                return err;
         }
 }
 
@@ -4000,10 +4004,10 @@ static bool sh_invariant(struct shepherd *sh) {
                                                                                        sh_list_min(&sh->ctx.inflight)) : true), &sh->queue.lock);
 }
 
-static int sh_init(struct shepherd *sh, struct t2 *mod, int idx, int cow_shift) {
+static int sh_init(struct shepherd *sh, struct t2 *mod, int idx, int cow_shift, int queue) {
         queue_init(&sh->queue);
         NOFAIL(pthread_cond_init(&sh->wantclean, NULL));
-        return pageout_ctx_init(&sh->ctx, mod, IO_QUEUE, idx, cow_shift);
+        return pageout_ctx_init(&sh->ctx, mod, queue, idx, cow_shift);
 }
 
 static void sh_fini(struct shepherd *sh) {
@@ -4031,7 +4035,7 @@ static void sh_broadcast(struct t2 *mod) {
 }
 
 static void sh_print(const struct shepherd *sh) {
-        printf("[%6"PRId64" : %6d + %6d : %6d / %8"PRId64"] ", sh->min, sh->queue.head_nr, sh->queue.tail_nr, sh->ctx.used, sh->ctx.cleaned);
+        printf("[%8"PRId64" : %8d + %8d : %5d / %10"PRId64"] ", sh->min, sh->queue.head_nr, sh->queue.tail_nr, sh->ctx.used, sh->ctx.cleaned);
 }
 
 static void sh_add(struct node **nn, int nr) {
@@ -4103,7 +4107,7 @@ static void sh_wait(struct shepherd *sh) {
         sh->idle = false;
 }
 
-static bool sh_wait_next(struct shepherd *sh, bool update_min) {
+static bool sh_wait_next_locked(struct shepherd *sh, bool update_min) {
         struct queue *q = &sh->queue;
         if (UNLIKELY(sh->ctx.used == 0 && !sh->ctx.mod->cache.sh_shutdown)) {
                 sh_wait(sh);
@@ -4122,6 +4126,11 @@ static bool sh_wait_next(struct shepherd *sh, bool update_min) {
         return true;
 }
 
+static bool sh_wait_next(struct shepherd *sh, bool update_min) {
+        mutex_lock(&sh->queue.lock);
+        return sh_wait_next_locked(sh, update_min);
+}
+
 static struct node *sh_next(struct shepherd *sh) {
         struct queue         *q    = &sh->queue;
         struct cds_list_head *item = queue_tryget(q);
@@ -4131,7 +4140,7 @@ static struct node *sh_next(struct shepherd *sh) {
                 queue_steal(q);
                 item = queue_tryget(q);
                 if (UNLIKELY(item == NULL)) {
-                        if (UNLIKELY(!sh_wait_next(sh, true))) {
+                        if (UNLIKELY(!sh_wait_next_locked(sh, true))) {
                                 return NULL;
                         }
                         continue;
@@ -4150,7 +4159,6 @@ static void *shepherd(void *arg) { /* Matthew 25:32, but a dog. */
         struct pageout_ctx *ctx  = &self->ctx;
         struct t2          *mod  = ctx->mod;
         struct cache       *c    = &mod->cache;
-        struct queue       *q    = &self->queue;
         int                 dlt  = c->briard_shift - c->sh_shift;
         t2_thread_register();
         while (true) {
@@ -4160,11 +4168,9 @@ static void *shepherd(void *arg) { /* Matthew 25:32, but a dog. */
                 if (UNLIKELY(n == NULL)) {
                         break;
                 }
-                while (TXCALL(te, stop(te, (void *)n))) {
+                while (TXCALL(te, stop(te, (void *)n)) && LIKELY(sh_wait_next(self, true))) {
                         NINC(n, shepherd_stopped); /* TODO: Race window. */
                         ASSERT(!c->sh_shutdown);
-                        mutex_lock(&q->lock);
-                        sh_wait_next(self, true);
                 }
                 NINC(n, shepherd_dequeued);
                 cds_list_del_init(&n->free);
@@ -4201,7 +4207,6 @@ static void *briard(void *arg) {
         struct shepherd    *self = arg;
         struct pageout_ctx *ctx  = &self->ctx;
         struct t2          *mod  = ctx->mod;
-        struct queue       *q    = &self->queue;
         struct cache       *c    = &mod->cache;
         t2_thread_register();
         while (true) {
@@ -4211,9 +4216,8 @@ static void *briard(void *arg) {
                 if (UNLIKELY(n == NULL && c->sh_nr == 0)) {
                         break; /* Exit only after all shepherds did. */
                 }
-                while (!canpage(n, te) && !TXCALL(te, throttle(te, (void *)n)) && LIKELY(!c->sh_shutdown)) {
-                        mutex_lock(&q->lock);
-                        sh_wait_next(self, true);
+                while (!canpage(n, te) && !TXCALL(te, throttle(te, (void *)n)) && LIKELY(sh_wait_next(self, true))) {
+                        ;
                 }
                 NINC(n, briard_dequeued);
                 cds_list_del_init(&n->free);
@@ -4270,7 +4274,6 @@ static void *buhund(void *arg) { /* For cows and eio. */
                         if (c->sh_shutdown && c->sh_nr == 0) {
                                 break; /* Exit only after all shepherds did. */
                         }
-                        mutex_lock(&q->lock);
                         sh_wait_next(self, false);
                         continue;
                 }
@@ -4339,10 +4342,19 @@ static void *pulse(void *arg) {
 static void cache_pulse(struct t2 *mod) {
 }
 
+static int64_t cache_used_at(struct cache *c, int i) {
+        struct freelist *free = &c->pool.free[i];
+        return free->total - free->avail - free->nr;
+}
+
+static int64_t cache_used(struct cache *c) {
+        return REDUCE(i, ARRAY_SIZE(c->pool.free), 0ull, + cache_used_at(c, i));
+}
+
 static bool enough(struct cache *c, int i) {
         int dummy;
         struct freelist *free = &c->pool.free[i];
-        return  (uint64_t)free->avail + free->nr >= 2 * EPOCH_DELTA * krate(&c->pool.rate[i], c->bolt >> BOLT_EPOCH_SHIFT) + 1 &&
+        return  (uint64_t)free->avail + free->nr >= 2 * EPOCH_DELTA * krate(&c->pool.rate[i], c->bolt >> MAXWELL_SHIFT) + 1 &&
                 !stress(free, &dummy);
 }
 
@@ -4391,8 +4403,6 @@ static void scan_bucket(struct t2 *mod, int32_t pos, int32_t crit, int32_t frac)
         mod->cache.md->window[mod->cache.md->pos++ & MASK(WINDOW_SHIFT)] = t; \
         if (UNLIKELY(n->ref != 0)) {                                    \
                 CINC(l[L].scan_skip_busy);                              \
-        } else if (n->flags & DIRTY) {                                  \
-                CINC(l[L].scan_skip_dirty);                             \
         } else if (is_hotter(t, crit, frac, ++fracpos)) {               \
                 CINC(l[L].scan_skip_hot);                               \
         } else {                                                        \
@@ -4425,15 +4435,15 @@ static int32_t scan(struct t2 *mod, int32_t pos, int32_t nr, int32_t crit, int32
 }
 
 static void crit_temp(struct maxwell_data *md) {
-        int32_t sum = 0;
-        int32_t t;
+        uint32_t sum = 0;
+        uint32_t t;
         if (md->pos >= ARRAY_SIZE(md->window)) {
                 memset(md->histogram, 0, SOF(md->histogram));
                 for (int32_t i = 0; i < ARRAY_SIZE(md->window); ++i) {
-                        ++md->histogram[md->window[i]];
+                        ++md->histogram[min_32(md->window[i], ARRAY_SIZE(md->histogram) - 1)];
                 }
                 for (t = 0; t < ARRAY_SIZE(md->histogram); ++t) {
-                        int32_t nr = md->histogram[t];
+                        uint32_t nr = md->histogram[t];
                         if (sum + nr > md->delta) {
                                 md->critfrac = (((int64_t)md->delta - sum) << CRIT_FRAC_SHIFT) / nr;
                                 break;
@@ -4489,11 +4499,20 @@ static void *maxwelld(void *arg) {
 
 /* @iocache */
 
+static __thread struct iocache_ctx {
+        ZSTD_CCtx *comp;
+        ZSTD_DCtx *decomp;
+} iocache_ctx;
+
 static int iocache_init(struct iocache *ioc, int32_t shift) {
-        if (IOCACHE) {
+        ioc->shift = shift;
+        if (IOCACHE && shift > 0) {
                 ioc->entry = mem_alloc(sizeof ioc->entry[0] << shift);
                 if (ioc->entry != NULL) {
-                        ioc->shift = shift;
+                        ioc->level = 1; /* ZSTD_CLEVEL_DEFAULT; */ /* TODO: ZSTD_defaultCLevel() in zstd v1.5.0. */
+                        for (int i = 0; i < ARRAY_SIZE(ioc->bound); ++i) {
+                                ioc->bound[i] = ZSTD_compressBound(1 << i);
+                        }
                         return 0;
                 } else {
                         return ERROR(-ENOMEM);
@@ -4504,7 +4523,7 @@ static int iocache_init(struct iocache *ioc, int32_t shift) {
 }
 
 static void iocache_fini(struct iocache *ioc) {
-        if (IOCACHE) {
+        if (IOCACHE && ioc->shift > 0) {
                 for (int32_t i = 0; i < (1 << ioc->shift); ++i) {
                         mem_free(((struct ioc *)&ioc->entry[i])->data);
                 }
@@ -4512,11 +4531,25 @@ static void iocache_fini(struct iocache *ioc) {
         }
 }
 
+static void iocache_thread_init(void) {
+        iocache_ctx.comp   = ZSTD_createCCtx();
+        iocache_ctx.decomp = ZSTD_createDCtx();
+}
+
+static void iocache_thread_fini(void) {
+        ZSTD_freeCCtx(iocache_ctx.comp);
+        ZSTD_freeDCtx(iocache_ctx.decomp);
+}
+
 static int iocache_put(struct iocache *ioc, struct node *n) {
-        if (IOCACHE) {
-                size_t maxsize = ZSTD_compressBound(taddr_ssize(n->addr));
+        if (IOCACHE && LIKELY(ioc->shift > 0)) {
+                int    shift   = taddr_sshift(n->addr);
+                int    nsize   = taddr_ssize(n->addr);
+                size_t maxsize = ioc->bound[shift];
                 void  *area    = alloca(maxsize);
-                size_t size    = ZSTD_compress(area, maxsize, n->data, taddr_ssize(n->addr), 1);
+                size_t size    = LIKELY(iocache_ctx.comp != NULL) ?
+                        ZSTD_compressCCtx(iocache_ctx.comp, area, maxsize, n->data, nsize, ioc->level) :
+                        ZSTD_compress(area, maxsize, n->data, nsize, ioc->level);
                 CINC(ioc_put);
                 if (LIKELY(!ZSTD_isError(size))) {
                         void *data = mem_alloc(size + 4);
@@ -4528,20 +4561,20 @@ static int iocache_put(struct iocache *ioc, struct node *n) {
                                 *(int32_t *)data = (int32_t)size;
                                 have = atomic_load(slot);
                                 while (UNLIKELY(!atomic_compare_exchange_weak(slot, &have, want))) {
-                                        ; /* TODO: Is there an ABA possibility here? */
+                                        ; /* No-ABA here. */
                                 }
                                 ASSERT(have.addr != n->addr);
                                 if (have.addr != 0) {
                                         CINC(ioc_conflict);
                                         mem_free(have.data);
                                 }
-                                CMOD(ioc_ratio, (size << 10) >> taddr_sshift(n->addr));
+                                CMOD(ioc_ratio, (size << 10) >> shift);
                                 return 0;
                         } else {
                                 return ERROR(-ENOMEM);
                         }
                 } else {
-                        return ERROR_INFO(-EINVAL, "ZSTD_compress() fails with %lu", (long unsigned)size, 0);
+                        return ERROR_INFO(-EINVAL, "ZSTD_compress() fails with %s (%lu)", ZSTD_getErrorName(size), (long unsigned)size);
                 }
         } else {
                 return 0;
@@ -4549,11 +4582,12 @@ static int iocache_put(struct iocache *ioc, struct node *n) {
 }
 
 static int iocache_get(struct iocache *ioc, struct node *n) {
-        if (IOCACHE) {
+        if (IOCACHE && LIKELY(ioc->shift > 0)) {
                 _Atomic(struct ioc) *slot = &ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)];
                 if (((struct ioc *)slot)->addr == n->addr) {
-                        struct ioc want = {};
-                        struct ioc have = atomic_load(slot);
+                        int        nsize = taddr_ssize(n->addr);
+                        struct ioc want  = {};
+                        struct ioc have  = atomic_load(slot);
                         size_t     size;
                         do {
                                 if (have.addr != n->addr) {
@@ -4562,13 +4596,15 @@ static int iocache_get(struct iocache *ioc, struct node *n) {
                                 }
                         } while (UNLIKELY(!atomic_compare_exchange_weak(slot, &have, want)));
                         CINC(ioc_hit);
-                        size = ZSTD_decompress(n->data, taddr_ssize(n->addr), have.data + 4, *(int32_t *)have.data);
+                        size = LIKELY(iocache_ctx.decomp != NULL) ?
+                                ZSTD_decompressDCtx(iocache_ctx.decomp, n->data, nsize, have.data + 4, *(int32_t *)have.data) :
+                                ZSTD_decompress(n->data, nsize, have.data + 4, *(int32_t *)have.data);
                         mem_free(have.data);
                         if (LIKELY(!ZSTD_isError(size))) {
-                                ASSERT((int32_t)size == taddr_ssize(n->addr));
+                                ASSERT((int32_t)size == nsize);
                                 return 0;
                         } else {
-                                return ERROR_INFO(-EINVAL, "ZSTD_decompress() fails with %lu", (long unsigned)size, 0);
+                                return ERROR_INFO(-EINVAL, "ZSTD_decompress() fails with %s (%lu)", ZSTD_getErrorName(size), (long unsigned)size);
                         }
                 } else {
                         CINC(ioc_miss);
@@ -5026,6 +5062,7 @@ static void counters_print(uint64_t flags) {
                 printf("wal.write_sync:      %10"PRId64"\n", GVAL(wal_write_sync));
                 counter_var_print1(&GVAL(wal_write_seg), "wal.write_seg:");
                 counter_var_print1(&GVAL(wal_write_nob), "wal.write_nob:");
+                counter_var_print1(&GVAL(wal_write_rate), "wal.write_rate:");
                 printf("wal.cur_aged:        %10"PRId64"\n", GVAL(wal_cur_aged));
                 printf("wal.cur_aged_skip:   %10"PRId64"\n", GVAL(wal_cur_aged_skip));
                 printf("wal.snapshot:        %10"PRId64"\n", GVAL(wal_snapshot));
@@ -5160,7 +5197,6 @@ static void counters_print(uint64_t flags) {
         }
         if (flags & T2_SF_MAXWELL) {
                 COUNTER_PRINT(scan_skip_busy);
-                COUNTER_PRINT(scan_skip_dirty);
                 COUNTER_PRINT(scan_skip_hot);
                 COUNTER_PRINT(scan_busy);
                 COUNTER_PRINT(scan_dirty);
@@ -5488,10 +5524,10 @@ static struct node *ht_lookup(struct ht *ht, taddr_t addr, uint32_t bucket) {
         struct cds_hlist_node *scan = rcu_dereference(head->next);
         struct node           *n;
 #define CHAINLINK do {                                                    \
+        CINC(chain);                                                      \
         n = COF(scan, struct node, hash);                                 \
         if (LIKELY(n->addr == addr && (n->flags & HEARD_BANSHEE) == 0)) { \
                 __builtin_prefetch(n->data);                              \
-                CINC(chain);                                              \
                 return n;                                                 \
         }                                                                 \
         scan = rcu_dereference(scan->next);                               \
@@ -5552,6 +5588,7 @@ static bool stress(struct freelist *free, int *pressure) {
 }
 
 static void pool_throttle(struct t2 *mod, struct freelist *free, taddr_t addr) {
+        return;
         int pressure;
         if (stress(free, &pressure)) {
                 int32_t rate   = SCAN_RATE_SHIFT - pressure / (32 / SCAN_RATE_SHIFT);
@@ -5569,8 +5606,8 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
         struct freelist *free = &c->pool.free[idx];
         struct node     *n    = NULL;
         pool_throttle(mod, free, addr);
+        mutex_lock(&free->lock);
         if (LIKELY(free->avail == 0)) {
-                mutex_lock(&free->lock);
                 while (UNLIKELY(free->nr == 0)) {
                         NOFAIL(pthread_cond_broadcast(&c->want));
                         NOFAIL(pthread_cond_wait(&free->got, &free->lock));
@@ -5594,7 +5631,6 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr) {
                         n->radix->prefix.len = -1;
                 }
         } else {
-                mutex_lock(&free->lock);
                 --free->avail;
                 mutex_unlock(&free->lock);
         }
@@ -5639,8 +5675,8 @@ static uint64_t kavg(struct ewma *a, uint32_t t) { /* Typical unit: quarter of n
         return ((uint64_t)kval(a) << (63 - BOLT_EPOCH_SHIFT)) >> min_32(t - a->cur, 63);
 }
 
-static uint64_t krate(struct ewma *a, uint32_t t) {
-        return (uint64_t)kval(a) >> min_32(t - a->cur, 63);
+static uint32_t krate(struct ewma *a, uint32_t t) {
+        return kval(a) >> min_32(t - a->cur, 31);
 }
 
 /* @buf */
@@ -7405,6 +7441,7 @@ struct wal_te {
         int                                    full_nr;
         int                                    ready_nr;
         int                                    inflight_nr;
+        int                                    direct_write;
         pthread_cond_t                         logwait;
         pthread_cond_t                         bufwait;
         pthread_cond_t                         bufwrite;
@@ -7629,6 +7666,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         off_t          off;
         int            idx;
         int            rem;
+        uint64_t       start;
         ASSERT(wal_log_free(en) > 0);
         header = (struct wal_rec) {
                 .magix = REC_MAGIX,
@@ -7667,6 +7705,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         idx = 0;
         rem = buf->used + 1;
         result = 0;
+        start = COUNTERS ? READ_ONCE(en->mod->tick) : 0;
         do {
                 int chunk = min_32(rem, WAL_MAX_IOV);
                 int rc    = pwritev(fd, &buf->seg[idx], chunk, off);
@@ -7683,6 +7722,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 lsn_t              lsn;
                 struct wal_buf    *scan;
                 struct stash_local sl = {};
+                CMOD(wal_write_rate, (READ_ONCE(en->mod->tick) - start) / result);
                 stash_local_init(&sl, &en->stash);
                 wal_buf_release(buf, &sl);
                 stash_local_fini(&sl);
@@ -7701,7 +7741,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                         en->start_written = max_64(en->start_written, header.u.header.start);
                         NOFAIL(pthread_cond_broadcast(&en->logwait));
                 }
-                NOFAIL(pthread_cond_signal(&en->bufwait));
+                NOFAIL(pthread_cond_broadcast(&en->bufwait));
         } else { /* TODO: Handle list linkage. */
                 LOG("Log write failure %s+%"PRId64"+%"PRId64": %i/%i.", en->logname, buf->lsn, buf->nob, result, errno);
                 result = ERROR(result < 0 ? -errno : -EIO);
@@ -7864,8 +7904,10 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         if (slow) {
                 mutex_unlock(&en->curlock);
                 wal_lock(en);
-                if (en->ready_nr <= en->ready_lo) {
+                if (en->ready_nr + en->direct_write <= en->ready_lo) {
+                        ++en->direct_write;
                         wal_progress(en, LOG_WRITE, 1, 0);
+                        --en->direct_write;
                 }
                 mutex_lock(&en->curlock);
                 wal_get(en, size);
@@ -8041,6 +8083,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
                 }
         }
         cache_sync(en->mod);
+        counters_fold();
         return done > 0;
 }
 
@@ -8485,9 +8528,11 @@ static bool wal_throttle(const struct t2_te *engine, struct t2_node *nn) {
 }
 
 static bool wal_stop(struct t2_te *engine, struct t2_node *nn) {
-        struct wal_te *en = COF(engine, struct wal_te, base);
-        struct node *n = (void *)nn;
-        return n->lsn_lo >= en->max_persistent;
+        struct wal_te *en  = COF(engine, struct wal_te, base);
+        struct node   *n   = (void *)nn;
+        struct cache  *c   = &en->mod->cache;
+        lsn_t          lim = en->max_paged + (cache_used(c) * (en->max_persistent - en->max_paged) >> c->shift);
+        return n->lsn_lo >= lim;
 }
 
 static bool wal_check(const struct t2_te *engine, struct t2_node *nn) {
@@ -8553,7 +8598,6 @@ static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *
                 }
                 result = wal_cond_timedwait(en, cond, deadline(sleep_sec, sleep_nsec, &end));
                 ASSERT(result == 0 || result == ETIMEDOUT);
-                counters_fold();
         }
         wal_unlock(en);
         t2_thread_degister();
@@ -8843,10 +8887,10 @@ static void file_done(struct t2_storage *storage, struct t2_io_ctx *arg) {
 }
 
 static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
-        struct file_storage *fs    = COF(storage, struct file_storage, gen);
-        uint64_t             off   = frag_off(taddr_saddr(addr));
-        int                  fr    = frag(fs, addr);
-        struct file_ctx     *ctx   = (void *)ioctx;
+        struct file_storage *fs  = COF(storage, struct file_storage, gen);
+        uint64_t             off = frag_off(taddr_saddr(addr));
+        int                  fr  = frag(fs, addr);
+        struct file_ctx     *ctx = (void *)ioctx;
         int                  result;
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
         if (UNLIKELY(fr > FRAG_NR)) {

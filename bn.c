@@ -394,6 +394,7 @@ static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var, ui
 
 static int ht_shift = 20;
 static int cache_shift = 22;
+static int ioc_shift = 22;
 static int counters_level = 0;
 static int shift_internal = 9;
 static int shift_twig     = 9;
@@ -670,21 +671,21 @@ enum {
         FLAGS      = 0, /* noforce-nosteal == redo only. */
         MIN_RADIX_LEVEL = 2,
         MAX_CLUSTER = 256,
-        SHEPHERD_SHIFT          =          2,
-        BRIARD_SHIFT            =          4,
-        BUHUND_SHIFT            =          4,
-        WAL_WORKERS             =          1,
-        WAL_LOG_SHIFT           =          0,
+        SHEPHERD_SHIFT          =          0,
+        BRIARD_SHIFT            =          0,
+        BUHUND_SHIFT            =          0,
+        WAL_WORKERS             =          6,
+        WAL_LOG_SHIFT           =          1,
         WAL_AGE_LIMIT           =    BILLION,
         WAL_SYNC_AGE            =    BILLION / 100,
         WAL_SYNC_NOB            = 1ull <<  4,
-        WAL_LOG_SIZE            = 1ull << 14,
+        WAL_LOG_SIZE            = 1ull << 17,
         WAL_RESERVE_QUANTUM     =         64,
         WAL_THRESHOLD_PAGED     =        512,
         WAL_THRESHOLD_PAGE      =        128,
         WAL_THRESHOLD_LOG_SYNCD =         64,
         WAL_THRESHOLD_LOG_SYNC  =         32,
-        WAL_READY_LO            =          2
+        WAL_READY_LO            =         -1
 };
 
 const double LOG_SLEEP = 1.0;
@@ -732,6 +733,7 @@ static void t_mount(struct benchmark *b) {
                                                            .te = engine,
                                                            .hshift = ht_shift,
                                                            .cshift = cache_shift,
+                                                           .ishift = ioc_shift,
                                                            .cache_shepherd_shift = SHEPHERD_SHIFT,
                                                            .cache_briard_shift = BRIARD_SHIFT,
                                                            .cache_buhund_shift = BUHUND_SHIFT,
@@ -1047,7 +1049,7 @@ int main(int argc, char **argv) {
 #if USE_MAP
         kv[MAP] = mapkv;
 #endif
-        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:C:KMF:")) != -1) {
+        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:I:C:KMF:")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -1075,6 +1077,9 @@ int main(int argc, char **argv) {
                         break;
                 case 'C':
                         cache_shift = atoi(optarg);
+                        break;
+                case 'I':
+                        ioc_shift = atoi(optarg);
                         break;
                 case 'c':
                         counters_level++;

@@ -31,6 +31,7 @@ struct t2_conf {
         struct t2_te         *te;
         int                   hshift;
         int                   cshift;
+        int                   ishift;
         int                   min_radix_level;
         int                   cache_shepherd_shift;
         int                   cache_briard_shift;
