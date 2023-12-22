@@ -392,6 +392,14 @@ static void var_fold(struct bphase *ph, struct bthread *bt, struct bvar *var, ui
         SET0(var);
 }
 
+enum {
+        STEAL = 1 << 0, /* Undo needed. */
+        FORCE = 1 << 1, /* Redo not needed. */
+        MAKE  = 1 << 2, /* Delete existing log. */
+        KEEP  = 1 << 3, /* Do not truncate the log on finalisation. */
+        FILL  = 1 << 4  /* Pre-fill the journal. */
+};
+
 static int ht_shift = 20;
 static int cache_shift = 22;
 static int ioc_shift = 22;
@@ -400,8 +408,7 @@ static int shift_internal = 9;
 static int shift_twig     = 9;
 static int shift_leaf     = 9;
 static int report_interval = 10;
-static bool keep = false;
-static bool make = true;
+static int wal_flags = MAKE; /* noforce-nosteal == redo only. */
 static uint64_t stats_flags = ~0ull;
 
 static struct t2_node_type *bn_ntype_internal;
@@ -668,7 +675,6 @@ enum {
         BILLION    = 1000000000,
         NR_BUFS    = 200,
         BUF_SIZE   = 1 << 20,
-        FLAGS      = 0, /* noforce-nosteal == redo only. */
         MIN_RADIX_LEVEL = 2,
         MAX_CLUSTER = 256,
         SHEPHERD_SHIFT          =          0,
@@ -679,7 +685,7 @@ enum {
         WAL_AGE_LIMIT           =    BILLION,
         WAL_SYNC_AGE            =    BILLION / 100,
         WAL_SYNC_NOB            = 1ull <<  4,
-        WAL_LOG_SIZE            = 1ull << 17,
+        WAL_LOG_SIZE            = 1ull << 14,
         WAL_RESERVE_QUANTUM     =         64,
         WAL_THRESHOLD_PAGED     =        512,
         WAL_THRESHOLD_PAGE      =        128,
@@ -690,18 +696,11 @@ enum {
 
 const double LOG_SLEEP = 1.0;
 
-enum {
-        STEAL = 1 << 0, /* Undo needed. */
-        FORCE = 1 << 1, /* Redo not needed. */
-        MAKE  = 1 << 2, /* Delete existing log. */
-        KEEP  = 1 << 3  /* Do not truncate the log on finalisation. */
-};
-
 static const char logname[] = "./log/l";
 static bool transactions = false;
 
 static void t_mount(struct benchmark *b) {
-        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, FLAGS|(make ? MAKE : 0)|(keep ? KEEP : 0), WAL_WORKERS, WAL_LOG_SHIFT, LOG_SLEEP, WAL_AGE_LIMIT,
+        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, wal_flags, WAL_WORKERS, WAL_LOG_SHIFT, LOG_SLEEP, WAL_AGE_LIMIT,
                                                        WAL_SYNC_AGE, WAL_SYNC_NOB, WAL_LOG_SIZE, WAL_RESERVE_QUANTUM,
                                                        WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO) : NULL;
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
@@ -717,7 +716,7 @@ static void t_mount(struct benchmark *b) {
                 &bn_ttype,
                 NULL
         };
-        if (b->kv.u.t2.root == 0 && !make) {
+        if (b->kv.u.t2.root == 0 && !(wal_flags & MAKE)) {
                 FILE *seg = fopen("bn.seg", "r");
                 if (seg != NULL) {
                         int nr = fscanf(seg, "%"SCNx64" %"SCNx64" %"SCNx64,
@@ -769,7 +768,7 @@ static void t_umount(struct benchmark *b) {
         t2_node_type_fini(bn_ntype_twig);
         t2_node_type_fini(bn_ntype_leaf);
         mod = NULL;
-        if (keep) {
+        if (wal_flags & KEEP) {
                 FILE *seg = fopen("bn.seg", "w");
                 if (seg != NULL) {
                         fprintf(seg, "%"PRIx64" %"PRIx64" %"PRIx64, b->kv.u.t2.root, b->kv.u.t2.free, b->kv.u.t2.bolt);
@@ -1049,7 +1048,7 @@ int main(int argc, char **argv) {
 #if USE_MAP
         kv[MAP] = mapkv;
 #endif
-        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:I:C:KMF:")) != -1) {
+        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:I:C:KMF:p")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -1099,10 +1098,13 @@ int main(int argc, char **argv) {
                         }
                         break;
                 case 'K':
-                        keep = true;
+                        wal_flags |= KEEP;
                         break;
                 case 'M':
-                        make = false;
+                        wal_flags &= ~MAKE;
+                        break;
+                case 'p':
+                        wal_flags |= FILL;
                         break;
                 case 'F':
                         stats_flags = t2_stats_flags_parse(optarg);

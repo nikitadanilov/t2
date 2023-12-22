@@ -7423,7 +7423,8 @@ enum {
         STEAL = 1 << 0, /* Undo needed. */
         FORCE = 1 << 1, /* Redo not needed. */
         MAKE  = 1 << 2, /* Delete existing log. */
-        KEEP  = 1 << 3  /* Do not truncate the log on finalisation. */
+        KEEP  = 1 << 3, /* Do not truncate the log on finalisation. */
+        FILL  = 1 << 4  /* Pre-fill the journal. */
 };
 
 struct wal_te {
@@ -7658,6 +7659,11 @@ static bool wal_should_sync_page(const struct wal_te *en, uint32_t flags) {
                  COND(READ_ONCE(en->mod->tick) - en->last_page_sync > en->sync_age, wal_sync_page_time));
 }
 
+static int wal_map(struct wal_te *en, lsn_t lsn, off_t *off) {
+        *off = ((lsn & (en->log_size - 1)) >> en->log_shift) << en->buf_size_shift;
+        return lsn & MASK(en->log_shift);
+}
+
 static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         int            result;
         struct wal_rec header;
@@ -7700,8 +7706,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         ASSERT(IS_IN(buf->used, buf->seg));
         buf->seg[0]         = (struct iovec) { .iov_base = &header, .iov_len  = sizeof header };
         buf->seg[buf->used] = (struct iovec) { .iov_base = &footer, .iov_len  = sizeof footer };
-        fd  = en->fd[buf->lsn & MASK(en->log_shift)];
-        off = ((buf->lsn & (en->log_size - 1)) >> en->log_shift) << en->buf_size_shift;
+        fd  = en->fd[wal_map(en, buf->lsn, &off)];
         idx = 0;
         rem = buf->used + 1;
         result = 0;
@@ -8168,6 +8173,26 @@ static void wal_fini(struct t2_te *engine) {
         mem_free(en);
 }
 
+static int wal_fill(struct wal_te *en) {
+        int   result = 0;
+        void *buf;
+        buf = mem_alloc(en->buf_size);
+        if (buf != NULL) {
+                for (lsn_t cur = 0; result == 0 && cur < en->log_size; ++cur) {
+                        off_t off;
+                        int   idx = wal_map(en, cur, &off);
+                        result = pwrite(en->fd[idx], buf, en->buf_size, off);
+                        if (result == en->buf_size) {
+                                result = 0;
+                        }
+                }
+                mem_free(buf);
+        } else {
+                result = ERROR(-ENOMEM);
+        }
+        return result;
+}
+
 struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
                        int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo) {
         struct wal_te *en     = mem_alloc(sizeof *en);
@@ -8240,6 +8265,9 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                                 result = ERROR(-errno);
                         }
                 }
+        }
+        if (result == 0 && flags & FILL) {
+                result = wal_fill(en);
         }
         if (result == 0) {
                 en->nr_bufs = nr_bufs;
