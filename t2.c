@@ -86,7 +86,7 @@ enum {
 #else
 #define ASSERT(expr) ASSUME(expr)
 #endif
-#define EXPENSIVE_ASSERTS_ON (1)
+#define EXPENSIVE_ASSERTS_ON (0)
 #if EXPENSIVE_ASSERTS_ON
 #define EXPENSIVE_ASSERT(expr) ASSERT(expr)
 #else
@@ -3868,6 +3868,7 @@ static int pageout(struct node *n, struct pageout_ctx *ctx) {
         node_iovec(n, &vec);
         req = req_get(ctx);
         if (UNLIKELY(req == NULL)) {
+                node_unlock(n);
                 return ERROR(-ENOMEM);
         }
         req->node = n;
@@ -3987,11 +3988,18 @@ static bool queues_are_ordered(const struct cds_list_head *q0, const struct cds_
         return true;
 }
 
-static lsn_t sh_list_min(const struct cds_list_head *head) {
+static lsn_t sh_list_min(const struct cds_list_head *head, struct node **out) {
         lsn_t min = MAX_LSN;
         struct node *n;
+        struct node *m = NULL;
         cds_list_for_each_entry(n, head, free) {
-                min = min_64(min, n->lsn_lo);
+                if (n->lsn_lo < min) {
+                        min = n->lsn_lo;
+                        m = n;
+                }
+        }
+        if (out != NULL) {
+                *out = m;
         }
         return min;
 }
@@ -4000,8 +4008,8 @@ static bool sh_invariant(struct shepherd *sh) {
         return  pageout_ctx_invariant(&sh->ctx) && sh->min != MAX_LSN &&
                 (!sh->queue.unordered ? queues_are_ordered(&sh->queue.tail, &sh->ctx.inflight) : true) &&
                 WITH_LOCK((!sh->queue.unordered ? queues_are_ordered(&sh->queue.head, &sh->queue.tail) : true) &&
-                          (TRANSACTIONS && sh->ctx.mod->te != NULL ? sh->min <= min_64(min_64(sh_list_min(&sh->queue.head), sh_list_min(&sh->queue.tail)),
-                                                                                       sh_list_min(&sh->ctx.inflight)) : true), &sh->queue.lock);
+                          (TRANSACTIONS && sh->ctx.mod->te != NULL ? sh->min <= min_64(min_64(sh_list_min(&sh->queue.head, NULL), sh_list_min(&sh->queue.tail, NULL)),
+                                                                                       sh_list_min(&sh->ctx.inflight, NULL)) : true), &sh->queue.lock);
 }
 
 static int sh_init(struct shepherd *sh, struct t2 *mod, int idx, int cow_shift, int queue) {
@@ -4201,7 +4209,7 @@ static void *shepherd(void *arg) { /* Matthew 25:32, but a dog. */
         return NULL;
 }
 
-enum { MAX_WAIT = 3 };
+enum { MAX_WAIT = 0 };
 
 static void *briard(void *arg) {
         struct shepherd    *self = arg;
@@ -4254,7 +4262,6 @@ static void *buhund(void *arg) { /* For cows and eio. */
         while (true) {
                 struct t2_te         *te = mod->te;
                 struct node          *n;
-                struct cds_list_head *item;
                 lsn_t                 shmin;
                 int                   result;
                 /*
@@ -4267,17 +4274,15 @@ static void *buhund(void *arg) { /* For cows and eio. */
                                c->briard[idx >> (c->buhund_shift - c->briard_shift)].min);
                 /* This must go after shmin calculation to win races with cows. */
                 WITH_LOCK_VOID(queue_steal(q), &q->lock);
-                item = queue_tryget(q);
-                sh_min_update(self, mod, min_64(shmin, min_64(sh_list_min(&self->ctx.inflight),
-                                                              sh_list_min(&q->tail))), false);
-                if (item == NULL) {
+                sh_min_update(self, mod, min_64(shmin, min_64(sh_list_min(&self->ctx.inflight, NULL),
+                                                              sh_list_min(&q->tail, &n))), false);
+                if (n == NULL) {
                         if (c->sh_shutdown && c->sh_nr == 0) {
                                 break; /* Exit only after all shepherds did. */
                         }
                         sh_wait_next(self, false);
                         continue;
                 }
-                n = COF(q->tail.prev, struct node, free);
                 NINC(n, buhund_dequeued);
                 cds_list_del_init(&n->free);
                 --self->queue.tail_nr;
@@ -5588,7 +5593,6 @@ static bool stress(struct freelist *free, int *pressure) {
 }
 
 static void pool_throttle(struct t2 *mod, struct freelist *free, taddr_t addr) {
-        return;
         int pressure;
         if (stress(free, &pressure)) {
                 int32_t rate   = SCAN_RATE_SHIFT - pressure / (32 / SCAN_RATE_SHIFT);
@@ -7511,7 +7515,7 @@ static bool wal_invariant(const struct wal_te *en) {
                 en->full_nr + en->inflight_nr + en->ready_nr + (en->cur != NULL) == en->nr_bufs &&
                 ((en->buf_size - 1) & en->buf_size) == 0 &&
                 (1 << en->buf_size_shift) == en->buf_size &&
-                (en->flags & ~(STEAL|FORCE|MAKE|KEEP)) == 0 &&
+                (en->flags & ~(STEAL|FORCE|MAKE|KEEP|FILL)) == 0 &&
                 en->start_persistent <= en->start_synced &&
                 en->start_synced     <= en->start_written &&
                 en->start_written    <= en->start &&
@@ -7664,6 +7668,11 @@ static int wal_map(struct wal_te *en, lsn_t lsn, off_t *off) {
         return lsn & MASK(en->log_shift);
 }
 
+static void wal_broadcast(struct wal_te *en) {
+        NOFAIL(pthread_cond_broadcast(&en->logwait));
+        sh_broadcast(en->mod);
+}
+
 static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         int            result;
         struct wal_rec header;
@@ -7672,7 +7681,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         off_t          off;
         int            idx;
         int            rem;
-        uint64_t       start;
+        uint64_t __attribute__((unused)) start;
         ASSERT(wal_log_free(en) > 0);
         header = (struct wal_rec) {
                 .magix = REC_MAGIX,
@@ -7744,7 +7753,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 if (lsn > en->max_written) {
                         en->max_written = lsn;
                         en->start_written = max_64(en->start_written, header.u.header.start);
-                        NOFAIL(pthread_cond_broadcast(&en->logwait));
+                        wal_broadcast(en);
                 }
                 NOFAIL(pthread_cond_broadcast(&en->bufwait));
         } else { /* TODO: Handle list linkage. */
@@ -7819,11 +7828,10 @@ static struct wal_rec *wal_next(struct wal_rec *rec) {
 
 enum {
         LOG_WRITE  = 1 << 0,
-        LOG_LAST   = 1 << 1,
-        LOG_SYNC   = 1 << 2,
-        PAGE_WRITE = 1 << 3,
-        PAGE_SYNC  = 1 << 4,
-        BUF_CLOSE  = 1 << 5
+        LOG_SYNC   = 1 << 1,
+        PAGE_WRITE = 1 << 2,
+        PAGE_SYNC  = 1 << 3,
+        BUF_CLOSE  = 1 << 4
 };
 
 static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t flags);
@@ -7840,8 +7848,8 @@ static void wal_wait_for(struct t2_te *engine, lsn_t lsn, bool force) {
         if (force && en->cur != NULL && en->cur->lsn <= lsn) {
                 wal_buf_end(en);
         }
+        wal_broadcast(en);
         while (!wal_tx_stable(en, lsn)) {
-                NOFAIL(pthread_cond_broadcast(&en->logwait));
                 wal_cond_wait(en, &en->logwait);
         }
         wal_unlock(en);
@@ -7909,7 +7917,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
         if (slow) {
                 mutex_unlock(&en->curlock);
                 wal_lock(en);
-                if (en->ready_nr + en->direct_write <= en->ready_lo) {
+                if (en->ready_nr + en->direct_write <= en->ready_lo && en->inflight_nr == en->nr_workers) {
                         ++en->direct_write;
                         wal_progress(en, LOG_WRITE, 1, 0);
                         --en->direct_write;
@@ -7964,8 +7972,7 @@ static void wal_log_sync(struct wal_te *en) {
                 en->start_persistent = en->start_synced;
                 en->start_synced = en->start_written;
                 en->min_want = max_64(en->max_persistent - en->log_size, 0);
-                NOFAIL(pthread_cond_broadcast(&en->logwait));
-                sh_broadcast(en->mod);
+                wal_broadcast(en);
         } else {
                 LOG("Cannot sync log: %i.", errno);
                 wal_print(&en->base);
@@ -7985,7 +7992,7 @@ static void wal_page_sync(struct wal_te *en) {
         CINC(wal_page_sync);
         if (LIKELY(result == 0)) {
                 en->start = max_64(en->start, max_paged);
-                NOFAIL(pthread_cond_broadcast(&en->logwait));
+                wal_broadcast(en);
         } else {
                 LOG("Cannot sync pages: %i.", errno);
                 wal_print(&en->base);
@@ -8039,8 +8046,7 @@ static void wal_snapshot(struct wal_te *en) {
                 en->start_persistent = en->start_synced;
                 en->start_synced = en->start_written;
                 en->min_want = max_64(en->max_persistent - en->log_size, 0);
-                NOFAIL(pthread_cond_broadcast(&en->logwait));
-                sh_broadcast(en->mod);
+                wal_broadcast(en);
         } else {
                 LOG("Snapshot failure %s: %i/%i/%i.", en->logname, rc1, rc2, errno);
                 wal_print(&en->base);
@@ -8054,7 +8060,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
         int                   done = 0;
         CINC(wal_progress);
         tail = en->full.prev;
-        if (done < max && ((allowed&LOG_WRITE && en->full_nr > 2) || allowed&LOG_LAST) && tail != &en->full) {
+        if (done < max && allowed&LOG_WRITE && tail != &en->full) {
                 wal_write(en, COF(tail, struct wal_buf, link));
                 ++done;
         }
@@ -8139,7 +8145,7 @@ static void wal_fini(struct t2_te *engine) {
         wal_lock(en);
         en->shutdown = true;
         NOFAIL(pthread_cond_broadcast(&en->bufwrite));
-        NOFAIL(pthread_cond_broadcast(&en->logwait));
+        wal_broadcast(en);
         wal_unlock(en);
         pthread_join(en->log_writer, NULL);
         for (int i = 0; i < en->nr_workers; ++i) {
@@ -8266,7 +8272,7 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
                         }
                 }
         }
-        if (result == 0 && flags & FILL) {
+        if (result == 0 && ((flags & (FILL|MAKE)) == (FILL|MAKE))) {
                 result = wal_fill(en);
         }
         if (result == 0) {
@@ -8339,7 +8345,7 @@ static void wal_recovery_done(struct wal_te *en, lsn_t start, lsn_t end) {
         en->start_persistent = en->start = en->start_synced = en->start_written = en->max_paged = start;
         en->min_want = max_64(en->max_persistent - en->log_size, 0);
         en->recovered = true;
-        NOFAIL(pthread_cond_broadcast(&en->logwait));
+        wal_broadcast(en);
         wal_unlock(en);
 }
 
@@ -8454,7 +8460,7 @@ static int wal_recover(struct wal_te *en) {
                 size[i] = st.st_size;
                 buf_nr += (st.st_size + en->buf_size - 1) >> en->buf_size_shift;
         }
-        if (buf_nr == 0) {
+        if (buf_nr == 0 || (en->flags & MAKE)) {
                 wal_recovery_done(en, 1, 1);
                 return 0;
         }
@@ -8551,8 +8557,9 @@ static bool wal_pinned(const struct t2_te *engine, struct t2_node *n) {
 static bool wal_throttle(const struct t2_te *engine, struct t2_node *nn) {
         const struct wal_te *en     = COF(engine, struct wal_te, base);
         struct node         *n      = (void *)nn;
+        lsn_t                size   = en->log_size;
         lsn_t                spread = n->lsn_hi - n->lsn_lo;
-        return spread >= (en->log_size >> 1) || (n->lsn_lo == en->start && spread >= (en->log_size >> 2));
+        return spread >= (size >> 1) || (n->lsn_lo == en->start && spread >= (size >> 2)) || wal_log_free(en) < (size >> 1);
 }
 
 static bool wal_stop(struct t2_te *engine, struct t2_node *nn) {
@@ -8579,7 +8586,7 @@ static void wal_maxpaged(struct t2_te *te, lsn_t min) {
         ASSERT(min >= en->max_paged || min == 0);
         if (min > en->max_paged) {
                 en->max_paged = min;
-                NOFAIL(pthread_cond_broadcast(&en->logwait));
+                wal_broadcast(en);
         }
         wal_unlock(en);
 }
@@ -8633,13 +8640,13 @@ static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *
 
 static void *wal_log_writer(void *arg) {
         struct wal_te *en = arg;
-        wal_work(en, LOG_LAST|LOG_SYNC, 2, &en->bufwrite);
+        wal_work(en, LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, INT_MAX, &en->logwait);
         return NULL;
 }
 
 static void *wal_worker(void *arg) {
         struct wal_te *en = arg;
-        wal_work(en, LOG_WRITE|LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, INT_MAX, &en->logwait);
+        wal_work(en, LOG_WRITE, INT_MAX, &en->bufwrite);
         return NULL;
 }
 
