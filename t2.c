@@ -1540,11 +1540,11 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                         bool underpressure = stress(&c->pool.free[i], &pressure);
                         printf(" %7i%s", pressure, underpressure ? "*" : " ");
                 }
-                printf("\n\n%15s ", "temperature:");
+                printf("\n\n%15s", "temperature:");
                 for (int i = 0; i < hist_buckets; ++i) {
                         printf(" %8i", 1 << i);
                 }
-                printf("\n%15s ", "count:");
+                printf("\n%15s", "count:");
                 for (int i = 0, pos = 0; i < hist_buckets; ++i) {
                         int32_t sum = 0;
                         while (pos < (1 << i)) {
@@ -3126,7 +3126,7 @@ static void cache_sync(struct t2 *mod) { /* TODO: Leaks on thread exit. */
                         }
                 }
                 if (epoch - c->epoch_signalled > EPOCH_DELTA) {
-                        NOFAIL(pthread_cond_broadcast(&mod->cache.want));
+                        NOFAIL(pthread_cond_signal(&mod->cache.want));
                         c->epoch_signalled = epoch;
                 }
                 mutex_unlock(&c->lock);
@@ -3761,13 +3761,19 @@ static void req_callback(struct rcu_head *head) {
 }
 
 static int node_clean(struct node *n) {
+        struct cache *c    = &n->mod->cache;
+        int           bits = taddr_sbits(n->addr);
+        int           kpa;
         TXCALL(n->mod->te, clean(n->mod->te, (struct t2_node **)&n, 1));
         node_state_print(n, 'C');
         NMOD(n, page_dirty_nr, n->flags >> 40);
         NMOD(n, page_lsn_diff, n->lsn_hi - n->lsn_lo);
         n->flags &= ~(DIRTY|PAGING|(~0ull << 40)); /* The only place where DIRTY is cleared. */
+        if (stress(&c->pool.free[bits], &kpa)) {
+                n->flags |= NOCACHE;
+        }
         n->lsn_lo = n->lsn_hi = 0;
-        return 1 << taddr_sbits(n->addr);
+        return 1 << bits;
 }
 
 static void pageout_done(struct pageout_ctx *ctx, struct pageout_req *req, int32_t nob) {
@@ -5604,8 +5610,10 @@ static struct node *pool_get(struct t2 *mod, taddr_t addr, uint32_t hash) {
         mutex_lock(&free->lock);
         if (LIKELY(free->avail == 0)) {
                 while (UNLIKELY(free->nr == 0)) {
-                        NOFAIL(pthread_cond_broadcast(&c->want));
-                        NOFAIL(pthread_cond_wait(&free->got, &free->lock));
+                        NOFAIL(pthread_cond_signal(&c->want));
+                        mutex_unlock(&free->lock);
+                        scan(mod, SCAN_RUN, &throttlemd, 1 << BOLT_EPOCH_SHIFT, 0);
+                        mutex_lock(&free->lock);
                         CINC(alloc_wait);
                 }
                 n = COF(free->head.next, struct node, free);
