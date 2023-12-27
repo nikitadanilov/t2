@@ -402,7 +402,6 @@ struct pageout_ctx {
         struct t2            *mod;
         int                   idx;
         int                   cow_shift;
-        int64_t               cleaned;
 };
 
 enum {
@@ -1541,14 +1540,14 @@ void t2_stats_print(struct t2 *mod, uint64_t flags) {
                         bool underpressure = stress(&c->pool.free[i], &pressure);
                         printf(" %7i%s", pressure, underpressure ? "*" : " ");
                 }
-                printf("\n\n%15s %8i", "temperature:", 0);
+                printf("\n\n%15s ", "temperature:");
                 for (int i = 0; i < hist_buckets; ++i) {
                         printf(" %8i", 1 << i);
                 }
-                printf("\n%15s %8i", "count:", c->md.histogram[0]);
-                for (int i = 0, pos = 1; i < hist_buckets; ++i) {
+                printf("\n%15s ", "count:");
+                for (int i = 0, pos = 0; i < hist_buckets; ++i) {
                         int32_t sum = 0;
-                        while (pos <= (1 << i)) {
+                        while (pos < (1 << i)) {
                                 sum += c->md.histogram[pos++];
                         }
                         printf(" %8i", sum);
@@ -3771,9 +3770,8 @@ static int node_clean(struct node *n) {
         return 1 << taddr_sbits(n->addr);
 }
 
-static int pageout_done(struct pageout_ctx *ctx, struct pageout_req *req, int32_t nob) {
+static void pageout_done(struct pageout_ctx *ctx, struct pageout_req *req, int32_t nob) {
         struct node *n       = req->node;
-        int          cleaned = 0;
         ASSERT(pageout_ctx_invariant(ctx));
         ASSERT(cds_list_contains(&ctx->inflight, &n->free));
         if (LIKELY(nob == taddr_ssize(n->addr))) {
@@ -3786,7 +3784,7 @@ static int pageout_done(struct pageout_ctx *ctx, struct pageout_req *req, int32_
                 ASSERT(n->flags & DIRTY);
                 ASSERT(!!(n->flags & PAGING) == (n->data == req->data));
                 if (n->data == req->data) {
-                        cleaned = node_clean(n);
+                        node_clean(n);
                         req_put(ctx, req);
                 } else {
                         if (req->lsn <= n->lsn_hi) {
@@ -3800,7 +3798,7 @@ static int pageout_done(struct pageout_ctx *ctx, struct pageout_req *req, int32_
                                 queue_put(&buhund->queue, &n->free);
                                 sh_signal(buhund);
                         } else { /* COWed, but not re-dirtied. */
-                                cleaned = node_clean(n);
+                                node_clean(n);
                         }
                         call_rcu_memb(&req->rcu, &req_callback);
                 }
@@ -3810,12 +3808,11 @@ static int pageout_done(struct pageout_ctx *ctx, struct pageout_req *req, int32_
                 LOG("Pageout failure: %"PRIx64": %i.", req->node->addr, nob);
         }
         ASSERT(pageout_ctx_invariant(ctx));
-        return cleaned;
 }
 
 static void pageout_complete_req(struct pageout_ctx *ctx, struct pageout_req *req, int32_t nob) {
         if (EISOK(req)) {
-                ctx->cleaned += pageout_done(ctx, req, nob);
+                pageout_done(ctx, req, nob);
                 ASSERT(ctx->used >= 0);
         } else {
                 LOG("Error waiting for io completion: %i.", ERRCODE(req));
@@ -4045,7 +4042,7 @@ static void sh_broadcast(struct t2 *mod) {
 }
 
 static void sh_print(const struct shepherd *sh) {
-        printf("[%8"PRId64" : %8d + %8d : %5d / %10"PRId64"] ", sh->min, sh->queue.head_nr, sh->queue.tail_nr, sh->ctx.used, sh->ctx.cleaned);
+        printf("[%8"PRId64" : %8d + %8d : %5d] ", sh->min, sh->queue.head_nr, sh->queue.tail_nr, sh->ctx.used);
 }
 
 static void sh_add(struct node **nn, int nr) {
@@ -5593,7 +5590,7 @@ static void pool_throttle(struct t2 *mod, struct freelist *free, taddr_t addr, u
                 int32_t rate = SCAN_RATE_SHIFT - pressure / (32 / SCAN_RATE_SHIFT);
                 int32_t run  = 1 << ((pressure / 4) + 3);
                 if (UNLIKELY((hash & MASK(rate)) == 0)) {
-                        scan(mod, run, &throttlemd, mod->cache.md.crittemp, mod->cache.md.critfrac);
+                        scan(mod, run, &throttlemd, 1 << BOLT_EPOCH_SHIFT, 0);
                 }
         }
 }
@@ -8563,6 +8560,9 @@ static bool wal_stop(struct t2_te *engine, struct t2_node *nn) {
         struct node   *n   = (void *)nn;
         struct cache  *c   = &en->mod->cache;
         lsn_t          lim = en->max_paged + (cache_used(c) * (en->max_persistent - en->max_paged) >> c->shift);
+        if (wal_log_free(en) < (en->log_size >> 2)) {
+                lim += (en->max_persistent - lim) >> 2;
+        }
         return n->lsn_lo >= lim && LIKELY(!en->quiesce);
 }
 
