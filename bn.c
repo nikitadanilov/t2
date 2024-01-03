@@ -740,6 +740,7 @@ static void t_mount(struct benchmark *b) {
                                                            .max_cluster = MAX_CLUSTER,
                                                            .ttypes = ttypes,
                                                            .ntypes = ntypes});
+        assert(!t2_is_err(mod));
         if (b->kv.u.t2.bolt != 0) {
                 bn_bolt_set(b->kv.u.t2.mod, b->kv.u.t2.bolt);
         }
