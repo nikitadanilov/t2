@@ -64,7 +64,7 @@ enum {
 #endif
 
 #if !defined(IOCACHE)
-#define IOCACHE (0)
+#define IOCACHE (1)
 #endif
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -2080,9 +2080,6 @@ static void put_final(struct node *n) {
         n->flags |= HEARD_BANSHEE;
         ht_delete(n);
         node_state_print(n, 'P');
-        if (LIKELY(n->ntype != NULL)) {
-                iocache_put(&n->mod->ioc, n);
-        }
         call_rcu_memb(&n->rcu, &free_callback);
 }
 
@@ -3934,6 +3931,7 @@ static int pageout(struct node *n, struct pageout_ctx *ctx) {
                 LOG("Cannot submit pageout: %"PRIx64": %i.", n->addr, result);
         }
         ASSERT(pageout_ctx_invariant(ctx));
+        iocache_put(&mod->ioc, n);
         return result;
 }
 
@@ -4605,9 +4603,10 @@ static int iocache_put(struct iocache *ioc, struct node *n) {
                                 while (UNLIKELY(!atomic_compare_exchange_weak(slot, &have, want))) {
                                         ; /* No-ABA here. */
                                 }
-                                ASSERT(have.addr != n->addr);
                                 if (have.addr != 0) {
-                                        CINC(ioc_conflict);
+                                        if (have.addr != n->addr) {
+                                                CINC(ioc_conflict);
+                                        }
                                         mem_free(have.data);
                                 }
                                 CMOD(ioc_ratio, (size << 10) >> shift);
@@ -4625,23 +4624,13 @@ static int iocache_put(struct iocache *ioc, struct node *n) {
 
 static int iocache_get(struct iocache *ioc, struct node *n) {
         if (IOCACHE && LIKELY(ioc->shift > 0)) {
-                _Atomic(struct ioc) *slot = &ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)];
-                if (((struct ioc *)slot)->addr == n->addr) {
-                        int        nsize = taddr_ssize(n->addr);
-                        struct ioc want  = {};
-                        struct ioc have  = atomic_load(slot);
-                        size_t     size;
-                        do {
-                                if (have.addr != n->addr) {
-                                        CINC(ioc_miss);
-                                        return +1;
-                                }
-                        } while (UNLIKELY(!atomic_compare_exchange_weak(slot, &have, want)));
-                        CINC(ioc_hit);
-                        size = LIKELY(iocache_ctx.decomp != NULL) ?
+                struct ioc have = atomic_load(&ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)]);
+                if (have.addr == n->addr) {
+                        int    nsize = taddr_ssize(n->addr);
+                        size_t size  = LIKELY(iocache_ctx.decomp != NULL) ?
                                 ZSTD_decompressDCtx(iocache_ctx.decomp, n->data, nsize, have.data + 4, *(int32_t *)have.data) :
                                 ZSTD_decompress(n->data, nsize, have.data + 4, *(int32_t *)have.data);
-                        mem_free(have.data);
+                        CINC(ioc_hit);
                         if (LIKELY(!ZSTD_isError(size))) {
                                 ASSERT((int32_t)size == nsize);
                                 return 0;
