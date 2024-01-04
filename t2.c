@@ -28,7 +28,7 @@
 #include <sys/resource.h>
 #include <dlfcn.h>
 #include <zstd.h>
-#include "liburing.h"
+#include <liburing.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
@@ -6957,9 +6957,9 @@ struct oheader {
 };
 
 struct orec {
-        int32_t off;
-        int16_t klen;
-        int16_t vlen;
+        int16_t off;
+        int8_t klen;
+        int8_t vlen;
 };
 
 enum {
@@ -7462,11 +7462,11 @@ enum {
 struct wal_te {
         struct t2_te                           base;
         alignas(MAX_CACHELINE) pthread_mutex_t curlock;
-        lsn_t                                  reserved;
+        alignas(MAX_CACHELINE) lsn_t           reserved;
         int64_t                                dirty_nr;
         struct wal_buf                        *cur;
         alignas(MAX_CACHELINE) pthread_mutex_t lock;
-        lsn_t                                  lsn;
+        alignas(MAX_CACHELINE) lsn_t           lsn;
         struct stash                           stash;
         struct cds_list_head                   ready;
         struct cds_list_head                   full;
@@ -7475,9 +7475,9 @@ struct wal_te {
         int                                    ready_nr;
         int                                    inflight_nr;
         int                                    direct_write;
-        pthread_cond_t                         logwait;
-        pthread_cond_t                         bufwait;
-        pthread_cond_t                         bufwrite;
+        alignas(MAX_CACHELINE) pthread_cond_t  logwait;
+        alignas(MAX_CACHELINE) pthread_cond_t  bufwait;
+        alignas(MAX_CACHELINE) pthread_cond_t  bufwrite;
         lsn_t                                  max_wait;
         lsn_t                                  max_inflight;
         lsn_t                                  max_written;
@@ -7499,6 +7499,7 @@ struct wal_te {
         int                                    buf_size;
         int                                    buf_size_shift;
         lsn_t                                  log_size;
+        int                                    log_size_shift;
         int64_t                                sync_nob;
         int                                    reserve_quantum;
         int                                    ready_lo;
@@ -7513,7 +7514,7 @@ struct wal_te {
         bool                                   use_barrier;
         struct t2                             *mod;
         int                                    snapshot_hand;
-        pthread_t                              log_writer;
+        pthread_t                              aux_worker;
         int                                    nr_workers;
         pthread_t                             *worker;
         const char                            *logname;
@@ -7542,8 +7543,8 @@ static bool wal_invariant(const struct wal_te *en) {
                 cds_list_length(&en->ready) == en->ready_nr &&
                 cds_list_length(&en->inflight) == en->inflight_nr &&
                 en->full_nr + en->inflight_nr + en->ready_nr + (en->cur != NULL) == en->nr_bufs &&
-                ((en->buf_size - 1) & en->buf_size) == 0 &&
                 (1 << en->buf_size_shift) == en->buf_size &&
+                (1 << en->log_size_shift) == en->log_size &&
                 (en->flags & ~(STEAL|FORCE|MAKE|KEEP|FILL)) == 0 &&
                 en->start_persistent <= en->start_synced &&
                 en->start_synced     <= en->start_written &&
@@ -7675,7 +7676,7 @@ static bool wal_should_sync_log(const struct wal_te *en, uint32_t flags) {
         return  !COND(en->log_syncing, wal_log_already) &&
                 (COND(en->max_written - en->max_synced > en->sync_nob, wal_sync_log_head) ||
                  COND(en->max_synced - en->max_persistent > en->sync_nob, wal_sync_log_head2) ||
-                 COND(wal_log_free(en) < wal_log_need(en) + ((threshold * en->log_size) >> 10), wal_sync_log_lo) ||
+                 COND(wal_log_free(en) < wal_log_need(en) + ((threshold << en->log_size_shift) >> 10), wal_sync_log_lo) ||
                  COND(en->max_wait >= en->max_persistent, wal_sync_log_want) ||
                  COND(READ_ONCE(en->mod->tick) - en->last_log_sync > en->sync_age, wal_sync_log_time));
 }
@@ -7683,7 +7684,7 @@ static bool wal_should_sync_log(const struct wal_te *en, uint32_t flags) {
 static bool wal_should_page(const struct wal_te *en, uint32_t flags) {
         int threshold = (flags & DAEMON) ? en->threshold_paged : en->threshold_page;
         return  !COND(en->max_paged == en->max_persistent, wal_page_wal) &&
-                (COND(en->max_paged - en->start < wal_log_need(en) + ((threshold * en->log_size) >> 10), wal_page_lo));
+                (COND(en->max_paged - en->start < wal_log_need(en) + ((threshold << en->log_size_shift) >> 10), wal_page_lo));
 }
 
 static bool wal_should_sync_page(const struct wal_te *en, uint32_t flags) {
@@ -7882,15 +7883,6 @@ static void wal_wait_for(struct t2_te *engine, lsn_t lsn, bool force) {
                 wal_cond_wait(en, &en->logwait);
         }
         wal_unlock(en);
-}
-
-static bool wal_is_old(struct wal_te *en, const struct node *n) {
-        return n->lsn_lo != 0 && n->lsn_hi - n->lsn_lo > (en->log_size >> 1); /* TODO: Make this a parameter. */
-}
-
-static lsn_t logsize(struct t2_te *te) {
-        struct wal_te *en = COF(te, struct wal_te, base);
-        return en->log_size;
 }
 
 static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype) {
@@ -8178,7 +8170,7 @@ static void wal_fini(struct t2_te *engine) {
         NOFAIL(pthread_cond_broadcast(&en->bufwrite));
         wal_broadcast(en);
         wal_unlock(en);
-        pthread_join(en->log_writer, NULL);
+        pthread_join(en->aux_worker, NULL);
         for (int i = 0; i < en->nr_workers; ++i) {
                 pthread_join(en->worker[i], NULL);
         }
@@ -8276,6 +8268,7 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         en->age_limit           = age_limit;
         en->sync_nob            = sync_nob;
         en->log_size            = log_size;
+        en->log_size_shift      = ilog2(log_size);
         en->buf_size            = buf_size;
         en->buf_size_shift      = ilog2(buf_size);
         en->reserve_quantum     = reserve_quantum;
@@ -8595,7 +8588,7 @@ static bool wal_throttle(const struct t2_te *engine, struct t2_node *nn) {
 static lsn_t wal_limit(const struct wal_te *en) {
         struct cache *c = &en->mod->cache;
         lsn_t lim = en->max_paged + (cache_used(c) * (en->max_persistent - en->max_paged) >> c->shift);
-        if (wal_log_free(en) < (en->log_size >> 2)) {
+        if (wal_log_free(en) < (en->log_size >> 1)) {
                 lim += (en->max_persistent - lim) >> 1;
         }
         return lim;
@@ -8641,7 +8634,7 @@ static void wal_print(struct t2_te *engine) {
                en->start_persistent, en->start_synced, en->start_written, en->start, en->max_paged,
                en->max_persistent, en->max_synced, en->max_written, en->max_inflight, en->lsn,
                en->ready_nr, en->full_nr, en->inflight_nr, wal_limit(en), en->max_wait,
-               en->snapshot_hand, en->reserved, wal_log_free(en), wal_log_free(en) * 100 / en->log_size);
+               en->snapshot_hand, en->reserved, wal_log_free(en), (wal_log_free(en) * 100) >> en->log_size_shift);
 }
 
 static uint64_t sleep_sec_nsec(double duration, uint64_t *nsec) {
@@ -8674,7 +8667,7 @@ static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *
         t2_thread_degister();
 }
 
-static void *wal_log_writer(void *arg) {
+static void *wal_aux_worker(void *arg) {
         struct wal_te *en = arg;
         wal_work(en, LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, INT_MAX, &en->logwait);
         return NULL;
@@ -8691,7 +8684,7 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
         int            result;
         en->mod = mod;
         en->use_barrier = FORALL(i, 1 << en->log_shift, SCALL(mod, same, en->fd[i]));
-        result = pthread_create(&en->log_writer, NULL, &wal_log_writer, en);
+        result = pthread_create(&en->aux_worker, NULL, &wal_aux_worker, en);
         if (result == 0) { /* TODO: Fix error cleanup. */
                 for (int i = 0; result == 0 && i < en->nr_workers; ++i) {
                         NOFAIL(pthread_create(&en->worker[i], NULL, &wal_worker, en));
