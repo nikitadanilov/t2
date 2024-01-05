@@ -36,6 +36,7 @@ struct t2_conf {
         int                   cache_shepherd_shift;
         int                   cache_briard_shift;
         int                   cache_buhund_shift;
+        bool                  cache_direct;
         int                   max_cluster;
         int                   scan_run;
         int                   free_hi;
@@ -69,6 +70,7 @@ struct t2_param {
         int            wal_threshold_log_syncd;
         int            wal_threshold_log_sync;
         int            wal_ready_lo;
+        bool           wal_directio;
         const char    *policy_leaf;
         const char    *policy_twig;
         const char    *policy_internal;
