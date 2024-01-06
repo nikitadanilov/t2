@@ -4272,7 +4272,7 @@ static void *shepherd(void *arg) { /* Matthew 25:32, but a dog. */
         return NULL;
 }
 
-enum { MAX_WAIT = 0 };
+enum { MAX_WAIT = 1 };
 
 static void *briard(void *arg) {
         struct shepherd    *self = arg;
