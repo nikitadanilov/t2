@@ -123,7 +123,7 @@ function setup_prereq() {
 
 function setup() {
     setup_prereq
-    echo Installing userspace-rcu
+    echo Installing userspace-rcu.
     run rm -fr userspace-rcu
     run git clone git://git.liburcu.org/userspace-rcu.git
     run cd userspace-rcu
