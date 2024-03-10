@@ -129,7 +129,7 @@ function libp() {
 function setup_prereq() {
     case "$distro" in
 	(ubuntu)
-	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev libsnappy-dev
+	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev libsnappy-dev bpfcc-tools bpftrace linux-headers-$(uname -r)
     ;;  (darwin)
 	    run brew install automake autoconf libtool gcc gperftools zstd
     ;;  (*)
