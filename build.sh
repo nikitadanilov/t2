@@ -112,7 +112,7 @@ function run() {
 function setup_prereq() {
     case "$distro" in
 	(ubuntu)
-	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev
+	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev libsnappy-dev
     ;;  (darwin)
 	    run brew install automake autoconf libtool gcc gperftools zstd
     ;;  (*)
@@ -123,6 +123,11 @@ function setup_prereq() {
 
 function setup() {
     setup_prereq
+    OCC="$CC"
+    OCXX="$CXX"
+    OCFLAGS="$CFLAGS"
+    OLDFLAGS="$LDFLAGS"
+    unset CC CXX CFLAGS LDFLAGS
     echo Installing userspace-rcu.
     run rm -fr userspace-rcu
     run git clone git://git.liburcu.org/userspace-rcu.git
@@ -133,6 +138,21 @@ function setup() {
     run sudo make install
     run cd ..
     run rm -fr userspace-rcu
+
+    echo Installing rockdb.
+    run rm -fr rocksdb
+    git clone https://github.com/facebook/rocksdb.git
+    cd rocksdb
+    export DEBUG_LEVEL=0
+    run make shared_lib
+    run sudo make install-shared install
+    cd ..
+    run rm -fr rocksdb
+
+    export CC="$OCC"
+    export CXX="$OCXX"
+    export CFLAGS="$OCFLAGS"
+    export LDFLAGS="$LDCFLAGS"
 }
 
 runut=0
