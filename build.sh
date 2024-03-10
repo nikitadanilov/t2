@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Copyright 2023--2024 Nikita Danilov <danilov@gmail.com>
+# See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licencing information.
+
 echo > config.h
 platform="$(uname -srm)"
 LDFLAGS="$LDFLAGS -L/usr/local/lib/ -ltcmalloc -lurcu -lpthread -ldl -lzstd -rdynamic"

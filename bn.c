@@ -1,6 +1,6 @@
 /* -*- C -*- */
 
-/* Copyright 2023 Nikita Danilov <danilov@gmail.com> */
+/* Copyright 2023--2024 Nikita Danilov <danilov@gmail.com> */
 /* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licencing information. */
 
 #include <math.h>
