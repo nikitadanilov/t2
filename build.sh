@@ -5,7 +5,7 @@
 
 echo > config.h
 platform="$(uname -srm)"
-LDFLAGS="$LDFLAGS -L/usr/local/lib/ -ltcmalloc -lurcu -lpthread -ldl -lzstd -rdynamic"
+LDFLAGS="$LDFLAGS -L/usr/local/lib/ -ltcmalloc_and_profiler -lurcu -lpthread -ldl -lzstd -rdynamic"
 CC=${CC:-cc}
 CXX=${CXX:-c++}
 CFLAGS="-I/usr/local/include -ggdb3 -fno-omit-frame-pointer -foptimize-sibling-calls -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
@@ -112,10 +112,24 @@ function run() {
     fi
 }
 
+function headerp() {
+    h="$1"
+    f=/tmp/check.h
+    echo \#include $h > $f
+    cc -E $f 2>/dev/null >/dev/null
+}
+
+function libp() {
+    l="$1"
+    f=/tmp/check.c
+    echo 'int main(int argc, char **argv) { return 0; }' > $f
+    cc $f -o/tmp/a.out $l 2>/dev/null >/dev/null
+}
+
 function setup_prereq() {
     case "$distro" in
 	(ubuntu)
-	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev libsnappy-dev
+	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev libsnappy-dev
     ;;  (darwin)
 	    run brew install automake autoconf libtool gcc gperftools zstd
     ;;  (*)
@@ -126,36 +140,31 @@ function setup_prereq() {
 
 function setup() {
     setup_prereq
-    OCC="$CC"
-    OCXX="$CXX"
-    OCFLAGS="$CFLAGS"
-    OLDFLAGS="$LDFLAGS"
-    unset CC CXX CFLAGS LDFLAGS
-    echo Installing userspace-rcu.
-    run rm -fr userspace-rcu
-    run git clone git://git.liburcu.org/userspace-rcu.git
-    run cd userspace-rcu
-    run ./bootstrap
-    run ./configure
-    run make
-    run sudo make install
-    run cd ..
-    run rm -fr userspace-rcu
-
-    echo Installing rockdb.
-    run rm -fr rocksdb
-    git clone https://github.com/facebook/rocksdb.git
-    cd rocksdb
-    export DEBUG_LEVEL=0
-    run make shared_lib
-    run sudo make install-shared install
-    cd ..
-    run rm -fr rocksdb
-
-    export CC="$OCC"
-    export CXX="$OCXX"
-    export CFLAGS="$OCFLAGS"
-    export LDFLAGS="$LDCFLAGS"
+    headerp '<urcu/urcu-memb.h>' && libp -lurcu || (
+        echo Installing userspace-rcu.
+        unset CC CXX CFLAGS LDFLAGS
+        run rm -fr userspace-rcu
+        run git clone git://git.liburcu.org/userspace-rcu.git
+        run cd userspace-rcu
+        run ./bootstrap
+        run ./configure
+        run make
+        run sudo make install
+        run cd ..
+        run rm -fr userspace-rcu
+    )
+    headerp '<rocksdb/c.h>' && libp -lrocksdb || (
+        echo Installing rockdb.
+        unset CC CXX CFLAGS LDFLAGS
+        run rm -fr rocksdb
+        git clone https://github.com/facebook/rocksdb.git
+        cd rocksdb
+        export DEBUG_LEVEL=0
+        run make shared_lib
+        run sudo make install-shared install
+        run cd ..
+        run rm -fr rocksdb
+    )
 }
 
 runut=0
