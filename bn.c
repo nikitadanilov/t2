@@ -557,7 +557,7 @@ static void *breport_thread(void *arg) {
         while (true) {
                 sleep(report_interval);
                 bphase_report(ph, false);
-                if (counters_level > 1) {
+                if (counters_level > 1 && kvt == T2) {
                         t2_stats_print(mod, stats_flags);
                         bn_counters_clear();
                 }
@@ -593,7 +593,7 @@ static void bphase(struct bphase *ph, int i) {
                 }
         }
         blog(BINFO, "    Phase %2i done.\n", i);
-        if (counters_level > 0) {
+        if (counters_level > 0 && kvt == T2) {
                 t2_stats_print(mod, stats_flags);
                 bn_counters_clear();
         }
