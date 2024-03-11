@@ -1,0 +1,35 @@
+#!/usr/bin/bash
+
+# Copyright 2023--2024 Nikita Danilov <danilov@gmail.com> 
+# See https://github.com/nikitadanilov/t2/blob/master/LICENCE for the licencing information.
+
+#
+# Collect "total" profile combining processor profile (profile-bpfcc) and offcpu profile (offcputime-bpfcc).
+#
+
+duration="$1"
+freq=1024
+
+# offcputime-bpfcc measures sleep time in microseconds.
+sudo offcputime-bpfcc -p $(pgrep -x bn) -d --stack-storage-size $((64 * 1024)) $duration > offcpustacks 2>/dev/null &
+sudo profile-bpfcc -p $(pgrep -x bn) -d -F$freq --stack-storage-size $((16 * 1024)) $duration > profilestacks 2>/dev/null &
+
+wait
+
+#
+# Processor profile requires some massaging:
+#
+# - Scale stack traces counts to microseconds.
+#
+# - Add "profile" at the top of each trace to distinguish them from offcpu.
+#
+# - Clean "b'futex_wait'" to "futex_wait"
+#
+cat profilestacks |\
+    awk "/^        [0-9]+$/ { print \"   \", int(\$1 * 1000000 / $freq); next; } /^\$/  { printf(\"\n    profile\n\"); next; } {print \$1;}" |\
+    sed "s/b'//" | sed "s/'$//" > profilestacks.1
+#
+# Combine all threads into one: "-     bn (124213)" -> "-"
+#
+(cat offcpustacks; cat profilestacks.1) | sed 's/-    .*$/-/g' | stackcollapse.pl | flamegraph.pl > offcpustacks.svg
+
