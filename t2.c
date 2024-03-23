@@ -451,7 +451,6 @@ struct cache {
         pthread_cond_t                         want; /* Signalled periodically (on epoch change) to wake maxwelld. */
         alignas(MAX_CACHELINE) pthread_mutex_t cleanlock;
         alignas(MAX_CACHELINE) struct pool     pool;
-        int                                    max_cluster;
         int                                    sh_nr;
         int                                    sh_shift;
         struct shepherd                       *sh;
@@ -1206,7 +1205,6 @@ enum {
         DEFAULT_BRIARD_SHIFT            =          3,
         DEFAULT_BUHUND_SHIFT            =          3,
         DEFAULT_DIRECT                  =       true,
-        DEFAULT_MAX_CLUSTER             =        256,
         DEFAULT_WAL_NR_BUFS             =        200,
         DEFAULT_WAL_BUF_SIZE            = 1ull << 20,
         DEFAULT_WAL_FLAGS               =          0,
@@ -1300,7 +1298,6 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
         if (param->conf.cache_briard_shift < param->conf.cache_shepherd_shift) {
                 CONFLICT(flags, "briard shift is less than shepherd shift.");
         }
-        SETIF0DEFAULT(flags, param, conf.max_cluster,           DEFAULT_MAX_CLUSTER,     "d");
         SETIF0DEFAULT(flags, param, conf.cshift,                DEFAULT_CSHIFT,          "d");
         SETIF0       (flags, param, conf.hshift,                param->conf.cshift,      "d", "sized to cache");
         SETIF0       (flags, param, conf.ishift,                param->conf.cshift,      "d", "sized to cache");
@@ -1332,7 +1329,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         struct pool         *p;
         ASSERT(cacheline_size() / MAX_CACHELINE * MAX_CACHELINE == cacheline_size());
         if (conf->hshift <= 0 || conf->cshift <= 0 || conf->ishift < 0 || conf->min_radix_level < 0 || conf->cache_shepherd_shift < 0 || conf->cache_briard_shift < 0 ||
-            conf->cache_shepherd_shift + conf->cache_briard_shift > 32 || conf->max_cluster <= 0 || conf->scan_run < 0) {
+            conf->cache_shepherd_shift + conf->cache_briard_shift > 32 || conf->scan_run < 0) {
                 return EPTR(-EINVAL);
         }
         mod = mem_alloc(sizeof *mod);
@@ -1354,7 +1351,6 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         mod->stor            = conf->storage;
         mod->te              = conf->te;
         mod->min_radix_level = conf->min_radix_level;
-        c->max_cluster       = conf->max_cluster;
         c->direct            = conf->cache_direct;
         next_stage(mod, true, FIELDS);
         for (struct t2_node_type **nt = conf->ntypes; *nt != NULL; ++nt) {
