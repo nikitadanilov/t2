@@ -5,7 +5,7 @@
 
 echo > config.h
 platform="$(uname -srm)"
-LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -ldl -lzstd -rdynamic"
+LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -ldl -lzstd -ltcmalloc -rdynamic"
 CC=${CC:-cc}
 CXX=${CXX:-c++}
 CFLAGS="-I/usr/local/include -march=native -ggdb3 -fno-omit-frame-pointer -foptimize-sibling-calls -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion $CFLAGS"
