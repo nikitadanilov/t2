@@ -105,10 +105,6 @@ extern uint64_t bn_bolt(const struct t2 *mod);
 extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
 extern void bn_counters_fold(void);
 extern void bn_counters_clear(void);
-extern struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
-                              uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                              int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio);
-
 static struct kv kv[KVNR];
 static enum kvtype kvt = T2;
 struct t2 *mod = NULL;
@@ -671,41 +667,12 @@ static void brun(struct benchmark *b) {
         kv[kvt].umount(b);
 }
 
-enum {
-        BILLION    = 1000000000,
-        NR_BUFS    = 200,
-        BUF_SIZE   = 1 << 20,
-        MIN_RADIX_LEVEL = 2,
-        MAX_CLUSTER = 256,
-        SHEPHERD_SHIFT          =          3,
-        BRIARD_SHIFT            =          3,
-        BUHUND_SHIFT            =          3,
-        DIRECT                  =       true,
-        WAL_WORKERS             =         64,
-        WAL_LOG_SHIFT           =          7,
-        WAL_AGE_LIMIT           =    BILLION,
-        WAL_SYNC_AGE            =    BILLION / 100,
-        WAL_SYNC_NOB            = 1ull <<  4,
-        WAL_LOG_SIZE            = 1ull << 16,
-        WAL_RESERVE_QUANTUM     =         64,
-        WAL_THRESHOLD_PAGED     =        512,
-        WAL_THRESHOLD_PAGE      =        128,
-        WAL_THRESHOLD_LOG_SYNCD =         64,
-        WAL_THRESHOLD_LOG_SYNC  =         32,
-        WAL_READY_LO            =         -1,
-        WAL_DIRECTIO            =       true
-};
-
 const double LOG_SLEEP = 1.0;
 
 static const char logname[] = "./log/l";
 static bool transactions = false;
 
 static void t_mount(struct benchmark *b) {
-        struct t2_te *engine = transactions ? wal_prep(logname, NR_BUFS, BUF_SIZE, wal_flags, WAL_WORKERS, WAL_LOG_SHIFT, LOG_SLEEP, WAL_AGE_LIMIT,
-                                                       WAL_SYNC_AGE, WAL_SYNC_NOB, WAL_LOG_SIZE, WAL_RESERVE_QUANTUM,
-                                                       WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO,
-                                                       WAL_DIRECTIO) : NULL;
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
         bn_ntype_twig     = t2_node_type_init(1, "simple-bn-twig",     shift_twig,     0);
         bn_ntype_leaf     = t2_node_type_init(0, "simple-bn-leaf",     shift_leaf,     0);
@@ -731,19 +698,19 @@ static void t_mount(struct benchmark *b) {
         if (b->kv.u.t2.free != 0) {
                 bn_file_free_set(bn_storage, b->kv.u.t2.free);
         }
-        mod = b->kv.u.t2.mod = t2_init(&(struct t2_conf) { .storage = bn_storage,
-                                                           .te = engine,
-                                                           .hshift = ht_shift,
-                                                           .cshift = cache_shift,
-                                                           .ishift = ioc_shift,
-                                                           .cache_shepherd_shift = SHEPHERD_SHIFT,
-                                                           .cache_briard_shift = BRIARD_SHIFT,
-                                                           .cache_buhund_shift = BUHUND_SHIFT,
-                                                           .cache_direct = DIRECT,
-                                                           .min_radix_level = MIN_RADIX_LEVEL,
-                                                           .max_cluster = MAX_CLUSTER,
-                                                           .ttypes = ttypes,
-                                                           .ntypes = ntypes});
+        mod = b->kv.u.t2.mod = t2_init_with(T2_INIT_EXPLAIN | T2_INIT_VERBOSE, &(struct t2_param) {
+                        .conf = {
+                                .storage = bn_storage,
+                                .hshift  = ht_shift,
+                                .cshift  = cache_shift,
+                                .ishift  = ioc_shift,
+                                .ttypes = ttypes,
+                                .ntypes = ntypes
+                        },
+                     .te_type = "wal",
+                 .wal_logname = logname,
+                   .wal_flags = wal_flags,
+                });
         assert(!t2_is_err(mod));
         if (b->kv.u.t2.bolt != 0) {
                 bn_bolt_set(b->kv.u.t2.mod, b->kv.u.t2.bolt);

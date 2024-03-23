@@ -1243,24 +1243,24 @@ static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stag
 enum {
         DEFAULT_CSHIFT                  =         22,
         DEFAULT_MIN_RADIX_LEVEL         =          2,
-        DEFAULT_SHEPHERD_SHIFT          =          2,
+        DEFAULT_SHEPHERD_SHIFT          =          3,
         DEFAULT_BRIARD_SHIFT            =          3,
         DEFAULT_BUHUND_SHIFT            =          3,
-        DEFAULT_DIRECT                  =      false,
+        DEFAULT_DIRECT                  =       true,
         DEFAULT_MAX_CLUSTER             =        256,
         DEFAULT_WAL_NR_BUFS             =        200,
         DEFAULT_WAL_BUF_SIZE            = 1ull << 20,
         DEFAULT_WAL_FLAGS               =          0,
-        DEFAULT_WAL_WORKERS             =         16,
-        DEFAULT_WAL_LOG_NR              = 1ull <<  8,
-        DEFAULT_WAL_SYNC_NOB            = 1ull <<  6,
-        DEFAULT_WAL_LOG_SIZE            = 1ull << 14,
+        DEFAULT_WAL_WORKERS             =         64,
+        DEFAULT_WAL_LOG_NR              = 1ull <<  1,
+        DEFAULT_WAL_SYNC_NOB            = 1ull <<  4,
+        DEFAULT_WAL_LOG_SIZE            = 1ull << 16,
         DEFAULT_WAL_RESERVE_QUANTUM     =         64,
         DEFAULT_WAL_THRESHOLD_PAGED     =        512,
         DEFAULT_WAL_THRESHOLD_PAGE      =        128,
         DEFAULT_WAL_THRESHOLD_LOG_SYNCD =         64,
         DEFAULT_WAL_THRESHOLD_LOG_SYNC  =         32,
-        DEFAULT_WAL_READY_LO            =          2,
+        DEFAULT_WAL_READY_LO            =         -1,
         DEFAULT_WAL_DIRECTIO            =      false
 };
 
@@ -1331,6 +1331,8 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                                 return EPTR(te);
                         }
                         SET(flags, param, conf.te, te, "p", "wal_prep()");
+                } else {
+                        CONFLICT(flags, "only \"wal\" te type is supported.");
                 }
         }
         if (param->conf.cache_buhund_shift < param->conf.cache_briard_shift) {
