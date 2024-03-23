@@ -57,8 +57,8 @@ esac
 case "$platform" in
     (*x86_64*)
 	# popcnt for ilog2()
-	# cx16 for mag_{get,put}() (128-bit CAS)
-        MFLAGS="popcnt cx16"
+	# No longer needed: cx16 for mag_{get,put}() (128-bit CAS)
+        MFLAGS="popcnt"
         ;;
 esac
 

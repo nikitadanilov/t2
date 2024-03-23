@@ -731,34 +731,6 @@ enum dir {
         RIGHT = +1
 };
 
-struct aba_item {
-        void *next;
-};
-
-struct aba_head {
-        uintptr_t        gen;
-        struct aba_item *ptr;
-};
-
-struct magazine {
-        struct aba_item  next;
-        int              used;
-        void            *unit[0];
-};
-
-struct stash {
-        alignas(MAX_CACHELINE) _Atomic(struct aba_head) empty;
-        alignas(MAX_CACHELINE) _Atomic(struct aba_head) inhab;
-        int                                            nr;
-        int                                            size;
-};
-
-struct stash_local {
-        struct magazine *mag;
-        struct stash    *stash;
-        int              nr;
-};
-
 #if COUNTERS
 struct counter_var {
         int64_t sum;
@@ -832,10 +804,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         int64_t wal_sync_page_time;
         int64_t wal_dirty_clean;
         int64_t wal_redirty;
-        int64_t stash_hit;
-        int64_t stash_miss;
-        int64_t stash_mags;
-        int64_t stash_units;
         int64_t malloc[MAX_ALLOC_BUCKET];
         int64_t ioc_hit;
         int64_t ioc_miss;
@@ -861,7 +829,6 @@ struct counters { /* Must be all 64-bit integers, see counters_fold(). */
         struct counter_var wal_log_sync_time;
         struct counter_var wal_page_sync_time;
         struct counter_var wal_buf_pinned;
-        struct counter_var stash_used;
         struct counter_var ioc_ratio;
         struct level_counters {
                 int64_t traverse_hit;
@@ -990,8 +957,6 @@ static void immanentise(const struct msg_ctx *ctx, ...) __attribute__((noreturn)
 static void *mem_alloc(size_t size);
 static void *mem_alloc_align(size_t size, int alignment);
 static void  mem_free(void *ptr);
-static void aba_put(_Atomic(struct aba_head) *head, struct aba_item *data);
-static struct aba_item *aba_get(_Atomic(struct aba_head) *head);
 static uint64_t now(void);
 static struct timespec *deadline(uint64_t sec, uint64_t nsec, struct timespec *out);
 static int32_t max_32(int32_t a, int32_t b);
@@ -1155,12 +1120,6 @@ static int iocache_put(struct iocache *ioc, struct node *n);
 static int iocache_get(struct iocache *ioc, struct node *n);
 static void iocache_thread_init(void);
 static void iocache_thread_fini(void);
-static void *stash_get(struct stash_local *sl);
-static void stash_put(struct stash_local *sl, void *unit);
-static void stash_init(struct stash *s, int nr, int size);
-static void stash_fini(struct stash *s);
-static void stash_local_init(struct stash_local *sl, struct stash *s);
-static void stash_local_fini(struct stash_local *sl);
 static bool cookie_is_valid(const struct t2_cookie *k);
 static void cookie_invalidate(uint64_t *addr);
 static void cookie_make(uint64_t *addr);
@@ -1495,7 +1454,6 @@ uint64_t t2_stats_flags_parse(const char *s) {
                 ['s'] = T2_SF_SHEPHERD,
                 ['i'] = T2_SF_IO,
                 ['M'] = T2_SF_MALLOC,
-                ['S'] = T2_SF_STASH,
                 ['p'] = T2_SF_POOL,
                 ['x'] = T2_SF_TX,
                 ['o'] = T2_SF_OS,
@@ -4657,124 +4615,6 @@ static int iocache_get(struct iocache *ioc, struct node *n) {
         }
 }
 
-/* @stash */
-
-static void mag_put(_Atomic(struct aba_head) *head, struct magazine *mag) {
-        aba_put(head, &mag->next);
-}
-
-static struct magazine *mag_get(_Atomic(struct aba_head) *head) {
-        struct aba_item *item = aba_get(head);
-        return COF(item, struct magazine, next);
-}
-
-static void mag_free(struct magazine *mag) {
-        for (int i = 0; i < mag->used; ++i) {
-                mem_free(mag->unit[i]);
-        }
-        mem_free(mag);
-}
-
-static struct magazine *mag_init(struct stash *s) {
-        struct magazine *mag = mem_alloc(sizeof *mag + s->nr * sizeof mag->unit[0]);
-        CINC(stash_mags);
-        return mag;
-}
-
-static struct magazine *mag_alloc(struct stash *s) {
-        struct magazine *mag = mag_init(s);
-        if (LIKELY(mag != NULL)) {
-                ASSERT(mag->used == 0);
-                for (int i = 0; i < s->nr; ++i) {
-                        mag->unit[i] = mem_alloc(s->size);
-                        CINC(stash_units);
-                        if (UNLIKELY(mag->unit[i] == NULL)) {
-                                mag->used = i + 1;
-                                mag_free(mag);
-                                return NULL;
-                        }
-                }
-                mag->used = s->nr;
-        }
-        return mag;
-}
-
-static void *stash_get(struct stash_local *sl) {
-        struct stash    *s   = sl->stash;
-        struct magazine *mag = sl->mag;
-        void            *unit;
-        if (UNLIKELY(mag == NULL)) {
-                mag = mag_get(&s->inhab);
-                if (UNLIKELY(mag == NULL)) {
-                        mag = mag_alloc(s);
-                        if (UNLIKELY(mag == NULL)) {
-                                return NULL;
-                        }
-                }
-                sl->mag = mag;
-        }
-        ASSERT(mag->used > 0);
-        unit = mag->unit[--mag->used];
-        CMOD(stash_used, mag->used);
-        if (UNLIKELY(mag->used == 0)) {
-                mag_put(&s->empty, mag);
-                sl->mag = NULL;
-        }
-        return unit;
-}
-
-static void stash_put(struct stash_local *sl, void *unit) {
-        struct stash    *s   = sl->stash;
-        struct magazine *mag = sl->mag;
-        if (UNLIKELY(mag == NULL)) {
-                mag = mag_get(&s->empty);
-                if (UNLIKELY(mag == NULL)) {
-                        mag = mag_init(s);
-                        if (UNLIKELY(mag == NULL)) {
-                                mem_free(unit);
-                                return;
-                        }
-                }
-                sl->mag = mag;
-        }
-        ASSERT(mag->used < s->nr);
-        mag->unit[mag->used++] = unit;
-        CMOD(stash_used, mag->used);
-        if (UNLIKELY(mag->used == s->nr)) {
-                mag_put(&s->inhab, mag);
-                sl->mag = NULL;
-        }
-}
-
-static void stash_init(struct stash *s, int nr, int size) {
-        s->nr = nr;
-        s->size = size;
-}
-
-static void stash_fini(struct stash *s) {
-        struct magazine *mag;
-        while ((mag = mag_get(&s->empty)) != NULL) {
-                mag_free(mag);
-        }
-        while ((mag = mag_get(&s->inhab)) != NULL) {
-                mag_free(mag);
-        }
-}
-
-static void stash_local_init(struct stash_local *sl, struct stash *s) {
-        ASSERT(sl->nr == 0);
-        ASSERT(sl->mag == NULL);
-        sl->nr = s->nr;
-        sl->stash = s;
-}
-
-static void stash_local_fini(struct stash_local *sl) {
-        ASSERT(sl->nr != 0);
-        if (sl->mag != NULL) {
-                mag_put(sl->mag->used == 0 ? &sl->stash->empty : &sl->stash->inhab, sl->mag);
-        }
-}
-
 /* @lib */
 
 __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...)
@@ -4818,29 +4658,6 @@ static void *mem_alloc(size_t size) {
 
 static void mem_free(void *ptr) {
         free(ptr);
-}
-
-static void aba_put(_Atomic(struct aba_head) *head, struct aba_item *data) {
-        struct aba_head new;
-        struct aba_head top = atomic_load(head);
-        do { /* atomic_compare_exchange_weak() updates "top" on failure. */
-                data->next = top.ptr;
-                new.gen  = top.gen + 1;
-                new.ptr  = data;
-        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, new)));
-}
-
-static struct aba_item *aba_get(_Atomic(struct aba_head) *head) {
-        struct aba_head new;
-        struct aba_head top = atomic_load(head);
-        do {
-                if (top.ptr == NULL) {
-                        return NULL;
-                }
-                new.gen = top.gen + 1;
-                new.ptr = top.ptr->next;
-        } while (UNLIKELY(!atomic_compare_exchange_weak(head, &top, new)));
-        return top.ptr;
 }
 
 static uint64_t now(void) {
@@ -5133,13 +4950,6 @@ static void counters_print(uint64_t flags) {
                 counter_var_print1(&GVAL(wal_buf_pinned),     "wal.buf_pinned:");
         }
         if (flags & T2_SF_SHEPHERD) {
-        }
-        if (flags & T2_SF_STASH) {
-                printf("stash.hit:           %10"PRId64"\n", GVAL(stash_hit));
-                printf("stash.miss:          %10"PRId64"\n", GVAL(stash_miss));
-                counter_var_print1(&GVAL(stash_used),         "stash.used:");
-                printf("stash.mags:          %10"PRId64"\n", GVAL(stash_mags));
-                printf("stash.units:         %10"PRId64"\n", GVAL(stash_units));
         }
         if (flags & T2_SF_IO) {
                 printf("read:                %10"PRId64"\n", GVAL(read));
