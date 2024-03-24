@@ -8863,17 +8863,55 @@ static struct file_storage file_storage = {
 /* @disorder */
 
 struct disorder_storage {
-        struct t2_storage  gen;
-        struct t2_storage *substrate;
+        struct t2_storage    gen;
+        struct t2_storage   *substrate;
+        struct cds_list_head reqs;
+        uint64_t             seq;
+        pthread_mutex_t      lock;
+        pthread_cond_t       cond;
+        pthread_t            daemon;
+        bool                 shutdown;
+        int                  randomness;
+        int                  sleep_min;
+        int                  sleep_range;
 };
+
+struct disorder_ctx {
+        struct t2_io_ctx *subring;
+};
+
+struct disorder_req {
+        struct cds_list_head linkage;
+        uint64_t             seq;
+        taddr_t              addr;
+        int                  nr;
+        struct iovec        *src;
+        struct disorder_ctx *ctx;
+        void                *arg;
+        bool                 inflight;
+};
+
+static void *disorder_daemon(void *arg);
 
 static int disorder_init(struct t2_storage *storage) {
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        NOFAIL(pthread_mutex_init(&dis->lock, NULL));
+        NOFAIL(pthread_cond_init(&dis->cond, NULL));
+        CDS_INIT_LIST_HEAD(&dis->reqs);
+        dis->shutdown = false;
+        dis->seq = 0;
+        NOFAIL(pthread_create(&dis->daemon, NULL, &disorder_daemon, dis));
         return dis->substrate->op->init(dis->substrate);
 }
 
 static void disorder_fini(struct t2_storage *storage) {
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        NOFAIL(WITH_LOCK((dis->shutdown = true,
+                          pthread_cond_broadcast(&dis->cond)), &dis->lock));
+        NOFAIL(pthread_join(dis->daemon, NULL));
+        ASSERT(cds_list_empty(&dis->reqs));
+        NOFAIL(pthread_cond_destroy(&dis->cond));
+        NOFAIL(pthread_mutex_destroy(&dis->lock));
         dis->substrate->op->fini(dis->substrate);
 }
 
@@ -8891,10 +8929,6 @@ static int disorder_read(struct t2_storage *storage, taddr_t addr, int nr, struc
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
         return dis->substrate->op->read(dis->substrate, addr, nr, dst);
 }
-
-struct disorder_ctx {
-        struct t2_io_ctx *subring;
-};
 
 static struct t2_io_ctx *disorder_create(struct t2_storage *storage, int queue) {
         struct disorder_storage *dis     = COF(storage, struct disorder_storage, gen);
@@ -8920,20 +8954,85 @@ static void disorder_done(struct t2_storage *storage, struct t2_io_ctx *arg) {
         mem_free(ctx);
 }
 
+static void disorder_post(struct disorder_storage *dis, struct disorder_req *req);
+
 static int disorder_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
         struct disorder_ctx     *ctx = (void *)ioctx;
-        return dis->substrate->op->write(dis->substrate, addr, nr, src, ctx->subring, arg);
+        if (ctx == NULL) { /* Synchronous write. */
+                return dis->substrate->op->write(dis->substrate, addr, nr, src, NULL, arg);
+        } else {
+                struct disorder_req *req  = mem_alloc(sizeof *req);
+                struct iovec        *copy = mem_alloc(nr * sizeof src[0]);
+                if (req != NULL && copy != NULL) {
+                        req->addr = addr;
+                        req->nr = nr;
+                        req->src = copy;
+                        req->ctx = ctx;
+                        req->arg = arg;
+                        memcpy(copy, src, nr * sizeof src[0]);
+                        disorder_post(dis, req);
+                        return 0;
+                } else {
+                        mem_free(req);
+                        mem_free(copy);
+                        return ERROR(-ENOMEM);
+                }
+        }
 }
 
 static void *disorder_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_t *nob, bool wait) {
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
         struct disorder_ctx     *ctx = (void *)ioctx;
-        return dis->substrate->op->end(dis->substrate, ctx->subring, nob, wait);
+        struct disorder_req     *req = dis->substrate->op->end(dis->substrate, ctx->subring, nob, wait);
+        if (req != NULL && EISOK(req)) {
+                void *arg = req->arg;
+                ASSERT(req->inflight);
+                mutex_lock(&dis->lock);
+                cds_list_del(&req->linkage);
+                NOFAIL(pthread_cond_broadcast(&dis->cond));
+                mutex_unlock(&dis->lock);
+                mem_free(req->src);
+                mem_free(req);
+                return arg;
+        } else {
+                return req;
+        }
+}
+
+static struct disorder_req *disorder_scan(struct disorder_storage *dis, uint64_t *min, uint64_t *max) {
+        struct disorder_req *scan;
+        struct disorder_req *select = NULL;
+        uint64_t             order  = MAX_LSN;
+        uint64_t             salt   = 0;
+        *min = MAX_LSN;
+        *max = 0;
+        cds_list_for_each_entry(scan, &dis->reqs, linkage) {
+                uint64_t rorder = scan->seq ^ (ht_hash64(scan->seq + salt++) & MASK(dis->randomness));
+                *min = min_64(*min, scan->seq);
+                *max = max_64(*max, scan->seq);
+                if (!scan->inflight && rorder < order) {
+                        select = scan;
+                }
+        }
+        return select;
 }
 
 static int disorder_sync(struct t2_storage *storage, bool barrier) {
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        uint64_t max;
+        uint64_t min;
+        uint64_t dummy;
+        disorder_scan(dis, &dummy, &max);
+        mutex_lock(&dis->lock);
+        while (true) {
+                disorder_scan(dis, &min, &dummy);
+                if (min > max) {
+                        break;
+                }
+                NOFAIL(pthread_cond_wait(&dis->cond, &dis->lock));
+        }
+        mutex_unlock(&dis->lock);
         return dis->substrate->op->sync(dis->substrate, barrier);
 }
 
@@ -8942,51 +9041,90 @@ static bool disorder_same(struct t2_storage *storage, int fd) {
         return dis->substrate->op->same(dis->substrate, fd);
 }
 
+static void disorder_process(struct disorder_storage *dis, struct disorder_req *req) {
+        ASSERT(!req->inflight);
+        req->inflight = true;
+        int result = dis->substrate->op->write(dis->substrate, req->addr, req->nr, req->src, req->ctx->subring, req);
+        ASSERT(result == 0);
+}
+
+static void disorder_post(struct disorder_storage *dis, struct disorder_req *req) {
+        mutex_lock(&dis->lock);
+        cds_list_add(&req->linkage, &dis->reqs);
+        req->seq = dis->seq++;
+        NOFAIL(pthread_cond_broadcast(&dis->cond));
+        mutex_unlock(&dis->lock);
+}
+
+static void *disorder_daemon(void *arg) {
+        struct disorder_storage *dis = arg;
+        uint64_t                 dummy;
+
+        mutex_lock(&dis->lock);
+        while (true) {
+                struct disorder_req *req;
+                while ((req = disorder_scan(dis, &dummy, &dummy)) != NULL) {
+                        struct timespec delay = { .tv_nsec = dis->sleep_min + rand() % dis->sleep_range };
+                        disorder_process(dis, req);
+                        mutex_unlock(&dis->lock);
+                        nanosleep(&delay, NULL);
+                        mutex_lock(&dis->lock);
+                }
+                if (dis->shutdown) {
+                        break;
+                } else {
+                        NOFAIL(pthread_cond_wait(&dis->cond, &dis->lock));
+                }
+        }
+        mutex_unlock(&dis->lock);
+        return NULL;
+}
+
 static struct t2_storage_op disorder_storage_op = {
-        .name     = "disorder-storage-op",
-        .init     = &disorder_init,
-        .fini     = &disorder_fini,
-        .create   = &disorder_create,
-        .done     = &disorder_done,
-        .alloc    = &disorder_alloc,
-        .free     = &disorder_free,
-        .read     = &disorder_read,
-        .write    = &disorder_write,
-        .end      = &disorder_end,
-        .sync     = &disorder_sync,
-        .same     = &disorder_same
+        .name   = "disorder-storage-op",
+        .init   = &disorder_init,
+        .fini   = &disorder_fini,
+        .create = &disorder_create,
+        .done   = &disorder_done,
+        .alloc  = &disorder_alloc,
+        .free   = &disorder_free,
+        .read   = &disorder_read,
+        .write  = &disorder_write,
+        .end    = &disorder_end,
+        .sync   = &disorder_sync,
+        .same   = &disorder_same
 };
 
 static struct disorder_storage disorder_storage = {
-        .gen       = { .op = &disorder_storage_op },
-        .substrate = &file_storage.gen
+        .gen         = { .op = &disorder_storage_op },
+        .substrate   = &file_storage.gen,
+        .randomness  = 5,
+        .sleep_min   = 0,
+        .sleep_range = 1000
 };
 
-/* non-static */ struct t2_storage *bn_storage = &file_storage.gen;
+/* non-static */ struct t2_storage *bn_storage = &disorder_storage.gen;
 taddr_t bn_tree_root(const struct t2_tree *t) {
         (void)disorder_storage;
         return t->root;
 }
 
 uint64_t bn_file_free(struct t2_storage *storage) {
-        struct file_storage *fs = COF(storage, struct file_storage, gen);
-        return fs->free;
+        return file_storage.free;
 }
 
 void bn_file_free_set(struct t2_storage *storage, uint64_t free) {
-        struct file_storage *fs = COF(storage, struct file_storage, gen);
-        fs->free = free;
+        file_storage.free = free;
         for (int i = 0; i < FRAG_NR; ++i) {
-                fs->frag_free[i] = free;
+                file_storage.frag_free[i] = free;
         }
 }
 
 void bn_file_truncate(struct t2_storage *storage, uint64_t off) {
-        struct file_storage *fs = COF(storage, struct file_storage, gen);
-        int namesize = strlen(fs->filename) + 10;
+        int namesize = strlen(file_storage.filename) + 10;
         char name[namesize]; /* VLA */
-        for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
-                snprintf(name, namesize, file_fmt, fs->filename, i);
+        for (int i = 0; i < ARRAY_SIZE(file_storage.frag_free); ++i) {
+                snprintf(name, namesize, file_fmt, file_storage.filename, i);
                 NOFAIL(truncate(name, off));
         }
 }
