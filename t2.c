@@ -8860,8 +8860,111 @@ static struct file_storage file_storage = {
         .filename = "./pages/p"
 };
 
+/* @disorder */
+
+struct disorder_storage {
+        struct t2_storage  gen;
+        struct t2_storage *substrate;
+};
+
+static int disorder_init(struct t2_storage *storage) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        return dis->substrate->op->init(dis->substrate);
+}
+
+static void disorder_fini(struct t2_storage *storage) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        dis->substrate->op->fini(dis->substrate);
+}
+
+static taddr_t disorder_alloc(struct t2_storage *storage, int shift_min, int shift_max) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        return dis->substrate->op->alloc(dis->substrate, shift_min, shift_max);
+}
+
+static void disorder_free(struct t2_storage *storage, taddr_t addr) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        dis->substrate->op->free(dis->substrate, addr);
+}
+
+static int disorder_read(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        return dis->substrate->op->read(dis->substrate, addr, nr, dst);
+}
+
+struct disorder_ctx {
+        struct t2_io_ctx *subring;
+};
+
+static struct t2_io_ctx *disorder_create(struct t2_storage *storage, int queue) {
+        struct disorder_storage *dis     = COF(storage, struct disorder_storage, gen);
+        struct t2_io_ctx        *subring = dis->substrate->op->create(dis->substrate, queue);
+        if (EISOK(subring)) {
+                struct disorder_ctx *ctx = mem_alloc(sizeof *ctx);
+                if (ctx != NULL) {
+                        ctx->subring = subring;
+                        return (void *)ctx;
+                } else {
+                        dis->substrate->op->done(dis->substrate, subring);
+                        return EPTR(-ENOMEM);
+                }
+        } else {
+                return subring;
+        }
+}
+
+static void disorder_done(struct t2_storage *storage, struct t2_io_ctx *arg) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        struct disorder_ctx     *ctx = (void *)arg;
+        dis->substrate->op->done(dis->substrate, ctx->subring);
+        mem_free(ctx);
+}
+
+static int disorder_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        struct disorder_ctx     *ctx = (void *)ioctx;
+        return dis->substrate->op->write(dis->substrate, addr, nr, src, ctx->subring, arg);
+}
+
+static void *disorder_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_t *nob, bool wait) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        struct disorder_ctx     *ctx = (void *)ioctx;
+        return dis->substrate->op->end(dis->substrate, ctx->subring, nob, wait);
+}
+
+static int disorder_sync(struct t2_storage *storage, bool barrier) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        return dis->substrate->op->sync(dis->substrate, barrier);
+}
+
+static bool disorder_same(struct t2_storage *storage, int fd) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        return dis->substrate->op->same(dis->substrate, fd);
+}
+
+static struct t2_storage_op disorder_storage_op = {
+        .name     = "disorder-storage-op",
+        .init     = &disorder_init,
+        .fini     = &disorder_fini,
+        .create   = &disorder_create,
+        .done     = &disorder_done,
+        .alloc    = &disorder_alloc,
+        .free     = &disorder_free,
+        .read     = &disorder_read,
+        .write    = &disorder_write,
+        .end      = &disorder_end,
+        .sync     = &disorder_sync,
+        .same     = &disorder_same
+};
+
+static struct disorder_storage disorder_storage = {
+        .gen       = { .op = &disorder_storage_op },
+        .substrate = &file_storage.gen
+};
+
 /* non-static */ struct t2_storage *bn_storage = &file_storage.gen;
 taddr_t bn_tree_root(const struct t2_tree *t) {
+        (void)disorder_storage;
         return t->root;
 }
 
@@ -8937,7 +9040,7 @@ static bool is_sorted(struct node *n) {
 
 #if UT
 
-static struct t2_storage *ut_storage = &file_storage.gen;
+static struct t2_storage *ut_storage = &disorder_storage.gen;
 
 static void usuite(const char *suite) {
         printf("        %s\n", suite);
