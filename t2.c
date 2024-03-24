@@ -3880,7 +3880,9 @@ static int pageout(struct node *n, struct pageout_ctx *ctx) {
         }
         req->node = n;
         req->data = n->data;
-        req->lsn = TXCALL(mod->te, lsn(mod->te));
+        if (TRANSACTIONS) {
+                req->lsn = TXCALL(mod->te, lsn(mod->te));
+        }
         n->flags |= PAGING;
         cds_list_add(&n->free, &ctx->inflight);
         node_unlock(n);
@@ -8036,7 +8038,15 @@ struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t f
         en->base.post     = &wal_post;
         en->base.quiesce  = &wal_quiesce;
         en->base.fini     = &wal_fini;
+        en->base.lsn      = &wal_lsn;
         en->base.make     = &wal_make;
+        en->base.open     = &wal_open;
+        en->base.close    = &wal_close;
+        en->base.wait_for = &wal_wait_for;
+        en->base.check    = &wal_check;
+        en->base.stop     = &wal_stop;
+        en->base.maxpaged = &wal_maxpaged;
+        en->base.clean    = &wal_clean;
         en->base.wait     = &wal_wait;
         en->base.done     = &wal_done;
         en->base.pinned   = &wal_pinned;

@@ -704,12 +704,13 @@ static void t_mount(struct benchmark *b) {
                                 .hshift  = ht_shift,
                                 .cshift  = cache_shift,
                                 .ishift  = ioc_shift,
-                                .ttypes = ttypes,
-                                .ntypes = ntypes
+                                .ttypes  = ttypes,
+                                .ntypes  = ntypes
                         },
-                     .te_type = "wal",
-                 .wal_logname = logname,
-                   .wal_flags = wal_flags,
+                        .no_te       = !transactions,
+                        .te_type     = transactions ? "wal" : NULL,
+                        .wal_logname = transactions ? logname : 0,
+                        .wal_flags   = transactions ? wal_flags : 0
                 });
         assert(!t2_is_err(mod));
         if (b->kv.u.t2.bolt != 0) {
