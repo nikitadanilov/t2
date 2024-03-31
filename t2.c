@@ -3613,7 +3613,7 @@ static int cache_init0(struct t2 *mod, const struct t2_conf *conf) {
         }
         for (c->sh_nr = 0; c->sh_nr < sh_nr; ++c->sh_nr) {
                 struct shepherd *sh = &c->sh[c->sh_nr]; /* Shepherds do most writes, give them larger queues. */
-                if ((result = sh_init(sh, mod, c->sh_nr, c->buhund_shift - c->sh_shift, 8 * IO_QUEUE)) != 0) {
+                if ((result = sh_init(sh, mod, c->sh_nr, c->buhund_shift - c->sh_shift, 2 * IO_QUEUE)) != 0) {
                         return ERROR(result);
                 }
         }
