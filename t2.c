@@ -439,6 +439,7 @@ struct shepherd {
         const lsn_t                        *par[MAX_PAR];
         bool                                idle;
         bool                                shutdown;
+        bool                                note;
         pthread_t                           thread;
 };
 
@@ -4135,7 +4136,7 @@ static struct node *sh_min(struct shepherd *sh) {
                 }
         }
         ASSERT(min >= sh->min || min == MAX_LSN);
-        if (TRANSACTIONS && mod->te != NULL && min > sh->min && min != MAX_LSN) {
+        if (TRANSACTIONS && !sh->note && mod->te != NULL && min > sh->min && min != MAX_LSN) {
                 sh->min = min;
                 TXCALL(mod->te, maxpaged(mod->te, sh_total_min(&mod->cache)));
         }
@@ -4169,6 +4170,9 @@ static void sh_wait(struct shepherd *sh) {
         NOFAIL(pthread_cond_broadcast(&sh->wantclean));
         pthread_cond_wait(&sh->wantclean, &sh->queue.lock);
         sh->idle = false;
+        if (sh->ctx.mod->te == NULL) {
+                sh->note = true; /* No TE. */
+        }
 }
 
 static bool sh_wait_next(struct shepherd *sh, bool qcheck) {
