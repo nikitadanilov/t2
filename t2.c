@@ -10011,7 +10011,7 @@ static void inc(char *key, int len) {
         }
 }
 
-void seq_ut_with(struct t2 *mod, struct t2_tx *tx) {
+static void seq_ut_with(struct t2 *mod, struct t2_tx *tx) {
         char key[] = "999999999";
         char val[] = "*VALUE*";
         struct t2_buf keyb;
@@ -10032,7 +10032,7 @@ void seq_ut_with(struct t2 *mod, struct t2_tx *tx) {
         }
 }
 
-void seq_ut() {
+static void seq_ut() {
         usuite("seq");
         utest("init");
         struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
@@ -10041,7 +10041,7 @@ void seq_ut() {
         utestdone();
 }
 
-void lib_ut() {
+static void lib_ut() {
         usuite("lib");
         utest("minmax");
 #define MINMAX(l, g) (min_32(l, g) == l && min_32(g, l) == l && max_32(l, g) == g && max_32(g, l) == g)
@@ -10078,7 +10078,7 @@ static void random_buf(char *buf, int32_t max, int32_t *out) {
         fill(buf, *out);
 }
 
-void *lookup_worker(void *arg) {
+static void *lookup_worker(void *arg) {
         struct t2_tree *t = arg;
         char kbuf[8];
         char vbuf[MAXSIZE];
@@ -10093,7 +10093,7 @@ void *lookup_worker(void *arg) {
         return NULL;
 }
 
-void *insert_worker(void *arg) {
+static void *insert_worker(void *arg) {
         struct t2_tree *t = arg;
         struct t2_tx *tx = t->ttype->mod->te != NULL ? t2_tx_make(t->ttype->mod) : NULL;
         char kbuf[8];
@@ -10114,7 +10114,7 @@ void *insert_worker(void *arg) {
         return NULL;
 }
 
-void *delete_worker(void *arg) {
+static void *delete_worker(void *arg) {
         struct t2_tree *t = arg;
         struct t2_tx *tx = t->ttype->mod->te != NULL ? t2_tx_make(t->ttype->mod) : NULL;
         char kbuf[8];
@@ -10132,7 +10132,7 @@ void *delete_worker(void *arg) {
         return NULL;
 }
 
-void *next_worker(void *arg) {
+static void *next_worker(void *arg) {
         struct t2_tree *t = arg;
         char key[8];
         struct t2_cursor_op cop = {
@@ -10218,7 +10218,7 @@ void mt_ut_with(struct t2 *mod, struct t2_tx *tx) {
         }
 }
 
-void mt_ut() {
+static void mt_ut() {
         usuite("mt");
         utest("init");
         struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
