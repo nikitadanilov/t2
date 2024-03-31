@@ -631,6 +631,7 @@ struct page {
         struct node    *node;
         uint64_t        seq;
         enum lock_mode  lm;
+        enum lock_mode  taken;
         struct cap      cap;
 };
 
@@ -997,7 +998,7 @@ static bool is_leaf(const struct node *n);
 static int32_t nr(const struct node *n);
 static int32_t nsize(const struct node *n);
 static int32_t utmost(const struct node *n, enum dir d);
-static void lock(struct node *n, enum lock_mode mode);
+static int lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
 static void touch_unlock(struct node *n, enum lock_mode mode);
 static void dirty(struct path *p, struct page *g);
@@ -1766,7 +1767,8 @@ static void node_state_print(struct node *n, char state) {
         }
 }
 
-static void lock(struct node *n, enum lock_mode mode) {
+static int lock(struct node *n, enum lock_mode mode) {
+        int result = 0;
         ASSERT(mode == NONE || mode == READ || mode == WRITE);
         COUNTERS_ASSERT(CVAL(rcu) == 0);
         if (LIKELY(mode == NONE)) {
@@ -1779,17 +1781,23 @@ static void lock(struct node *n, enum lock_mode mode) {
                 if (n->flags&PAGING) { /* COW. */
                         int32_t size = taddr_ssize(n->addr);
                         void *area = mem_alloc_align(size, size);
-                        ASSERT(area != NULL);
-                        memcpy(area, n->data, size);
-                        n->data = area;
-                        n->flags &= ~PAGING;
-                        NINC(n, page_cow);
+                        if (LIKELY(area != NULL)) {
+                                memcpy(area, n->data, size);
+                                n->data = area;
+                                n->flags &= ~PAGING;
+                                NINC(n, page_cow);
+                        } else {
+                                NOFAIL(pthread_rwlock_unlock(&n->lock));
+                                CDEC(wlock);
+                                result = ERROR(-ENOMEM);
+                        }
                 }
         } else if (mode == READ) {
                 NOFAIL(pthread_rwlock_rdlock(&n->lock));
                 CINC(rlock);
                 node_state_print(n, 'l');
         }
+        return result;
 }
 
 static void unlock(struct node *n, enum lock_mode mode) {
@@ -1958,30 +1966,31 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
         struct node *n = ninit(mod, addr);
         COUNTERS_ASSERT(CVAL(rcu) == 0);
         if (EISOK(n)) {
-                lock(n, WRITE);
-                if (LIKELY(n->ntype == NULL)) {
-                        int result = readdata(n);
-                        if (LIKELY(result == 0)) {
-                                if (LIKELY(NCALL(n, check(n)) && addr != 0)) {
-                                        struct header *h = nheader(n);
-                                        node_seq_increase(n);
-                                        NCALL(n, load(n, mod->ntypes[h->ntype])); /* TODO: Handle errors. */
-                                        rcu_assign_pointer(n->ntype, mod->ntypes[h->ntype]);
-                                        EXPENSIVE_ASSERT(is_sorted(n));
-                                } else {
-                                        result = ERROR(-ESTALE);
+                int result = lock(n, WRITE);
+                if (LIKELY(result) == 0) {
+                        if (LIKELY(n->ntype == NULL)) {
+                                result = readdata(n);
+                                if (LIKELY(result == 0)) {
+                                        if (LIKELY(NCALL(n, check(n)) && addr != 0)) {
+                                                struct header *h = nheader(n);
+                                                node_seq_increase(n);
+                                                NCALL(n, load(n, mod->ntypes[h->ntype])); /* TODO: Handle errors. */
+                                                rcu_assign_pointer(n->ntype, mod->ntypes[h->ntype]);
+                                                EXPENSIVE_ASSERT(is_sorted(n));
+                                        } else {
+                                                result = ERROR(-ESTALE);
+                                        }
+                                        CINC(read);
+                                        CADD(read_bytes, taddr_ssize(n->addr));
                                 }
-                                CINC(read);
-                                CADD(read_bytes, taddr_ssize(n->addr));
                         }
-                        if (UNLIKELY(result != 0)) {
-                                unlock(n, WRITE);
-                                ndelete(n);
-                                put(n);
-                                return EPTR(result);
-                        }
+                        unlock(n, WRITE);
                 }
-                unlock(n, WRITE);
+                if (UNLIKELY(result != 0)) {
+                        ndelete(n);
+                        put(n);
+                        return EPTR(result);
+                }
                 NINC(n, get);
         }
         return n;
@@ -2008,7 +2017,7 @@ static struct node *alloc(struct t2_tree *t, int8_t level, struct cap *cap) {
         if (EISOK(addr)) {
                 n = ninit(mod, addr);
                 if (EISOK(n)) {
-                        lock(n, WRITE);
+                        lock(n, WRITE); /* Cannot fail: the node is unreachable. */
                         *nheader(n) = (struct header) {
                                 .magix  = NODE_MAGIX,
                                 .ntype  = ntype->id,
@@ -2548,6 +2557,18 @@ static void dirty(struct path *p, struct page *g) {
         }
 }
 
+static int page_lock(struct page *g) {
+        int result = 0;
+        ASSERT(g->taken == NONE);
+        if (g->node != NULL) {
+                result = lock(g->node, g->lm);
+                if (LIKELY(result == 0)) {
+                        g->taken = g->lm;
+                }
+        }
+        return result;
+}
+
 static void path_dirty(struct path *p) {
         for (int i = p->used; i >= 0; --i) {
                 struct rung *r = &p->rung[i];
@@ -2561,33 +2582,28 @@ static void path_dirty(struct path *p) {
 
 static int path_lock(struct path *p) {
         /* Top to bottom, left to right. */
+        int result = 0;
         if (UNLIKELY(p->newroot.node != NULL)) {
-                lock(p->newroot.node, WRITE);
+                result = page_lock(&p->newroot);
+                if (result != 0) {
+                        return result;
+                }
         }
-        for (int i = 0; i <= p->used; ++i) {
-                struct rung *r = &p->rung[i];
+        for (int i = 0; i <= p->used && LIKELY(result == 0); ++i) {
+                struct rung *r     = &p->rung[i];
                 struct page *left  = brother(r, LEFT);
                 struct page *right = brother(r, RIGHT);
                 ASSERT(i > 0 ? level(r->page.node) + 1 == level((r - 1)->page.node) : true);
-                if (left->node != NULL) {
-                        lock(left->node, left->lm);
-                }
-                lock(r->page.node, r->page.lm);
-                if (r->allocated.node != NULL) {
-                        lock(r->allocated.node, r->allocated.lm);
-                }
-                if (right->node != NULL) {
-                        lock(right->node, right->lm);
+                result = page_lock(left) ?: page_lock(&r->page) ?: page_lock(&r->allocated) ?: page_lock(right);
+                if (result != 0) {
+                        return result;
                 }
                 if (UNLIKELY(!rung_precheck(r, i))) {
                         NINC(r->page.node, precheck);
-                        for (++r, ++i; i <= p->used; ++i, ++r) {
-                                brother(r, LEFT)->lm = brother(r, RIGHT)->lm = r->allocated.lm = r->page.lm = NONE;
-                        }
-                        return -ESTALE;
+                        result = -ESTALE;
                 }
         }
-        return 0;
+        return result;
 }
 
 static void path_fini(struct path *p) {
@@ -2599,30 +2615,30 @@ static void path_fini(struct path *p) {
                         if (UNLIKELY(r->flags & DELDEX)) {
                                 dealloc(right->node);
                         }
-                        touch_unlock(right->node, right->lm);
+                        touch_unlock(right->node, right->taken);
                         put(right->node);
                 }
-                touch_unlock(r->page.node, r->page.lm);
+                touch_unlock(r->page.node, r->page.taken);
                 if (UNLIKELY(left->node != NULL)) {
-                        touch_unlock(left->node, left->lm);
+                        touch_unlock(left->node, left->taken);
                         put(left->node);
                 }
                 if (r->flags & PINNED) {
                         put(r->page.node);
                 }
-                if (UNLIKELY(r->allocated.node != NULL)) {
+                if (UNLIKELY(r->allocated.node != NULL && EISOK(r->allocated.node))) {
                         if (UNLIKELY(!(r->flags & ALUSED))) {
                                 dealloc(r->allocated.node);
                                 NINC(r->allocated.node, allocated_unused);
                         }
-                        touch_unlock(r->allocated.node, r->allocated.lm);
+                        touch_unlock(r->allocated.node, r->allocated.taken);
                         put(r->allocated.node);
                 }
                 buf_free(&r->scratch);
         }
         p->used = -1;
         if (UNLIKELY(p->newroot.node != NULL)) {
-                touch_unlock(p->newroot.node, WRITE);
+                touch_unlock(p->newroot.node, p->newroot.taken);
                 put(p->newroot.node);
         }
 }
@@ -3297,26 +3313,28 @@ static int cookie_node_complete(struct path *p, struct node *n) {
         case DELETE:
                 if (found == (p->opt == DELETE)) {
                         rcu_leave(p, NULL);
-                        lock(n, WRITE);
-                        result = traverse_complete(p, 0);
-                        if (LIKELY(result == DONE)) {
-                                if (p->opt == INSERT) {
-                                        result = rec_insert(n, s.idx + 1, r, &rung->page.cap);
-                                        if (result == -ENOSPC) {
-                                                result = -ESTALE;
+                        result = lock(n, WRITE);
+                        if (LIKELY(result == 0)) {
+                                result = traverse_complete(p, 0);
+                                if (LIKELY(result == DONE)) {
+                                        if (p->opt == INSERT) {
+                                                result = rec_insert(n, s.idx + 1, r, &rung->page.cap);
+                                                if (result == -ENOSPC) {
+                                                        result = -ESTALE;
+                                                }
+                                        } else {
+                                                rec_delete(n, s.idx, &rung->page.cap);
+                                                result = 0;
                                         }
+                                        if (result == 0) {
+                                                path_txadd(p);
+                                        }
+                                        rcu_lock();
                                 } else {
-                                        rec_delete(n, s.idx, &rung->page.cap);
-                                        result = 0;
+                                        result = -ESTALE;
                                 }
-                                if (result == 0) {
-                                        path_txadd(p);
-                                }
-                                rcu_lock();
-                        } else {
-                                result = -ESTALE;
+                                unlock(n, WRITE);
                         }
-                        unlock(n, WRITE);
                 } else {
                         result = p->opt == INSERT ? -EEXIST : -ENOENT;
                 }
@@ -3896,6 +3914,9 @@ static int pageout(struct node *n, struct pageout_ctx *ctx) {
         }
         if (UNLIKELY(result != 0)) {
                 LOG("Cannot submit pageout: %"PRIx64": %i.", n->addr, result);
+                --ctx->used;
+                ++ctx->avail;
+                cds_list_del_init(&n->free);
         }
         ASSERT(pageout_ctx_invariant(ctx));
         iocache_put(&mod->ioc, n);
@@ -4635,23 +4656,33 @@ static void mem_alloc_count(size_t size, int delta) {
         CADD(malloc[min_32(ilog2(size), MAX_ALLOC_BUCKET - 1)], delta);
 }
 
+static bool ut_mem_alloc_fail();
+
 static void *mem_alloc_align(size_t size, int alignment) {
-        void *out = NULL;
-        int   result = posix_memalign(&out, alignment, size);
-        if (result == 0) {
-                memset(out, 0, size);
-                mem_alloc_count(size, +1);
+        if (UT && ut_mem_alloc_fail()) {
+                return NULL;
+        } else {
+                void *out = NULL;
+                int   result = posix_memalign(&out, alignment, size);
+                if (result == 0) {
+                        memset(out, 0, size);
+                        mem_alloc_count(size, +1);
+                }
+                return out;
         }
-        return out;
 }
 
 static void *mem_alloc(size_t size) {
-        void *out = malloc(size);
-        if (LIKELY(out != NULL)) {
-                memset(out, 0, size);
-                mem_alloc_count(size, +1);
+        if (UT && ut_mem_alloc_fail()) {
+                return NULL;
+        } else {
+                void *out = malloc(size);
+                if (LIKELY(out != NULL)) {
+                        memset(out, 0, size);
+                        mem_alloc_count(size, +1);
+                }
+                return out;
         }
-        return out;
 }
 
 static void mem_free(void *ptr) {
@@ -7208,9 +7239,13 @@ struct t2_node *t2_apply(struct t2 *mod, struct t2_txrec *txr) {
         if (IS_IN(txr->ntype, mod->ntypes) && mod->ntypes[txr->ntype] != NULL) {
                 struct node *n = take(mod, txr->addr, mod->ntypes[txr->ntype]);
                 if (EISOK(n)) {
-                        lock(n, WRITE);
-                        memcpy(n->data + txr->off, txr->part.addr, txr->part.len);
-                        return (void *)n; /* Return locked. */
+                        int result = lock(n, WRITE);
+                        if (LIKELY(result == 0)) {
+                                memcpy(n->data + txr->off, txr->part.addr, txr->part.len);
+                                return (void *)n; /* Return locked. */
+                        } else {
+                                return EPTR(result);
+                        }
                 } else {
                         return EPTR(n);
                 }
@@ -9111,7 +9146,7 @@ static struct disorder_storage disorder_storage = {
         .sleep_range = 1000
 };
 
-/* non-static */ struct t2_storage *bn_storage = &disorder_storage.gen;
+/* non-static */ struct t2_storage *bn_storage = &file_storage.gen;
 taddr_t bn_tree_root(const struct t2_tree *t) {
         (void)disorder_storage;
         return t->root;
@@ -9186,7 +9221,33 @@ static bool is_sorted(struct node *n) {
 
 #if UT
 
-static struct t2_storage *ut_storage = &disorder_storage.gen;
+static int ut_mem_alloc_fail_N = 0;
+
+static __thread int ut_mem_alloc_safe = 0;
+
+static bool ut_mem_alloc_fail() {
+        return ut_mem_alloc_fail_N != 0 && ut_mem_alloc_safe == 0 && rand() % ut_mem_alloc_fail_N == 0;
+}
+
+#define SAFE_ALLOC(expr) ({                     \
+        typeof (expr) __e;                      \
+        ++ut_mem_alloc_safe;                    \
+        __e = (expr);                           \
+        --ut_mem_alloc_safe;                    \
+        __e;                                    \
+})
+
+#define UT_NOFAIL(expr)                                                                 \
+({                                                                                      \
+        int result = (expr);                                                            \
+        if (UNLIKELY(result != 0 && (result != -ENOMEM || ut_mem_alloc_fail_N == 0))) { \
+                IMMANENTISE("UT: " #expr " failed with %i.", result);                   \
+        }                                                                               \
+})
+
+#define EOOM(result) ((result) == -ENOMEM && ut_mem_alloc_fail_N != 0)
+
+static struct t2_storage *ut_storage = &file_storage.gen;
 
 static void usuite(const char *suite) {
         printf("        %s\n", suite);
@@ -9212,7 +9273,7 @@ static void populate(struct slot *s, struct t2_buf *key, struct t2_buf *val) {
         struct sheader *sh = simple_header(s->node);
         for (int32_t i = 0; simple_free(s->node) >=
                      buf_len(key) + buf_len(val) + SOF(struct dir_element); ++i) {
-                NOFAIL(simple_insert(s, &cap));
+                UT_NOFAIL(simple_insert(s, &cap));
                 radixmap_update(s->node);
                 ASSERT(sh->nr == i + 1);
                 ((char *)key->addr)[1]++;
@@ -9247,7 +9308,7 @@ static void simple_ut() {
         struct node n = {
                 .ntype = &ntype,
                 .addr  = taddr_make(0x100000, ntype.shift),
-                .data  = mem_alloc_align(1ul << ntype.shift, 1ul << ntype.shift),
+                .data  = SAFE_ALLOC(mem_alloc_align(1ul << ntype.shift, 1ul << ntype.shift)),
                 .seq   = 1,
                 .mod   = &mod
         };
@@ -9276,7 +9337,7 @@ static void simple_ut() {
         utest("insert");
         populate(&s, &key, &val);
         result = simple_insert(&s, &m);
-        ASSERT(result == -ENOSPC);
+        ASSERT(result == -ENOSPC || EOOM(result));
         radixmap_update(&n);
         utest("get");
         for (int32_t i = 0; i < sh->nr; ++i) {
@@ -9307,7 +9368,7 @@ static void simple_ut() {
                 s.idx++;
                 key = BUF_VAL(key0);
                 val = BUF_VAL(val0);
-                NOFAIL(simple_insert(&s, &m));
+                UT_NOFAIL(simple_insert(&s, &m));
                 radixmap_update(&n);
                 ASSERT(HAS_DEFAULT_FORMAT && strcmp(STRINGIFY(DEFAULT_FORMAT), "simple") == 0 ? is_sorted(&n) : true);
                 key0[1] += 251; /* Co-prime with 256. */
@@ -9320,7 +9381,7 @@ static void simple_ut() {
 }
 
 static struct node *node_alloc_ut(struct t2 *mod, uint64_t blk) {
-        struct node *n = mem_alloc(sizeof *n);
+        struct node *n = SAFE_ALLOC(mem_alloc(sizeof *n));
         n->addr = taddr_make(blk & TADDR_ADDR_MASK, 9);
         n->mod = mod;
         return n;
@@ -9365,7 +9426,7 @@ static void ht_ut() {
                 ht_delete(n);
         }
         utest("uniform");
-        table = mem_alloc(sizeof table[0] << shift);
+        table = SAFE_ALLOC(mem_alloc(sizeof table[0] << shift));
         addr = 0;
         for (int i = 0; i < (10 << shift); ++i, addr += 1 << TADDR_MIN_SHIFT) {
                 ++table[ht_hash(addr) & MASK(shift)];
@@ -9404,7 +9465,7 @@ static void traverse_ut() {
         struct node n = {
                 .ntype = &ntype,
                 .addr  = addr,
-                .data  = mem_alloc_align(1ul << ntype.shift, 1ul << ntype.shift),
+                .data  = SAFE_ALLOC(mem_alloc_align(1ul << ntype.shift, 1ul << ntype.shift)),
                 .seq   = 1
         };
         ASSERT(n.data != NULL);
@@ -9452,7 +9513,7 @@ static void traverse_ut() {
                 buf_init_str(&val, val0);
                 SET0(&m);
                 cap_init(&m, nsize(&n));
-                NOFAIL(NCALL(&n, insert(&s, &m)));
+                UT_NOFAIL(NCALL(&n, insert(&s, &m)));
                 radixmap_update(&n);
                 ASSERT(is_sorted(&n));
         }
@@ -9461,27 +9522,27 @@ static void traverse_ut() {
         key0[0] = '0';
         SET0(&p);
         path_init(&p, &t, &s.rec, NULL, LOOKUP);
-        NOFAIL(traverse(&p));
+        UT_NOFAIL(traverse(&p));
         key0[0] = '2';
         SET0(&p);
         path_init(&p, &t, &s.rec, NULL, LOOKUP);
-        NOFAIL(traverse(&p));
+        UT_NOFAIL(traverse(&p));
         key0[0] = '8';
         SET0(&p);
         path_init(&p, &t, &s.rec, NULL, LOOKUP);
-        NOFAIL(traverse(&p));
+        UT_NOFAIL(traverse(&p));
         utest("too-small");
         key0[0] = ' ';
         SET0(&p);
         path_init(&p, &t, &s.rec, NULL, LOOKUP);
         result = traverse(&p);
-        ASSERT(result == -ENOENT);
+        ASSERT(result == -ENOENT || EOOM(result));
         utest("non-existent");
         key0[0] = '1';
         SET0(&p);
         path_init(&p, &t, &s.rec, NULL, LOOKUP);
         result = traverse(&p);
-        ASSERT(result == -ENOENT);
+        ASSERT(result == -ENOENT || EOOM(result));
         ht_delete(&n);
         utest("t2_fini");
         t2_fini(mod);
@@ -9507,17 +9568,17 @@ static void insert_ut() {
         struct cap m = {};
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
-        struct node *n = alloc(&t, 0, &m);
+        struct node *n = SAFE_ALLOC(alloc(&t, 0, &m));
         ASSERT(n != NULL && EISOK(n));
         t.root = n->addr;
         n->flags |= DIRTY;
         sh_add(n->mod, &n, 1);
         put(n);
         utest("insert-1");
-        NOFAIL(t2_insert(&t, &r, NULL));
+        UT_NOFAIL(t2_insert(&t, &r, NULL));
         utest("eexist");
         result = t2_insert(&t, &r, NULL);
-        ASSERT(result == -EEXIST);
+        ASSERT(result == -EEXIST || EOOM(result));
         utest("fini");
         t2_fini(mod);
         utestdone();
@@ -9545,15 +9606,15 @@ static void tree_ut() {
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
         utest("insert-1");
-        NOFAIL(t2_insert(t, &r, NULL));
+        UT_NOFAIL(t2_insert(t, &r, NULL));
         utest("eexist");
         result = t2_insert(t, &r, NULL);
-        ASSERT(result == -EEXIST);
+        ASSERT(result == -EEXIST || EOOM(result));
         utest("5K");
         key = BUF_VAL(k64);
         val = BUF_VAL(v64);
         for (k64 = 0; k64 < 5000; ++k64) {
-                NOFAIL(t2_insert(t, &r, NULL));
+                UT_NOFAIL(t2_insert(t, &r, NULL));
         }
         utest("20K");
         key = BUF_VAL(k64);
@@ -9561,26 +9622,24 @@ static void tree_ut() {
         for (int i = 0; i < 20000; ++i) {
                 k64 = ht_hash64(i);
                 v64 = ht_hash64(i + 1);
-                NOFAIL(t2_insert(t, &r, NULL));
+                UT_NOFAIL(t2_insert(t, &r, NULL));
         }
         utest("50K");
         for (int i = 0; i < 50000; ++i) {
                 k64 = ht_hash64(i);
                 v64 = ht_hash64(i + 1);
                 result = t2_insert(t, &r, NULL);
-                ASSERT(result == (i < 20000 ? -EEXIST : 0));
+                ASSERT(result == (i < 20000 ? -EEXIST : 0) || EOOM(result));
         }
         utest("check");
         for (int i = 0; i < 50000; ++i) {
                 k64 = ht_hash64(i);
-                NOFAIL(t2_lookup(t, &r));
+                UT_NOFAIL(t2_lookup(t, &r));
                 ASSERT(v64 == ht_hash64(i + 1));
         }
         utest("fini");
-        t2_stats_print(mod, 0);
         t2_fini(mod);
         utestdone();
-        counters_print(~0ull);
 }
 
 static void fill(char *x, int nr) {
@@ -9591,7 +9650,7 @@ static void fill(char *x, int nr) {
 
 static void tx_begin(struct t2 *mod, struct t2_tx *tx) {
         if (tx != NULL) {
-                NOFAIL(t2_tx_open(mod, tx));
+                UT_NOFAIL(t2_tx_open(mod, tx));
         }
 }
 
@@ -9631,7 +9690,7 @@ static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 fill(val, vsize);
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
-                NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
+                UT_NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
                 for (int j = 0; j < 10; ++j) {
                         long probe = rand();
                         *(long *)key = probe;
@@ -9653,7 +9712,8 @@ static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 *(long *)key = j;
                 keyb = (struct t2_buf){ .len = ksize,    .addr = &key };
                 valb = (struct t2_buf){ .len = SOF(val), .addr = &val };
-                NOFAIL(t2_lookup(t, &r));
+                result = t2_lookup(t, &r);
+                ASSERT(result == 0 || EOOM(result) || (result == -ENOENT && ut_mem_alloc_fail_N != 0));
         }
         utest("rand");
         U *= 1;
@@ -9668,7 +9728,7 @@ static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
                 result = WITH_TX(mod, tx, t2_insert(t, &r, tx));
-                ASSERT(result == 0 || result == -EEXIST);
+                ASSERT(result == 0 || result == -EEXIST || EOOM(result));
                 if (result == -EEXIST) {
                         exist++;
                 }
@@ -9691,7 +9751,6 @@ static void stress_ut() {
         utest("fini");
         t2_fini(mod);
         utestdone();
-        counters_print(~0ull);
 }
 
 static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
@@ -9724,7 +9783,7 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 fill(val, vsize);
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
-                NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
+                UT_NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
         }
         for (long i = U - 1; i >= 0; --i) {
                 for (long j = 0; j < U; ++j) {
@@ -9743,7 +9802,7 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 *(long *)key = i;
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
-                NOFAIL(WITH_TX(mod, tx, t2_delete(t, &r, tx)));
+                UT_NOFAIL(WITH_TX(mod, tx, t2_delete(t, &r, tx)));
         }
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
@@ -9752,7 +9811,7 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 keyb = (struct t2_buf){ .len = ksize,    .addr = &key };
                 valb = (struct t2_buf){ .len = SOF(val), .addr = &val };
                 result = t2_lookup(t, &r);
-                ASSERT(result == -ENOENT);
+                ASSERT(result == -ENOENT || EOOM(result));
         }
         utest("rand");
         U = 100000;
@@ -9770,14 +9829,14 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                         fill(val, vsize);
                         valb = (struct t2_buf){ .len = vsize, .addr = &val };
                         result = WITH_TX(mod, tx, t2_insert(t, &r, tx));
-                        ASSERT(result == 0 || result == -EEXIST);
+                        ASSERT(result == 0 || result == -EEXIST || EOOM(result));
                         if (result == -EEXIST) {
                                 exist++;
                         }
                         inserts++;
                 } else {
                         result = WITH_TX(mod, tx, t2_delete(t, &r, tx));
-                        ASSERT(result == 0 || result == -ENOENT);
+                        ASSERT(result == 0 || result == -ENOENT || EOOM(result));
                         if (result == -ENOENT) {
                                 noent++;
                         }
@@ -9838,7 +9897,7 @@ static void next_ut_with(struct t2 *mod, struct t2_tx *tx) {
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(i);
                 valb = BUF_VAL(i);
-                NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
+                UT_NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
         }
         utest("smoke");
         for (long i = 0, del = 0; i < U; ++i, del += 7, del %= U) {
@@ -9846,7 +9905,7 @@ static void next_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 struct t2_buf maxkey = BUF_VAL(ulongmax);
                 keyb = BUF_VAL(del);
                 valb = BUF_VAL(del);
-                NOFAIL(WITH_TX(mod, tx, t2_delete(t, &r, tx)));
+                UT_NOFAIL(WITH_TX(mod, tx, t2_delete(t, &r, tx)));
                 c.dir = T2_MORE;
                 t2_cursor_init(&c, &zero);
                 cit = 0;
@@ -9882,7 +9941,7 @@ static void cookie_ut() {
         int result;
         usuite("cookie");
         utest("init");
-        NOFAIL(signal_init());
+        UT_NOFAIL(signal_init());
         cookie_make(&v[0]);
         cookie_load(&v[0], &k);
         result = cookie_is_valid(&k);
@@ -9964,7 +10023,7 @@ void seq_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 valb = BUF_VAL(val);
                 r.key = &keyb;
                 r.val = &valb;
-                NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
+                UT_NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
                 inc(key, (sizeof key) - 1);
         }
 }
@@ -9976,8 +10035,6 @@ void seq_ut() {
         utest("fini");
         t2_fini(mod);
         utestdone();
-        counters_print(~0ull);
-        counters_clear();
 }
 
 void lib_ut() {
@@ -10026,7 +10083,7 @@ void *lookup_worker(void *arg) {
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 int result = t2_lookup_ptr(t, kbuf, ksize, vbuf, sizeof vbuf);
-                ASSERT(result == 0 || result == -ENOENT);
+                ASSERT(result == 0 || result == -ENOENT || EOOM(result));
         }
         t2_thread_degister();
         return NULL;
@@ -10044,7 +10101,7 @@ void *insert_worker(void *arg) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 random_buf(vbuf, sizeof vbuf, &vsize);
                 int result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, tx));
-                ASSERT(result == 0 || result == -EEXIST);
+                ASSERT(result == 0 || result == -EEXIST || EOOM(result));
         }
         if (tx != NULL) {
                 t2_tx_done(t->ttype->mod, tx);
@@ -10062,7 +10119,7 @@ void *delete_worker(void *arg) {
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 int result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, kbuf, ksize, tx));
-                ASSERT(result == 0 || result == -ENOENT);
+                ASSERT(result == 0 || result == -ENOENT || EOOM(result));
         }
         if (tx != NULL) {
                 t2_tx_done(t->ttype->mod, tx);
@@ -10113,7 +10170,7 @@ void mt_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 random_buf(vbuf, sizeof vbuf, &vsize);
                 result = WITH_TX(mod, tx, t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, tx));
-                ASSERT(result == 0 || result == -EEXIST);
+                ASSERT(result == 0 || result == -EEXIST || EOOM(result));
         }
         utest("lookup");
         for (int i = 0; i < THREADS; ++i) {
@@ -10165,7 +10222,6 @@ void mt_ut() {
         utest("fini");
         t2_fini(mod);
         utestdone();
-        counters_print(~0ull);
 }
 
 static void open_ut() {
@@ -10189,7 +10245,7 @@ static void open_ut() {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 random_buf(vbuf, sizeof vbuf, &vsize);
                 result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, NULL);
-                ASSERT(result == 0 || result == -EEXIST);
+                ASSERT(result == 0 || result == -EEXIST || EOOM(result));
         }
         root = t->root;
         free = bn_file_free(&file_storage.gen);
@@ -10221,7 +10277,6 @@ static void open_ut() {
         utest("fini");
         t2_fini(mod);
         utestdone();
-        counters_print(~0ull);
 }
 
 #if TRANSACTIONS
@@ -10322,7 +10377,7 @@ static void wal_ut() {
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
         result = t2_tx_open(mod, tx);
-        ASSERT(result == 0);
+        ASSERT(result == 0 || EOOM(result));
         t = t2_tree_create(&ttype, tx);
         ASSERT(EISOK(t));
         t2_tx_close(mod, tx);
@@ -10336,24 +10391,24 @@ static void wal_ut() {
         tx = t2_tx_make(mod);
         ASSERT(EISOK(tx));
         result = t2_tx_open(mod, tx);
-        ASSERT(result == 0);
+        ASSERT(result == 0 || EOOM(result));
         t = t2_tree_create(&ttype, tx);
         ASSERT(EISOK(t));
         t2_tx_close(mod, tx);
         for (uint64_t k = 0; k < NOPS; ++k) {
                 uint64_t bek = htobe64(k);
                 result = t2_tx_open(mod, tx);
-                ASSERT(result == 0);
+                ASSERT(result == 0 || EOOM(result));
                 result = t2_insert_ptr(t, &bek, SOF(bek), &k, SOF(k), tx);
-                ASSERT(result == 0);
+                ASSERT(result == 0 || EOOM(result));
                 t2_tx_close(mod, tx);
         }
         for (uint64_t k = 0; k < NOPS; k += 2) {
                 uint64_t bek = htobe64(k);
                 result = t2_tx_open(mod, tx);
-                ASSERT(result == 0);
+                ASSERT(result == 0 || EOOM(result));
                 result = t2_delete_ptr(t, &bek, SOF(bek), tx);
-                ASSERT(result == 0);
+                ASSERT(result == 0 || EOOM(result));
                 t2_tx_close(mod, tx);
         }
         t2_tx_done(mod, tx);
@@ -10373,12 +10428,10 @@ static void wal_ut() {
         ASSERT(EISOK(t));
         wal_ut_verify(t);
         t2_tree_close(t);
-        t2_stats_print(mod, 0);
         t2_fini(mod);
         free0 = 512;
         file_storage.filename = oldfile;
         utestdone();
-        counters_print(~0ull);
 }
 
 static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *label) {
@@ -10422,10 +10475,7 @@ static void mt_ut_tx() {
         ut_with_tx(&mt_ut_with, "mt-tx");
 }
 
-int main(int argc, char **argv) {
-        argv0 = argv[0];
-        setbuf(stdout, NULL);
-        setbuf(stderr, NULL);
+void ut() {
         lib_ut();
         simple_ut();
         ht_ut();
@@ -10446,7 +10496,29 @@ int main(int argc, char **argv) {
         next_ut_tx();
         seq_ut_tx();
         mt_ut_tx();
+}
+
+int main(int argc, char **argv) {
+        argv0 = argv[0];
+        setbuf(stdout, NULL);
+        setbuf(stderr, NULL);
+        ut();
+        printf("Re-running with disordered storage.\n");
+        ut_storage = &disorder_storage.gen;
+        ut();
+        ut_storage = &file_storage.gen;
+        for (int i = 100000; i != 0; i /= 2) {
+                printf("Re-running with every %i memory allocation failing.\n", i);
+                ut_mem_alloc_fail_N = i;
+                ut();
+        }
         return 0;
+}
+
+#else  /* UT */
+
+static bool ut_mem_alloc_fail() {
+        return false;
 }
 
 #endif /* UT */
