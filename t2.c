@@ -8416,8 +8416,16 @@ static bool wal_stop(struct t2_te *engine, struct t2_node *nn) {
 
 static bool wal_check(const struct t2_te *engine, struct t2_node *nn) {
         struct wal_te *en = COF(engine, struct wal_te, base);
-        struct node *n = (void *)nn;
-        return (n->flags & DIRTY) ? en->max_paged <= n->lsn_lo && n->lsn_lo <= n->lsn_hi : true;
+        struct node   *n  = (void *)nn;
+        bool           inrange;
+        if (n->flags & DIRTY) {
+                wal_lock(en);
+                inrange = en->max_paged <= n->lsn_lo && n->lsn_lo <= n->lsn_hi;
+                wal_unlock(en);
+                return inrange;
+        } else {
+                return false;
+        }
 }
 
 static void wal_clean(struct t2_te *engine, struct t2_node **nodes, int nr) {
