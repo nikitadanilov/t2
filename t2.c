@@ -1091,9 +1091,9 @@ static void wal_maxpaged(struct t2_te *engine, lsn_t min);
 static void wal_print   (struct t2_te *engine);
 static void wal_pulse   (struct t2 *mod);
 static lsn_t wal_lsn(struct t2_te *engine);
-struct t2_te *wal_prep  (const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
-                         uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                         int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio);
+static struct t2_te *wal_prep  (const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
+                                uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
+                                int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
 static void cap_normalise(struct cap *cap, uint32_t size);
@@ -8050,11 +8050,11 @@ static int wal_fill(struct wal_te *en) {
         return result;
 }
 
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers,
-                       int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age,
-                       uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd,
-                       int threshold_log_sync, int ready_lo, bool directio) {
+static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers,
+                              int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age,
+                              uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
+                              int threshold_paged, int threshold_page, int threshold_log_syncd,
+                              int threshold_log_sync, int ready_lo, bool directio) {
         struct wal_te *en     = mem_alloc(sizeof *en);
         pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
         int           *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
@@ -8559,9 +8559,9 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
 }
 
 #else /* TRANSACTIONS */
-struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
-                       uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                       int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio) {
+static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
+                              uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
+                              int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio) {
         return NULL; /* TODO: For bn.c. */
 }
 
@@ -10479,7 +10479,7 @@ static void mt_ut_tx() {
         ut_with_tx(&mt_ut_with, "mt-tx");
 }
 
-void ut() {
+static void ut() {
         lib_ut();
         simple_ut();
         ht_ut();
