@@ -1084,7 +1084,6 @@ static void wal_wait_for(struct t2_te *engine, lsn_t lsn, bool force);
 static void wal_done    (struct t2_te *engine, struct t2_tx *trax);
 static bool wal_pinned  (const struct t2_te *engine, struct t2_node *n);
 static bool wal_throttle(const struct t2_te *engine, struct t2_node *n);
-static bool wal_check   (const struct t2_te *engine, struct t2_node *n);
 static bool wal_stop    (struct t2_te *engine, struct t2_node *n);
 static void wal_clean   (struct t2_te *engine, struct t2_node **nodes, int nr);
 static void wal_maxpaged(struct t2_te *engine, lsn_t min);
@@ -3939,10 +3938,6 @@ static bool canpage(const struct node *n, const struct t2_te *te) {
         return !TRANSACTIONS || te == NULL || !pinned(n, te);
 }
 
-static bool tx_node_check(const struct node *n, const struct t2_te *te) {
-        return !TRANSACTIONS || te == NULL || TXCALL(te, check(te, (void *)n));
-}
-
 static void pageout_prep(struct pageout_ctx *ctx) {
         ASSERT(pageout_ctx_invariant(ctx));
         pageout_complete_pending(ctx);
@@ -4432,7 +4427,6 @@ static void scan_bucket(struct t2 *mod, int32_t pos, struct maxwell_data *md, in
                 return;                                                 \
         }                                                               \
         n = COF(link, struct node, hash);                               \
-        ASSERT(tx_node_check(n, mod->te));                              \
         node_state_print(n, 's');                                       \
         t = krate(&nheader(n)->kelvin, bolt(n));                        \
         md->window[md->pos++ & MASK(WINDOW_SHIFT)] = t;                 \
@@ -8082,7 +8076,6 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         en->base.open     = &wal_open;
         en->base.close    = &wal_close;
         en->base.wait_for = &wal_wait_for;
-        en->base.check    = &wal_check;
         en->base.stop     = &wal_stop;
         en->base.maxpaged = &wal_maxpaged;
         en->base.clean    = &wal_clean;
@@ -8451,20 +8444,6 @@ static bool wal_stop(struct t2_te *engine, struct t2_node *nn) {
         struct wal_te *en  = COF(engine, struct wal_te, base);
         struct node   *n   = (void *)nn;
         return n->lsn_lo >= wal_limit(en) && LIKELY(!en->quiesce);
-}
-
-static bool wal_check(const struct t2_te *engine, struct t2_node *nn) {
-        struct wal_te *en = COF(engine, struct wal_te, base);
-        struct node   *n  = (void *)nn;
-        bool           inrange;
-        if (n->flags & DIRTY) {
-                wal_lock(en);
-                inrange = en->max_paged <= n->lsn_lo && n->lsn_lo <= n->lsn_hi;
-                wal_unlock(en);
-                return inrange;
-        } else {
-                return false;
-        }
 }
 
 static void wal_clean(struct t2_te *engine, struct t2_node **nodes, int nr) {
