@@ -5296,19 +5296,27 @@ static uint64_t threadid(void)
 }
 #endif
 
+static volatile bool debugger_plug = true;
+
 static void debugger_attach(void) {
         int         result;
         const char *debugger = getenv("DEBUGGER");
         if (debugger == NULL) {
                 return;
+        } else if (strcmp(debugger, "wait") == 0) {
+                printf("Waiting for debugger, pid: %i tid: %i.\n", getpid(), gettid());
+                result = +1;
+        } else {
+                if (argv0 == NULL) {
+                        puts("Quod est nomen meum?");
+                        return;
+                }
+                result = fork();
         }
-        if (argv0 == NULL) {
-                puts("Quod est nomen meum?");
-                return;
-        }
-        result = fork();
         if (result > 0) {
-                pause();
+                while (debugger_plug) {
+                        sleep(1);
+                }
         } else if (result == 0) {
                 const char *argv[4];
                 char        pidbuf[16];
@@ -5317,6 +5325,7 @@ static void debugger_attach(void) {
                 argv[2] = pidbuf;
                 argv[3] = NULL;
                 snprintf(pidbuf, sizeof pidbuf, "%i", getppid());
+                printf("Attaching debugger: %s %s %s\n", argv[0], argv[1], argv[2]);
                 execvp(debugger, (void *)argv);
                 exit(1);
         }
