@@ -7563,6 +7563,12 @@ static void wal_broadcast(struct wal_te *en) {
         sh_broadcast(en->mod);
 }
 
+static ssize_t (*ut_pwrite)(int fd, const void *buf, size_t count, off_t offset) = NULL;
+
+static ssize_t wal_pwrite(int fd, const void *buf, size_t count, off_t offset) {
+        return (UT && ut_pwrite != NULL ? ut_pwrite : pwrite)(fd, buf, count, offset);
+}
+
 struct wal_header {
         struct wal_rec h;
         struct hdata {
@@ -7628,7 +7634,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         ASSERT(buf->lsn != 0);
         fd = en->fd[wal_map(en, buf->lsn, &off)];
         start = COUNTERS ? READ_ONCE(en->mod->tick) : 0;
-        result = pwrite(fd, buf->data, nob, off);
+        result = wal_pwrite(fd, buf->data, nob, off);
         if (LIKELY(result == nob)) {
                 lsn_t              lsn;
                 struct wal_buf    *scan;
