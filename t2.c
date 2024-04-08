@@ -7981,6 +7981,11 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
 static void wal_pulse(struct t2 *mod) { /* TODO: Periodically check that lsn is not about to overflow. */
 }
 
+static void wal_sync_all(struct wal_te *en) {
+        for (int i = 0; i < (1 << en->log_shift); ++i) {
+                fd_sync(en->fd[i]); /* Force sync, not barrier. */
+        }
+}
 static void wal_quiesce(struct t2_te *engine) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         wal_lock(en);
@@ -8000,9 +8005,7 @@ static void wal_quiesce(struct t2_te *engine) {
         wal_page_sync(en);
         wal_snapshot(en);
         wal_snapshot(en);
-        for (int i = 0; i < (1 << en->log_shift); ++i) {
-                fd_sync(en->fd[i]); /* Force sync, not barrier. */
-        }
+        wal_sync_all(en);
         wal_unlock(en);
 }
 
@@ -8383,6 +8386,28 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
         return 0;
 }
 
+static int wal_recovery_clean(struct wal_te *en, struct rbuf *index, int nr, lsn_t end) {
+        bool zeroed = false;
+        /* Zero out unrecovered records, lest they confuse the next recovery. */
+        for (int i = 0; i < nr; ++i) {
+                const struct rbuf *r = &index[i];
+                const struct wal_header zero = {};
+                if (r->lsn >= end) {
+                        int result = pwrite(en->fd[r->idx], &zero, sizeof zero, r->off);
+                        if (result != sizeof zero) {
+                                LOG("Cannot zero buffer.");
+                                rbuf_print(r);
+                                return ERROR(result < 0 ? -errno : -EIO);
+                        }
+                        zeroed = true;
+                }
+        }
+        if (zeroed) {
+                wal_sync_all(en);
+        }
+        return 0;
+}
+
 static int wal_recover(struct wal_te *en) {
         int          buf_nr = 0;
         int          result;
@@ -8409,12 +8434,11 @@ static int wal_recover(struct wal_te *en) {
                 if (result == 0) {
                         void *buf = mem_alloc(en->buf_size);
                         if (buf != NULL) {
-                                result = wal_index_replay(en, buf_nr, index, last.start, last.end, buf);
+                                result = wal_index_replay(en, buf_nr, index, last.start, last.end, buf) ?:
+                                         cache_load(en->mod) ?:
+                                         wal_recovery_clean(en, index, buf_nr, last.end);
                                 if (result == 0) {
-                                        result = cache_load(en->mod);
-                                        if (result == 0) {
-                                                wal_recovery_done(en, last.start, last.end);
-                                        }
+                                        wal_recovery_done(en, last.start, last.end);
                                 }
                                 mem_free(buf);
                         } else {
