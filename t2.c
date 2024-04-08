@@ -8299,6 +8299,7 @@ static void rbuf_print(const struct rbuf *rbuf) {
 
 static int wal_index_replay(struct wal_te *en, int nr, struct rbuf *index, lsn_t start, lsn_t end, void *buf) {
         int result = 0;
+        printf("Replaying %i groups from %"PRId64" to %"PRId64" [", nr, start, end);
         for (int i = 0; result == 0 && i < nr; ++i) {
                 struct rbuf *r = &index[i];
                 if (start <= r->lsn && r->lsn < end) {
@@ -8309,7 +8310,11 @@ static int wal_index_replay(struct wal_te *en, int nr, struct rbuf *index, lsn_t
                         }
                         result = wal_buf_replay(en, buf, result);
                 }
+                if (i % (nr / 50) == 0) {
+                        printf(".");
+                }
         }
+        printf("]\n");
         return result;
 }
 
