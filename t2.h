@@ -158,6 +158,8 @@ struct t2_storage_op {
         int               (*read)  (struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst);
         int               (*write) (struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ctx, void *arg);
         void             *(*end)   (struct t2_storage *storage, struct t2_io_ctx *ctx, int32_t *nob, bool wait);
+        uint64_t          (*tell)  (struct t2_storage *storage);
+        void              (*set)   (struct t2_storage *storage, uint64_t free);
         int               (*sync)  (struct t2_storage *storage, bool barrier);
         bool              (*same)  (struct t2_storage *storage, int fd);
 };

@@ -8710,6 +8710,13 @@ static void *mso_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_
         return NULL;
 }
 
+static uint64_t mso_tell(struct t2_storage *storage) {
+        return 0;
+}
+
+static void mso_set(struct t2_storage *storage, uint64_t off) {
+}
+
 static void mso_done(struct t2_storage *storage, struct t2_io_ctx *ctx) {
 }
 
@@ -8732,6 +8739,8 @@ static struct t2_storage_op mock_storage_op = {
         .read     = &mso_read,
         .write    = &mso_write,
         .end      = &mso_end,
+        .tell     = &mso_tell,
+        .set      = &mso_set,
         .sync     = &mso_sync,
         .same     = &mso_same
 };
@@ -8944,6 +8953,21 @@ static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32
         }
 }
 
+static uint64_t file_tell(struct t2_storage *storage) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        return fs->free;
+}
+
+static void file_set(struct t2_storage *storage, uint64_t free) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        mutex_lock(&fs->lock);
+        fs->free = max_64(free, fs->free);
+        for (int i = 0; i < FRAG_NR; ++i) {
+                fs->frag_free[i] = fs->free;
+        }
+        mutex_unlock(&fs->lock);
+}
+
 static int file_sync(struct t2_storage *storage, bool barrier) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         int result = 0;
@@ -8972,6 +8996,8 @@ static struct t2_storage_op file_storage_op = {
         .read     = &file_read,
         .write    = &file_write,
         .end      = &file_end,
+        .tell     = &file_tell,
+        .set      = &file_set,
         .sync     = &file_sync,
         .same     = &file_same
 };
@@ -10645,6 +10671,10 @@ static bool ut_mem_alloc_fail() {
  * - meta-index, call-backs for root relocation
  *
  * - record block allocation and de-allocation in the log
+ *
+ * - speed up and parallelise replay
+ *
+ * - support pageout during recovery for logs larger than memory
  *
  * Done:
  *
