@@ -8772,10 +8772,28 @@ struct file_storage {
         uint64_t          free;
         bool              allsame;
         dev_t             device;
+        bool              kill_switch;
 };
 
-static int64_t free0 = 512;
+enum { FREE0 = 1024 };
+static int64_t free0 = FREE0;
 static const char file_fmt[] = "%s.%03x";
+
+static void file_kill_check(struct file_storage *fs) {
+        mutex_lock(&fs->lock);
+        if (UNLIKELY(fs->kill_switch)) {
+                while (1) {
+                        sleep(1);
+                }
+        }
+        mutex_unlock(&fs->lock);
+}
+
+static void file_kill(struct file_storage *fs) {
+        mutex_lock(&fs->lock);
+        fs->kill_switch = true;
+        /* Leave with the mutex held. */
+}
 
 static int file_init(struct t2_storage *storage) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
@@ -8832,6 +8850,7 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
         taddr_t              result;
         int                  hand;
         uint64_t             lim;
+        file_kill_check(fs);
         mutex_lock(&fs->lock);
         hand = frag_select(fs);
         lim = fs->frag_free[hand] + (1ull << shift_min);
@@ -8846,6 +8865,7 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
 }
 
 static void file_free(struct t2_storage *storage, taddr_t addr) {
+        file_kill_check((void *)storage);
 }
 
 static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst) {
@@ -8854,6 +8874,7 @@ static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct io
         int                  fr    = frag(fs, addr);
         int                  result;
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + dst[i].iov_len));
+        file_kill_check(fs);
         if (UNLIKELY(fr > FRAG_NR)) {
                 return -ESTALE;
         }
@@ -8878,6 +8899,7 @@ struct file_ctx {
 
 static struct t2_io_ctx *file_create(struct t2_storage *storage, int queue) {
         struct file_ctx *ctx = mem_alloc(sizeof *ctx);
+        file_kill_check((void *)storage);
         if (ctx != NULL) {
                 int result = io_uring_queue_init(queue, &ctx->ring, URING_FLAGS);
                 if (result < 0) {
@@ -8892,6 +8914,7 @@ static struct t2_io_ctx *file_create(struct t2_storage *storage, int queue) {
 
 static void file_done(struct t2_storage *storage, struct t2_io_ctx *arg) {
         struct file_ctx *ctx = (void *)arg;
+        file_kill_check((void *)storage);
         io_uring_queue_exit(&ctx->ring);
         mem_free(ctx);
 }
@@ -8902,6 +8925,7 @@ static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct i
         int                  fr  = frag(fs, addr);
         struct file_ctx     *ctx = (void *)ioctx;
         int                  result;
+        file_kill_check(fs);
         ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
         if (UNLIKELY(fr > FRAG_NR)) {
                 return -ESTALE;
@@ -8937,6 +8961,7 @@ static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32
         struct io_uring_cqe *cqe;
         struct file_ctx     *ctx = (void *)ioctx;
         int                  result;
+        file_kill_check((void *)storage);
         if (ctx == NULL) {
                 return NULL;
         }
@@ -8971,6 +8996,7 @@ static void file_set(struct t2_storage *storage, uint64_t free) {
 static int file_sync(struct t2_storage *storage, bool barrier) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         int result = 0;
+        file_kill_check(fs);
         for (int i = 0; i < FRAG_NR; ++i) {
                 int rc = (barrier ? fd_barrier : fd_sync)(fs->fd[i]);
                 result = result ?: rc;
@@ -9147,6 +9173,16 @@ static void *disorder_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, i
         }
 }
 
+static uint64_t disorder_tell(struct t2_storage *storage) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        return dis->substrate->op->tell(dis->substrate);
+}
+
+static void disorder_set(struct t2_storage *storage, uint64_t free) {
+        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
+        dis->substrate->op->set(dis->substrate, free);
+}
+
 static struct disorder_req *disorder_scan(struct disorder_storage *dis, uint64_t *min, uint64_t *max) {
         struct disorder_req *scan;
         struct disorder_req *select = NULL;
@@ -9238,6 +9274,8 @@ static struct t2_storage_op disorder_storage_op = {
         .read   = &disorder_read,
         .write  = &disorder_write,
         .end    = &disorder_end,
+        .tell   = &disorder_tell,
+        .set    = &disorder_set,
         .sync   = &disorder_sync,
         .same   = &disorder_same
 };
@@ -9261,10 +9299,7 @@ uint64_t bn_file_free(struct t2_storage *storage) {
 }
 
 void bn_file_free_set(struct t2_storage *storage, uint64_t free) {
-        file_storage.free = free;
-        for (int i = 0; i < FRAG_NR; ++i) {
-                file_storage.frag_free[i] = free;
-        }
+        storage->op->set(storage, free);
 }
 
 void bn_file_truncate(struct t2_storage *storage, uint64_t off) {
@@ -10533,7 +10568,7 @@ static void wal_ut() {
         wal_ut_verify(t);
         t2_tree_close(t);
         t2_fini(mod);
-        free0 = 512;
+        free0 = FREE0;
         file_storage.filename = oldfile;
         utestdone();
 }
@@ -10550,14 +10585,219 @@ static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *labe
         utestdone();
 }
 
-#else
+struct seg_state {
+        taddr_t              root;
+        uint64_t             free;
+        uint64_t             bolt;
+        struct t2_tree      *tree;
+        struct t2           *mod;
+        struct file_storage *file;
+        int                  iter;
+        int                  nr_threads;
+        uint64_t            *idx;
+        int                  sleep_min;
+        int                  sleep_max;
+};
+
+static void seg_load(struct seg_state *ss) {
+        FILE *seg = fopen("ct.seg", "r");
+        ASSERT(seg != NULL);
+        int nr = fscanf(seg, "%"SCNx64" %"SCNx64" %"SCNx64, &ss->root, &ss->free, &ss->bolt);
+        assert(nr == 3);
+        fclose(seg);
+}
+
+static void seg_save(struct seg_state *ss) {
+        FILE *seg = fopen("ct.seg", "w");
+        ASSERT(seg != NULL);
+        fprintf(seg, "%"PRIx64" %"PRIx64" %"PRIx64, ss->tree->root, ss->file->free, ss->mod->cache.bolt);
+        fflush(seg);
+        fclose(seg);
+}
+
+static ssize_t ct_pwrite(int fd, const void *buf, size_t count, off_t offset) {
+        return count;
+}
+
+static struct seg_state cseg = {};
+static bool stop = false;
+
+static void *abaddon(void *arg) {
+        do {
+                sleep(cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min));
+        } while (stop);
+        puts("    .... Crashing.");
+        file_kill(&file_storage);
+        //ut_pwrite = &ct_pwrite;
+        seg_save(&cseg);
+        abort();
+        return NULL;
+}
+
+struct ct_val {
+        uint64_t tno;
+        uint64_t idx;
+};
+
+struct ct_key {
+        uint64_t      h;
+        struct ct_val val;
+};
+
+static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, struct ct_val *val) {
+        val->tno = threadno;
+        val->idx = idx;
+        key->val = *val;
+        key->h   = ht_hash64(val->tno + (val->idx << 17));
+}
+
+static bool checkrec(struct ct_key *key, struct ct_val *val) {
+        return memcmp(&key->val, val, sizeof *val) == 0 && key->h == ht_hash64(val->tno + (val->idx << 17));
+}
+
+static void *ct_scan(void *arg) {
+        int               tno = (long)arg;
+        struct t2_tree   *t   = cseg.tree;
+        int               result;
+        uint64_t          idx = 0;
+        struct ct_key     key;
+        struct ct_val     val;
+        t2_thread_register();
+        ASSERT(cseg.iter != 0);
+        while (true) {
+                makerec(tno, idx, &key, &val);
+                result = t2_lookup_ptr(t, &key, sizeof key, &val, sizeof val);
+                if (result == -ENOENT) {
+                        break;
+                } else if (result != 0 || !checkrec(&key, &val)) {
+                        printf("    .... Thread %i scan error: %i.\n", tno, result);
+                        exit(1);
+                } else {
+                        ++idx;
+                }
+        }
+        printf("    .... Thread %i scanned to: %"PRIu64"\n", tno, idx);
+        cseg.idx[tno] = idx;
+        t2_thread_degister();
+        return NULL;
+}
+
+static void *busy(void *arg) {
+        int             tno = (long)arg;
+        struct t2_tree *t   = cseg.tree;
+        struct t2_tx   *tx;
+        int             result;
+        struct ct_key   key;
+        struct ct_val   val;
+        t2_thread_register();
+        tx = t2_tx_make(t->ttype->mod);
+        ASSERT(EISOK(tx));
+        while (true) {
+                makerec(tno, cseg.idx[tno], &key, &val);
+                result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, sizeof key, &val, sizeof val, tx));
+                ASSERT(result == 0 || result == -EEXIST || EOOM(result));
+                if (result == -EEXIST) {
+                        printf("    .... Thread %i gap before %"PRId64".\n", tno, cseg.idx[tno]);
+                        stop = true;
+                        debugger_attach();
+                        t2_lookup_ptr(t, &key, sizeof key, &val, sizeof val);
+                        exit(1);
+                }
+                ++cseg.idx[tno];
+        }
+        t2_tx_done(t->ttype->mod, tx);
+        t2_thread_degister();
+        return NULL;
+}
+
+#include <sys/types.h>
+#include <sys/wait.h>
+
+static void ct(int argc, char **argv) {
+        enum { CT_SHIFT = 24 };
+        ASSERT(argc > 5);
+        ASSERT(ut_storage == &file_storage.gen ||
+               (ut_storage == &disorder_storage.gen && disorder_storage.substrate == &file_storage.gen));
+        cseg.iter = argv[2][0] == 'c';
+        cseg.nr_threads = atoi(argv[3]);
+        cseg.sleep_min = atoi(argv[4]);
+        cseg.sleep_max = atoi(argv[5]);
+        ASSERT(cseg.sleep_min < cseg.sleep_max);
+        uint64_t idx[cseg.nr_threads];
+        memset(idx, 0, sizeof idx);
+        cseg.idx = idx;
+        while (true) {
+                pid_t child = fork();
+                int   status;
+                if (child == 0) {
+                        pthread_t       tid[cseg.nr_threads + 1];
+                        struct t2      *mod;
+                        struct t2_tree *t;
+                        int32_t         flags = FLAGS;
+                        printf("    Iteration %5i.\n", cseg.iter);
+                        if (cseg.iter != 0) {
+                                seg_load(&cseg);
+                                file_set(&file_storage.gen, cseg.free);
+                        } else {
+                                flags |= MAKE;
+                        }
+                        mod = T2_INIT(&file_storage.gen, wprep(flags), CT_SHIFT, CT_SHIFT, ttypes, ntypes);
+                        if (cseg.iter == 0) {
+                                struct t2_tx *tx = t2_tx_make(mod);
+                                ASSERT(EISOK(tx));
+                                int result = t2_tx_open(mod, tx);
+                                ASSERT(result == 0 || EOOM(result));
+                                t = t2_tree_create(&ttype, tx);
+                        } else {
+                                t = t2_tree_open(&ttype, cseg.root);
+                                mod->cache.bolt = cseg.bolt;
+                        }
+                        ASSERT(EISOK(t));
+                        cseg.mod  = mod;
+                        cseg.tree = t;
+                        cseg.file = &file_storage;
+                        if (cseg.iter != 0) {
+                                for (int i = 0; i < cseg.nr_threads; ++i) {
+                                        NOFAIL(pthread_create(&tid[i], NULL, &ct_scan, (void *)(long)i));
+                                }
+                                for (int i = 0; i < cseg.nr_threads; ++i) {
+                                        NOFAIL(pthread_join(tid[i], NULL));
+                                }
+                        }
+                        for (int i = 0; i < cseg.nr_threads; ++i) {
+                                NOFAIL(pthread_create(&tid[i], NULL, &busy, (void *)(long)i));
+                        }
+                        NOFAIL(pthread_create(&tid[cseg.nr_threads], NULL, &abaddon, NULL));
+                        while (true) {
+                                wait(&status);
+                        }
+                } else {
+                        ASSERT(child > 0);
+                        pid_t deceased = wait(&status);
+                        ASSERT(deceased == child);
+                        puts("    .... Child teriminated.");
+                        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGABRT) {
+                                printf("    .... Child wasn't aborted properly: %o.\n", status);
+                                break;
+                        }
+                        ++ cseg.iter;
+                }
+        }
+}
+
+#else /* TRANSACTIONS */
+
 static void wal_ut() {
 }
 
 static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *label) {
 }
 
-#endif
+static void ct() {
+        puts("Crash test is not compiled in.");
+}
+
+#endif /* TRANSACTIONS */
 
 static void stress_ut_tx() {
         ut_with_tx(&stress_ut_with, "stress-tx");
@@ -10606,15 +10846,19 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        ut();
-        printf("Re-running with disordered storage.\n");
-        ut_storage = &disorder_storage.gen;
-        ut();
-        ut_storage = &file_storage.gen;
-        for (int i = 100000; i != 0; i /= 2) {
-                printf("Re-running with every %i memory allocation failing.\n", i);
-                ut_mem_alloc_fail_N = i;
+        if (argc > 1 && strcmp(argv[1], "c") == 0) {
+                ct(argc, argv);
+        } else {
                 ut();
+                printf("Re-running with disordered storage.\n");
+                ut_storage = &disorder_storage.gen;
+                ut();
+                ut_storage = &file_storage.gen;
+                for (int i = 100000; i != 0; i /= 2) {
+                        printf("Re-running with every %i memory allocation failing.\n", i);
+                        ut_mem_alloc_fail_N = i;
+                        ut();
+                }
         }
         return 0;
 }
