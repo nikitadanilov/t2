@@ -2878,7 +2878,7 @@ static int insert_prep(struct path *p) {
         int            result = 0;
         SLOT_DEFINE(s, p->rung[idx].page.node);
         if (leaf_search(p->rung[idx].page.node, p, &s)) {
-                return -EEXIST;
+                return path_lock(p) ?: -EEXIST;
         }
         p->rung[idx].pos = s.idx;
         do {
@@ -2912,7 +2912,7 @@ static int delete_prep(struct path *p) {
         int result = 0;
         SLOT_DEFINE(s, p->rung[idx].page.node);
         if (!leaf_search(p->rung[idx].page.node, p, &s)) {
-                return -ENOENT;
+                return path_lock(p) ?: -ENOENT;
         }
         p->rung[idx].pos = s.idx;
         do {
