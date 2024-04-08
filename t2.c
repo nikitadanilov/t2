@@ -10616,7 +10616,10 @@ static void seg_save(struct seg_state *ss) {
 }
 
 static ssize_t ct_pwrite(int fd, const void *buf, size_t count, off_t offset) {
-        return count;
+        while (true) {
+                sleep(1);
+        }
+        return -EBADF;
 }
 
 static struct seg_state cseg = {};
@@ -10628,7 +10631,7 @@ static void *abaddon(void *arg) {
         } while (stop);
         puts("    .... Crashing.");
         file_kill(&file_storage);
-        //ut_pwrite = &ct_pwrite;
+        ut_pwrite = &ct_pwrite;
         seg_save(&cseg);
         abort();
         return NULL;
@@ -10645,21 +10648,25 @@ struct ct_key {
 };
 
 static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, struct ct_val *val) {
-        val->tno = threadno;
-        val->idx = idx;
+        val->tno = htobe64(threadno);
+        val->idx = htobe64(idx);
         key->val = *val;
-        key->h   = ht_hash64(val->tno + (val->idx << 17));
+        key->h   = ht_hash64(threadno + (idx << 17));
 }
 
 static bool checkrec(struct ct_key *key, struct ct_val *val) {
-        return memcmp(&key->val, val, sizeof *val) == 0 && key->h == ht_hash64(val->tno + (val->idx << 17));
+        return memcmp(&key->val, val, sizeof *val) == 0 && key->h == ht_hash64(be64toh(val->tno) + (be64toh(val->idx) << 17));
 }
 
 static void *ct_scan(void *arg) {
         int               tno = (long)arg;
         struct t2_tree   *t   = cseg.tree;
-        int               result;
+        bool              got = false;
+        bool              ok;
         uint64_t          idx = 0;
+        uint64_t          lo;
+        uint64_t          half;
+        int               result;
         struct ct_key     key;
         struct ct_val     val;
         t2_thread_register();
@@ -10668,17 +10675,31 @@ static void *ct_scan(void *arg) {
                 makerec(tno, idx, &key, &val);
                 result = t2_lookup_ptr(t, &key, sizeof key, &val, sizeof val);
                 if (result == -ENOENT) {
-                        break;
-                } else if (result != 0 || !checkrec(&key, &val)) {
+                        if (got) {
+                                break;
+                        }
+                } else if (result == 0) {
+                        if (!checkrec(&key, &val)) {
+                                printf("    .... Thread %i corrupt record: %i.\n", tno, result);
+                                exit(1);
+                        } else if (!got) {
+                                lo = idx;
+                        }
+                        got = true;
+                } else  {
                         printf("    .... Thread %i scan error: %i.\n", tno, result);
                         exit(1);
-                } else {
-                        ++idx;
                 }
+                ++idx;
         }
-        printf("    .... Thread %i scanned to: %"PRIu64"\n", tno, idx);
+        half = idx >> 1;
+        ok = lo == half || lo == half + (idx & 1);
+        printf("    .... Thread %i found: %"PRIu64" .. %"PRIu64": %s\n", tno, lo, idx, ok ? "correct" : "wrong");
         cseg.idx[tno] = idx;
         t2_thread_degister();
+        if (!ok) {
+                exit(1);
+        }
         return NULL;
 }
 
@@ -10687,23 +10708,35 @@ static void *busy(void *arg) {
         struct t2_tree *t   = cseg.tree;
         struct t2_tx   *tx;
         int             result;
+        uint64_t        idx = cseg.idx[tno];
         struct ct_key   key;
         struct ct_val   val;
         t2_thread_register();
         tx = t2_tx_make(t->ttype->mod);
         ASSERT(EISOK(tx));
+        if (idx > 0 && (idx & 1)) {
+                makerec(tno, (idx - 1) >> 1, &key, &val);
+                WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
+        }
         while (true) {
-                makerec(tno, cseg.idx[tno], &key, &val);
+                makerec(tno, idx, &key, &val);
                 result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, sizeof key, &val, sizeof val, tx));
-                ASSERT(result == 0 || result == -EEXIST || EOOM(result));
+                ASSERT(result == 0 || result == -EEXIST);
                 if (result == -EEXIST) {
-                        printf("    .... Thread %i gap before %"PRId64".\n", tno, cseg.idx[tno]);
+                        printf("    .... Thread %i gap before %"PRId64".\n", tno, idx);
                         stop = true;
                         debugger_attach();
                         t2_lookup_ptr(t, &key, sizeof key, &val, sizeof val);
                         exit(1);
                 }
-                ++cseg.idx[tno];
+                //printf("inserted: %i %i\n", tno, (int)idx);
+                if (!(idx & 1)) {
+                        makerec(tno, idx >> 1, &key, &val);
+                        result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
+                        ASSERT(result == 0 || (result == -ENOENT && idx == cseg.idx[tno]));
+                        //printf("deleted: %i %i\n", tno, (int)idx >> 1);
+                }
+                ++idx;
         }
         t2_tx_done(t->ttype->mod, tx);
         t2_thread_degister();
@@ -10716,9 +10749,10 @@ static void *busy(void *arg) {
 static void ct(int argc, char **argv) {
         enum { CT_SHIFT = 24 };
         ASSERT(argc > 5);
+        ut_storage = &disorder_storage.gen;
         ASSERT(ut_storage == &file_storage.gen ||
                (ut_storage == &disorder_storage.gen && disorder_storage.substrate == &file_storage.gen));
-        cseg.iter = argv[2][0] == 'c';
+        cseg.iter = argv[2][0] == 'c'; /* Skip iteration 0, when 'c'ontinuing. */
         cseg.nr_threads = atoi(argv[3]);
         cseg.sleep_min = atoi(argv[4]);
         cseg.sleep_max = atoi(argv[5]);
