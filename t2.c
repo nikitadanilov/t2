@@ -7270,16 +7270,12 @@ enum rec_type {
         FREE   = 'F'
 };
 
-static const int64_t REC_MAGIX = 0xa50d4e3333337221ll;
-
-struct wal_superblock {
-        int64_t magix;
-};
+static const int16_t REC_MAGIX = 0x1804;
 
 struct wal_rec {
-        int64_t magix;
+        int16_t magix;
+        int16_t rtype;
         int32_t len;
-        int32_t rtype;
         union {
                 struct {
                         taddr_t node;
@@ -7288,8 +7284,6 @@ struct wal_rec {
                 } update;
                 struct {
                         lsn_t   lsn;
-                        lsn_t   start;
-                        lsn_t   end;
                 } header;
         } u;
         uint8_t data[0];
@@ -7374,7 +7368,7 @@ struct wal_te {
         bool                                   directio;
         struct t2                             *mod;
         int                                    snapshot_hand;
-        struct wal_rec                        *snapbuf;
+        struct wal_header                     *snapbuf;
         int                                    snapbuf_size;
         pthread_t                              aux_worker;
         int                                    nr_workers;
@@ -7569,17 +7563,28 @@ static void wal_broadcast(struct wal_te *en) {
         sh_broadcast(en->mod);
 }
 
+struct wal_header {
+        struct wal_rec h;
+        struct hdata {
+                lsn_t    start;
+                lsn_t    end;
+                uint64_t bolt;
+                uint64_t free;
+        } data;
+} __attribute__((packed));
+
+SASSERT(offsetof(struct wal_header, data) == offsetof(struct wal_header, h.data));
+
 static int wal_write(struct wal_te *en, struct wal_buf *buf) {
-        int             result;
-        struct wal_rec *rec;
-        int             fd;
-        off_t           off;
-        lsn_t           bstart = en->start;
-        lsn_t           bend   = en->max_synced;
-        int             nob;
+        int   result;
+        int   fd;
+        off_t off;
+        lsn_t bstart = en->start;
+        lsn_t bend   = en->max_synced;
+        int   nob;
         uint64_t __attribute__((unused)) start;
         ASSERT(wal_log_free(en) > 0);
-        ASSERT(buf->off + SOF(*rec) <= en->buf_size);
+        ASSERT(buf->off + SOF(struct wal_rec) <= en->buf_size);
         ASSERT(en->cur != buf);
         cds_list_move(&buf->link, &en->inflight);
         --en->full_nr;
@@ -7589,25 +7594,36 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         CMOD(wal_inflight, en->inflight_nr);
         en->max_inflight = max_64(en->max_inflight, buf->lsn + 1);
         wal_unlock(en);
-        nob = en->directio ? en->buf_size : en->buf_size - buf->free + SOF(*rec);
+        nob = en->directio ? en->buf_size : en->buf_size - buf->free + SOF(struct wal_rec);
         CINC(wal_write);
         CMOD(wal_write_nob, nob);
-        *(struct wal_rec *)buf->data = (struct wal_rec) {
-                .magix = REC_MAGIX,
-                .rtype = HEADER,
-                .len   = 0,
-                .u     = {
-                        .header = {
-                                .lsn   = buf->lsn,
-                                .start = bstart,
-                                .end   = bend
+        *(struct wal_header *)buf->data = (struct wal_header) {
+                .h = {
+                        .magix = REC_MAGIX,
+                        .rtype = HEADER,
+                        .len   = sizeof(struct hdata),
+                        .u     = {
+                                .header = {
+                                        .lsn = buf->lsn,
+                                }
                         }
+                },
+                .data = {
+                        .start = bstart,
+                        .end   = bend,
+                        .bolt  = en->mod->cache.bolt,
+                        .free  = SCALL(en->mod, tell)
                 }
         };
         *(struct wal_rec *)(buf->data + buf->off) = (struct wal_rec) {
                 .magix = REC_MAGIX,
                 .rtype = FOOTER,
-                .len   = buf->free + SOF(*rec)
+                .len   = buf->free + SOF(struct wal_rec),
+                .u     = {
+                        .header = {
+                                .lsn = buf->lsn
+                        }
+                }
         };
         ASSERT(buf->lsn != 0);
         fd = en->fd[wal_map(en, buf->lsn, &off)];
@@ -7650,8 +7666,8 @@ static void wal_buf_start(struct wal_te *en) {
         cds_list_del(&buf->link);
         --en->ready_nr;
         buf->lsn  = en->lsn;
-        buf->off  = sizeof(struct wal_rec);
-        buf->free = en->buf_size - 2 * sizeof(struct wal_rec);
+        buf->off  = sizeof(struct wal_header);
+        buf->free = en->buf_size - sizeof(struct wal_header) - sizeof(struct wal_rec);
         en->cur_age = READ_ONCE(en->mod->tick);
 }
 
@@ -7877,6 +7893,8 @@ static int wal_page(struct wal_te *en) {
         return 0;
 }
 
+static bool wal_rec_invariant(const struct wal_rec *rec);
+
 static void wal_snapshot(struct wal_te *en) {
         int   rc1;
         int   rc2;
@@ -7885,10 +7903,13 @@ static void wal_snapshot(struct wal_te *en) {
         int   idx        = en->snapshot_hand++ & MASK(en->log_shift);
         en->snapshotting = true;
         wal_unlock(en);
-        en->snapbuf[0].u.header.start = start;
-        en->snapbuf[0].u.header.end   = max_synced;
+        en->snapbuf->data.start = start;
+        en->snapbuf->data.end   = max_synced;
+        en->snapbuf->data.bolt  = en->mod->cache.bolt;
+        en->snapbuf->data.free  = SCALL(en->mod, tell);
+        ASSERT(wal_rec_invariant((void *)en->snapbuf));
         CINC(wal_snapshot);
-        rc1 = pwrite(en->fd[idx], en->snapbuf, en->snapbuf_size, (en->log_size << en->buf_size_shift) >> en->log_shift);
+        rc1 = wal_pwrite(en->fd[idx], en->snapbuf, en->snapbuf_size, (en->log_size << en->buf_size_shift) >> en->log_shift);
         rc2 = en->directio ? 0 : fd_sync(en->fd[idx]);
         if (LIKELY(rc1 == en->snapbuf_size && rc2 == 0)) {
                 wal_lock(en);
@@ -8061,7 +8082,7 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         struct wal_te *en     = mem_alloc(sizeof *en);
         pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
         int           *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
-        int            nob    = (sizeof en->snapbuf[0] + sizeof en->snapbuf[1] + DIRECTIO_ALIGNMENT - 1) / DIRECTIO_ALIGNMENT * DIRECTIO_ALIGNMENT;
+        int            nob    = (sizeof *en->snapbuf + sizeof (struct wal_rec) + DIRECTIO_ALIGNMENT - 1) / DIRECTIO_ALIGNMENT * DIRECTIO_ALIGNMENT;
         void          *snap   = mem_alloc_align(nob, DIRECTIO_ALIGNMENT);
         int            result = 0;
         ASSERT(nr_bufs > 0);
@@ -8107,8 +8128,6 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         en->worker              = ws;
         en->nr_workers          = workers;
         en->fd                  = fd;
-        en->snapbuf             = snap;
-        en->snapbuf_size        = nob;
         en->log_shift           = log_shift;
         en->log_sleep           = log_sleep;
         en->sync_age            = sync_age;
@@ -8126,15 +8145,19 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         en->threshold_log_syncd = threshold_log_syncd;
         en->threshold_log_sync  = threshold_log_sync;
         en->directio            = directio;
+        en->snapbuf             = snap;
         en->snapbuf_size        = nob;
-        en->snapbuf[0]          = (struct wal_rec) {
-                .magix = REC_MAGIX,
-                .rtype = HEADER
+        en->snapbuf[0]          = (struct wal_header) {
+                .h = {
+                        .magix = REC_MAGIX,
+                        .rtype = HEADER,
+                        .len   = sizeof (struct hdata)
+                }
         };
-        en->snapbuf[1]          = (struct wal_rec) {
+        *((struct wal_rec *)&en->snapbuf[1]) = (struct wal_rec) {
                 .magix = REC_MAGIX,
                 .rtype = FOOTER,
-                .len   = en->buf_size - sizeof en->snapbuf[0] - sizeof en->snapbuf[1]
+                .len   = en->buf_size - sizeof *en->snapbuf - sizeof (struct wal_rec)
         };
         for (int i = 0; result == 0 && i < (1 << en->log_shift); ++i) {
                 if (flags & MAKE) {
@@ -8169,13 +8192,15 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
 }
 
 static bool wal_rec_invariant(const struct wal_rec *rec) {
+        struct wal_header *h = (void *)rec;
+        lsn_t lsn = rec->u.header.lsn;
         return  rec->magix == REC_MAGIX &&
                 (rec->rtype == HEADER || rec->rtype == FOOTER || rec->rtype == UNDO ||
                  rec->rtype == REDO || rec->rtype == ALLOC || rec->rtype == FREE) &&
-                rec->rtype == HEADER ? (rec->len == 0 &&
-                                        rec->u.header.start > 0 && rec->u.header.start <= rec->u.header.lsn &&
-                                        rec->u.header.end   > 0 && rec->u.header.end   <= rec->u.header.lsn &&
-                                        rec->u.header.start <= rec->u.header.end) : true;
+                rec->rtype == HEADER ? (rec->len == sizeof (struct hdata) && /* Snapshot's lsn is 0. */
+                                        h->data.start > 0 && (lsn == 0 || h->data.start <= lsn) &&
+                                        h->data.end   > 0 && (lsn == 0 || h->data.end   <= lsn) &&
+                                        h->data.start <= h->data.end) : true;
 }
 
 static bool wal_buf_is_valid(struct wal_te *en, struct wal_rec *rec) {
@@ -8191,7 +8216,15 @@ static int wal_buf_replay(struct wal_te *en, void *space, int len) {
                 if (!wal_rec_invariant(rec)) {
                         result = ERROR(-EIO);
                 } else if (rec->rtype == HEADER) {
+                        struct wal_header *h = (void *)rec;
                         lsn = rec->u.header.lsn;
+                        en->mod->cache.bolt = max_64(en->mod->cache.bolt, h->data.bolt);
+                        SCALL(en->mod, set, h->data.free);
+                } else if (rec->rtype == FOOTER) {
+                        if (rec->u.header.lsn != lsn) {
+                                LOG("Mismatch: header: %"PRIx64" footer: %"PRIx64, lsn, rec->u.header.lsn);
+                                return ERROR(-EIO);
+                        }
                 } else if (rec->rtype == REDO) {
                         struct t2_txrec txr = {
                                 .addr  = rec->u.update.node,
@@ -8277,31 +8310,49 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
         int pos = 0;
         ASSERT(*nr > 0);
         for (int i = 0; i < (1 << en->log_shift); ++i) {
+                lsn_t prev    = 0;
+                lsn_t first   = 0;
+                bool  reached = false;
                 for (int64_t off = 0; off < size[i]; off += en->buf_size) {
-                        struct wal_rec rec;
-                        result = pread(en->fd[i], &rec, sizeof rec, off);
-                        if (off == 0 && IS0(&rec)) { /* Log never wrapped around. */
+                        struct wal_header hdr;
+                        lsn_t             lsn;
+                        result = pread(en->fd[i], &hdr, sizeof hdr, off);
+                        if (off == 0 && IS0(&hdr)) { /* Log never wrapped around. */
                                 continue;
                         }
-                        if (result != sizeof rec) {
+                        if (result != sizeof hdr) {
                                 LOG("Cannot read log record %04x+%"PRId64": %i/%i.", i, off, result, errno);
                                 return ERROR(result < 0 ? -errno : -EIO);
                         }
-                        if (IS0(&rec)) {
+                        if (IS0(&hdr)) {
                                 continue; /* Skip hole due to a snapshot at the end of the log. */
                         }
-                        if (rec.magix != REC_MAGIX || rec.rtype != HEADER) {
+                        if (hdr.h.magix != REC_MAGIX || hdr.h.rtype != HEADER) {
                                 LOG("Wrong record in log %04x+%"PRId64": %016"PRIx64" != %016"PRIx64" or %016"PRIx32" != %016"PRIx32".",
-                                    i, off, rec.magix, REC_MAGIX, rec.rtype, (int32_t)HEADER);
+                                    i, off, hdr.h.magix, REC_MAGIX, hdr.h.rtype, (int32_t)HEADER);
                                 return ERROR(-EIO);
                         }
+                        lsn = hdr.h.u.header.lsn;
+                        if (first > 0) {
+                                if (lsn != 0 && lsn != prev + (1 << en->log_shift)) { /* Found a drop in lsn sequence. */
+                                        if (reached || lsn >= first) {
+                                                LOG("Wrong lsn ordering in log %04x+%"PRId64".", i, off);
+                                                return ERROR(-EIO);
+                                        } else {
+                                                reached = true;
+                                        }
+                                }
+                        } else {
+                                first = lsn;
+                        }
+                        prev = lsn;
                         ASSERT(pos < *nr);
                         index[pos++] = (struct rbuf) {
                                 .idx   = i,
                                 .off   = off,
-                                .lsn   = rec.u.header.lsn,
-                                .start = rec.u.header.start,
-                                .end   = rec.u.header.end
+                                .lsn   = lsn,
+                                .start = hdr.data.start,
+                                .end   = hdr.data.end
                         };
                 }
         }
