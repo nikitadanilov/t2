@@ -468,15 +468,19 @@ struct cache {
 };
 
 struct ioc {
-        alignas(MAX_CACHELINE) taddr_t  addr;
-        void                           *data;
+        taddr_t  addr;
+        void    *data;
+};
+
+struct ioc_aligned {
+        alignas(MAX_CACHELINE) _Atomic(struct ioc) ioc;
 };
 
 struct iocache {
-        int32_t              shift;
-        _Atomic(struct ioc) *entry;
-        int                  level;
-        size_t               bound[32];
+        int32_t             shift;
+        struct ioc_aligned *entry;
+        int                 level;
+        size_t              bound[32];
 };
 
 struct slot;
@@ -4579,7 +4583,7 @@ static int iocache_put(struct iocache *ioc, struct node *n) {
                         void *data = mem_alloc(size + 4);
                         if (LIKELY(data != NULL)) {
                                 struct ioc           want = { .addr = n->addr, .data = data };
-                                _Atomic(struct ioc) *slot = &ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)];
+                                _Atomic(struct ioc) *slot = &ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)].ioc;
                                 struct ioc           have;
                                 memcpy(data + 4, area, size);
                                 *(int32_t *)data = (int32_t)size;
@@ -4608,7 +4612,7 @@ static int iocache_put(struct iocache *ioc, struct node *n) {
 
 static int iocache_get(struct iocache *ioc, struct node *n) {
         if (IOCACHE && LIKELY(ioc->shift > 0)) {
-                struct ioc have = atomic_load(&ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)]);
+                struct ioc have = atomic_load(&ioc->entry[ht_hash(n->addr) & MASK(ioc->shift)].ioc);
                 if (have.addr == n->addr) {
                         int    nsize = taddr_ssize(n->addr);
                         size_t size  = LIKELY(iocache_ctx.decomp != NULL) ?
