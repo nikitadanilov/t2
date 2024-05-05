@@ -4488,7 +4488,6 @@ static void *maxwelld(void *arg) {
         struct t2           *mod = arg;
         struct cache        *c   = &mod->cache;
         struct maxwell_data *md  = &c->md;
-        int32_t              pos = 0;
         t2_thread_register();
         md->delta = ARRAY_SIZE(md->window) >> 1;
         while (true) {
@@ -4499,7 +4498,6 @@ static void *maxwelld(void *arg) {
                         if (EXISTS(i, ARRAY_SIZE(c->pool.free), !enough(c, i)) && LIKELY(!c->md_shutdown)) {
                                 crit_temp(md);
                                 scan(mod, SCAN_RUN, md, md->crittemp, md->critfrac);
-                                pos += SCAN_RUN;
                                 cache_sync(mod);
                                 counters_fold();
                         } else {
