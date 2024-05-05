@@ -4736,13 +4736,19 @@ static int64_t max_64(int64_t a, int64_t b) {
         return a - ((a - b) & ((a - b) >> 63));
 }
 
+enum { USE_CLZERO = true };
+
 static int ilog2(uint32_t x) {
-        x = x | (x >>  1);
-        x = x | (x >>  2);
-        x = x | (x >>  4);
-        x = x | (x >>  8);
-        x = x | (x >> 16);
-        return __builtin_popcount(x) - 1;
+        if (USE_CLZERO) {
+                return 31 - __builtin_clz(x);  /* __builtin_clz(0) is undefined?! */
+        } else {
+                x = x | (x >>  1);
+                x = x | (x >>  2);
+                x = x | (x >>  4);
+                x = x | (x >>  8);
+                x = x | (x >> 16);
+                return __builtin_popcount(x) - 1;
+        }
 }
 
 static int int32_cmp(int32_t a, int32_t b) {
@@ -10201,6 +10207,11 @@ static void lib_ut() {
         ASSERT(ilog2  (8) ==  3);
         ASSERT(ilog2(256) ==  8);
         ASSERT(ilog2(257) ==  8);
+        for (int32_t i = 2; i < 31; ++i) {
+                ASSERT(ilog2(1 << i)       == i);
+                ASSERT(ilog2((1 << i) - 1) == i - 1);
+                ASSERT(ilog2((1 << i) + 1) == i);
+        }
         utestdone();
 }
 
