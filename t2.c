@@ -3678,7 +3678,6 @@ static void cache_fini(struct t2 *mod) {
                 }
                 sh_fini(&c->sh[i]);
         }
-        mem_free(c->sh);
         for (int i = 0; i < c->briard_nr; ++i) {
                 if (!IS0(&c->briard[i].thread)) {
                         c->briard[i].shutdown = true;
@@ -3687,7 +3686,6 @@ static void cache_fini(struct t2 *mod) {
                 }
                 sh_fini(&c->briard[i]);
         }
-        mem_free(c->briard);
         for (int i = 0; i < c->buhund_nr; ++i) {
                 if (!IS0(&c->buhund[i].thread)) {
                         c->buhund[i].shutdown = true;
@@ -3697,6 +3695,8 @@ static void cache_fini(struct t2 *mod) {
                 sh_fini(&c->buhund[i]);
         }
         mem_free(c->buhund);
+        mem_free(c->briard);
+        mem_free(c->sh);
         ASSERT(cds_list_empty(&c->eio));
         NOFAIL(pthread_mutex_destroy(&c->cleanlock));
         cache_clean(mod);
