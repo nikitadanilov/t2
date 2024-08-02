@@ -92,6 +92,7 @@ struct bphase {
         pthread_cond_t start;
         struct benchmark *parent;
         bool run;
+        bool shutdown;
         uint64_t begin;
         uint64_t last;
 };

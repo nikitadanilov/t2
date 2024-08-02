@@ -310,6 +310,23 @@ static struct benchmark *bparse(const struct span *s) {
         return b;
 }
 
+static void bdone(struct benchmark *b) {
+        for (int i = 0; i < b->nr; ++i) {
+                struct bphase *ph = &b->phase[i];
+                for (int j = 0; j < ph->nr; ++j) {
+                        struct bgroup *g = &ph->group[j];
+                        mem_free(g->thread.choice);
+                        mem_free(g->thread.rt);
+                }
+                NOFAIL(pthread_mutex_destroy(&ph->lock));
+                NOFAIL(pthread_cond_destroy(&ph->cond));
+                NOFAIL(pthread_cond_destroy(&ph->start));
+                mem_free(ph->group);
+        }
+        mem_free(b->phase);
+        mem_free(b);
+}
+
 static uint64_t brnd(uint64_t prev) {
         return (prev * 6364136223846793005ULL + 1442695040888963407ULL) >> 11;
 }
@@ -548,17 +565,15 @@ static void bphase_report(struct bphase *ph, bool final);
 
 static void *breport_thread(void *arg) {
         struct bphase *ph = arg;
-        NOFAIL(pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL));
-        NOFAIL(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL));
-        while (true) {
+        while (!ph->shutdown) {
                 sleep(report_interval);
                 bphase_report(ph, false);
                 if (counters_level > 1 && kvt == T2) {
                         t2_stats_print(mod, stats_flags);
                         bn_counters_clear();
                 }
-                pthread_testcancel();
         }
+        return NULL;
 }
 
 static void bphase(struct bphase *ph, int i) {
@@ -567,6 +582,7 @@ static void bphase(struct bphase *ph, int i) {
         NOFAIL(pthread_cond_init(&ph->cond, NULL));
         NOFAIL(pthread_cond_init(&ph->start, NULL));
         ph->idx = i;
+        ph->shutdown = false;
         blog(BINFO, "    Starting phase %2i.\n", i);
         for (int i = 0; i < ph->nr; ++i) {
                 ph->group[i].thread.rt = mem_alloc(ph->group[i].nr * sizeof(struct rthread));
@@ -582,7 +598,7 @@ static void bphase(struct bphase *ph, int i) {
         ph->run = true;
         NOFAIL(pthread_cond_broadcast(&ph->cond));
         mutex_unlock(&ph->lock);
-        NOFAIL(pthread_create(&reporter, NULL, *breport_thread, ph));
+        NOFAIL(pthread_create(&reporter, NULL, &breport_thread, ph));
         for (int i = 0; i < ph->nr; ++i) {
                 for (int j = 0; j < ph->group[i].nr; ++j) {
                         pthread_join(ph->group[i].thread.rt[j].self, NULL);
@@ -593,7 +609,8 @@ static void bphase(struct bphase *ph, int i) {
                 t2_stats_print(mod, stats_flags);
                 bn_counters_clear();
         }
-        NOFAIL(pthread_cancel(reporter));
+        ph->shutdown = true;
+        NOFAIL(pthread_join(reporter, NULL));
         NOFAIL(pthread_cond_destroy(&ph->start));
         NOFAIL(pthread_cond_destroy(&ph->cond));
         NOFAIL(pthread_mutex_destroy(&ph->lock));
@@ -1087,6 +1104,7 @@ int main(int argc, char **argv) {
         if (total != NULL) {
                 struct benchmark *b = bparse(&SPAN(total, total + strlen(total)));
                 brun(b);
+                bdone(b);
                 return 0;
         } else {
                 puts("Huh?");
