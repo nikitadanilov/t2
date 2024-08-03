@@ -42,6 +42,7 @@ struct t2_conf {
         int                   free_hi;
         int                   free_lo;
         int                   scan_rate_shift;
+        bool                  seg_make;
         struct t2_tree_type **ttypes;
         struct t2_node_type **ntypes;
 };
@@ -233,7 +234,7 @@ struct t2_node_type *t2_node_type_init(int16_t id, const char *name, int shift, 
 void                 t2_node_type_fini(struct t2_node_type *nt);
 
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx);
-struct t2_tree *t2_tree_open(struct t2_tree_type *ttype, taddr_t root);
+struct t2_tree *t2_tree_open(struct t2_tree_type *ttype, uint32_t id);
 void            t2_tree_close(struct t2_tree *t);
 
 int  t2_lookup(struct t2_tree *t, struct t2_rec *r);
