@@ -3277,7 +3277,8 @@ static int traverse_complete(struct path *p, int result) {
                 path_reset(p);
                 rcu_lock();
                 return AGAIN;
-        } else if (UNLIKELY(result != 0)) {
+        } else if (UNLIKELY(result != 0 && (p->opt != INSERT || result != -EEXIST) &&
+                                           (p->opt != DELETE || result != -ENOENT))) {
                 return result;
         } else if (UNLIKELY(!path_is_valid(p))) {
                 path_reset(p);
@@ -10972,22 +10973,19 @@ static void ct(int argc, char **argv) {
                         pthread_t       tid[cseg.nr_threads + 1];
                         struct t2      *mod;
                         struct t2_tree *t;
-                        int32_t         flags = FLAGS;
                         printf("    Iteration %5i.\n", cseg.iter);
-                        if (cseg.iter != 0) {
-                                seg_load(&cseg);
-                        } else {
-                                flags |= MAKE;
-                        }
-                        mod = T2_INIT_MAKE(&file_storage.gen, wprep(flags), CT_SHIFT, CT_SHIFT, ttypes, ntypes, cseg.iter == 0);
                         if (cseg.iter == 0) {
+                                mod = T2_INIT(&file_storage.gen, wprep(MAKE), CT_SHIFT, CT_SHIFT, ttypes, ntypes);
                                 struct t2_tx *tx = t2_tx_make(mod);
                                 ASSERT(EISOK(tx));
                                 int result = t2_tx_open(mod, tx);
                                 ASSERT(result == 0 || EOOM(result));
                                 t = t2_tree_create(&ttype, tx);
                                 ASSERT(t->id == 1);
+                                t2_tx_done(mod, tx);
                         } else {
+                                seg_load(&cseg);
+                                mod = T2_INIT_MAKE(&file_storage.gen, wprep(0), CT_SHIFT, CT_SHIFT, ttypes, ntypes, false);
                                 t = t2_tree_open(&ttype, 1);
                                 mod->cache.bolt = cseg.bolt;
                         }
