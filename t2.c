@@ -10806,7 +10806,6 @@ static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *labe
 }
 
 struct seg_state {
-        taddr_t              root;
         uint64_t             free;
         uint64_t             bolt;
         struct t2_tree      *tree;
@@ -10822,7 +10821,7 @@ struct seg_state {
 static void seg_load(struct seg_state *ss) {
         FILE *seg = fopen("ct.seg", "r");
         ASSERT(seg != NULL);
-        int nr = fscanf(seg, "%"SCNx64" %"SCNx64" %"SCNx64, &ss->root, &ss->free, &ss->bolt);
+        int nr = fscanf(seg, "%"SCNx64" %"SCNx64, &ss->free, &ss->bolt);
         assert(nr == 3);
         fclose(seg);
 }
@@ -10830,7 +10829,7 @@ static void seg_load(struct seg_state *ss) {
 static void seg_save(struct seg_state *ss) {
         FILE *seg = fopen("ct.seg", "w");
         ASSERT(seg != NULL);
-        fprintf(seg, "%"PRIx64" %"PRIx64" %"PRIx64, ss->tree->root, ss->file->free, ss->mod->cache.bolt);
+        fprintf(seg, "%"PRIx64" %"PRIx64, ss->file->free, ss->mod->cache.bolt);
         fflush(seg);
         fclose(seg);
 }
