@@ -664,7 +664,8 @@ enum rung_flags {
         SEPCHG = 1ull << 2,
         DELDEX = 1ull << 3,
         SELFSH = 1ull << 4,
-        MUSTPL = 1ull << 5
+        MUSTPL = 1ull << 5,
+        UNROOT = 1ull << 6
 };
 
 enum policy_id {
@@ -2311,7 +2312,6 @@ static int newnode(struct path *p, int idx) {
                        } else {
                                p->newroot.lm = p->sb.lm = WRITE;
                                p->sb.node = root->mod->seg.sb;
-                               seg_root_mod(&root->mod->seg, p->tree->id, root->addr, &p->sb.cap);
                                return +1; /* Done. */
                        }
                } else {
@@ -2702,6 +2702,10 @@ static void path_fini(struct path *p) {
         }
         p->used = -1;
         if (UNLIKELY(p->newroot.node != NULL)) {
+                if (p->rung[0].flags & UNROOT) {
+                        dealloc(p->newroot.node);
+                        NINC(p->newroot.node, allocated_unused);
+                }
                 touch_unlock(p->newroot.node, p->newroot.taken);
                 put(p->newroot.node);
         }
@@ -3084,6 +3088,7 @@ static int root_add(struct path *p) {
         struct t2_buf ptr;
         SLOT_DEFINE(s, oldroot);
         if (UNLIKELY(buf_len(&p->rung[0].keyout) == 0 && buf_len(&p->rung[0].valout) == 0)) {
+                p->rung[0].flags |= UNROOT;
                 return 0; /* Nothing to do. */
         }
         rec_get(&s, 0);
@@ -3095,6 +3100,8 @@ static int root_add(struct path *p) {
         s.rec.val = &p->rung[0].valout;
         NOFAIL(NCALL(s.node, insert(&s, &p->newroot.cap)));
         p->rung[0].flags |= ALUSED;
+        ASSERT(p->sb.lm == WRITE);
+        seg_root_mod(&s.node->mod->seg, p->tree->id, p->newroot.node->addr, &p->sb.cap);
         /* Barrier? */
         p->tree->root = p->newroot.node->addr;
         return 0;
