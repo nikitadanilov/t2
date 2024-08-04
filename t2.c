@@ -1085,6 +1085,7 @@ static void node_type_degister(struct t2_node_type *ntype);
 static struct t2_buf *ptr_buf(struct node *n, struct t2_buf *b);
 static struct t2_buf *addr_buf(taddr_t *addr, struct t2_buf *b);
 static uint32_t kval(struct ewma *a);
+static int txadd_code(struct node *n, struct t2_txrec *txr, int32_t code);
 static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob);
 static struct t2_tx *wal_make(struct t2_te *te);
 static int  wal_init    (struct t2_te *engine, struct t2 *mod);
@@ -1136,6 +1137,7 @@ static int iocache_put(struct iocache *ioc, struct node *n);
 static int iocache_get(struct iocache *ioc, struct node *n);
 static void iocache_thread_init(void);
 static void iocache_thread_fini(void);
+static void seg_init0(struct seg *s, struct t2 *mod);
 static int seg_init(struct seg *s, struct t2 *mod, bool make);
 static void seg_fini(struct seg *s);
 static void seg_root_mod(struct seg *s, uint32_t id, taddr_t root, struct cap *cap);
@@ -1378,6 +1380,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         for (struct t2_node_type **nt = conf->ntypes; *nt != NULL; ++nt) {
                 node_type_register(mod, *nt);
         }
+        seg_init0(&mod->seg, mod);
         next_stage(mod, true, NTYPES);
         for (struct t2_tree_type **tt = conf->ttypes; *tt != NULL; ++tt) {
                 tree_type_register(mod, *tt);
@@ -1391,7 +1394,7 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         }
         next_stage(mod, true, POOL);
         NEXT_STAGE(mod, ht_init(&mod->ht, conf->hshift), HT_INIT);
-        NEXT_STAGE(mod, SCALL(mod, init), STORAGE_INIT);
+        NEXT_STAGE(mod, SCALL(mod, init, conf->seg_make), STORAGE_INIT);
         NEXT_STAGE(mod, iocache_init(&mod->ioc, conf->ishift), IOCACHE_INIT);
         NEXT_STAGE(mod, cache_init(mod, conf), CACHE_INIT);
         NEXT_STAGE(mod, TXCALL(conf->te, init(conf->te, mod)), TX_INIT);
@@ -1713,11 +1716,12 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx) {
                         lock(root, WRITE);
                         t->id = seg_root_add(&mod->seg, root->addr, &gsb.cap);
                         if (TRANSACTIONS && tx != NULL) {
-                                struct t2_txrec txr[2 * M_NR];
+                                struct t2_txrec txr[2 * M_NR + 1];
                                 int32_t         nob = 0;
                                 struct t2_te   *te  = mod->te;
-                                int             nr  = txadd(&groot, txr, &nob);
-                                nr += txadd(&gsb, &txr[nr], &nob);
+                                int             nr  = txadd_code(root, txr, T2_TXR_ALLOC);
+                                nr += txadd(&groot, &txr[nr], &nob);
+                                nr += txadd(&gsb,   &txr[nr], &nob);
                                 TXCALL(te, post(te, tx, nob, nr, txr));
                         }
                         t->root = root->addr;
@@ -1747,10 +1751,17 @@ struct t2_tree *t2_tree_open(struct t2_tree_type *ttype, uint32_t id) {
                 t->ttype = ttype;
                 t->id    = id;
                 t->root  = seg_root_get(&ttype->mod->seg, id);
+                if (t->root == 0) {
+                        return EPTR(-ENOENT);
+                }
                 return t;
         } else {
                 return EPTR(-ENOMEM);
         }
+}
+
+uint32_t t2_tree_id(const struct t2_tree *t) {
+        return t->id;
 }
 
 void t2_tree_close(struct t2_tree *t) {
@@ -2750,6 +2761,17 @@ static void path_print(struct path *p) {
         puts("");
 }
 
+static int txadd_code(struct node *n, struct t2_txrec *txr, int32_t code) {
+        if (n != NULL) {
+                *txr = (struct t2_txrec) {
+                        .node = (void *)n,
+                        .addr = n->addr,
+                        .off  = code
+                };
+        }
+        return n != NULL;
+}
+
 static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
         struct node *n   = g->node;
         struct cap  *cap = &g->cap;
@@ -2759,6 +2781,7 @@ static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
                         int32_t start = cap->ext[i].start;
                         int32_t end   = cap->ext[i].end;
                         if (end > start) {
+                                ASSERT(start < T2_TXR_ALLOC);
                                 txr[pos] = (struct t2_txrec) {
                                         .node = (void *)n,
                                         .addr = n->addr,
@@ -2781,14 +2804,30 @@ static int txadd(struct page *g, struct t2_txrec *txr, int32_t *nob) {
         return pos;
 }
 
+static int path_txr_nr(const struct path *p) {
+        return
+                p->used + 2 +                    /* Allocated or deallocated on each rung, plus a new root. */
+                ((p->used + 1) * 4 + 1) * M_NR + /* Left, trunk, right and allocated on each rung, plus a new root. */
+                1;                               /* Superblock. */
+}
+
 static void path_txadd(struct path *p) {
-        if (TRANSACTIONS && p->tx != NULL) { /* TODO: Log node allocations and de-allocations. */
-                struct t2_txrec txr[((p->used + 1) * 4 + 1) * M_NR + 1]; /* VLA. */
+        if (TRANSACTIONS && p->tx != NULL) {
+                struct t2_txrec txr[path_txr_nr(p)]; /* VLA. */
                 struct t2_te   *te  = p->tree->ttype->mod->te;
                 int             pos = 0;
                 int32_t         nob = 0;
                 for (int i = 0; i <= p->used; ++i) {
                         struct rung *r = &p->rung[i];
+                        struct node *a = r->allocated.node;
+                        if (r->flags & ALUSED) {
+                                pos += txadd_code(a, &txr[pos], T2_TXR_ALLOC);
+                        } else if (UNLIKELY(a != NULL && EISOK(a))) {
+                                pos += txadd_code(a, &txr[pos], T2_TXR_DEALLOC);
+                        }
+                        if (r->flags & DELDEX) {
+                                pos += txadd_code(brother(r, RIGHT)->node, &txr[pos], T2_TXR_DEALLOC);
+                        }
                         pos += txadd(brother(r, LEFT),  &txr[pos], &nob);
                         pos += txadd(&r->page,          &txr[pos], &nob);
                         pos += txadd(brother(r, RIGHT), &txr[pos], &nob);
@@ -2796,8 +2835,10 @@ static void path_txadd(struct path *p) {
                                 pos += txadd(&r->allocated, &txr[pos], &nob);
                         }
                 }
-                pos += txadd(&p->newroot, &txr[pos], &nob);
-                pos += txadd(&p->sb,      &txr[pos], &nob);
+                pos += txadd_code(p->newroot.node, &txr[pos], T2_TXR_ALLOC);
+                pos += txadd(&p->newroot,          &txr[pos], &nob);
+                pos += txadd(&p->sb,               &txr[pos], &nob);
+                ASSERT(pos <= path_txr_nr(p));
                 TXCALL(te, post(te, p->tx, nob, pos, txr));
         }
 }
@@ -4752,8 +4793,7 @@ static const struct node_type_ops seg_sb_ops = {
         .free       = (void *)&seg_unreachable,
 };
 
-static int seg_init(struct seg *s, struct t2 *mod, bool make) {
-        int result = 0;
+static void seg_init0(struct seg *s, struct t2 *mod) {
         SASSERT(sizeof (struct sb) <= SB_SIZE);
         s->sb_ntype = (struct t2_node_type) {
                 .shift = SB_SHIFT,
@@ -4762,6 +4802,10 @@ static int seg_init(struct seg *s, struct t2 *mod, bool make) {
                 .name  = "sb",
         };
         node_type_register(mod, &s->sb_ntype);
+}
+
+static int seg_init(struct seg *s, struct t2 *mod, bool make) {
+        int result = 0;
         if (make) {
                 struct t2_tx *tx = t2_tx_make(mod);
                 if (EISOK(tx)) {
@@ -7472,6 +7516,7 @@ struct t2_node *t2_apply(struct t2 *mod, struct t2_txrec *txr) {
                         return EPTR(n);
                 }
         } else {
+                puts("EIO");
                 return EPTR(-EIO);
         }
 }
@@ -7480,9 +7525,7 @@ enum rec_type {
         HEADER = '<',
         FOOTER = '>',
         UNDO   = 'U',
-        REDO   = 'R',
-        ALLOC  = 'A',
-        FREE   = 'F'
+        REDO   = 'R'
 };
 
 static const int16_t REC_MAGIX = 0x1804;
@@ -7789,7 +7832,6 @@ struct wal_header {
                 lsn_t    start;
                 lsn_t    end;
                 uint64_t bolt;
-                uint64_t free;
         } data;
 } __attribute__((packed));
 
@@ -7832,7 +7874,6 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                         .start = bstart,
                         .end   = bend,
                         .bolt  = en->mod->cache.bolt,
-                        .free  = SCALL(en->mod, tell)
                 }
         };
         *(struct wal_rec *)(buf->data + buf->off) = (struct wal_rec) {
@@ -8125,7 +8166,6 @@ static void wal_snapshot(struct wal_te *en) {
         en->snapbuf->data.start = start;
         en->snapbuf->data.end   = max_synced;
         en->snapbuf->data.bolt  = en->mod->cache.bolt;
-        en->snapbuf->data.free  = SCALL(en->mod, tell);
         ASSERT(wal_rec_invariant((void *)en->snapbuf));
         CINC(wal_snapshot);
         rc1 = wal_pwrite(en->fd[idx], en->snapbuf, en->snapbuf_size, (en->log_size << en->buf_size_shift) >> en->log_shift);
@@ -8416,8 +8456,7 @@ static bool wal_rec_invariant(const struct wal_rec *rec) {
         struct wal_header *h = (void *)rec;
         lsn_t lsn = rec->u.header.lsn;
         return  rec->magix == REC_MAGIX &&
-                (rec->rtype == HEADER || rec->rtype == FOOTER || rec->rtype == UNDO ||
-                 rec->rtype == REDO || rec->rtype == ALLOC || rec->rtype == FREE) &&
+                (rec->rtype == HEADER || rec->rtype == FOOTER || rec->rtype == UNDO || rec->rtype == REDO) &&
                 rec->rtype == HEADER ? (rec->len == sizeof (struct hdata) && /* Snapshot's lsn is 0. */
                                         h->data.start > 0 && (lsn == 0 || h->data.start <= lsn) &&
                                         h->data.end   > 0 && (lsn == 0 || h->data.end   <= lsn) &&
@@ -8440,34 +8479,37 @@ static int wal_buf_replay(struct wal_te *en, void *space, int len) {
                         struct wal_header *h = (void *)rec;
                         lsn = rec->u.header.lsn;
                         en->mod->cache.bolt = max_64(en->mod->cache.bolt, h->data.bolt);
-                        SCALL(en->mod, set, h->data.free);
                 } else if (rec->rtype == FOOTER) {
                         if (rec->u.header.lsn != lsn) {
                                 LOG("Mismatch: header: %"PRIx64" footer: %"PRIx64, lsn, rec->u.header.lsn);
                                 return ERROR(-EIO);
                         }
                 } else if (rec->rtype == REDO) {
-                        struct t2_txrec txr = {
-                                .addr  = rec->u.update.node,
-                                .off   = rec->u.update.off,
-                                .ntype = rec->u.update.ntype,
-                                .part  = {
-                                        .len  = rec->len,
-                                        .addr = &rec->data
-                                }
-                        };
-                        struct node *n = (void *)t2_apply(en->mod, &txr);
-                        if (EISOK(n)) {
-                                if (!(n->flags & DIRTY)) {
-                                        n->flags |= DIRTY;
-                                        t2_lsnset((void *)n, lsn);
-                                        sh_add(n->mod, &n, 1);
-                                }
-                                ASSERT(ncheck(n));
-                                unlock(n, WRITE);
-                                put(n);
+                        if (rec->u.update.off == T2_TXR_ALLOC || rec->u.update.off == T2_TXR_DEALLOC) {
+                                result = SCALL(en->mod, replay, rec->u.update.node, rec->u.update.off);
                         } else {
-                                result = ERROR(ERRCODE(n));
+                                struct t2_txrec txr = {
+                                        .addr  = rec->u.update.node,
+                                        .off   = rec->u.update.off,
+                                        .ntype = rec->u.update.ntype,
+                                        .part  = {
+                                                .len  = rec->len,
+                                                .addr = &rec->data
+                                        }
+                                };
+                                struct node *n = (void *)t2_apply(en->mod, &txr);
+                                if (EISOK(n)) {
+                                        if (!(n->flags & DIRTY)) {
+                                                n->flags |= DIRTY;
+                                                t2_lsnset((void *)n, lsn);
+                                                sh_add(n->mod, &n, 1);
+                                        }
+                                        ASSERT(ncheck(n));
+                                        unlock(n, WRITE);
+                                        put(n);
+                                } else {
+                                        result = ERROR(ERRCODE(n));
+                                }
                         }
                 }
         }
@@ -8864,7 +8906,7 @@ struct mock_storage {
         struct t2_storage gen;
 };
 
-static int mso_init(struct t2_storage *storage) {
+static int mso_init(struct t2_storage *storage, bool make) {
         return 0;
 }
 
@@ -8921,13 +8963,6 @@ static void *mso_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_
         return NULL;
 }
 
-static uint64_t mso_tell(struct t2_storage *storage) {
-        return 0;
-}
-
-static void mso_set(struct t2_storage *storage, uint64_t off) {
-}
-
 static void mso_done(struct t2_storage *storage, struct t2_io_ctx *ctx) {
 }
 
@@ -8937,6 +8972,10 @@ static int mso_sync(struct t2_storage *storage, bool barrier) {
 
 static bool mso_same(struct t2_storage *storage, int fd) {
         return false;
+}
+
+static int mso_replay(struct t2_storage *storage, taddr_t addr, enum t2_txr_op op) {
+        return 0;
 }
 
 static struct t2_storage_op mock_storage_op = {
@@ -8950,10 +8989,9 @@ static struct t2_storage_op mock_storage_op = {
         .read     = &mso_read,
         .write    = &mso_write,
         .end      = &mso_end,
-        .tell     = &mso_tell,
-        .set      = &mso_set,
         .sync     = &mso_sync,
-        .same     = &mso_same
+        .same     = &mso_same,
+        .replay   = &mso_replay
 };
 
 static __attribute__((unused)) struct t2_storage mock_storage = {
@@ -8988,7 +9026,6 @@ struct file_storage {
 
 enum { FREE0 = 1024 * 1024 };
 SASSERT((long)FREE0 >= (long)SB_SIZE);
-static int64_t free0 = FREE0;
 static const char file_fmt[] = "%s.%03x";
 
 static void file_kill_check(struct file_storage *fs) {
@@ -9007,24 +9044,28 @@ static void file_kill(struct file_storage *fs) {
         /* Leave with the mutex held. */
 }
 
-static int file_init(struct t2_storage *storage) {
+static int file_init(struct t2_storage *storage, bool make) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         struct stat st;
         int namesize = strlen(fs->filename) + 10;
         char name[namesize]; /* VLA */
         NOFAIL(pthread_mutex_init(&fs->lock, NULL));
         if (fs->free == 0) {
-                fs->free = free0;
+                fs->free = FREE0;
         }
         fs->allsame = true;
         for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
-                fs->frag_free[i] = fs->free;
                 snprintf(name, namesize, file_fmt, fs->filename, i);
                 fs->fd[i] = open(name, O_RDWR | O_CREAT, 0777);
                 if (fs->fd[i] < 0) {
                         return ERROR(-errno);
                 }
+                if (make) {
+                        NOFAIL(ftruncate(fs->fd[i], FREE0));
+                }
                 NOFAIL(fstat(fs->fd[i], &st));
+                fs->frag_free[i] = st.st_size;
+                fs->free = max_64(fs->free, fs->frag_free[i]);
                 if (i == 0) {
                         fs->device = st.st_dev;
                 }
@@ -9190,21 +9231,6 @@ static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32
         }
 }
 
-static uint64_t file_tell(struct t2_storage *storage) {
-        struct file_storage *fs = COF(storage, struct file_storage, gen);
-        return fs->free;
-}
-
-static void file_set(struct t2_storage *storage, uint64_t free) {
-        struct file_storage *fs = COF(storage, struct file_storage, gen);
-        mutex_lock(&fs->lock);
-        fs->free = max_64(free, fs->free);
-        for (int i = 0; i < FRAG_NR; ++i) {
-                fs->frag_free[i] = fs->free;
-        }
-        mutex_unlock(&fs->lock);
-}
-
 static int file_sync(struct t2_storage *storage, bool barrier) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         int result = 0;
@@ -9223,6 +9249,24 @@ static bool file_same(struct t2_storage *storage, int fd) {
         return fs->allsame && st.st_dev == fs->device;
 }
 
+static int file_replay(struct t2_storage *storage, taddr_t addr, enum t2_txr_op op) {
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        ASSERT(op ==  T2_TXR_ALLOC || op ==  T2_TXR_DEALLOC);
+        if (op == T2_TXR_ALLOC) {
+                uint64_t end = taddr_saddr(addr) + taddr_ssize(addr);
+                mutex_lock(&fs->lock);
+                fs->free = max_64(end, fs->free);
+                for (int i = 0; i < FRAG_NR; ++i) {
+                        if (end > fs->frag_free[i]) {
+                                ftruncate(fs->fd[i], end);
+                        }
+                        fs->frag_free[i] = fs->free;
+                }
+                mutex_unlock(&fs->lock);
+        }
+        return 0;
+}
+
 static struct t2_storage_op file_storage_op = {
         .name     = "file-storage-op",
         .init     = &file_init,
@@ -9234,10 +9278,9 @@ static struct t2_storage_op file_storage_op = {
         .read     = &file_read,
         .write    = &file_write,
         .end      = &file_end,
-        .tell     = &file_tell,
-        .set      = &file_set,
         .sync     = &file_sync,
-        .same     = &file_same
+        .same     = &file_same,
+        .replay   = &file_replay
 };
 
 static struct file_storage file_storage = {
@@ -9246,6 +9289,8 @@ static struct file_storage file_storage = {
 };
 
 /* @disorder */
+
+#if UT
 
 struct disorder_storage {
         struct t2_storage    gen;
@@ -9278,7 +9323,7 @@ struct disorder_req {
 
 static void *disorder_daemon(void *arg);
 
-static int disorder_init(struct t2_storage *storage) {
+static int disorder_init(struct t2_storage *storage, bool make) {
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
         NOFAIL(pthread_mutex_init(&dis->lock, NULL));
         NOFAIL(pthread_cond_init(&dis->cond, NULL));
@@ -9286,7 +9331,7 @@ static int disorder_init(struct t2_storage *storage) {
         dis->shutdown = false;
         dis->seq = 0;
         NOFAIL(pthread_create(&dis->daemon, NULL, &disorder_daemon, dis));
-        return dis->substrate->op->init(dis->substrate);
+        return dis->substrate->op->init(dis->substrate, make);
 }
 
 static void disorder_fini(struct t2_storage *storage) {
@@ -9385,16 +9430,6 @@ static void *disorder_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, i
         }
 }
 
-static uint64_t disorder_tell(struct t2_storage *storage) {
-        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
-        return dis->substrate->op->tell(dis->substrate);
-}
-
-static void disorder_set(struct t2_storage *storage, uint64_t free) {
-        struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
-        dis->substrate->op->set(dis->substrate, free);
-}
-
 static struct disorder_req *disorder_scan(struct disorder_storage *dis, uint64_t *min, uint64_t *max) {
         struct disorder_req *scan;
         struct disorder_req *select = NULL;
@@ -9486,8 +9521,6 @@ static struct t2_storage_op disorder_storage_op = {
         .read   = &disorder_read,
         .write  = &disorder_write,
         .end    = &disorder_end,
-        .tell   = &disorder_tell,
-        .set    = &disorder_set,
         .sync   = &disorder_sync,
         .same   = &disorder_same
 };
@@ -9500,28 +9533,9 @@ static struct disorder_storage disorder_storage = {
         .sleep_range = 1000
 };
 
+#endif /* UT */
+
 /* non-static */ struct t2_storage *bn_storage = &file_storage.gen;
-taddr_t bn_tree_root(const struct t2_tree *t) {
-        (void)disorder_storage;
-        return t->root;
-}
-
-uint64_t bn_file_free(struct t2_storage *storage) {
-        return file_storage.free;
-}
-
-void bn_file_free_set(struct t2_storage *storage, uint64_t free) {
-        storage->op->set(storage, free);
-}
-
-void bn_file_truncate(struct t2_storage *storage, uint64_t off) {
-        int namesize = strlen(file_storage.filename) + 10;
-        char name[namesize]; /* VLA */
-        for (int i = 0; i < ARRAY_SIZE(file_storage.frag_free); ++i) {
-                snprintf(name, namesize, file_fmt, file_storage.filename, i);
-                NOFAIL(truncate(name, off));
-        }
-}
 
 uint64_t bn_bolt(const struct t2 *mod) {
         return mod->cache.bolt;
@@ -10593,7 +10607,6 @@ static void open_ut() {
         int32_t vsize;
         int     result;
         uint32_t id;
-        uint64_t free;
         uint64_t bolt;
         usuite("open");
         utest("populate");
@@ -10607,13 +10620,11 @@ static void open_ut() {
                 ASSERT(result == 0 || result == -EEXIST || EOOM(result));
         }
         id = t->id;
-        free = bn_file_free(&file_storage.gen);
         bolt = mod->cache.bolt;
         t2_tree_close(t);
         t2_fini(mod);
         utest("open");
         mod = T2_INIT_MAKE(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes, false);
-        bn_file_free_set(&file_storage.gen, free);
         mod->cache.bolt = bolt;
         t = t2_tree_open(&ttype, id);
         ASSERT(EISOK(t));
@@ -10720,13 +10731,9 @@ static void wal_ut() {
         struct t2 *mod;
         struct t2_tx *tx;
         struct t2_tree *t;
-        uint32_t id;
-        int64_t free;
-        int64_t bolt;
         int result;
         usuite("wal");
         /* Re-assign it in case file_storage.filename points to a device, that cannot be truncated. */
-        const char *oldfile = file_storage.filename;
         file_storage.filename = "./pages/wp";
         utest("init");
         mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
@@ -10745,52 +10752,6 @@ static void wal_ut() {
         t2_fini(mod);
         utestdone();
         return; /* TODO: Restore. */
-        utest("replay-ops");
-        mod = T2_INIT(ut_storage, wprep(FLAGS|MAKE|KEEP), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        tx = t2_tx_make(mod);
-        ASSERT(EISOK(tx));
-        result = t2_tx_open(mod, tx);
-        ASSERT(result == 0 || EOOM(result));
-        t = t2_tree_create(&ttype, tx);
-        ASSERT(EISOK(t));
-        t2_tx_close(mod, tx);
-        for (uint64_t k = 0; k < NOPS; ++k) {
-                uint64_t bek = htobe64(k);
-                result = t2_tx_open(mod, tx);
-                ASSERT(result == 0 || EOOM(result));
-                result = t2_insert_ptr(t, &bek, SOF(bek), &k, SOF(k), tx);
-                ASSERT(result == 0 || EOOM(result));
-                t2_tx_close(mod, tx);
-        }
-        for (uint64_t k = 0; k < NOPS; k += 2) {
-                uint64_t bek = htobe64(k);
-                result = t2_tx_open(mod, tx);
-                ASSERT(result == 0 || EOOM(result));
-                result = t2_delete_ptr(t, &bek, SOF(bek), tx);
-                ASSERT(result == 0 || EOOM(result));
-                t2_tx_close(mod, tx);
-        }
-        t2_tx_done(mod, tx);
-        wal_ut_verify(t);
-        id = t->id;
-        free = bn_file_free(&file_storage.gen);
-        bolt = mod->cache.bolt;
-        t2_tree_close(t);
-        t2_fini(mod);
-        bn_file_truncate(&file_storage.gen, 0);
-        bn_file_truncate(&file_storage.gen, free + (1 << 20));
-        file_storage.free = 0;
-        free0 = free;
-        mod = T2_INIT(ut_storage, wprep(FLAGS), HT_SHIFT, CA_SHIFT, ttypes, ntypes);
-        mod->cache.bolt = bolt;
-        t = t2_tree_open(&ttype, id);
-        ASSERT(EISOK(t));
-        wal_ut_verify(t);
-        t2_tree_close(t);
-        t2_fini(mod);
-        free0 = FREE0;
-        file_storage.filename = oldfile;
-        utestdone();
 }
 
 static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *label) {
@@ -10806,7 +10767,6 @@ static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *labe
 }
 
 struct seg_state {
-        uint64_t             free;
         uint64_t             bolt;
         struct t2_tree      *tree;
         struct t2           *mod;
@@ -10821,15 +10781,15 @@ struct seg_state {
 static void seg_load(struct seg_state *ss) {
         FILE *seg = fopen("ct.seg", "r");
         ASSERT(seg != NULL);
-        int nr = fscanf(seg, "%"SCNx64" %"SCNx64, &ss->free, &ss->bolt);
-        assert(nr == 3);
+        int nr = fscanf(seg, "%"SCNx64, &ss->bolt);
+        assert(nr == 1);
         fclose(seg);
 }
 
 static void seg_save(struct seg_state *ss) {
         FILE *seg = fopen("ct.seg", "w");
         ASSERT(seg != NULL);
-        fprintf(seg, "%"PRIx64" %"PRIx64, ss->file->free, ss->mod->cache.bolt);
+        fprintf(seg, "%"PRIx64, ss->mod->cache.bolt);
         fflush(seg);
         fclose(seg);
 }
@@ -10988,11 +10948,10 @@ static void ct(int argc, char **argv) {
                         printf("    Iteration %5i.\n", cseg.iter);
                         if (cseg.iter != 0) {
                                 seg_load(&cseg);
-                                file_set(&file_storage.gen, cseg.free);
                         } else {
                                 flags |= MAKE;
                         }
-                        mod = T2_INIT(&file_storage.gen, wprep(flags), CT_SHIFT, CT_SHIFT, ttypes, ntypes);
+                        mod = T2_INIT_MAKE(&file_storage.gen, wprep(flags), CT_SHIFT, CT_SHIFT, ttypes, ntypes, cseg.iter == 0);
                         if (cseg.iter == 0) {
                                 struct t2_tx *tx = t2_tx_make(mod);
                                 ASSERT(EISOK(tx));

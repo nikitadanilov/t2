@@ -147,10 +147,29 @@ struct t2_te { /* Transaction engine. */
  * instance.
  */
 typedef uint64_t taddr_t;
+
+struct t2_buf {
+        int32_t  len;
+        void    *addr;
+};
+
+enum t2_txr_op {
+        T2_TXR_ALLOC = INT32_MAX - 2,
+        T2_TXR_DEALLOC
+};
+
+struct t2_txrec { /* Transaction log record. */
+        struct t2_node *node;
+        taddr_t         addr;
+        int16_t         ntype;
+        int32_t         off;
+        struct t2_buf   part;
+};
+
 struct t2_io_ctx;
 struct t2_storage_op {
         const char *name;
-        int               (*init)  (struct t2_storage *storage);
+        int               (*init)  (struct t2_storage *storage, bool make);
         void              (*fini)  (struct t2_storage *storage);
         struct t2_io_ctx *(*create)(struct t2_storage *storage, int queue);
         void              (*done)  (struct t2_storage *storage, struct t2_io_ctx *arg);
@@ -163,19 +182,7 @@ struct t2_storage_op {
         void              (*set)   (struct t2_storage *storage, uint64_t free);
         int               (*sync)  (struct t2_storage *storage, bool barrier);
         bool              (*same)  (struct t2_storage *storage, int fd);
-};
-
-struct t2_buf {
-        int32_t  len;
-        void    *addr;
-};
-
-struct t2_txrec { /* Transaction log record. */
-        struct t2_node *node;
-        taddr_t         addr;
-        int16_t         ntype;
-        int32_t         off;
-        struct t2_buf   part;
+        int               (*replay)(struct t2_storage *storage, taddr_t addr, enum t2_txr_op op);
 };
 
 struct t2_cookie {
@@ -235,6 +242,7 @@ void                 t2_node_type_fini(struct t2_node_type *nt);
 
 struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx);
 struct t2_tree *t2_tree_open(struct t2_tree_type *ttype, uint32_t id);
+uint32_t        t2_tree_id(const struct t2_tree *t);
 void            t2_tree_close(struct t2_tree *t);
 
 int  t2_lookup(struct t2_tree *t, struct t2_rec *r);

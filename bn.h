@@ -127,8 +127,7 @@ struct kvbenchmark {
                 struct {
                         struct t2_tree *tree;
                         struct t2      *mod;
-                        taddr_t         root;
-                        uint64_t        free;
+                        uint32_t        id;
                         uint64_t        bolt;
                 } t2;
                 struct rocksdb_benchmark r;

@@ -703,17 +703,13 @@ static void t_mount(struct benchmark *b) {
                 &bn_ttype,
                 NULL
         };
-        if (b->kv.u.t2.root == 0 && !(wal_flags & MAKE)) {
+        if (b->kv.u.t2.bolt == 0 && !(wal_flags & MAKE)) {
                 FILE *seg = fopen("bn.seg", "r");
                 if (seg != NULL) {
-                        int nr = fscanf(seg, "%"SCNx64" %"SCNx64" %"SCNx64,
-                                        &b->kv.u.t2.root, &b->kv.u.t2.free, &b->kv.u.t2.bolt);
-                        assert(nr == 3);
+                        int nr = fscanf(seg, "%"SCNx64, &b->kv.u.t2.bolt);
+                        assert(nr == 1);
                         fclose(seg);
                 }
-        }
-        if (b->kv.u.t2.free != 0) {
-                bn_file_free_set(bn_storage, b->kv.u.t2.free);
         }
         mod = b->kv.u.t2.mod = t2_init_with(T2_INIT_EXPLAIN | T2_INIT_VERBOSE, &(struct t2_param) {
                         .conf = {
@@ -733,8 +729,8 @@ static void t_mount(struct benchmark *b) {
         if (b->kv.u.t2.bolt != 0) {
                 bn_bolt_set(b->kv.u.t2.mod, b->kv.u.t2.bolt);
         }
-        if (b->kv.u.t2.root != 0) {
-                b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.root);
+        if (b->kv.u.t2.id != 0) {
+                b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.id);
         } else {
                 if (transactions) {
                         struct t2_tx *tx = t2_tx_make(b->kv.u.t2.mod);
@@ -749,11 +745,10 @@ static void t_mount(struct benchmark *b) {
 }
 
 static void t_umount(struct benchmark *b) {
-        b->kv.u.t2.root = bn_tree_root(b->kv.u.t2.tree);
+        b->kv.u.t2.id = t2_tree_id(b->kv.u.t2.tree);
         b->kv.u.t2.bolt = bn_bolt(b->kv.u.t2.mod);
         t2_tree_close(b->kv.u.t2.tree);
         t2_fini(b->kv.u.t2.mod);
-        b->kv.u.t2.free = bn_file_free(bn_storage);
         t2_node_type_fini(bn_ntype_internal);
         t2_node_type_fini(bn_ntype_twig);
         t2_node_type_fini(bn_ntype_leaf);
@@ -761,7 +756,7 @@ static void t_umount(struct benchmark *b) {
         if (wal_flags & KEEP) {
                 FILE *seg = fopen("bn.seg", "w");
                 if (seg != NULL) {
-                        fprintf(seg, "%"PRIx64" %"PRIx64" %"PRIx64, b->kv.u.t2.root, b->kv.u.t2.free, b->kv.u.t2.bolt);
+                        fprintf(seg, "%"PRIx64, b->kv.u.t2.bolt);
                         fclose(seg);
                 }
         }
