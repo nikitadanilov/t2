@@ -1395,11 +1395,11 @@ struct t2 *t2_init(const struct t2_conf *conf) {
         }
         next_stage(mod, true, POOL);
         NEXT_STAGE(mod, ht_init(&mod->ht, conf->hshift), HT_INIT);
-        NEXT_STAGE(mod, SCALL(mod, init, conf->seg_make), STORAGE_INIT);
+        NEXT_STAGE(mod, SCALL(mod, init, conf->make), STORAGE_INIT);
         NEXT_STAGE(mod, iocache_init(&mod->ioc, conf->ishift), IOCACHE_INIT);
         NEXT_STAGE(mod, cache_init(mod, conf), CACHE_INIT);
         NEXT_STAGE(mod, TXCALL(conf->te, init(conf->te, mod)), TX_INIT);
-        NEXT_STAGE(mod, seg_init(&mod->seg, mod, conf->seg_make), SEG_INIT);
+        NEXT_STAGE(mod, seg_init(&mod->seg, mod, conf->make), SEG_INIT);
         return mod;
 }
 
@@ -9845,10 +9845,10 @@ static struct t2_tree_type *ttypes[] = {
         NULL
 };
 
-#define T2_INIT_MAKE(s, t, h, c, tt, nt, make) ({                            \
+#define T2_INIT_MAKE(s, t, h, c, tt, nt, mak) ({                            \
         struct t2_te *_te = (t);                                        \
         struct t2 *_mod = t2_init_with(0, &(struct t2_param) { .conf = { .storage = s, .te = _te, .hshift = h, .cshift = c, \
-                                                               .ttypes = tt, .ntypes = nt, .seg_make = (make) }, .no_te = (_te == NULL) });     \
+                                                               .ttypes = tt, .ntypes = nt, .make = (mak) }, .no_te = (_te == NULL) });     \
         ASSERT(EISOK(_mod));                                            \
         _mod;                                                           \
 })

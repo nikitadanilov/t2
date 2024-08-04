@@ -42,7 +42,7 @@ struct t2_conf {
         int                   free_hi;
         int                   free_lo;
         int                   scan_rate_shift;
-        bool                  seg_make;
+        bool                  make;
         struct t2_tree_type **ttypes;
         struct t2_node_type **ntypes;
 };
