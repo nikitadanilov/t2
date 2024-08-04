@@ -11150,10 +11150,6 @@ static bool ut_mem_alloc_fail() {
  *
  * - preallocate log and pages
  *
- * - meta-index, call-backs for root relocation
- *
- * - record block allocation and de-allocation in the log
- *
  * - speed up and parallelise replay
  *
  * - support pageout during recovery for logs larger than memory
@@ -11195,6 +11191,10 @@ static bool ut_mem_alloc_fail() {
  * + cursor benchmark
  *
  * + asynchronous pageout
+ *
+ * + meta-index, call-backs for root relocation
+ *
+ * + record block allocation and de-allocation in the log
  *
  * References:
  *
