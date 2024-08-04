@@ -5382,10 +5382,12 @@ static void stacktrace() {
         for (int i = 0; unw_step(&cursor) > 0; ++i) {
                 unw_word_t offset;
                 unw_word_t pc;
+                unw_word_t sp;
                 char       name[128] = {};
                 unw_get_reg(&cursor, UNW_REG_IP, &pc);
-                unw_get_proc_name(&cursor, name, sizeof(name), &offset);
-                printf("%03d: %08lx: %s+%#08x\n", i, (long)pc, name, (unsigned)offset);
+                unw_get_reg(&cursor, UNW_REG_SP, &sp);
+                unw_get_proc_name(&cursor, name, sizeof name, &offset);
+                printf("%03d: %08lx %08lx: %s+%#08x\n", i, (long)sp, (long)pc, name, (unsigned)offset);
     }
 }
 #endif
