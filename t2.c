@@ -3277,7 +3277,8 @@ static int traverse_complete(struct path *p, int result) {
                 path_reset(p);
                 rcu_lock();
                 return AGAIN;
-        } else if (UNLIKELY(result != 0)) {
+        } else if (UNLIKELY(result != 0 && (p->opt != INSERT || result != -EEXIST) &&
+                                           (p->opt != DELETE || result != -ENOENT))) {
                 return result;
         } else if (UNLIKELY(!path_is_valid(p))) {
                 path_reset(p);
