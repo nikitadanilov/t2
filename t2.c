@@ -9284,7 +9284,8 @@ static int file_replay(struct t2_storage *storage, taddr_t addr, enum t2_txr_op 
                 fs->free = max_64(end, fs->free);
                 for (int i = 0; i < FRAG_NR; ++i) {
                         if (end > fs->frag_free[i]) {
-                                ftruncate(fs->fd[i], end);
+                                int result = ftruncate(fs->fd[i], end);
+                                (void)result; /* Suppress 'warn_unused_result'. */
                         }
                         fs->frag_free[i] = fs->free;
                 }
