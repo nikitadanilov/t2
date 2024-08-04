@@ -3624,6 +3624,15 @@ static bool addr_is_valid(void *addr) {
         return result;
 }
 
+static void thread_set_name(const char *fmt, ...) {
+        char buf[16];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(buf, ARRAY_SIZE(buf), fmt, args);
+        va_end(args);
+        pthread_setname_np(pthread_self(), buf);
+}
+
 #elif ON_DARWIN
 
 #include <sys/sysctl.h>
@@ -3649,6 +3658,9 @@ static bool addr_is_valid(void *addr) {
                 address <= ((mach_vm_address_t)addr) &&
                 ((mach_vm_address_t)(addr + sizeof(uint64_t))) <= address + size &&
                 (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
+}
+
+static void thread_set_name(const char *fmt, ...) {
 }
 
 #endif
@@ -4308,6 +4320,7 @@ static void *shepherd(void *arg) { /* Matthew 25:32, but a dog. */
         struct cache       *c    = &mod->cache;
         int                 dlt  = c->briard_shift - c->sh_shift;
         t2_thread_register();
+        thread_set_name("t2.shepherd%02i", self - c->sh);
         while (true) {
                 struct t2_te *te = mod->te;
                 struct node  *n  = sh_next(self);
@@ -4357,6 +4370,7 @@ static void *briard(void *arg) {
         struct t2          *mod  = ctx->mod;
         struct cache       *c    = &mod->cache;
         t2_thread_register();
+        thread_set_name("t2.briard%02i", self - c->briard);
         self->par[0] = &c->sh[self->ctx.idx >> (c->briard_shift - c->sh_shift)].min;
         while (true) {
                 struct t2_te *te = mod->te;
@@ -4402,6 +4416,7 @@ static void *buhund(void *arg) { /* For cows and eio. */
         struct cache    *c    = &mod->cache;
         struct queue    *q    = &self->queue;
         t2_thread_register();
+        thread_set_name("t2.buhund%02i", self - c->buhund);
         self->par[0] = &c->sh    [self->ctx.idx >> (c->buhund_shift - c->sh_shift)].min;
         self->par[1] = &c->briard[self->ctx.idx >> (c->buhund_shift - c->briard_shift)].min;
         q->unordered = true;
@@ -4463,6 +4478,7 @@ enum { PULSE_TICK = BILLION / 100 };
 static void *pulse(void *arg) {
         struct t2 *mod = arg;
         struct timespec tick = { .tv_nsec = PULSE_TICK };
+        thread_set_name("t2.pulse");
         while (!mod->shutdown) {
                 nanosleep(&tick, NULL);
                 WRITE_ONCE(mod->tick, now());
@@ -4588,6 +4604,7 @@ static void *maxwelld(void *arg) {
         struct cache        *c   = &mod->cache;
         struct maxwell_data *md  = &c->md;
         t2_thread_register();
+        thread_set_name("t2.maxwelld");
         md->delta = ARRAY_SIZE(md->window) >> 1;
         while (true) {
                 struct timespec end;
@@ -8857,12 +8874,14 @@ static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *
 
 static void *wal_aux_worker(void *arg) {
         struct wal_te *en = arg;
+        thread_set_name("t2.walaux");
         wal_work(en, LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, INT_MAX, &en->logwait);
         return NULL;
 }
 
 static void *wal_worker(void *arg) {
         struct wal_te *en = arg;
+        thread_set_name("t2.walworker");
         wal_work(en, LOG_WRITE, INT_MAX, &en->bufwrite);
         return NULL;
 }
@@ -9490,6 +9509,7 @@ static void *disorder_daemon(void *arg) {
         struct disorder_storage *dis = arg;
         uint64_t                 dummy;
 
+        thread_set_name("t2.disorderd");
         mutex_lock(&dis->lock);
         while (true) {
                 struct disorder_req *req;
