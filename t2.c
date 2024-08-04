@@ -7554,7 +7554,6 @@ struct wal_te {
         lsn_t                                  start_written;
         lsn_t                                  start_synced;
         lsn_t                                  start_persistent;
-        lsn_t                                  min_want; /* TODO: Useless, get rid of. */
         uint64_t                               last_log_sync;
         uint64_t                               last_page_sync;
         uint64_t                               cur_age;
@@ -8078,7 +8077,6 @@ static void wal_log_sync(struct wal_te *en) {
                 en->max_synced = en->max_written;
                 en->start_persistent = en->start_synced;
                 en->start_synced = en->start_written;
-                en->min_want = max_64(en->max_persistent - en->log_size, 0);
                 wal_broadcast(en);
         } else {
                 LOG("Cannot sync log: %i.", errno);
@@ -8137,7 +8135,6 @@ static void wal_snapshot(struct wal_te *en) {
                 en->max_synced = en->max_written;
                 en->start_persistent = en->start_synced;
                 en->start_synced = en->start_written;
-                en->min_want = max_64(en->max_persistent - en->log_size, 0);
                 wal_broadcast(en);
         } else {
                 LOG("Snapshot failure %s: %i/%i/%i.", en->logname, rc1, rc2, errno);
@@ -8479,7 +8476,6 @@ static void wal_recovery_done(struct wal_te *en, lsn_t start, lsn_t end) {
         wal_lock(en);
         en->lsn = en->max_persistent = en->max_synced = en->max_written = en->max_inflight = end;
         en->start_persistent = en->start = en->start_synced = en->start_written = en->max_paged = start;
-        en->min_want = max_64(en->max_persistent - en->log_size, 0);
         en->recovered = true;
         wal_broadcast(en);
         wal_unlock(en);
