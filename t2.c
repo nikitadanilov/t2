@@ -10791,7 +10791,6 @@ static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *labe
 }
 
 struct seg_state {
-        uint64_t             bolt;
         struct t2_tree      *tree;
         struct t2           *mod;
         struct file_storage *file;
@@ -10802,22 +10801,6 @@ struct seg_state {
         int                  sleep_max;
         uint64_t             nr_ops;
 };
-
-static void seg_load(struct seg_state *ss) {
-        FILE *seg = fopen("ct.seg", "r");
-        ASSERT(seg != NULL);
-        int nr = fscanf(seg, "%"SCNx64, &ss->bolt);
-        assert(nr == 1);
-        fclose(seg);
-}
-
-static void seg_save(struct seg_state *ss) {
-        FILE *seg = fopen("ct.seg", "w");
-        ASSERT(seg != NULL);
-        fprintf(seg, "%"PRIx64, ss->mod->cache.bolt);
-        fflush(seg);
-        fclose(seg);
-}
 
 static ssize_t ct_pwrite(int fd, const void *buf, size_t count, off_t offset) {
         while (true) {
@@ -10983,9 +10966,7 @@ static void ct(int argc, char **argv) {
                         struct t2_tree *t;
                         int32_t         flags = FLAGS;
                         printf("    Iteration %5i.\n", cseg.iter);
-                        if (cseg.iter != 0) {
-                                seg_load(&cseg);
-                        } else {
+                        if (cseg.iter == 0) {
                                 flags |= MAKE;
                         }
                         mod = T2_INIT_MAKE(&file_storage.gen, wprep(flags), CT_SHIFT, CT_SHIFT, ttypes, ntypes, cseg.iter == 0);
@@ -10998,7 +10979,6 @@ static void ct(int argc, char **argv) {
                                 ASSERT(t->id == 1);
                         } else {
                                 t = t2_tree_open(&ttype, 1);
-                                mod->cache.bolt = cseg.bolt;
                         }
                         ASSERT(EISOK(t));
                         cseg.mod  = mod;
@@ -11019,7 +10999,6 @@ static void ct(int argc, char **argv) {
                         puts("    .... Crashing.");
                         file_kill(&file_storage);
                         ut_pwrite = &ct_pwrite;
-                        seg_save(&cseg);
                         abort();
                 } else {
                         ASSERT(child > 0);
