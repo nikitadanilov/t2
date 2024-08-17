@@ -10810,6 +10810,7 @@ struct seg_state {
         uint64_t            *idx;
         int                  sleep_min;
         int                  sleep_max;
+        uint64_t             nr_ops;
 };
 
 static void seg_load(struct seg_state *ss) {
@@ -10931,7 +10932,7 @@ static void *busy(void *arg) {
                 makerec(tno, (idx - 1) >> 1, &key, &val);
                 WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
         }
-        while (true) {
+        while (cseg.nr_ops == 0 || idx < cseg.nr_ops) {
                 makerec(tno, idx, &key, &val);
                 result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, sizeof key, &val, sizeof val, tx));
                 ASSERT(result == 0 || result == -EEXIST);
@@ -10952,6 +10953,31 @@ static void *busy(void *arg) {
         t2_tx_done(t->ttype->mod, tx);
         t2_thread_degister();
         return NULL;
+}
+
+static void mt_check_ut() {
+        enum { CT_SHIFT = 24 };
+        uint64_t      idx[9 * THREADS] = {};
+        pthread_t     tid[ARRAY_SIZE(idx)];
+        struct t2_tx *tx = NULL;
+        usuite("mt-check");
+        utest("init");
+        struct t2 *mod  = T2_INIT(ut_storage, NULL, CT_SHIFT, CT_SHIFT, ttypes, ntypes);
+        cseg.nr_threads = ARRAY_SIZE(idx);
+        cseg.idx        = idx;
+        cseg.nr_ops     = OPS;
+        cseg.tree       = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
+        ASSERT(EISOK(cseg.tree));
+        utest("check");
+        for (int i = 0; i < ARRAY_SIZE(idx); ++i) {
+                NOFAIL(pthread_create(&tid[i], NULL, &busy, (void *)(long)i));
+        }
+        for (int i = 0; i < ARRAY_SIZE(idx); ++i) {
+                NOFAIL(pthread_join(tid[i], NULL));
+        }
+        utest("fini");
+        t2_fini(mod);
+        utestdone();
 }
 
 #include <sys/types.h>
@@ -11085,6 +11111,7 @@ static void ut() {
         next_ut_tx();
         seq_ut_tx();
         mt_ut_tx();
+        mt_check_ut();
 }
 
 int main(int argc, char **argv) {
