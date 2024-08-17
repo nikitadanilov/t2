@@ -275,15 +275,14 @@ enum t2_stats_flags {
         T2_SF_SHEPHERD   = 1ull <<  2, /* s */
         T2_SF_IO         = 1ull <<  3, /* i */
         T2_SF_MALLOC     = 1ull <<  4, /* M */
-        T2_SF_STASH      = 1ull <<  5, /* S */
-        T2_SF_POOL       = 1ull <<  6, /* p */
-        T2_SF_TX         = 1ull <<  7, /* x */
-        T2_SF_OS         = 1ull <<  8, /* o */
-        T2_SF_COUNTERS   = 1ull <<  9, /* c */
-        T2_SF_HASH       = 1ull << 10, /* h */
+        T2_SF_POOL       = 1ull <<  5, /* p */
+        T2_SF_TX         = 1ull <<  6, /* x */
+        T2_SF_OS         = 1ull <<  7, /* o */
+        T2_SF_COUNTERS   = 1ull <<  8, /* c */
+        T2_SF_HASH       = 1ull <<  9, /* h */
 
         T2_SF_SCAN       = T2_SF_MAXWELL | T2_SF_SHEPHERD,
-        T2_SF_ALLOC      = T2_SF_MALLOC | T2_SF_STASH
+        T2_SF_ALLOC      = T2_SF_MALLOC
 };
 
 void t2_stats_print(struct t2 *mod, uint64_t flags);
