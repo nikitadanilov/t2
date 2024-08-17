@@ -8607,9 +8607,6 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
         int pos = 0;
         ASSERT(*nr > 0);
         for (int i = 0; i < (1 << en->log_shift); ++i) {
-                lsn_t prev    = 0;
-                lsn_t first   = 0;
-                bool  reached = false;
                 for (int64_t off = 0; off < size[i]; off += en->buf_size) {
                         struct wal_header hdr;
                         lsn_t             lsn;
@@ -8630,19 +8627,6 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
                                 return ERROR(-EIO);
                         }
                         lsn = hdr.h.u.header.lsn;
-                        if (first > 0) {
-                                if (lsn != 0 && lsn != prev + (1 << en->log_shift)) { /* Found a drop in lsn sequence. */
-                                        if (reached || lsn >= first) {
-                                                LOG("Wrong lsn ordering in log %04x+%"PRId64".", i, off);
-                                                return ERROR(-EIO);
-                                        } else {
-                                                reached = true;
-                                        }
-                                }
-                        } else {
-                                first = lsn;
-                        }
-                        prev = lsn;
                         ASSERT(pos < *nr);
                         index[pos++] = (struct rbuf) {
                                 .idx   = i,
@@ -8654,19 +8638,25 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
                 }
         }
         ASSERT(pos <= *nr);
-        *nr = pos;
         qsort(index, pos, sizeof(struct rbuf), &rbuf_cmp);
         for (snapend = 0; snapend < pos && index[snapend].lsn == 0; ++snapend) {
                 ;
         }
         for (int i = snapend + 1; i < pos; ++i) {
-                if (index[i].start < index[i - 1].start || index[i].end < index[i - 1].end) {
+                ASSERT(index[i].lsn >= index[i - 1].lsn);
+                if (index[i].lsn == index[i - 1].lsn ||
+                    index[i].start < index[i - 1].start || index[i].end < index[i - 1].end) {
                         LOG("Non-monotonic records.");
                         rbuf_print(&index[i - 1]);
                         rbuf_print(&index[i]);
                         return ERROR(-EIO);
                 }
+                if (index[i].lsn != index[i - 1].lsn + 1) {
+                        pos = i;
+                        break;
+                }
         }
+        *nr  = pos;
         *out = index[pos - 1];
         if (snapend > 0 && index[snapend - 1].end > out->end) {
                 *out = index[snapend - 1];
