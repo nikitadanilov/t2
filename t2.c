@@ -10827,12 +10827,9 @@ static ssize_t ct_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 }
 
 static struct seg_state cseg = {};
-static bool stop = false;
 
 static void *abaddon(void *arg) {
-        do {
-                sleep(cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min));
-        } while (stop);
+        sleep(cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min));
         puts("    .... Crashing.");
         file_kill(&file_storage);
         ut_pwrite = &ct_pwrite;
@@ -10861,6 +10858,13 @@ static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, struct 
 static bool checkrec(struct ct_key *key, struct ct_val *val) {
         return memcmp(&key->val, val, sizeof *val) == 0 && key->h == ht_hash64(be64toh(val->tno) + (be64toh(val->idx) << 17));
 }
+
+/* Assertion checked in an optimised build. */
+#define CT_ASSERT(x) ({                         \
+        if (UNLIKELY(!(x))) {                   \
+                IMMANENTISE(#x);                \
+        }                                       \
+})
 
 static void *ct_scan(void *arg) {
         int               tno = (long)arg;
@@ -10925,18 +10929,11 @@ static void *busy(void *arg) {
         while (cseg.nr_ops == 0 || idx < cseg.nr_ops) {
                 makerec(tno, idx, &key, &val);
                 result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, sizeof key, &val, sizeof val, tx));
-                ASSERT(result == 0 || result == -EEXIST);
-                if (result == -EEXIST) {
-                        printf("    .... Thread %i gap before %"PRId64".\n", tno, idx);
-                        stop = true;
-                        debugger_attach();
-                        t2_lookup_ptr(t, &key, sizeof key, &val, sizeof val);
-                        exit(1);
-                }
+                CT_ASSERT(result == 0);
                 if (!(idx & 1)) {
                         makerec(tno, idx >> 1, &key, &val);
                         result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
-                        ASSERT(result == 0 || (result == -ENOENT && idx == cseg.idx[tno]));
+                        CT_ASSERT(result == 0 || (result == -ENOENT && idx == cseg.idx[tno]));
                 }
                 ++idx;
         }
