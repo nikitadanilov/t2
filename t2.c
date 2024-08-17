@@ -10828,16 +10828,6 @@ static ssize_t ct_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 
 static struct seg_state cseg = {};
 
-static void *abaddon(void *arg) {
-        sleep(cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min));
-        puts("    .... Crashing.");
-        file_kill(&file_storage);
-        ut_pwrite = &ct_pwrite;
-        seg_save(&cseg);
-        abort();
-        return NULL;
-}
-
 struct ct_val {
         uint64_t tno;
         uint64_t idx;
@@ -11025,10 +11015,12 @@ static void ct(int argc, char **argv) {
                         for (int i = 0; i < cseg.nr_threads; ++i) {
                                 NOFAIL(pthread_create(&tid[i], NULL, &busy, (void *)(long)i));
                         }
-                        NOFAIL(pthread_create(&tid[cseg.nr_threads], NULL, &abaddon, NULL));
-                        while (true) {
-                                wait(&status);
-                        }
+                        sleep(cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min));
+                        puts("    .... Crashing.");
+                        file_kill(&file_storage);
+                        ut_pwrite = &ct_pwrite;
+                        seg_save(&cseg);
+                        abort();
                 } else {
                         ASSERT(child > 0);
                         pid_t deceased = wait(&status);
