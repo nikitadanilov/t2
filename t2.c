@@ -711,6 +711,7 @@ struct path {
         struct t2_rec  *rec;
         enum optype     opt;
         struct t2_tx   *tx;
+        int             rc;
         struct page     newroot;
         struct page     sb;
 };
@@ -2700,6 +2701,7 @@ static void path_fini(struct path *p) {
                 }
                 buf_free(&r->scratch);
         }
+        p->rc   = 0;
         p->used = -1;
         if (UNLIKELY(p->newroot.node != NULL)) {
                 if (p->rung[0].flags & UNROOT) {
@@ -2981,7 +2983,9 @@ static int insert_prep(struct path *p) {
         int            result = 0;
         SLOT_DEFINE(s, p->rung[idx].page.node);
         if (leaf_search(p->rung[idx].page.node, p, &s)) {
-                return path_lock(p) ?: -EEXIST;
+                p->rung[idx].page.lm = WRITE;
+                p->rc = -EEXIST;
+                return path_lock(p);
         }
         p->rung[idx].pos = s.idx;
         do {
@@ -3015,7 +3019,9 @@ static int delete_prep(struct path *p) {
         int result = 0;
         SLOT_DEFINE(s, p->rung[idx].page.node);
         if (!leaf_search(p->rung[idx].page.node, p, &s)) {
-                return path_lock(p) ?: -ENOENT;
+                p->rung[idx].page.lm = WRITE;
+                p->rc = -ENOENT;
+                return path_lock(p);
         }
         p->rung[idx].pos = s.idx;
         do {
@@ -3277,8 +3283,7 @@ static int traverse_complete(struct path *p, int result) {
                 path_reset(p);
                 rcu_lock();
                 return AGAIN;
-        } else if (UNLIKELY(result != 0 && (p->opt != INSERT || result != -EEXIST) &&
-                                           (p->opt != DELETE || result != -ENOENT))) {
+        } else if (UNLIKELY(result != 0)) {
                 return result;
         } else if (UNLIKELY(!path_is_valid(p))) {
                 path_reset(p);
@@ -3358,7 +3363,7 @@ static int traverse(struct path *p) {
                                 rcu_leave(p, NULL);
                                 result = PREPARE(p, insert_prep(p));
                                 if (LIKELY(result == DONE)) {
-                                        result = COMPLETE(insert_complete(p, n));
+                                        result = p->rc ?: COMPLETE(insert_complete(p, n));
                                         break;
                                 } else if (result < 0) {
                                         break;
@@ -3367,7 +3372,7 @@ static int traverse(struct path *p) {
                                 rcu_leave(p, NULL);
                                 result = PREPARE(p, delete_prep(p));
                                 if (LIKELY(result == DONE)) {
-                                        result = COMPLETE(delete_complete(p, n));
+                                        result = p->rc ?: COMPLETE(delete_complete(p, n));
                                         break;
                                 } else if (result < 0) {
                                         break;
