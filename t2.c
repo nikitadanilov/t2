@@ -7861,7 +7861,6 @@ struct wal_header {
         struct hdata {
                 lsn_t    start;
                 lsn_t    end;
-                uint64_t bolt;
         } data;
 } __attribute__((packed));
 
@@ -7903,7 +7902,6 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 .data = {
                         .start = bstart,
                         .end   = bend,
-                        .bolt  = en->mod->cache.bolt,
                 }
         };
         *(struct wal_rec *)(buf->data + buf->off) = (struct wal_rec) {
@@ -8195,7 +8193,6 @@ static void wal_snapshot(struct wal_te *en) {
         wal_unlock(en);
         en->snapbuf->data.start = start;
         en->snapbuf->data.end   = max_synced;
-        en->snapbuf->data.bolt  = en->mod->cache.bolt;
         ASSERT(wal_rec_invariant((void *)en->snapbuf));
         CINC(wal_snapshot);
         rc1 = wal_pwrite(en->fd[idx], en->snapbuf, en->snapbuf_size, (en->log_size << en->buf_size_shift) >> en->log_shift);
@@ -8506,9 +8503,7 @@ static int wal_buf_replay(struct wal_te *en, void *space, int len) {
                 if (!wal_rec_invariant(rec)) {
                         result = ERROR(-EIO);
                 } else if (rec->rtype == HEADER) {
-                        struct wal_header *h = (void *)rec;
                         lsn = rec->u.header.lsn;
-                        en->mod->cache.bolt = max_64(en->mod->cache.bolt, h->data.bolt);
                 } else if (rec->rtype == FOOTER) {
                         if (rec->u.header.lsn != lsn) {
                                 LOG("Mismatch: header: %"PRIx64" footer: %"PRIx64, lsn, rec->u.header.lsn);
@@ -9560,14 +9555,6 @@ static struct disorder_storage disorder_storage = {
 #endif /* UT */
 
 /* non-static */ struct t2_storage *bn_storage = &file_storage.gen;
-
-uint64_t bn_bolt(const struct t2 *mod) {
-        return mod->cache.bolt;
-}
-
-void bn_bolt_set(struct t2 *mod, uint64_t bolt) {
-        mod->cache.bolt = bolt;
-}
 
 void bn_counters_fold(void) {
         counters_fold();

@@ -101,8 +101,6 @@ extern struct t2_storage *bn_storage;
 extern taddr_t bn_tree_root(const struct t2_tree *t);
 extern uint64_t bn_file_free(struct t2_storage *storage);
 extern void bn_file_free_set(struct t2_storage *storage, uint64_t free);
-extern uint64_t bn_bolt(const struct t2 *mod);
-extern void bn_bolt_set(struct t2 *mod, uint64_t bolt);
 extern void bn_counters_fold(void);
 extern void bn_counters_clear(void);
 static struct kv kv[KVNR];
@@ -703,14 +701,6 @@ static void t_mount(struct benchmark *b) {
                 &bn_ttype,
                 NULL
         };
-        if (b->kv.u.t2.bolt == 0 && !(wal_flags & MAKE)) {
-                FILE *seg = fopen("bn.seg", "r");
-                if (seg != NULL) {
-                        int nr = fscanf(seg, "%"SCNx64, &b->kv.u.t2.bolt);
-                        assert(nr == 1);
-                        fclose(seg);
-                }
-        }
         mod = b->kv.u.t2.mod = t2_init_with(T2_INIT_EXPLAIN | T2_INIT_VERBOSE, &(struct t2_param) {
                         .conf = {
                                 .storage = bn_storage,
@@ -726,9 +716,6 @@ static void t_mount(struct benchmark *b) {
                         .wal_flags   = transactions ? wal_flags : 0
                 });
         assert(!t2_is_err(mod));
-        if (b->kv.u.t2.bolt != 0) {
-                bn_bolt_set(b->kv.u.t2.mod, b->kv.u.t2.bolt);
-        }
         if (b->kv.u.t2.id != 0) {
                 b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.id);
         } else {
@@ -746,20 +733,12 @@ static void t_mount(struct benchmark *b) {
 
 static void t_umount(struct benchmark *b) {
         b->kv.u.t2.id = t2_tree_id(b->kv.u.t2.tree);
-        b->kv.u.t2.bolt = bn_bolt(b->kv.u.t2.mod);
         t2_tree_close(b->kv.u.t2.tree);
         t2_fini(b->kv.u.t2.mod);
         t2_node_type_fini(bn_ntype_internal);
         t2_node_type_fini(bn_ntype_twig);
         t2_node_type_fini(bn_ntype_leaf);
         mod = NULL;
-        if (wal_flags & KEEP) {
-                FILE *seg = fopen("bn.seg", "w");
-                if (seg != NULL) {
-                        fprintf(seg, "%"PRIx64, b->kv.u.t2.bolt);
-                        fclose(seg);
-                }
-        }
 }
 
 static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {
