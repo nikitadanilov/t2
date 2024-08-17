@@ -92,8 +92,6 @@ struct t2_tx { /* Transaction. */
 };
 
 typedef int64_t lsn_t;
-struct shepherd;
-struct path;
 struct t2_te { /* Transaction engine. */
         int           (*post)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
         int           (*ante)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
