@@ -11148,6 +11148,9 @@ static void ct() {
         puts("Crash test is not compiled in.");
 }
 
+static void mt_check_ut() {
+}
+
 #endif /* TRANSACTIONS */
 
 static void stress_ut_tx() {
