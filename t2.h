@@ -261,7 +261,7 @@ void    t2_release(struct t2_node *n);
 void    t2_lsnset (struct t2_node *n, lsn_t lsn);
 lsn_t   t2_lsnget (const struct t2_node *n);
 taddr_t t2_addr   (const struct t2_node *n);
-struct t2_node *t2_apply(struct t2 *mod, struct t2_txrec *txr);
+struct t2_node *t2_apply(struct t2 *mod, const struct t2_txrec *txr);
 
 int   t2_error(int idx, char *buf, int nob, int *err);
 void  t2_error_print(void);

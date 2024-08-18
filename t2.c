@@ -7542,7 +7542,7 @@ taddr_t t2_addr(const struct t2_node *node) {
         return n->addr;
 }
 
-struct t2_node *t2_apply(struct t2 *mod, struct t2_txrec *txr) {
+struct t2_node *t2_apply(struct t2 *mod, const struct t2_txrec *txr) {
         if (IS_IN(txr->ntype, mod->ntypes) && mod->ntypes[txr->ntype] != NULL) {
                 struct node *n = take(mod, txr->addr, mod->ntypes[txr->ntype]);
                 if (EISOK(n)) {
@@ -7557,7 +7557,6 @@ struct t2_node *t2_apply(struct t2 *mod, struct t2_txrec *txr) {
                         return EPTR(n);
                 }
         } else {
-                puts("EIO");
                 return EPTR(-EIO);
         }
 }
@@ -9148,9 +9147,11 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
 static void file_free(struct t2_storage *storage, taddr_t addr) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
         file_kill_check(fs);
-        mutex_lock(&fs->lock);
-        fd_prune(fs->fd[frag_select(fs)], frag_off(taddr_saddr(addr)), taddr_ssize(addr));
-        mutex_unlock(&fs->lock);
+        if (!TRANSACTIONS) { /* TODO: Must be WALed. */
+                mutex_lock(&fs->lock);
+                fd_prune(fs->fd[frag_select(fs)], frag_off(taddr_saddr(addr)), taddr_ssize(addr));
+                mutex_unlock(&fs->lock);
+        }
 }
 
 static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst) {
