@@ -8588,7 +8588,7 @@ static int wal_index_replay(struct wal_te *en, int nr, struct rbuf *index, lsn_t
                         }
                         result = wal_buf_replay(en, buf, result);
                 }
-                if (i % (nr / 50) == 0) {
+                if (i % (nr/50 + 1) == 0) {
                         printf(".");
                 }
         }
