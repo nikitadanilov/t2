@@ -10456,6 +10456,7 @@ static void cookie_ut() {
         cookie_load(&v[0], &k);
         result = cookie_is_valid(&k);
         ASSERT(result);
+#if !defined(__SANITIZE_ADDRESS__)
         utest("addr-is-valid");
         for (uint64_t b = 0; b <= 0xff; ++b) {
                 void *addr = (void *)((b << 20) ^ (uint64_t)&v[0]);
@@ -10472,6 +10473,7 @@ static void cookie_ut() {
         result = addr_is_valid((void *)&cit);
         ASSERT(result);
         signal_fini();
+#endif
         utest("stacktrace");
         LOG("Testing stacktrace.");
         stacktrace(); /* Test it here. */
