@@ -11087,6 +11087,7 @@ static void ct(int argc, char **argv) {
                         struct t2      *mod;
                         struct t2_tree *t;
                         int32_t         flags = FLAGS;
+                        srand(time(NULL) ^ getpid());
                         printf("    Iteration %5i.\n", cseg.iter);
                         if (cseg.iter == 0) {
                                 flags |= MAKE;
