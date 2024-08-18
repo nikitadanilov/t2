@@ -7482,7 +7482,7 @@ static struct node_type_ops odir_ops = {
 
 #if ON_DARWIN
 static int fd_sync(int fd) {
-        return fcntl(fd, F_FULLFSYNC, 0);
+        return fcntl(fd, F_FULLFSYNC, 0) < 0 ? ERROR(-errno) : 0;
 }
 
 static int fd_prune(int fd, uint64_t start, uint64_t len) {
@@ -7490,24 +7490,24 @@ static int fd_prune(int fd, uint64_t start, uint64_t len) {
                 .fp_offset = start,
                 .fp_length = len
         };
-        return fcntl(fd, F_PUNCHHOLE, &hole);
+        return fcntl(fd, F_PUNCHHOLE, &hole) ? ERROR(-errno) : 0;
 }
 
 static int fd_barrier(int fd) {
-        return fcntl(fd, F_BARRIERFSYNC, 0);
+        return fcntl(fd, F_BARRIERFSYNC, 0) ? ERROR(-errno) : 0;
 }
 
 #elif ON_LINUX
 static int fd_sync(int fd) {
-        return fdatasync(fd);
+        return fdatasync(fd) ? ERROR(-errno) : 0;
 }
 
 static int fd_prune(int fd, uint64_t start, uint64_t len) {
-        return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, len);
+        return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, len) ? ERROR(-errno) : 0;
 }
 
 static int fd_barrier(int fd) {
-        return fd_sync(fd);
+        return fd_sync(fd) ? ERROR(-errno) : 0;
 }
 
 #endif
