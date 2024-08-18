@@ -9287,7 +9287,7 @@ static int file_async_start(struct file_storage *fs, taddr_t addr, int nr, struc
 
 static struct t2_io_ctx *file_create(struct t2_storage *storage, int nr) {
         ASSERT((nr & (nr - 1)) == 0);
-        nr = min_32(nr, AIO_LISTIO_MAX);
+        nr = min_32(nr, IO_QUEUE);
         struct aio_ctx *ctx = mem_alloc(sizeof *ctx + nr * sizeof ctx->queue[0]);
         file_kill_check((void *)storage);
         if (ctx != NULL) {
