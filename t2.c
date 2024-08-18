@@ -9140,7 +9140,11 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
 }
 
 static void file_free(struct t2_storage *storage, taddr_t addr) {
-        file_kill_check((void *)storage);
+        struct file_storage *fs = COF(storage, struct file_storage, gen);
+        file_kill_check(fs);
+        mutex_lock(&fs->lock);
+        fd_prune(fs->fd[frag_select(fs)], frag_off(taddr_saddr(addr)), taddr_ssize(addr));
+        mutex_unlock(&fs->lock);
 }
 
 static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *dst) {
@@ -9421,6 +9425,8 @@ static int file_replay(struct t2_storage *storage, taddr_t addr, enum t2_txr_op 
                         fs->frag_free[i] = fs->free;
                 }
                 mutex_unlock(&fs->lock);
+        } else {
+                file_free(storage, addr);
         }
         return 0;
 }
