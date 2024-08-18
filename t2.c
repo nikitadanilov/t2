@@ -28,12 +28,13 @@
 #include <sys/resource.h>
 #include <dlfcn.h>
 #include <zstd.h>
-#include <liburing.h>
 #define _LGPL_SOURCE
 #define URCU_INLINE_SMALL_FUNCTIONS
 #include <urcu/urcu-memb.h>
 #include <urcu/rcuhlist.h>
 #include <urcu/list.h>
+#include <aio.h>
+
 #include "t2.h"
 #include "config.h"
 
@@ -1349,7 +1350,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
 #undef SETIF0
 
 enum {
-        IO_QUEUE = 1024 /* TODO: Make this a parameter. */
+        IO_QUEUE = USE_URING ? 1024 : AIO_LISTIO_MAX / 2 /* TODO: Make this a parameter. */
 };
 
 struct t2 *t2_init(const struct t2_conf *conf) {
@@ -9026,8 +9027,7 @@ enum {
         FRAG_SHIFT  = 0,
         FRAG_NR     = 1 << FRAG_SHIFT,
         FRAG_MASK   = FRAG_NR - 1,
-        BASE_SHIFT  = 64 - 8 - 16,
-        URING_FLAGS = 0
+        BASE_SHIFT  = 64 - 8 - 16
 };
 
 SASSERT(FRAG_SHIFT <= 16);
@@ -9168,6 +9168,15 @@ static int file_read(struct t2_storage *storage, taddr_t addr, int nr, struct io
         }
 }
 
+#if USE_URING
+
+/* @uring */
+#include <liburing.h>
+
+enum {
+        URING_FLAGS = 0
+};
+
 struct file_ctx {
         struct io_uring ring;
 };
@@ -9215,7 +9224,7 @@ static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct i
                 if (LIKELY(result == taddr_ssize(addr))) {
                         return +1; /* Sync IO. */
                 } else if (result < 0) {
-                        return ERROR(result);
+                        return ERROR(-errno);
                 } else {
                         return ERROR(-EIO);
                 }
@@ -9252,6 +9261,132 @@ static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32
                 return EPTR(result);
         }
 }
+
+#elif USE_AIO
+
+/* @aio */
+
+struct iorec {
+        struct aiocb  cb;
+        void         *arg;
+};
+
+struct aio_ctx {
+        int          nr;
+        int          scan;
+        struct iorec queue[0];
+};
+
+static struct t2_io_ctx *file_create(struct t2_storage *storage, int nr) {
+        ASSERT((nr & (nr - 1)) == 0);
+        nr = min_32(nr, AIO_LISTIO_MAX);
+        struct aio_ctx *ctx = mem_alloc(sizeof *ctx + nr * sizeof ctx->queue[0]);
+        file_kill_check((void *)storage);
+        if (ctx != NULL) {
+                ctx->nr = nr;
+                return (void *)ctx;
+        } else {
+                return EPTR(-ENOMEM);
+        }
+}
+
+static void file_done(struct t2_storage *storage, struct t2_io_ctx *arg) {
+        struct aio_ctx *ctx = (void *)arg;
+        file_kill_check((void *)storage);
+        ASSERT(FORALL(i, ctx->nr, ctx->queue[i].arg == NULL));
+        mem_free(ctx);
+}
+
+static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
+        struct file_storage *fs  = COF(storage, struct file_storage, gen);
+        uint64_t             off = frag_off(taddr_saddr(addr));
+        int                  fr  = frag(fs, addr);
+        struct aio_ctx      *ctx = (void *)ioctx;
+        int                  result;
+        file_kill_check(fs);
+        ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
+        if (UNLIKELY(fr > FRAG_NR)) {
+                return -ESTALE;
+        }
+        if (UNLIKELY(off >= fs->frag_free[fr])) {
+                return -ESTALE;
+        }
+        CINC(file_write);
+        CADD(file_write_bytes, taddr_ssize(addr));
+        if (UNLIKELY(ctx == NULL)) {
+                result = pwritev(fs->fd[fr], src, nr, off);
+                if (LIKELY(result == taddr_ssize(addr))) {
+                        return +1; /* Sync IO. */
+                } else if (result < 0) {
+                        return ERROR(-errno);
+                } else {
+                        return ERROR(-EIO);
+                }
+        } else {
+                ASSERT(arg != NULL);
+                ASSERT(nr == 1);
+                for (int i = 0; i < ctx->nr; ++i) {
+                        struct iorec *ior = &ctx->queue[ctx->scan++ & (ctx->nr - 1)];
+                        if (ior->arg == NULL) {
+                                ior->cb = (struct aiocb) {
+                                        .aio_fildes = fs->fd[fr],
+                                        .aio_offset = off,
+                                        .aio_buf    = src[0].iov_base,
+                                        .aio_nbytes = taddr_ssize(addr),
+                                };
+                                result = aio_write(&ior->cb);
+                                if (result == 0) {
+                                        ior->arg = arg;
+                                }
+                                return result != 0 ? ERROR(-errno) : 0;
+                        }
+                }
+                return ERROR(-EAGAIN);
+        }
+}
+
+static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_t *nob, bool wait) {
+        struct aio_ctx *ctx = (void *)ioctx;
+        file_kill_check((void *)storage);
+        if (ctx == NULL) {
+                return NULL;
+        }
+        while (true) {
+                struct iorec *ior;
+                int           result;
+                for (int i = 0; i < ctx->nr; ++i) {
+                        ior = &ctx->queue[i];
+                        if (ior->arg != NULL) {
+                                result = aio_error(&ior->cb);
+                                if (result != EINPROGRESS) {
+                                        void *arg = ior->arg;
+                                        result = aio_return(&ior->cb);
+                                        *nob = result >= 0 ? result : ERROR(-errno);
+                                        ior->arg = NULL;
+                                        return arg;
+                                }
+                        }
+                }
+                if (!wait) {
+                        return NULL;
+                } else {
+                        const struct aiocb *wait[COUNT(i, ctx->nr, ctx->queue[i].arg != NULL)]; /* VLA! */
+                        int                 pos = 0;
+                        for (int i = 0; i < ctx->nr; ++i) {
+                                if (ctx->queue[i].arg != NULL) {
+                                        wait[pos++] = &ctx->queue[i].cb;
+                                }
+                        }
+                        ASSERT(pos == ARRAY_SIZE(wait));
+                        result = aio_suspend(wait, ARRAY_SIZE(wait), NULL);
+                        if (result != 0) {
+                                return EPTR(-errno);
+                        }
+                }
+        }
+}
+
+#endif
 
 static int file_sync(struct t2_storage *storage, bool barrier) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);

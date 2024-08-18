@@ -8,6 +8,9 @@
 #include <mach/mach_vm.h>
 #include <libkern/OSByteOrder.h>
 
+#define USE_URING (0)
+#define USE_AIO (1)
+
 #define O_DIRECT (0)
 #define HAS_O_DIRECT (0)
 
