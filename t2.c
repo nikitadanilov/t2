@@ -9185,6 +9185,22 @@ struct file_ctx {
         struct io_uring ring;
 };
 
+static int file_async_start(struct file_storage *fs, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
+        uint64_t             off = frag_off(taddr_saddr(addr));
+        int                  fr  = frag(fs, addr);
+        struct file_ctx     *ctx = (void *)ioctx;
+        int                  result;
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+        if (LIKELY(sqe != NULL)) {
+                io_uring_prep_writev(sqe, fs->fd[fr], src, nr, off);
+                io_uring_sqe_set_data(sqe, arg);
+                io_uring_submit(&ctx->ring);
+                return 0;
+        } else {
+                return ERROR(-EAGAIN);
+        }
+}
+
 static struct t2_io_ctx *file_create(struct t2_storage *storage, int queue) {
         struct file_ctx *ctx = mem_alloc(sizeof *ctx);
         file_kill_check((void *)storage);
@@ -9205,44 +9221,6 @@ static void file_done(struct t2_storage *storage, struct t2_io_ctx *arg) {
         file_kill_check((void *)storage);
         io_uring_queue_exit(&ctx->ring);
         mem_free(ctx);
-}
-
-static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
-        struct file_storage *fs  = COF(storage, struct file_storage, gen);
-        uint64_t             off = frag_off(taddr_saddr(addr));
-        int                  fr  = frag(fs, addr);
-        struct file_ctx     *ctx = (void *)ioctx;
-        int                  result;
-        file_kill_check(fs);
-        ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
-        if (UNLIKELY(fr > FRAG_NR)) {
-                return -ESTALE;
-        }
-        if (UNLIKELY(off >= fs->frag_free[fr])) {
-                return -ESTALE;
-        }
-        CINC(file_write);
-        CADD(file_write_bytes, taddr_ssize(addr));
-        if (UNLIKELY(ctx == NULL)) {
-                result = pwritev(fs->fd[fr], src, nr, off);
-                if (LIKELY(result == taddr_ssize(addr))) {
-                        return +1; /* Sync IO. */
-                } else if (result < 0) {
-                        return ERROR(-errno);
-                } else {
-                        return ERROR(-EIO);
-                }
-        } else {
-                struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
-                if (LIKELY(sqe != NULL)) {
-                        io_uring_prep_writev(sqe, fs->fd[fr], src, nr, off);
-                        io_uring_sqe_set_data(sqe, arg);
-                        io_uring_submit(&ctx->ring);
-                        return 0;
-                } else {
-                        return ERROR(-EAGAIN);
-                }
-        }
 }
 
 static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_t *nob, bool wait) {
@@ -9281,6 +9259,28 @@ struct aio_ctx {
         struct iorec queue[0];
 };
 
+static int file_async_start(struct file_storage *fs, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
+        struct aio_ctx *ctx = (void *)ioctx;
+        int             result;
+        ASSERT(arg != NULL);
+        ASSERT(nr == 1);
+        for (int i = 0; i < ctx->nr; ++i) {
+                struct iorec *ior = &ctx->queue[ctx->scan++ & (ctx->nr - 1)];
+                if (ior->arg == NULL) {
+                        ior->cb = (struct aiocb) {
+                                .aio_fildes = fs->fd[frag(fs, addr)],
+                                .aio_offset = frag_off(taddr_saddr(addr)),
+                                .aio_buf    = src[0].iov_base,
+                                .aio_nbytes = taddr_ssize(addr),
+                        };
+                        result = aio_write(&ior->cb);
+                        ior->arg = result == 0 ? arg : NULL;
+                        return result != 0 ? ERROR(-errno) : 0;
+                }
+        }
+        return ERROR(-EAGAIN);
+}
+
 static struct t2_io_ctx *file_create(struct t2_storage *storage, int nr) {
         ASSERT((nr & (nr - 1)) == 0);
         nr = min_32(nr, AIO_LISTIO_MAX);
@@ -9299,54 +9299,6 @@ static void file_done(struct t2_storage *storage, struct t2_io_ctx *arg) {
         file_kill_check((void *)storage);
         ASSERT(FORALL(i, ctx->nr, ctx->queue[i].arg == NULL));
         mem_free(ctx);
-}
-
-static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
-        struct file_storage *fs  = COF(storage, struct file_storage, gen);
-        uint64_t             off = frag_off(taddr_saddr(addr));
-        int                  fr  = frag(fs, addr);
-        struct aio_ctx      *ctx = (void *)ioctx;
-        int                  result;
-        file_kill_check(fs);
-        ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
-        if (UNLIKELY(fr > FRAG_NR)) {
-                return -ESTALE;
-        }
-        if (UNLIKELY(off >= fs->frag_free[fr])) {
-                return -ESTALE;
-        }
-        CINC(file_write);
-        CADD(file_write_bytes, taddr_ssize(addr));
-        if (UNLIKELY(ctx == NULL)) {
-                result = pwritev(fs->fd[fr], src, nr, off);
-                if (LIKELY(result == taddr_ssize(addr))) {
-                        return +1; /* Sync IO. */
-                } else if (result < 0) {
-                        return ERROR(-errno);
-                } else {
-                        return ERROR(-EIO);
-                }
-        } else {
-                ASSERT(arg != NULL);
-                ASSERT(nr == 1);
-                for (int i = 0; i < ctx->nr; ++i) {
-                        struct iorec *ior = &ctx->queue[ctx->scan++ & (ctx->nr - 1)];
-                        if (ior->arg == NULL) {
-                                ior->cb = (struct aiocb) {
-                                        .aio_fildes = fs->fd[fr],
-                                        .aio_offset = off,
-                                        .aio_buf    = src[0].iov_base,
-                                        .aio_nbytes = taddr_ssize(addr),
-                                };
-                                result = aio_write(&ior->cb);
-                                if (result == 0) {
-                                        ior->arg = arg;
-                                }
-                                return result != 0 ? ERROR(-errno) : 0;
-                        }
-                }
-                return ERROR(-EAGAIN);
-        }
 }
 
 static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_t *nob, bool wait) {
@@ -9391,6 +9343,35 @@ static void *file_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32
 }
 
 #endif
+
+static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct iovec *src, struct t2_io_ctx *ioctx, void *arg) {
+        struct file_storage *fs  = COF(storage, struct file_storage, gen);
+        uint64_t             off = frag_off(taddr_saddr(addr));
+        int                  fr  = frag(fs, addr);
+        int                  result;
+        file_kill_check(fs);
+        ASSERT(taddr_ssize(addr) == REDUCE(i, nr, 0, + src[i].iov_len));
+        if (UNLIKELY(fr > FRAG_NR)) {
+                return -ESTALE;
+        }
+        if (UNLIKELY(off >= fs->frag_free[fr])) {
+                return -ESTALE;
+        }
+        CINC(file_write);
+        CADD(file_write_bytes, taddr_ssize(addr));
+        if (UNLIKELY(ioctx == NULL)) {
+                result = pwritev(fs->fd[fr], src, nr, off);
+                if (LIKELY(result == taddr_ssize(addr))) {
+                        return +1; /* Sync IO. */
+                } else if (result < 0) {
+                        return ERROR(-errno);
+                } else {
+                        return ERROR(-EIO);
+                }
+        } else {
+                return file_async_start(fs, addr, nr, src, ioctx, arg);
+        }
+}
 
 static int file_sync(struct t2_storage *storage, bool barrier) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
