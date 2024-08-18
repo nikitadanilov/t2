@@ -1350,7 +1350,12 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
 #undef SETIF0
 
 enum {
-        IO_QUEUE = USE_URING ? 1024 : AIO_LISTIO_MAX / 2 /* TODO: Make this a parameter. */
+        IO_QUEUE = /* TODO: Make this a parameter. */
+#if USE_URING || !defined(AIO_LISTIO_MAX)
+        1024
+#else
+        AIO_LISTIO_MAX / 2
+#endif
 };
 
 struct t2 *t2_init(const struct t2_conf *conf) {
@@ -9189,7 +9194,6 @@ static int file_async_start(struct file_storage *fs, taddr_t addr, int nr, struc
         uint64_t             off = frag_off(taddr_saddr(addr));
         int                  fr  = frag(fs, addr);
         struct file_ctx     *ctx = (void *)ioctx;
-        int                  result;
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
         if (LIKELY(sqe != NULL)) {
                 io_uring_prep_writev(sqe, fs->fd[fr], src, nr, off);
