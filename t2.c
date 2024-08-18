@@ -1244,7 +1244,7 @@ enum {
         DEFAULT_WAL_THRESHOLD_LOG_SYNCD =         64,
         DEFAULT_WAL_THRESHOLD_LOG_SYNC  =         32,
         DEFAULT_WAL_READY_LO            =         -1,
-        DEFAULT_WAL_DIRECTIO            =      false
+        DEFAULT_WAL_DIRECTIO            = HAS_O_DIRECT
 };
 
 const double DEFAULT_WAL_LOG_SLEEP = 1.0;
@@ -1306,6 +1306,9 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         }
                         if (param->wal_log_size & (param->wal_log_size - 1)) {
                                 CONFLICT(flags, "wal_log_size is not a power of 2.");
+                        }
+                        if (param->wal_directio && !HAS_O_DIRECT) {
+                                CONFLICT(flags, "O_DIRECT requested, but not supported.");
                         }
                         te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags, param->wal_workers,
                                       ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age, param->wal_sync_nob, param->wal_log_size, param->wal_reserve_quantum,
@@ -8378,6 +8381,7 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         ASSERT((buf_size & (buf_size - 1)) == 0);
         ASSERT(workers > 0);
         ASSERT(log_sleep > 0);
+        ASSERT(directio ? HAS_O_DIRECT : true);
         if (en == NULL || ws == NULL || fd == NULL || snap == NULL) {
                 mem_free(en);
                 mem_free(ws);
@@ -10727,7 +10731,7 @@ enum {
         WAL_THRESHOLD_LOG_SYNCD =         64,
         WAL_THRESHOLD_LOG_SYNC  =         32,
         WAL_READY_LO            =          2,
-        WAL_DIRECTIO            =       true
+        WAL_DIRECTIO            = HAS_O_DIRECT
 };
 
 const double WAL_LOG_SLEEP = 1.0;

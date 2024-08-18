@@ -8,6 +8,8 @@
 #include <endian.h>
 #include <linux/falloc.h>
 
+#define HAS_O_DIRECT (1)
+
 extern int fallocate(int fd, int mode, off_t offset, off_t len); /* Hmm... */
 
 /*

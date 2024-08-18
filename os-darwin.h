@@ -8,6 +8,9 @@
 #include <mach/mach_vm.h>
 #include <libkern/OSByteOrder.h>
 
+#define O_DIRECT (0)
+#define HAS_O_DIRECT (0)
+
 #define htobe16(x) OSSwapHostToBigInt16(x)
 #define htole16(x) OSSwapHostToLittleInt16(x)
 #define be16toh(x) OSSwapBigToHostInt16(x)
