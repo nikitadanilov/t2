@@ -4801,7 +4801,7 @@ static void sb_print(struct node *n) {
         struct sb *sb = seg_sb(n);
         for (uint32_t i = 0; i < ARRAY_SIZE(sb->root); ++i) {
                 if (sb->root[i] != 0) {
-                        printf("%04i: %16lx\n", i, sb->root[i]);
+                        printf("%04i: %16lx\n", i, (unsigned long)sb->root[i]);
                 }
         }
 }
@@ -4903,7 +4903,7 @@ static uint32_t seg_root_add(struct seg *s, taddr_t root, struct cap *cap) {
                         return i;
                 }
         }
-        return ERROR(-EXFULL);
+        return ERROR(-ENOSPC);
 }
 
 static taddr_t seg_root_get(struct seg *s, uint32_t id) {
@@ -5593,7 +5593,7 @@ static void debugger_attach(void) {
         if (debugger == NULL) {
                 return;
         } else if (strcmp(debugger, "wait") == 0) {
-                printf("Waiting for debugger, pid: %i tid: %i.\n", getpid(), gettid());
+                printf("Waiting for debugger, pid: %i tid: %"PRId64".\n", getpid(), threadid());
                 result = +1;
         } else {
                 if (argv0 == NULL) {
