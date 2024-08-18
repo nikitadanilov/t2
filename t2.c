@@ -9563,20 +9563,20 @@ static int disorder_write(struct t2_storage *storage, taddr_t addr, int nr, stru
 static void *disorder_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, int32_t *nob, bool wait) {
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
         struct disorder_ctx     *ctx = (void *)ioctx;
-        struct disorder_req     *req = dis->substrate->op->end(dis->substrate, ctx->subring, nob, wait);
+        struct disorder_req     *req;
+        mutex_lock(&dis->lock);
+        req = dis->substrate->op->end(dis->substrate, ctx->subring, nob, wait);
         if (req != NULL && EISOK(req)) {
                 void *arg = req->arg;
                 ASSERT(req->inflight);
-                mutex_lock(&dis->lock);
                 cds_list_del(&req->linkage);
                 NOFAIL(pthread_cond_broadcast(&dis->cond));
-                mutex_unlock(&dis->lock);
                 mem_free(req->src);
                 mem_free(req);
-                return arg;
-        } else {
-                return req;
+                req = (void *)arg;
         }
+        mutex_unlock(&dis->lock);
+        return req;
 }
 
 static struct disorder_req *disorder_scan(struct disorder_storage *dis, uint64_t *min, uint64_t *max) {
