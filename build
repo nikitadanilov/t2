@@ -64,6 +64,8 @@ esac
 
 case "$platform" in ####################### Darwin #############################
     (*Darwin*)
+        CFLAGS="-I/opt/homebrew/include $CFLAGS"
+        LDFLAGS="-L/opt/homebrew/lib $LDFLAGS"
         ROCKSDB_LDFLAGS="-lrocksdb"
         LMDB_LDFLAGS="-L/usr/local/lib -llmdb"
         MAP_LDFLAGS="-lstdc++"
@@ -131,7 +133,14 @@ function setup_prereq() {
 	(ubuntu)
 	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev libsnappy-dev bpfcc-tools bpftrace linux-headers-$(uname -r)
     ;;  (darwin)
-	    run brew install automake autoconf libtool gcc gperftools zstd
+            which -s brew
+            if [[ $? != 0 ]] ; then
+                bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+                eval "$(/opt/homebrew/bin/brew shellenv)"
+            else
+                run brew update
+            fi
+            run brew install automake autoconf libtool gcc gperftools zstd
     ;;  (*)
 	    echo "Unknown distro '$distro'"
 	    exit 1
