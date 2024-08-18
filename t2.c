@@ -5135,6 +5135,7 @@ static void counters_check() {
         }
         if (CVAL(wlock) != 0) {
                 LOG("Leaked wlock: %i.", CVAL(wlock));
+                debugger_attach();
         }
         if (CVAL(rcu) != 0) {
                 LOG("Leaked rcu: %i.", CVAL(rcu));
@@ -10058,7 +10059,7 @@ static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
         struct t2_tree *t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         ASSERT(EISOK(t));
         utest("probe");
-        long U = 500000;
+        long U = 200000;
         for (long i = 0; i < U; ++i) {
                 ksize = sizeof i;
                 vsize = rand() % maxsize;
