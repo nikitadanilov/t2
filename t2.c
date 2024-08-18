@@ -2738,6 +2738,7 @@ static void path_pin(struct path *p) {
         for (int i = p->used; i >= 0; --i) {
                 struct rung *r = &p->rung[i];
                 if (!(r->flags & PINNED)) {
+                        (void)rcu_dereference(r->page.node->data); /* Force reload, see req_callback(). */
                         ref(r->page.node);
                         r->flags |= PINNED;
                 }
