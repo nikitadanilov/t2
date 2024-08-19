@@ -651,12 +651,17 @@ struct cap {
         struct ext ext[M_NR];
 };
 
+#define SHADOW_CHECK_ON (0)
+
 struct page {
         struct node    *node;
         uint64_t        seq;
         enum lock_mode  lm;
         enum lock_mode  taken;
         struct cap      cap;
+#if SHADOW_CHECK_ON
+        void           *shadow;
+#endif
 };
 
 enum rung_flags {
@@ -1020,7 +1025,6 @@ static int32_t nsize(const struct node *n);
 static int32_t utmost(const struct node *n, enum dir d);
 static int lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
-static void touch_unlock(struct node *n, enum lock_mode mode);
 static void dirty(struct page *g, bool hastx);
 static void radixmap_update(struct node *n);
 static struct header *nheader(const struct node *n);
@@ -1877,11 +1881,6 @@ static void unlock(struct node *n, enum lock_mode mode) {
         }
 }
 
-static void touch_unlock(struct node *n, enum lock_mode mode) {
-        touch(n);
-        unlock(n, mode);
-}
-
 static struct node *peek(struct t2 *mod, taddr_t addr) {
         CINC(peek);
         return ht_lookup(&mod->ht, addr, ht_bucket(&mod->ht, addr));
@@ -2624,15 +2623,44 @@ static void dirty(struct page *g, bool hastx) {
 }
 
 static int page_lock(struct page *g) {
-        int result = 0;
+        struct node *n      = g->node;
+        int          result = 0;
         ASSERT(g->taken == NONE);
-        if (g->node != NULL) {
-                result = lock(g->node, g->lm);
+        if (n != NULL) {
+                result = lock(n, g->lm);
                 if (LIKELY(result == 0)) {
                         g->taken = g->lm;
+                        if (SHADOW_CHECK_ON && g->lm == WRITE) {
+                                g->shadow = mem_alloc(nsize(n));
+                                if (LIKELY(g->shadow != NULL)) {
+                                        memcpy(g->shadow, n->data, nsize(n));
+                                }
+                        }
                 }
         }
         return result;
+}
+
+static void page_unlock(struct page *g) {
+        if (SHADOW_CHECK_ON && g->shadow != NULL) {
+                for (int i = 0; i < ARRAY_SIZE(g->cap.ext); ++i) {
+                        int32_t start = g->cap.ext[i].start;
+                        int32_t end   = g->cap.ext[i].end;
+                        if (end > start) {
+                                memcpy(g->shadow + start, g->node->data + start, end - start);
+                        }
+                }
+                if (memcmp(g->shadow + sizeof(struct ewma), /* Skip temperature, it's not captured. */
+                           g->node->data + sizeof(struct ewma),
+                           nsize(g->node) - sizeof(struct ewma)) != 0) {
+                        nprint(g->node);
+                        IMMANENTISE("Shadow copy does not match.");
+                }
+                mem_free(g->shadow);
+                g->shadow = NULL;
+        }
+        touch(g->node);
+        unlock(g->node, g->taken);
 }
 
 static void path_dirty(struct path *p) {
@@ -2689,12 +2717,12 @@ static void path_fini(struct path *p) {
                         if (UNLIKELY(r->flags & DELDEX)) {
                                 dealloc(right->node);
                         }
-                        touch_unlock(right->node, right->taken);
+                        page_unlock(right);
                         put(right->node);
                 }
-                touch_unlock(r->page.node, r->page.taken);
+                page_unlock(&r->page);
                 if (UNLIKELY(left->node != NULL)) {
-                        touch_unlock(left->node, left->taken);
+                        page_unlock(left);
                         put(left->node);
                 }
                 if (r->flags & PINNED) {
@@ -2705,7 +2733,7 @@ static void path_fini(struct path *p) {
                                 dealloc(r->allocated.node);
                                 NINC(r->allocated.node, allocated_unused);
                         }
-                        touch_unlock(r->allocated.node, r->allocated.taken);
+                        page_unlock(&r->allocated);
                         put(r->allocated.node);
                 }
                 buf_free(&r->scratch);
@@ -2717,11 +2745,11 @@ static void path_fini(struct path *p) {
                         dealloc(p->newroot.node);
                         NINC(p->newroot.node, allocated_unused);
                 }
-                touch_unlock(p->newroot.node, p->newroot.taken);
+                page_unlock(&p->newroot);
                 put(p->newroot.node);
         }
         if (UNLIKELY(p->sb.node != NULL)) {
-                touch_unlock(p->sb.node, p->sb.taken);
+                page_unlock(&p->sb);
         }
 }
 
@@ -4037,6 +4065,7 @@ static int pageout(struct node *n, struct pageout_ctx *ctx) {
         }
         n->flags |= PAGING;
         cds_list_add(&n->free, &ctx->inflight);
+        EXPENSIVE_ASSERT(is_sorted(n));
         node_unlock(n);
         ++ctx->used;
         --ctx->avail;
@@ -4485,6 +4514,7 @@ static int cache_load(struct t2 *mod) {
                 struct cds_hlist_head *head = ht_head(&mod->ht, scan);
                 struct node           *n;
                 cds_hlist_for_each_entry_2(n, head, hash) {
+                        EXPENSIVE_ASSERT(is_sorted(n));
                         if (n->flags & DIRTY) {
                                 if (!NCALLD(n, check(n))) {
                                         return ERROR(-EIO);
@@ -5877,10 +5907,10 @@ static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := 
         struct t2_buf *key    = s->rec.key;
         struct t2_buf *val    = s->rec.val;
         int            result = 0;
-        if (s->idx < 0) {
+        if (UNLIKELY(s->idx < 0)) {
                 return ERROR(-ERANGE);
         }
-        if (r->kcb != NULL) {
+        if (UNLIKELY(r->kcb != NULL)) {
                 r->kcb(key, r->arg);
         } else {
                 if (LIKELY(buf_len(r->key) >= buf_len(key))) {
@@ -5890,7 +5920,7 @@ static int val_copy(struct t2_rec *r, struct node *n, struct slot *s) { /* r := 
                         result = ERROR(-ENAMETOOLONG);
                 }
         }
-        if (r->vcb != NULL) {
+        if (UNLIKELY(r->vcb != NULL)) {
                 r->vcb(val, r->arg);
         } else {
                 if (LIKELY(buf_len(r->val) >= buf_len(val))) {
@@ -6769,6 +6799,9 @@ static int lazy_compact(struct node *n, struct cap *cap) {
         ASSERT(lazy_invariant(n));
         NINC(n, compact);
         if (scratch != NULL) {
+                if (SHADOW_CHECK_ON) {
+                        memcpy(scratch, n->data, size);
+                }
                 for (int32_t i = 0; i < d->nr; ++i) {
                         *(struct lrec *)(scratch + vcur) = (struct lrec){ .vlen = d->val[i].len, .klen = d->key[i].len };
                         kcur -= d->key[i].len;
@@ -7208,6 +7241,9 @@ static int odir_compact(struct node *n, struct cap *cap) {
         NINC(n, compact);
         if (scratch != NULL) {
                 int32_t off = OHSIZE;
+                if (SHADOW_CHECK_ON) {
+                        memcpy(scratch, n->data, size);
+                }
                 for (int32_t i = 0; i < nr; ++i) {
                         struct orec *old = oat(n, i);
                         *oat_with(scratch + size, i) = (struct orec){ .off = off, .klen = old->klen, .vlen = old->vlen };
