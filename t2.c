@@ -11131,6 +11131,7 @@ static void ct(int argc, char **argv) {
                         cseg.tree = t;
                         cseg.file = &file_storage;
                         if (cseg.iter != 0) {
+                                puts("    .... Checking.");
                                 for (int i = 0; i < cseg.nr_threads; ++i) {
                                         NOFAIL(pthread_create(&tid[i], NULL, &ct_scan, (void *)(long)i));
                                 }
@@ -11138,13 +11139,12 @@ static void ct(int argc, char **argv) {
                                         NOFAIL(pthread_join(tid[i], NULL));
                                 }
                         }
+                        puts("    .... Inserting.");
                         for (int i = 0; i < cseg.nr_threads; ++i) {
                                 NOFAIL(pthread_create(&tid[i], NULL, &busy, (void *)(long)i));
                         }
                         sleep(cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min));
                         puts("    .... Crashing.");
-                        file_kill(&file_storage);
-                        ut_pwrite = &ct_pwrite;
                         abort();
                 } else {
                         ASSERT(child > 0);
