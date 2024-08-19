@@ -9718,6 +9718,9 @@ void bn_counters_clear(void) {
 }
 
 static bool is_sorted(struct node *n) {
+        if (n->ntype->id == SB_NTYPE_ID) {
+                return true;
+        }
         SLOT_DEFINE(ss, n);
         char   *keyarea = NULL;
         int32_t keysize = 0;
