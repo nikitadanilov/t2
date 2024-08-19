@@ -8573,6 +8573,9 @@ static int rbuf_cmp(const void *a0, const void *a1) {
         const struct rbuf *r0 = a0;
         const struct rbuf *r1 = a1;
         if (r0->lsn == r1->lsn) {
+                if (r0->off == INT64_MAX || r1->off == INT64_MAX) {
+                        return 0; /* bsearch() key has offset of INT64_MAX. */
+                }
                 if (r0->lsn != 0) {
                         LOG("Duplicate lsn-s %8"PRId64" in the logs %04x+%"PRId64" and %04x+%"PRId64".",
                             r0->lsn, r0->idx, r0->off, r1->idx, r1->off);
@@ -8611,6 +8614,9 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
         int result;
         int snapend;
         int pos = 0;
+        struct rbuf *start;
+        struct rbuf *end;
+        struct rbuf  key = { .off = INT64_MAX };
         ASSERT(*nr > 0);
         for (int i = 0; i < (1 << en->log_shift); ++i) {
                 for (int64_t off = 0; off < size[i]; off += en->buf_size) {
@@ -8648,24 +8654,32 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
         for (snapend = 0; snapend < pos && index[snapend].lsn == 0; ++snapend) {
                 ;
         }
-        for (int i = snapend + 1; i < pos; ++i) {
-                ASSERT(index[i].lsn >= index[i - 1].lsn);
-                if (index[i].lsn == index[i - 1].lsn ||
-                    index[i].start < index[i - 1].start || index[i].end < index[i - 1].end) {
-                        LOG("Non-monotonic records.");
-                        rbuf_print(&index[i - 1]);
-                        rbuf_print(&index[i]);
-                        return ERROR(-EIO);
-                }
-                if (index[i].lsn != index[i - 1].lsn + 1) {
-                        pos = i;
-                        break;
-                }
-        }
         *nr  = pos;
         *out = index[pos - 1];
         if (snapend > 0 && index[snapend - 1].end > out->end) {
                 *out = index[snapend - 1];
+        }
+        key.lsn = out->start;
+        start = bsearch(&key, index, pos, sizeof(struct rbuf), &rbuf_cmp);
+        if (start == NULL || start->lsn != out->start) {
+                LOG("Start record is missing.");
+                rbuf_print(out);
+                return ERROR(-EIO);
+        }
+        key.lsn = out->end - 1;
+        end = bsearch(&key, index, pos, sizeof(struct rbuf), &rbuf_cmp);
+        if (end == NULL || end->lsn != out->end - 1) {
+                LOG("End record is missing.");
+                rbuf_print(out);
+                return ERROR(-EIO);
+        }
+        for (struct rbuf *scan = start; scan < end; ++scan) {
+                if ((scan + 1)->lsn != scan->lsn + 1) {
+                        LOG("Non-sequential records.");
+                        rbuf_print(scan);
+                        rbuf_print(scan + 1);
+                        return ERROR(-EIO);
+                }
         }
         return 0;
 }
@@ -8694,6 +8708,7 @@ static int wal_recovery_clean(struct wal_te *en, struct rbuf *index, int nr, lsn
 
 static int wal_recover(struct wal_te *en) {
         int          buf_nr = 0;
+        int          buf_nr0;
         int          result;
         struct rbuf *index;
         int64_t     *size = alloca(sizeof size[0] * (1 << en->log_shift));
@@ -8714,6 +8729,7 @@ static int wal_recover(struct wal_te *en) {
         index = mem_alloc(sizeof index[0] * buf_nr);
         if (index != NULL) {
                 struct rbuf last = {};
+                buf_nr0 = buf_nr;
                 result = wal_index_build(en, &buf_nr, index, size, &last);
                 if (result == 0) {
                         void *buf = mem_alloc(en->buf_size);
@@ -8727,6 +8743,10 @@ static int wal_recover(struct wal_te *en) {
                                 mem_free(buf);
                         } else {
                                 result = ERROR(-ENOMEM);
+                        }
+                } else {
+                        for (int i = 0; i < buf_nr0; ++i) {
+                                rbuf_print(&index[i]);
                         }
                 }
                 mem_free(index);
@@ -11068,7 +11088,7 @@ static void mt_check_ut() {
 static void ct(int argc, char **argv) {
         enum { CT_SHIFT = 24 };
         ASSERT(argc > 5);
-        ut_storage = &disorder_storage.gen;
+        ut_storage = &file_storage.gen;
         ASSERT(ut_storage == &file_storage.gen ||
                (ut_storage == &disorder_storage.gen && disorder_storage.substrate == &file_storage.gen));
         cseg.iter = argv[2][0] == 'c'; /* Skip iteration 0, when 'c'ontinuing. */
