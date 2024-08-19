@@ -11185,13 +11185,13 @@ static void ct(int argc, char **argv) {
                         }
                         sleep(cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min));
                         puts("    .... Crashing.");
-                        abort();
+                        kill(getpid(), SIGKILL);
                 } else {
                         ASSERT(child > 0);
                         pid_t deceased = wait(&status);
                         ASSERT(deceased == child);
                         puts("    .... Child teriminated.");
-                        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGABRT) {
+                        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
                                 printf("    .... Child wasn't aborted properly: %o.\n", status);
                                 break;
                         }
