@@ -11265,7 +11265,7 @@ static bool ut_mem_alloc_fail() {
  *
  * - "streams" (sequential, random)
  *
- * - tools: dump, load, repair
+ * - tools: dump, load, repair; node-level dump-restore (defrag, vacuum)
  *
  * - in-place operations
  *
