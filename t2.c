@@ -11091,7 +11091,7 @@ static void mt_check_ut() {
 static void ct(int argc, char **argv) {
         enum { CT_SHIFT = 24 };
         ASSERT(argc > 5);
-        ut_storage = &file_storage.gen;
+        ut_storage = &disorder_storage.gen;
         ASSERT(ut_storage == &file_storage.gen ||
                (ut_storage == &disorder_storage.gen && disorder_storage.substrate == &file_storage.gen));
         cseg.iter = argv[2][0] == 'c'; /* Skip iteration 0, when 'c'ontinuing. */
