@@ -2630,19 +2630,22 @@ static int page_lock(struct page *g) {
                 result = lock(n, g->lm);
                 if (LIKELY(result == 0)) {
                         g->taken = g->lm;
-                        if (SHADOW_CHECK_ON && g->lm == WRITE) {
+#if SHADOW_CHECK_ON
+                        if (g->lm == WRITE) {
                                 g->shadow = mem_alloc(nsize(n));
                                 if (LIKELY(g->shadow != NULL)) {
                                         memcpy(g->shadow, n->data, nsize(n));
                                 }
                         }
+#endif
                 }
         }
         return result;
 }
 
 static void page_unlock(struct page *g) {
-        if (SHADOW_CHECK_ON && g->shadow != NULL) {
+#if SHADOW_CHECK_ON
+        if (g->shadow != NULL) {
                 for (int i = 0; i < ARRAY_SIZE(g->cap.ext); ++i) {
                         int32_t start = g->cap.ext[i].start;
                         int32_t end   = g->cap.ext[i].end;
@@ -2659,6 +2662,7 @@ static void page_unlock(struct page *g) {
                 mem_free(g->shadow);
                 g->shadow = NULL;
         }
+#endif
         touch(g->node);
         unlock(g->node, g->taken);
 }
