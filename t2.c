@@ -2754,7 +2754,7 @@ static void path_fini(struct path *p) {
 }
 
 static void path_reset(struct path *p) {
-        path_fini(p);
+        path_fini(p); /* TODO: Count resets, eventually fail the traversal. */
         memset(p->rung, 0, sizeof p->rung);
         SET0(&p->newroot);
         SET0(&p->sb);
