@@ -11335,6 +11335,8 @@ static bool ut_mem_alloc_fail() {
  *
  * - support pageout during recovery for logs larger than memory
  *
+ * - general multi-operation transactions
+ *
  * Done:
  *
  * + path locking and re-checking (allocate new nodes outside of the lock)
