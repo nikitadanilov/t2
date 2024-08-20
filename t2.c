@@ -10975,7 +10975,14 @@ static void ut_with_tx(void (*ut)(struct t2 *, struct t2_tx *), const char *labe
         utestdone();
 }
 
+enum ct_mode {
+        FIXED,
+        GROWING,
+        CHECK
+};
+
 struct seg_state {
+        enum ct_mode         mode;
         struct t2_tree      *tree;
         struct t2           *mod;
         struct file_storage *file;
@@ -10985,14 +10992,8 @@ struct seg_state {
         int                  sleep_min;
         int                  sleep_max;
         uint64_t             nr_ops;
+        _Atomic(int32_t)     initialised;
 };
-
-static ssize_t ct_pwrite(int fd, const void *buf, size_t count, off_t offset) {
-        while (true) {
-                sleep(1);
-        }
-        return -EBADF;
-}
 
 static struct seg_state cseg = {};
 
@@ -11059,7 +11060,8 @@ static void *ct_scan(void *arg) {
                 ++idx;
         }
         half = idx >> 1;
-        ok = lo == half || lo == half + (idx & 1);
+        ok = cseg.mode == FIXED ? (idx - lo == cseg.nr_ops || idx - lo == cseg.nr_ops + 1) :
+                                  (lo == half || lo == half + (idx & 1));
         printf("    .... Thread %i found: %"PRIu64" .. %"PRIu64": %s\n", tno, lo, idx, ok ? "correct" : "wrong");
         cseg.idx[tno] = idx;
         t2_thread_degister();
@@ -11067,6 +11069,15 @@ static void *ct_scan(void *arg) {
                 exit(1);
         }
         return NULL;
+}
+
+static bool todelete(uint64_t idx) {
+        return  ((cseg.mode == GROWING || cseg.mode == CHECK) && !(idx & 1)) ||
+                (cseg.mode == FIXED && idx >= cseg.nr_ops);
+}
+
+static uint64_t victim(uint64_t idx) {
+        return cseg.mode == FIXED ? idx - cseg.nr_ops : (idx >> 1);
 }
 
 static void *busy(void *arg) {
@@ -11080,19 +11091,26 @@ static void *busy(void *arg) {
         t2_thread_register();
         tx = t2_tx_make(t->ttype->mod);
         ASSERT(EISOK(tx));
-        if (idx > 0 && (idx & 1)) {
-                makerec(tno, (idx - 1) >> 1, &key, &val);
+        if (idx > 0 && todelete(idx - 1)) {
+                makerec(tno, victim(idx - 1), &key, &val);
                 WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
         }
-        while (cseg.nr_ops == 0 || idx < cseg.nr_ops) {
+        while (true) {
+                if (cseg.mode == CHECK && idx == cseg.nr_ops) {
+                        break;
+                }
                 makerec(tno, idx, &key, &val);
                 result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, sizeof key, &val, sizeof val, tx));
                 CT_ASSERT(result == 0);
-                if (!(idx & 1)) {
-                        makerec(tno, idx >> 1, &key, &val);
+                if (todelete(idx)) {
+                        makerec(tno, victim(idx), &key, &val);
                         result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
                         CT_ASSERT(result == 0 || (result == -ENOENT && idx == cseg.idx[tno]));
                 }
+                if (cseg.mode == FIXED && cseg.iter == 0 && idx == cseg.nr_ops - 1) {
+                        t2_tx_wait(cseg.mod, tx, true);
+                }
+                cseg.initialised += cseg.mode != FIXED || idx >= cseg.nr_ops;
                 ++idx;
         }
         t2_tx_done(t->ttype->mod, tx);
@@ -11112,6 +11130,7 @@ static void mt_check_ut() {
         cseg.idx        = idx;
         cseg.nr_ops     = OPS;
         cseg.tree       = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
+        cseg.mode       = CHECK;
         ASSERT(EISOK(cseg.tree));
         utest("check");
         for (int i = 0; i < ARRAY_SIZE(idx); ++i) {
@@ -11134,10 +11153,12 @@ static void ct(int argc, char **argv) {
         ut_storage = &disorder_storage.gen;
         ASSERT(ut_storage == &file_storage.gen ||
                (ut_storage == &disorder_storage.gen && disorder_storage.substrate == &file_storage.gen));
+        cseg.mode = argv[1][1] == 'f' ? FIXED : GROWING;
         cseg.iter = argv[2][0] == 'c'; /* Skip iteration 0, when 'c'ontinuing. */
         cseg.nr_threads = atoi(argv[3]);
         cseg.sleep_min = atoi(argv[4]);
         cseg.sleep_max = atoi(argv[5]);
+        cseg.nr_ops = cseg.mode == FIXED ? atol(&argv[1][2]) : 0;
         ASSERT(cseg.sleep_min < cseg.sleep_max);
         uint64_t idx[cseg.nr_threads];
         memset(idx, 0, sizeof idx);
@@ -11150,6 +11171,7 @@ static void ct(int argc, char **argv) {
                         struct t2      *mod;
                         struct t2_tree *t;
                         int32_t         flags = FLAGS;
+                        int             sec;
                         srand(time(NULL) ^ getpid());
                         printf("    Iteration %5i.\n", cseg.iter);
                         if (cseg.iter == 0) {
@@ -11163,6 +11185,8 @@ static void ct(int argc, char **argv) {
                                 ASSERT(result == 0 || EOOM(result));
                                 t = t2_tree_create(&ttype, tx);
                                 ASSERT(t->id == 1);
+                                t2_tx_close(mod, tx);
+                                t2_tx_done(mod, tx);
                         } else {
                                 t = t2_tree_open(&ttype, 1);
                         }
@@ -11170,6 +11194,7 @@ static void ct(int argc, char **argv) {
                         cseg.mod  = mod;
                         cseg.tree = t;
                         cseg.file = &file_storage;
+                        cseg.initialised = 0;
                         if (cseg.iter != 0) {
                                 puts("    .... Checking.");
                                 for (int i = 0; i < cseg.nr_threads; ++i) {
@@ -11183,7 +11208,11 @@ static void ct(int argc, char **argv) {
                         for (int i = 0; i < cseg.nr_threads; ++i) {
                                 NOFAIL(pthread_create(&tid[i], NULL, &busy, (void *)(long)i));
                         }
-                        sleep(cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min));
+                        do {
+                                sec = cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min);
+                                printf("    .... Sleeping for %i.\n", sec);
+                                sleep(sec);
+                        } while (cseg.initialised < cseg.nr_threads);
                         puts("    .... Crashing.");
                         kill(getpid(), SIGKILL);
                 } else {
@@ -11265,7 +11294,7 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        if (argc > 1 && strcmp(argv[1], "c") == 0) {
+        if (argc > 1 && argv[1][0] == 'c') {
                 ct(argc, argv);
         } else {
                 ut();
