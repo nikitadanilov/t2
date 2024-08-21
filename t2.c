@@ -2446,36 +2446,38 @@ static bool utmost_path(struct path *p, int idx, enum dir d) {
 static int split_right_exec_delete(struct path *p, int idx) {
         int result = 0;
         struct rung *r = &p->rung[idx];
+        struct node *n = r->page.node;
         struct node *right = brother(r, RIGHT)->node;
-        SLOT_DEFINE(s, r->page.node);
-        if (!is_leaf(r->page.node)) {
+        SLOT_DEFINE(s, n);
+        if (!is_leaf(n)) {
                 if (UNLIKELY(nr(p->rung[idx + 1].page.node) == 0)) { /* Rightmost in the tree. */
                         ASSERT(utmost_path(p, idx, RIGHT));
                         s.idx = r->pos;
                         NCALL(s.node, delete(&s, &r->page.cap));
                         p->rung[idx + 1].flags |= DELEMP;
-                        result = UNLIKELY(nr(r->page.node) == 0 && idx > 0);
-                } else if (r->pos + 1 < nr(r->page.node)) {
+                        result = UNLIKELY(nr(n) == 0 && idx > 0);
+                } else if (r->pos + 1 < nr(n)) {
                         s.idx = r->pos + 1;
                         delete_update(p, idx, &s, &r->page);
+                        ASSERT(nr(n) > 0);
                 } else {
                         ASSERT(right != NULL);
                         s.node = right;
                         s.idx = 0;
                         delete_update(p, idx, &s, brother(r, RIGHT));
-                        r->flags |= SEPCHG;
-                        result = +1;
+                        r->flags |= nr(right) > 0 ? SEPCHG : DELDEX;
+                        result = +1; /* If this leaves the right node empty, continue upward, skip merge below. */
                 }
         }
-        if (right != NULL && can_merge(r->page.node, right)) {
-                ASSERT(nr(right) > 0);
+        if (right != NULL && can_merge(n, right) && nr(right) > 0) {
                 NOFAIL(merge(&r->page, brother(r, RIGHT), LEFT));
-                ASSERT(nr(r->page.node) > 0);
-                EXPENSIVE_ASSERT(is_sorted(r->page.node));
+                ASSERT(nr(n) > 0);
+                ASSERT(nr(right) == 0);
+                EXPENSIVE_ASSERT(is_sorted(n));
                 r->flags |= DELDEX;
                 r->flags &= ~SEPCHG;
                 result = +1;
-        } else if (UNLIKELY(nr(r->page.node) == 0)) {
+        } else if (UNLIKELY(nr(n) == 0)) {
                 ASSERT(utmost_path(p, idx, RIGHT));
                 result = +1;
         }
@@ -2811,7 +2813,7 @@ static void path_print(struct path *p) {
                 printf("\n        left:      ");
                 page_print(&p->rung[i].brother[0]);
                 printf("\n        node:      ");
-                page_print(&p->rung[i].page);;
+                page_print(&p->rung[i].page);
                 printf("\n        allocated: ");
                 page_print(&p->rung[i].allocated);
                 printf("\n        right:     ");
@@ -10446,6 +10448,20 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                         deletes = 0;
                 }
         }
+        t2_tree_close(t);
+        utest("all");
+        t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
+        ASSERT(EISOK(t));
+        for (int i = 0; i < U; ++i) {
+                result = WITH_TX(mod, tx, t2_insert_ptr(t, &i, sizeof i, &i, sizeof i, tx));
+                ASSERT(result == 0);
+        }
+        for (int i = 0; i < U; ++i) {
+                result = WITH_TX(mod, tx, t2_delete_ptr(t, &i, sizeof i, tx));
+                ASSERT(result == 0);
+        }
+        t2_lookup_ptr(t, key, SOF(key), val, SOF(val));
+        t2_tree_close(t);
 }
 
 static void delete_ut() {
@@ -11273,7 +11289,7 @@ static void ct(int argc, char **argv) {
                         ASSERT(child > 0);
                         pid_t deceased = wait(&status);
                         ASSERT(deceased == child);
-                        puts("    .... Child teriminated.");
+                        puts("    .... Child terminated.");
                         if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
                                 printf("    .... Child wasn't aborted properly: %o.\n", status);
                                 break;
@@ -11419,6 +11435,8 @@ static bool ut_mem_alloc_fail() {
  * - support pageout during recovery for logs larger than memory
  *
  * - general multi-operation transactions
+ *
+ * - simplify rung flags
  *
  * Done:
  *
