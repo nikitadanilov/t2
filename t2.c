@@ -6512,7 +6512,11 @@ static void nprint(struct node *n) {
 
 
 static void buf_print(const struct t2_buf *b) {
-        range_print(b->addr, b->len, b->addr, b->len);
+        if (b != NULL) {
+                range_print(b->addr, b->len, b->addr, b->len);
+        } else {
+                printf("[nil]");
+        }
 }
 
 static void rec_print(const struct t2_rec *r) {
