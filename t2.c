@@ -671,7 +671,8 @@ enum rung_flags {
         DELDEX = 1ull << 3,
         SELFSH = 1ull << 4,
         MUSTPL = 1ull << 5,
-        UNROOT = 1ull << 6
+        UNROOT = 1ull << 6,
+        DELEMP = 1ull << 7
 };
 
 enum policy_id {
@@ -2134,6 +2135,7 @@ static void put(struct node *n) {
 
 static int dealloc(struct node *n) {
         struct t2 *mod = n->mod;
+        ASSERT(nr(n) == 0);
         node_state_print(n, 'f');
         ndelete(n);
         SCALL(mod, free, n->addr);
@@ -2417,6 +2419,7 @@ static bool can_merge(struct node *n0, struct node *n1) {
 static void delete_update(struct path *p, int idx, struct slot *s, struct page *g) {
         ASSERT(idx < p->used);
         ASSERT(g->node == s->node);
+        ASSERT(g->taken == WRITE);
         NCALL(s->node, delete(s, &g->cap));
         if (p->rung[idx + 1].flags & SEPCHG) {
                 struct node  *child = brother(&p->rung[idx + 1], RIGHT)->node;
@@ -2450,6 +2453,8 @@ static int split_right_exec_delete(struct path *p, int idx) {
                         ASSERT(utmost_path(p, idx, RIGHT));
                         s.idx = r->pos;
                         NCALL(s.node, delete(&s, &r->page.cap));
+                        p->rung[idx + 1].flags |= DELEMP;
+                        result = UNLIKELY(nr(r->page.node) == 0 && idx > 0);
                 } else if (r->pos + 1 < nr(r->page.node)) {
                         s.idx = r->pos + 1;
                         delete_update(p, idx, &s, &r->page);
@@ -2712,20 +2717,26 @@ static int path_lock(struct path *p) {
         return result;
 }
 
-static void path_fini(struct path *p) {
+static void path_fini(struct path *p, bool reset) {
         for (; p->used >= 0; --p->used) {
                 struct rung *r = &p->rung[p->used];
                 struct page *left  = brother(r, LEFT);
                 struct page *right = brother(r, RIGHT);
                 if (UNLIKELY(right->node != NULL)) {
+                        ASSERT(reset || right->taken != WRITE || (nr(right->node) == 0) == !!(r->flags & DELDEX));
                         if (UNLIKELY(r->flags & DELDEX)) {
                                 dealloc(right->node);
                         }
                         page_unlock(right);
                         put(right->node);
                 }
+                ASSERT(reset || r->page.taken != WRITE || (nr(r->page.node) == 0) == !!(r->flags & DELEMP));
+                if (UNLIKELY(r->flags & DELEMP)) {
+                        dealloc(r->page.node);
+                }
                 page_unlock(&r->page);
                 if (UNLIKELY(left->node != NULL)) {
+                        ASSERT(nr(left->node) > 0);
                         page_unlock(left);
                         put(left->node);
                 }
@@ -2758,7 +2769,7 @@ static void path_fini(struct path *p) {
 }
 
 static void path_reset(struct path *p) {
-        path_fini(p); /* TODO: Count resets, eventually fail the traversal. */
+        path_fini(p, true); /* TODO: Count resets, eventually fail the traversal. */
         memset(p->rung, 0, sizeof p->rung);
         SET0(&p->newroot);
         SET0(&p->sb);
@@ -2872,6 +2883,9 @@ static void path_txadd(struct path *p) {
                                 pos += txadd_code(a, &txr[pos], T2_TXR_ALLOC);
                         } else if (UNLIKELY(a != NULL && EISOK(a))) {
                                 pos += txadd_code(a, &txr[pos], T2_TXR_DEALLOC);
+                        }
+                        if (UNLIKELY(r->flags & DELEMP)) {
+                                pos += txadd_code(r->page.node, &txr[pos], T2_TXR_DEALLOC);
                         }
                         if (r->flags & DELDEX) {
                                 pos += txadd_code(brother(r, RIGHT)->node, &txr[pos], T2_TXR_DEALLOC);
@@ -3511,7 +3525,7 @@ static int cookie_try(struct path *p) {
                 if (is_leaf(n)) { /* TODO: More checks? */
                         path_add(p, n, 0);
                         result = cookie_node_complete(p, n);
-                        path_fini(p);
+                        path_fini(p, false);
                 }
         }
         rcu_unlock();
@@ -3531,7 +3545,7 @@ static int traverse_result(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx
                 CINC(cookie_hit);
         }
         cache_sync(t->ttype->mod);
-        path_fini(&p);
+        path_fini(&p, false);
         counters_check();
         return result;
 }
