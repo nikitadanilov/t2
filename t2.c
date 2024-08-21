@@ -10989,6 +10989,7 @@ struct seg_state {
         int                  iter;
         int                  nr_threads;
         uint64_t            *idx;
+        uint64_t            *lo;
         int                  sleep_min;
         int                  sleep_max;
         uint64_t             nr_ops;
@@ -11031,7 +11032,7 @@ static void *ct_scan(void *arg) {
         bool              got = false;
         bool              ok;
         uint64_t          idx = 0;
-        uint64_t          lo;
+        uint64_t          lo = cseg.lo[tno];
         uint64_t          half;
         int               result;
         struct ct_key     key;
@@ -11064,6 +11065,7 @@ static void *ct_scan(void *arg) {
                                   (lo == half || lo == half + (idx & 1));
         printf("    .... Thread %i found: %"PRIu64" .. %"PRIu64": %s\n", tno, lo, idx, ok ? "correct" : "wrong");
         cseg.idx[tno] = idx;
+        cseg.lo[tno] = lo;
         t2_thread_degister();
         if (!ok) {
                 exit(1);
@@ -11121,6 +11123,7 @@ static void *busy(void *arg) {
 static void mt_check_ut() {
         enum { CT_SHIFT = 24 };
         uint64_t      idx[9 * THREADS] = {};
+        uint64_t      lo [9 * THREADS] = {};
         pthread_t     tid[ARRAY_SIZE(idx)];
         struct t2_tx *tx = NULL;
         usuite("mt-check");
@@ -11128,6 +11131,7 @@ static void mt_check_ut() {
         struct t2 *mod  = T2_INIT(ut_storage, NULL, CT_SHIFT, CT_SHIFT, ttypes, ntypes);
         cseg.nr_threads = ARRAY_SIZE(idx);
         cseg.idx        = idx;
+        cseg.lo         = lo;
         cseg.nr_ops     = OPS;
         cseg.tree       = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         cseg.mode       = CHECK;
@@ -11147,6 +11151,31 @@ static void mt_check_ut() {
 #include <sys/types.h>
 #include <sys/wait.h>
 
+static void seg_save() {
+        uint64_t lo  = MAX_LSN;
+        FILE    *seg = fopen("ct.seg", "w");
+        ASSERT(seg != NULL);
+        for (int i = 0; i < cseg.nr_threads; ++i) {
+                lo = min_64(lo, cseg.lo[i]);
+        }
+        fprintf(seg, "%lu", lo);
+        fflush(seg);
+        fclose(seg);
+}
+
+static void seg_load() {
+        uint64_t lo;
+        FILE    *seg = fopen("ct.seg", "r");
+        int      nr;
+        ASSERT(seg != NULL);
+        nr = fscanf(seg, "%lu", &lo);
+        ASSERT(nr == 1);
+        for (int i = 0; i < cseg.nr_threads; ++i) {
+                cseg.lo[i] = lo;
+        }
+        fclose(seg);
+}
+
 static void ct(int argc, char **argv) {
         enum { CT_SHIFT = 24 };
         ASSERT(argc > 5);
@@ -11161,8 +11190,11 @@ static void ct(int argc, char **argv) {
         cseg.nr_ops = cseg.mode == FIXED ? atol(&argv[1][2]) : 0;
         ASSERT(cseg.sleep_min < cseg.sleep_max);
         uint64_t idx[cseg.nr_threads];
+        uint64_t lo [cseg.nr_threads];
         memset(idx, 0, sizeof idx);
+        memset(lo , 0, sizeof lo);
         cseg.idx = idx;
+        cseg.lo  = lo;
         while (true) {
                 pid_t child = fork();
                 int   status;
@@ -11189,6 +11221,9 @@ static void ct(int argc, char **argv) {
                                 t2_tx_done(mod, tx);
                         } else {
                                 t = t2_tree_open(&ttype, 1);
+                                if (cseg.iter > 1) {
+                                        seg_load();
+                                }
                         }
                         ASSERT(EISOK(t));
                         cseg.mod  = mod;
@@ -11196,13 +11231,14 @@ static void ct(int argc, char **argv) {
                         cseg.file = &file_storage;
                         cseg.initialised = 0;
                         if (cseg.iter != 0) {
-                                puts("    .... Checking.");
+                                printf("    .... Checking from %lu.\n", cseg.lo[0]);
                                 for (int i = 0; i < cseg.nr_threads; ++i) {
                                         NOFAIL(pthread_create(&tid[i], NULL, &ct_scan, (void *)(long)i));
                                 }
                                 for (int i = 0; i < cseg.nr_threads; ++i) {
                                         NOFAIL(pthread_join(tid[i], NULL));
                                 }
+                                seg_save();
                         }
                         puts("    .... Inserting.");
                         for (int i = 0; i < cseg.nr_threads; ++i) {
