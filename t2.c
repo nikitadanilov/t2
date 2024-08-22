@@ -11192,7 +11192,7 @@ static void seg_save() {
         for (int i = 0; i < cseg.nr_threads; ++i) {
                 lo = min_64(lo, cseg.lo[i]);
         }
-        fprintf(seg, "%lu", lo);
+        fprintf(seg, "%"PRId64, lo);
         fflush(seg);
         fclose(seg);
 }
@@ -11202,7 +11202,7 @@ static void seg_load() {
         FILE    *seg = fopen("ct.seg", "r");
         int      nr;
         ASSERT(seg != NULL);
-        nr = fscanf(seg, "%lu", &lo);
+        nr = fscanf(seg, "%"PRId64, &lo);
         ASSERT(nr == 1);
         for (int i = 0; i < cseg.nr_threads; ++i) {
                 cseg.lo[i] = lo;
