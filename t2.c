@@ -11061,6 +11061,8 @@ struct ct_key {
 };
 
 static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, int *ksize, struct ct_val *val, int *vlen) {
+        memset(key, 0, sizeof *key);
+        memset(val, 0, sizeof *val);
         key->tno = htobe16(threadno);
         key->idx = htobe64(idx);
         key->h   = ht_hash64(threadno + (idx << 17));
