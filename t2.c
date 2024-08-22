@@ -2245,7 +2245,7 @@ static void radixmap_update(struct node *n) {
 
 /* @policy */
 
-#define USE_PREFIX_SEPARATORS (0)
+#define USE_PREFIX_SEPARATORS (0) /* TODO: Fix deletion with this enabled. */
 
 static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r, int level) {
         ASSERT(buf_cmp(l, r) < 0);
@@ -2434,6 +2434,13 @@ static void delete_update(struct path *p, int idx, struct slot *s, struct page *
                         /* Take the rightmost key in the leaf. */
                         rec_get(&leaf, nr(leaf.node) - 1);
                         prefix_separator(leaf.rec.key, s->rec.key, level(s->node));
+                        /*
+                         * TODO: This can fail with -ENOSPC, when the new key is
+                         * longer than the deleted one.
+                         *
+                         * The only correct solution seems to be a full fledged
+                         * insert at this point (possibly adding a new root!).
+                         */
                         NOFAIL(NCALL(s->node, insert(s, &g->cap)));
                 }
         }
@@ -11040,21 +11047,29 @@ struct ct_val {
 
 struct ct_key {
         uint64_t h;
-        uint64_t tno;
         uint64_t idx;
+        uint16_t tno;
+        int8_t   nr;
+        char     load[7];
 };
 
-static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, struct ct_val *val, int *vlen) {
-        key->tno = htobe64(threadno);
+static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, int *ksize, struct ct_val *val, int *vlen) {
+        key->tno = htobe16(threadno);
         key->idx = htobe64(idx);
         key->h   = ht_hash64(threadno + (idx << 17));
+        key->nr  = idx % SOF(key->load);
         val->h   = key->h;
         val->nr  = val->h % SOF(val->load);
         *vlen = offsetof(struct ct_val, load[val->nr]);
+        *ksize = offsetof(struct ct_key, load[0 /* key->nr */]); /* TODO: Variable-sized key deletion is not working. */
 }
 
 static bool checkrec(struct ct_key *key, struct ct_val *val) {
-        return key->h == ht_hash64(be64toh(key->tno) + (be64toh(key->idx) << 17)) && val->nr == (int8_t)(val->h % SOF(val->load));
+        uint64_t idx = be64toh(key->idx);
+        return  key->h == ht_hash64(be16toh(key->tno) + (idx << 17)) &&
+                val->h == key->h &&
+                key->nr == (int8_t)(idx    % SOF(key->load)) &&
+                val->nr == (int8_t)(val->h % SOF(val->load));
 }
 
 /* Assertion checked in an optimised build. */
@@ -11075,12 +11090,13 @@ static void *ct_scan(void *arg) {
         int               result;
         struct ct_key     key;
         struct ct_val     val;
+        int               klen;
         int               vlen;
         t2_thread_register();
         ASSERT(cseg.iter != 0);
         while (true) {
-                makerec(tno, idx, &key, &val, &vlen);
-                result = t2_lookup_ptr(t, &key, sizeof key, &val, sizeof val);
+                makerec(tno, idx, &key, &klen, &val, &vlen);
+                result = t2_lookup_ptr(t, &key, klen, &val, sizeof val);
                 if (result == -ENOENT) {
                         if (got) {
                                 break;
@@ -11129,24 +11145,25 @@ static void *busy(void *arg) {
         uint64_t        idx = cseg.idx[tno];
         struct ct_key   key;
         struct ct_val   val;
+        int             klen;
         int             vlen;
         t2_thread_register();
         tx = t2_tx_make(t->ttype->mod);
         ASSERT(EISOK(tx));
         if (idx > 0 && todelete(idx - 1)) {
-                makerec(tno, victim(idx - 1), &key, &val, &vlen);
-                WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
+                makerec(tno, victim(idx - 1), &key, &klen, &val, &vlen);
+                WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, klen, tx));
         }
         while (true) {
                 if (cseg.mode == CHECK && idx == cseg.nr_ops) {
                         break;
                 }
-                makerec(tno, idx, &key, &val, &vlen);
-                result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, sizeof key, &val, vlen, tx));
+                makerec(tno, idx, &key, &klen, &val, &vlen);
+                result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, klen, &val, vlen, tx));
                 CT_ASSERT(result == 0);
                 if (todelete(idx)) {
-                        makerec(tno, victim(idx), &key, &val, &vlen);
-                        result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
+                        makerec(tno, victim(idx), &key, &klen, &val, &vlen);
+                        result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, klen, tx));
                         CT_ASSERT(result == 0 || (result == -ENOENT && idx == cseg.idx[tno]));
                 }
                 if (cseg.mode == FIXED && cseg.iter == 0 && idx == cseg.nr_ops - 1) {
