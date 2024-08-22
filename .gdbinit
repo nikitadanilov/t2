@@ -4,4 +4,7 @@ set print thread-events off
 set print inferior-events off
 handle SIGSEGV noprint nostop pass
 break immanentise
+command
+set scheduler-locking on
+end
 
