@@ -11033,24 +11033,28 @@ struct seg_state {
 static struct seg_state cseg = {};
 
 struct ct_val {
+        uint64_t h;
+        int8_t   nr;
+        char     load[7];
+};
+
+struct ct_key {
+        uint64_t h;
         uint64_t tno;
         uint64_t idx;
 };
 
-struct ct_key {
-        uint64_t      h;
-        struct ct_val val;
-};
-
-static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, struct ct_val *val) {
-        val->tno = htobe64(threadno);
-        val->idx = htobe64(idx);
-        key->val = *val;
+static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, struct ct_val *val, int *vlen) {
+        key->tno = htobe64(threadno);
+        key->idx = htobe64(idx);
         key->h   = ht_hash64(threadno + (idx << 17));
+        val->h   = key->h;
+        val->nr  = val->h % SOF(val->load);
+        *vlen = offsetof(struct ct_val, load[val->nr]);
 }
 
 static bool checkrec(struct ct_key *key, struct ct_val *val) {
-        return memcmp(&key->val, val, sizeof *val) == 0 && key->h == ht_hash64(be64toh(val->tno) + (be64toh(val->idx) << 17));
+        return key->h == ht_hash64(be64toh(key->tno) + (be64toh(key->idx) << 17)) && val->nr == (int8_t)(val->h % SOF(val->load));
 }
 
 /* Assertion checked in an optimised build. */
@@ -11071,10 +11075,11 @@ static void *ct_scan(void *arg) {
         int               result;
         struct ct_key     key;
         struct ct_val     val;
+        int               vlen;
         t2_thread_register();
         ASSERT(cseg.iter != 0);
         while (true) {
-                makerec(tno, idx, &key, &val);
+                makerec(tno, idx, &key, &val, &vlen);
                 result = t2_lookup_ptr(t, &key, sizeof key, &val, sizeof val);
                 if (result == -ENOENT) {
                         if (got) {
@@ -11124,22 +11129,23 @@ static void *busy(void *arg) {
         uint64_t        idx = cseg.idx[tno];
         struct ct_key   key;
         struct ct_val   val;
+        int             vlen;
         t2_thread_register();
         tx = t2_tx_make(t->ttype->mod);
         ASSERT(EISOK(tx));
         if (idx > 0 && todelete(idx - 1)) {
-                makerec(tno, victim(idx - 1), &key, &val);
+                makerec(tno, victim(idx - 1), &key, &val, &vlen);
                 WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
         }
         while (true) {
                 if (cseg.mode == CHECK && idx == cseg.nr_ops) {
                         break;
                 }
-                makerec(tno, idx, &key, &val);
-                result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, sizeof key, &val, sizeof val, tx));
+                makerec(tno, idx, &key, &val, &vlen);
+                result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, sizeof key, &val, vlen, tx));
                 CT_ASSERT(result == 0);
                 if (todelete(idx)) {
-                        makerec(tno, victim(idx), &key, &val);
+                        makerec(tno, victim(idx), &key, &val, &vlen);
                         result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, sizeof key, tx));
                         CT_ASSERT(result == 0 || (result == -ENOENT && idx == cseg.idx[tno]));
                 }
