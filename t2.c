@@ -5650,37 +5650,44 @@ static uint64_t threadid(void)
 #endif
 
 static volatile bool debugger_plug = true;
+static _Atomic(int) debugger_attached = 0;
 
 static void debugger_attach(void) {
-        int         result;
-        const char *debugger = getenv("DEBUGGER");
-        if (debugger == NULL) {
-                return;
-        } else if (strcmp(debugger, "wait") == 0) {
-                printf("Waiting for debugger, pid: %i tid: %"PRId64".\n", getpid(), threadid());
-                result = +1;
-        } else {
-                if (argv0 == NULL) {
-                        puts("Quod est nomen meum?");
+        if (debugger_attached++ == 0) {
+                int         result;
+                const char *debugger = getenv("DEBUGGER");
+                if (debugger == NULL) {
                         return;
+                } else if (strcmp(debugger, "wait") == 0) {
+                        printf("Waiting for debugger, pid: %i tid: %"PRId64".\n", getpid(), threadid());
+                        result = +1;
+                } else {
+                        if (argv0 == NULL) {
+                                puts("Quod est nomen meum?");
+                                return;
+                        }
+                        result = fork();
                 }
-                result = fork();
-        }
-        if (result > 0) {
+                if (result > 0) {
+                        while (debugger_plug) {
+                                sleep(1);
+                        }
+                } else if (result == 0) {
+                        const char *argv[4];
+                        char        pidbuf[16];
+                        argv[0] = debugger;
+                        argv[1] = argv0;
+                        argv[2] = pidbuf;
+                        argv[3] = NULL;
+                        snprintf(pidbuf, sizeof pidbuf, "%i", getppid());
+                        printf("Attaching debugger: %s %s %s\n", argv[0], argv[1], argv[2]);
+                        execvp(debugger, (void *)argv);
+                        exit(1);
+                }
+        } else {
                 while (debugger_plug) {
                         sleep(1);
                 }
-        } else if (result == 0) {
-                const char *argv[4];
-                char        pidbuf[16];
-                argv[0] = debugger;
-                argv[1] = argv0;
-                argv[2] = pidbuf;
-                argv[3] = NULL;
-                snprintf(pidbuf, sizeof pidbuf, "%i", getppid());
-                printf("Attaching debugger: %s %s %s\n", argv[0], argv[1], argv[2]);
-                execvp(debugger, (void *)argv);
-                exit(1);
         }
 }
 
