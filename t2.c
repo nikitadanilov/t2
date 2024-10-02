@@ -2440,6 +2440,8 @@ static void delete_update(struct path *p, int idx, struct slot *s, struct page *
                          *
                          * The only correct solution seems to be a full fledged
                          * insert at this point (possibly adding a new root!).
+                         *
+                         * See DELETE_WORKAROUND.
                          */
                         NOFAIL(NCALL(s->node, insert(s, &g->cap)));
                 }
@@ -2449,6 +2451,15 @@ static void delete_update(struct path *p, int idx, struct slot *s, struct page *
 static bool utmost_path(struct path *p, int idx, enum dir d) {
         return FORALL(i, idx, p->rung[i].page.lm == WRITE ? p->rung[i].pos == utmost(p->rung[i].page.node, d) : true);
 }
+
+/*
+ * When nodes are merged during deletion, a separating key higher in the tree
+ * needs to be updated (SEPCHG, delete_update()). As the new separating key can
+ * be longer than the old one, deletion might result in a split and a new root.
+ *
+ * For now, only merge nodes that share the immediate parent.
+ */
+enum { DELETE_WORKAROUND = true };
 
 static int split_right_exec_delete(struct path *p, int idx) {
         int result = 0;
@@ -2477,14 +2488,16 @@ static int split_right_exec_delete(struct path *p, int idx) {
                 }
         }
         if (right != NULL && can_merge(n, right) && nr(right) > 0) {
-                NOFAIL(merge(&r->page, brother(r, RIGHT), LEFT));
-                ASSERT(nr(n) > 0);
-                ASSERT(nr(right) == 0);
-                EXPENSIVE_ASSERT(is_sorted(n));
-                r->flags |= DELDEX;
-                r->flags &= ~SEPCHG;
-                result = +1;
-        } else if (UNLIKELY(nr(n) == 0)) {
+                if (!DELETE_WORKAROUND || (idx > 0 && (r - 1)->pos + 1 < nr((r - 1)->page.node))) {
+                        NOFAIL(merge(&r->page, brother(r, RIGHT), LEFT));
+                        ASSERT(nr(n) > 0);
+                        ASSERT(nr(right) == 0);
+                        EXPENSIVE_ASSERT(is_sorted(n));
+                        r->flags |= DELDEX;
+                        r->flags &= ~SEPCHG;
+                        result = +1;
+                }
+        } else if (UNLIKELY(!DELETE_WORKAROUND && nr(n) == 0)) {
                 ASSERT(utmost_path(p, idx, RIGHT));
                 result = +1;
         }
@@ -2732,20 +2745,20 @@ static void path_fini(struct path *p, bool reset) {
                 struct page *left  = brother(r, LEFT);
                 struct page *right = brother(r, RIGHT);
                 if (UNLIKELY(right->node != NULL)) {
-                        ASSERT(reset || right->taken != WRITE || (nr(right->node) == 0) == !!(r->flags & DELDEX));
+                        ASSERT(DELETE_WORKAROUND || reset || right->taken != WRITE || (nr(right->node) == 0) == !!(r->flags & DELDEX));
                         if (UNLIKELY(r->flags & DELDEX)) {
                                 dealloc(right->node);
                         }
                         page_unlock(right);
                         put(right->node);
                 }
-                ASSERT(reset || r->page.taken != WRITE || (nr(r->page.node) == 0) == !!(r->flags & DELEMP));
+                ASSERT(DELETE_WORKAROUND || reset || r->page.taken != WRITE || (nr(r->page.node) == 0) == !!(r->flags & DELEMP));
                 if (UNLIKELY(r->flags & DELEMP)) {
                         dealloc(r->page.node);
                 }
                 page_unlock(&r->page);
                 if (UNLIKELY(left->node != NULL)) {
-                        ASSERT(nr(left->node) > 0);
+                        ASSERT(DELETE_WORKAROUND || nr(left->node) > 0);
                         page_unlock(left);
                         put(left->node);
                 }
@@ -3256,12 +3269,25 @@ static int next_complete(struct path *p, struct node *n) {
                 if (LIKELY(sibling != NULL && nr(sibling) > 0)) { /* Rightmost leaf can be empty. */
                         s.node = sibling;
                         rec_get(&s, utmost(sibling, -c->dir)); /* Cute. */
+                } else if (UNLIKELY(DELETE_WORKAROUND && sibling != NULL && nr(sibling) == 0)) {
+                        struct rung *up = r - 1;
+                        ASSERT(p->used > 0);
+                        if (up->pos == utmost(up->page.node, (enum dir)c->dir)) {
+                                sibling = brother(up, (enum dir)c->dir)->node;
+                                ASSERT(sibling != NULL);
+                                s.node = sibling;
+                                rec_get(&s, utmost(sibling, -c->dir));
+                        } else {
+                                s.node = up->page.node;
+                                rec_get(&s, up->pos + c->dir);
+                        }
                 } else {
                         return 0;
                 }
         }
         if (result >= 0) {
-                int32_t keylen = buf_len(s.rec.key);
+                int32_t keylen = buf_len(s.rec.key); /* Check that keys are monotone. */
+                EXPENSIVE_ASSERT(mcmp(c->curkey.addr, c->curkey.len, s.rec.key->addr, keylen) * c->dir < 0);
                 if (LIKELY(keylen <= c->maxlen)) {
                         c->curkey.len = c->maxlen;
                         buf_copy(&c->curkey, s.rec.key);
@@ -11070,7 +11096,7 @@ static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, int *ks
         val->h   = key->h;
         val->nr  = val->h % SOF(val->load);
         *vlen = offsetof(struct ct_val, load[val->nr]);
-        *ksize = offsetof(struct ct_key, load[0 /* key->nr */]); /* TODO: Variable-sized key deletion is not working. */
+        *ksize = offsetof(struct ct_key, load[key->nr]);
 }
 
 static bool checkrec(struct ct_key *key, struct ct_val *val) {
