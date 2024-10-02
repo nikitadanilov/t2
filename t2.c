@@ -2458,6 +2458,9 @@ static bool utmost_path(struct path *p, int idx, enum dir d) {
  * be longer than the old one, deletion might result in a split and a new root.
  *
  * For now, only merge nodes that share the immediate parent.
+ *
+ * This is a temporary work-around. For one thing, it might result in empty leaf
+ * nodes.
  */
 enum { DELETE_WORKAROUND = true };
 
