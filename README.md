@@ -17,7 +17,7 @@ Build
 
 [build](https://github.com/nikitadanilov/t2/blob/master/build) script manages build process.
 
-To install the packages necessary for build, this needs to be done once:
+To install the packages necessary for build (this needs to be done once):
 
     $ ./build -S
 
