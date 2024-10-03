@@ -12,6 +12,29 @@ Fast lookup path is fully lockless (as a matter of fact, it does not use any
 atomic instructions) and scales as concurrency levels increase. In general t2
 performance compares favourably to rocksdb, lmdb and `std::map`.
 
+Build
+-----
+
+[build](https://github.com/nikitadanilov/t2/blob/master/build) script manages build process.
+
+To install the packages necessary for build, this needs to be done once:
+
+    $ ./build -S
+
+To build a debug version (this is the default, when no options are given):
+
+    $ ./build -d
+
+To build an optimised version:
+
+    $ ./build -f
+
+The last 2 commands produce:
+
+- `t2.o`: an object file that can be linked in your application;
+- `ut`: a unit-test binary;
+- `bn`: a benchmarking executable.
+
 Benchmarks
 ----------
 
