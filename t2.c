@@ -1632,7 +1632,7 @@ struct t2_node_type *t2_node_type_init(int16_t id, const char *name, int shift, 
                 nt->id    = id;
                 nt->name  = name;
                 nt->shift = shift;
-                nt->ops   = &odir_ops;
+                nt->ops   = &CONCAT(DEFAULT_FORMAT, _ops);
                 (void)simple_ops;
                 (void)lazy_ops;
                 (void)odir_ops;
