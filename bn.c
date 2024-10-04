@@ -701,14 +701,15 @@ static void t_mount(struct benchmark *b) {
                 &bn_ttype,
                 NULL
         };
-        mod = b->kv.u.t2.mod = t2_init_with(T2_INIT_EXPLAIN | T2_INIT_VERBOSE, &(struct t2_param) {
+        mod = b->kv.u.t2.mod = t2_init_with(blog_level > 0 ? T2_INIT_EXPLAIN | T2_INIT_VERBOSE : 0, &(struct t2_param) {
                         .conf = {
                                 .storage = bn_storage,
                                 .hshift  = ht_shift,
                                 .cshift  = cache_shift,
                                 .ishift  = ioc_shift,
                                 .ttypes  = ttypes,
-                                .ntypes  = ntypes
+                                .ntypes  = ntypes,
+                                .make    = (wal_flags & MAKE)
                         },
                         .no_te       = !transactions,
                         .te_type     = transactions ? "wal" : NULL,
