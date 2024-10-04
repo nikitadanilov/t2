@@ -6468,6 +6468,7 @@ static void simple_make(struct node *n, struct cap *cap) {
         int32_t         size = nsize(n);
         struct sheader *sh   = simple_header(n);
         sh->dir_off = SOF(*sh) + (size - SOF(*sh)) / 2;
+        sh->nr      = 0;
         *sat(sh, 0) = (struct dir_element){ .koff = SOF(*sh), .voff = size };
         CINC(l[sh->head.level].make);
         if (TRANSACTIONS) {
