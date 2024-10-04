@@ -9212,10 +9212,10 @@ static int file_init(struct t2_storage *storage, bool make) {
                         return ERROR(-errno);
                 }
                 if (make) {
-                        NOFAIL(ftruncate(fs->fd[i], FREE0));
+                        ftruncate(fs->fd[i], FREE0);
                 }
                 NOFAIL(fstat(fs->fd[i], &st));
-                fs->frag_free[i] = st.st_size;
+                fs->frag_free[i] = max_64(st.st_size, FREE0);
                 fs->free = max_64(fs->free, fs->frag_free[i]);
                 if (i == 0) {
                         fs->device = st.st_dev;
