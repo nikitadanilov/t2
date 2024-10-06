@@ -5,7 +5,6 @@
 
 #define _GNU_SOURCE
 #include <stdbool.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <errno.h>
@@ -7999,7 +7998,11 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         CMOD(wal_inflight, en->inflight_nr);
         en->max_inflight = max_64(en->max_inflight, buf->lsn + 1);
         wal_unlock(en);
-        nob = en->directio ? en->buf_size : en->buf_size - buf->free + SOF(struct wal_rec);
+        nob = en->buf_size - buf->free;
+        if (en->directio) {
+                nob = (nob + DIRECTIO_ALIGNMENT - 1) / DIRECTIO_ALIGNMENT * DIRECTIO_ALIGNMENT;
+        }
+        ASSERT(nob <= en->buf_size);
         CINC(wal_write);
         CMOD(wal_write_nob, nob);
         *(struct wal_header *)buf->data = (struct wal_header) {
@@ -8021,7 +8024,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         *(struct wal_rec *)(buf->data + buf->off) = (struct wal_rec) {
                 .magix = REC_MAGIX,
                 .rtype = FOOTER,
-                .len   = buf->free + SOF(struct wal_rec),
+                .len   = buf->free,
                 .u     = {
                         .header = {
                                 .lsn = buf->lsn
