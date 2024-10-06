@@ -9211,10 +9211,16 @@ static int file_init(struct t2_storage *storage, bool make) {
                 if (fs->fd[i] < 0) {
                         return ERROR(-errno);
                 }
-                if (make) {
-                        ftruncate(fs->fd[i], FREE0);
-                }
                 NOFAIL(fstat(fs->fd[i], &st));
+                if ((st.st_mode & S_IFMT) != S_IFREG) {
+                        return ERROR(-EINVAL);
+                }
+                if (make) {
+                        int result = ftruncate(fs->fd[i], FREE0);
+                        if (result != 0) {
+                                return ERROR(result);
+                        }
+                }
                 fs->frag_free[i] = max_64(st.st_size, FREE0);
                 fs->free = max_64(fs->free, fs->frag_free[i]);
                 if (i == 0) {
