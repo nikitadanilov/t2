@@ -5840,7 +5840,7 @@ static int64_t pool_used(struct t2 *mod) {
 }
 
 enum {
-        FREE_HI         = 5,
+        FREE_HI         = 8,
         FREE_LO         = 4,
         SCAN_RATE_SHIFT = 6
 };
