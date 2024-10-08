@@ -4000,6 +4000,8 @@ static void req_callback(struct rcu_head *head) {
         mem_free(req);
 }
 
+enum { PRESSURE_DROP_ALL = 8 };
+
 static int node_clean(struct node *n) {
         struct cache *c    = &n->mod->cache;
         int           bits = taddr_sbits(n->addr);
@@ -4010,7 +4012,8 @@ static int node_clean(struct node *n) {
         NMOD(n, page_lsn_diff, n->lsn_hi - n->lsn_lo);
         n->flags &= ~(DIRTY|PAGING|(~0ull << 40)); /* The only place where DIRTY is cleared. */
         if (stress(&c->pool.free[bits], &kpa) &&
-            !is_hotter(krate(&nheader(n)->kelvin, bolt(n)), c->md.crittemp, c->md.critfrac, ++shepherd_hand)) {
+            (kpa >= PRESSURE_DROP_ALL ||
+             !is_hotter(krate(&nheader(n)->kelvin, bolt(n)), c->md.crittemp, c->md.critfrac, ++shepherd_hand))) {
                 NINC(n, direct_put);
                 n->flags |= NOCACHE;
         }
