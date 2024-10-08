@@ -7666,6 +7666,7 @@ struct t2_node *t2_apply(struct t2 *mod, const struct t2_txrec *txr) {
 
 enum rec_type {
         HEADER = '<',
+        COMPRS = '%',
         FOOTER = '>',
         UNDO   = 'U',
         REDO   = 'R'
@@ -7974,18 +7975,31 @@ struct wal_header {
         struct hdata {
                 lsn_t    start;
                 lsn_t    end;
+                int32_t  nob;
         } data;
 } __attribute__((packed));
 
 SASSERT(offsetof(struct wal_header, data) == offsetof(struct wal_header, h.data));
 
+struct wal_writer_ctx {
+        ZSTD_CCtx *cctx;
+        size_t     buf_len;
+        void      *buf;
+        int        level;
+};
+
+static __thread struct wal_writer_ctx wal_writer_ctx = {};
+
 static int wal_write(struct wal_te *en, struct wal_buf *buf) {
-        int   result;
-        int   fd;
-        off_t off;
-        lsn_t bstart = en->start;
-        lsn_t bend   = en->max_synced;
-        int   nob;
+        int                result;
+        int                fd;
+        off_t              off;
+        lsn_t              bstart = en->start;
+        lsn_t              bend   = en->max_synced;
+        void              *data;
+        struct wal_header *header;
+        int                nob;
+        enum rec_type      rt;
         uint64_t __attribute__((unused)) start;
         ASSERT(wal_log_free(en) > 0);
         ASSERT(buf->off + SOF(struct wal_rec) <= en->buf_size);
@@ -7998,30 +8012,10 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         CMOD(wal_inflight, en->inflight_nr);
         en->max_inflight = max_64(en->max_inflight, buf->lsn + 1);
         wal_unlock(en);
-        nob = en->buf_size - buf->free;
-        if (en->directio) {
-                nob = (nob + DIRECTIO_ALIGNMENT - 1) / DIRECTIO_ALIGNMENT * DIRECTIO_ALIGNMENT;
-        }
-        ASSERT(nob <= en->buf_size);
         CINC(wal_write);
-        CMOD(wal_write_nob, nob);
-        *(struct wal_header *)buf->data = (struct wal_header) {
-                .h = {
-                        .magix = REC_MAGIX,
-                        .rtype = HEADER,
-                        .len   = sizeof(struct hdata),
-                        .u     = {
-                                .header = {
-                                        .lsn = buf->lsn,
-                                }
-                        }
-                },
-                .data = {
-                        .start = bstart,
-                        .end   = bend,
-                }
-        };
-        *(struct wal_rec *)(buf->data + buf->off) = (struct wal_rec) {
+        rt = HEADER;
+        data = buf->data;
+        *(struct wal_rec *)(data + buf->off) = (struct wal_rec) {
                 .magix = REC_MAGIX,
                 .rtype = FOOTER,
                 .len   = buf->free,
@@ -8032,9 +8026,43 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 }
         };
         ASSERT(buf->lsn != 0);
+        nob = en->buf_size - buf->free;
+        if (wal_writer_ctx.cctx != NULL) {
+                nob = ZSTD_compressCCtx(wal_writer_ctx.cctx,
+                                        wal_writer_ctx.buf + sizeof *header, wal_writer_ctx.buf_len - sizeof *header,
+                                        data + sizeof *header, nob - sizeof *header, wal_writer_ctx.level) + sizeof *header;
+                if (UNLIKELY(nob > en->buf_size)) { /* Overflow. */
+                        nob = en->buf_size - buf->free;
+                } else {
+                        data = wal_writer_ctx.buf;
+                        rt = COMPRS;
+                }
+        }
+        *(header = data) = (struct wal_header) {
+                .h = {
+                        .magix = REC_MAGIX,
+                        .rtype = rt,
+                        .len   = sizeof(struct hdata),
+                        .u     = {
+                                .header = {
+                                        .lsn = buf->lsn,
+                                }
+                        }
+                },
+                .data = {
+                        .start = bstart,
+                        .end   = bend,
+                        .nob   = nob
+                }
+        };
+        if (en->directio) {
+                nob = (nob + DIRECTIO_ALIGNMENT - 1) / DIRECTIO_ALIGNMENT * DIRECTIO_ALIGNMENT;
+        }
+        ASSERT(nob <= en->buf_size);
+        CMOD(wal_write_nob, nob);
         fd = en->fd[wal_map(en, buf->lsn, &off)];
         start = COUNTERS ? READ_ONCE(en->mod->tick) : 0;
-        result = wal_pwrite(fd, buf->data, nob, off);
+        result = wal_pwrite(fd, data, nob, off);
         if (LIKELY(result == nob)) {
                 lsn_t              lsn;
                 struct wal_buf    *scan;
@@ -8495,6 +8523,7 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         ASSERT(workers > 0);
         ASSERT(log_sleep > 0);
         ASSERT(directio ? HAS_O_DIRECT : true);
+        ASSERT((buf_size & (DIRECTIO_ALIGNMENT - 1)) == 0);
         if (en == NULL || ws == NULL || fd == NULL || snap == NULL) {
                 mem_free(en);
                 mem_free(ws);
@@ -8597,30 +8626,42 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         return result == 0 ? &en->base : EPTR(result);
 }
 
+static bool wal_is_header(const struct wal_rec *rec) {
+        return rec->rtype == HEADER || rec->rtype == COMPRS;
+}
+
 static bool wal_rec_invariant(const struct wal_rec *rec) {
         struct wal_header *h = (void *)rec;
         lsn_t lsn = rec->u.header.lsn;
         return  rec->magix == REC_MAGIX &&
-                (rec->rtype == HEADER || rec->rtype == FOOTER || rec->rtype == UNDO || rec->rtype == REDO) &&
-                rec->rtype == HEADER ? (rec->len == sizeof (struct hdata) && /* Snapshot's lsn is 0. */
-                                        h->data.start > 0 && (lsn == 0 || h->data.start <= lsn) &&
-                                        h->data.end   > 0 && (lsn == 0 || h->data.end   <= lsn) &&
-                                        h->data.start <= h->data.end) : true;
+                (rec->rtype == HEADER || rec->rtype == COMPRS || rec->rtype == FOOTER || rec->rtype == UNDO || rec->rtype == REDO) &&
+                (wal_is_header(rec) ? (rec->len == sizeof (struct hdata) && /* Snapshot's lsn is 0. */
+                                       h->data.start > 0 && (lsn == 0 || h->data.start <= lsn) &&
+                                       h->data.end   > 0 && (lsn == 0 || h->data.end   <= lsn) &&
+                                       h->data.start <= h->data.end) : true);
 }
 
 static bool wal_buf_is_valid(struct wal_te *en, struct wal_rec *rec) {
-        return wal_rec_invariant(rec) && rec->rtype == HEADER;
+        return wal_rec_invariant(rec) && wal_is_header(rec);
 }
 
-static int wal_buf_replay(struct wal_te *en, void *space, int len) {
+static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len) {
         struct wal_rec *rec;
         int             result = 0;
         lsn_t           lsn    = -1;
         ASSERT((en->flags & (FORCE|STEAL)) == 0); /* Redo-Noundo */
+        rec = space;
+        if (rec->rtype == COMPRS) {
+                struct wal_header *h = space; /* TODO: Use ZSTD_decompressDCtx(). */
+                ZSTD_decompress(scratch + sizeof *h, en->buf_size - sizeof *h,
+                                space   + sizeof *h, h->data.nob  - sizeof *h);
+                *(struct wal_header *)scratch = *h;
+                space = scratch;
+        }
         for (rec = space; result == 0 && (void *)rec < space + len; rec = wal_next(rec)) {
                 if (!wal_rec_invariant(rec)) {
                         result = ERROR(-EIO);
-                } else if (rec->rtype == HEADER) {
+                } else if (wal_is_header(rec)) {
                         lsn = rec->u.header.lsn;
                 } else if (rec->rtype == FOOTER) {
                         if (rec->u.header.lsn != lsn) {
@@ -8696,18 +8737,18 @@ static void rbuf_print(const struct rbuf *rbuf) {
         printf("%04x+%"PRId64": %8"PRId64" [%8"PRId64" .. %8"PRId64"]\n", rbuf->idx, rbuf->off, rbuf->lsn, rbuf->start, rbuf->end);
 }
 
-static int wal_index_replay(struct wal_te *en, int nr, struct rbuf *index, lsn_t start, lsn_t end, void *buf) {
+static int wal_index_replay(struct wal_te *en, int nr, struct rbuf *index, lsn_t start, lsn_t end, void *buf0, void *buf1) {
         int result = 0;
         printf("Replaying %i groups from %"PRId64" to %"PRId64" [", nr, start, end);
         for (int i = 0; result == 0 && i < nr; ++i) {
                 struct rbuf *r = &index[i];
                 if (start <= r->lsn && r->lsn < end) {
-                        result = pread(en->fd[r->idx], buf, en->buf_size, r->off);
+                        result = pread(en->fd[r->idx], buf0, en->buf_size, r->off);
                         if (result < SOF(struct wal_rec)) {
                                 LOG("Cannot read log buffer %04x+%"PRId64": %i/%i.", r->idx, r->off, result, errno);
                                 return ERROR(result < 0 ? -errno : -EIO);
                         }
-                        result = wal_buf_replay(en, buf, result);
+                        result = wal_buf_replay(en, buf0, buf1, result);
                 }
                 if (i % (nr/50 + 1) == 0) {
                         printf(".");
@@ -8740,9 +8781,10 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
                         if (IS0(&hdr)) {
                                 continue; /* Skip hole due to a snapshot at the end of the log. */
                         }
-                        if (hdr.h.magix != REC_MAGIX || hdr.h.rtype != HEADER) {
-                                LOG("Wrong record in log %04x+%"PRId64": %016"PRIx64" != %016"PRIx64" or %016"PRIx32" != %016"PRIx32".",
-                                    i, off, hdr.h.magix, REC_MAGIX, hdr.h.rtype, (int32_t)HEADER);
+                        if (hdr.h.magix != REC_MAGIX || !wal_is_header(&hdr.h)) {
+                                LOG("Wrong record in log %04x+%"PRId64": %016"PRIx64" != %016"PRIx64
+                                    " or %016"PRIx32" != %016"PRIx32" and %016"PRIx32" != %016"PRIx32".",
+                                    i, off, hdr.h.magix, REC_MAGIX, hdr.h.rtype, (int32_t)HEADER, hdr.h.rtype, (int32_t)COMPRS);
                                 return ERROR(-EIO);
                         }
                         lsn = hdr.h.u.header.lsn;
@@ -8839,18 +8881,20 @@ static int wal_recover(struct wal_te *en) {
                 buf_nr0 = buf_nr;
                 result = wal_index_build(en, &buf_nr, index, size, &last);
                 if (result == 0) {
-                        void *buf = mem_alloc(en->buf_size);
-                        if (buf != NULL) {
-                                result = wal_index_replay(en, buf_nr, index, last.start, last.end, buf) ?:
+                        void *buf0 = mem_alloc(en->buf_size);
+                        void *buf1 = mem_alloc(en->buf_size);
+                        if (buf0 != NULL && buf1 != NULL) {
+                                result = wal_index_replay(en, buf_nr, index, last.start, last.end, buf0, buf1) ?:
                                          cache_load(en->mod) ?:
                                          wal_recovery_clean(en, index, buf_nr, last.end);
                                 if (result == 0) {
                                         wal_recovery_done(en, last.start, last.end);
                                 }
-                                mem_free(buf);
                         } else {
                                 result = ERROR(-ENOMEM);
                         }
+                        mem_free(buf1);
+                        mem_free(buf0);
                 } else {
                         for (int i = 0; i < buf_nr0; ++i) {
                                 rbuf_print(&index[i]);
@@ -9008,9 +9052,18 @@ static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *
         t2_thread_degister();
 }
 
+static void wal_writer_ctx_init(struct wal_te *en) {
+        wal_writer_ctx.cctx    = ZSTD_createCCtx();
+        wal_writer_ctx.level   = ZSTD_CLEVEL_DEFAULT - 1; /* TODO: ZSTD_defaultCLevel() in zstd v1.5.0. */
+        wal_writer_ctx.buf_len = ZSTD_compressBound(en->buf_size);
+        wal_writer_ctx.buf     = en->directio ? mem_alloc_align(en->buf_size, DIRECTIO_ALIGNMENT) : mem_alloc(en->buf_size);
+        ASSERT(en->directio ? (en->buf_size & (DIRECTIO_ALIGNMENT - 1)) == 0 : true);
+}
+
 static void *wal_aux_worker(void *arg) {
         struct wal_te *en = arg;
         thread_set_name("t2.walaux");
+        wal_writer_ctx_init(en);
         wal_work(en, LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, INT_MAX, &en->logwait);
         return NULL;
 }
@@ -9018,6 +9071,7 @@ static void *wal_aux_worker(void *arg) {
 static void *wal_worker(void *arg) {
         struct wal_te *en = arg;
         thread_set_name("t2.walworker");
+        wal_writer_ctx_init(en);
         wal_work(en, LOG_WRITE, INT_MAX, &en->bufwrite);
         return NULL;
 }
