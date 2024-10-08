@@ -418,7 +418,7 @@ static int counters_level = 0;
 static int shift_internal = 9;
 static int shift_twig     = 9;
 static int shift_leaf     = 9;
-static int report_interval = 10;
+static double report_interval = 10.0;
 static int wal_flags = MAKE; /* noforce-nosteal == redo only. */
 static uint64_t stats_flags = ~0ull;
 
@@ -563,8 +563,12 @@ static void bphase_report(struct bphase *ph, bool final);
 
 static void *breport_thread(void *arg) {
         struct bphase *ph = arg;
+        struct timespec sleep = {
+                .tv_sec  = (int)report_interval,
+                .tv_nsec = 1000000000.0 * (report_interval - (int)report_interval)
+        };
         while (!ph->shutdown) {
-                sleep(report_interval);
+                NOFAIL(nanosleep(&sleep, NULL));
                 bphase_report(ph, false);
                 if (counters_level > 1 && kvt == T2) {
                         t2_stats_print(mod, stats_flags);
@@ -1022,7 +1026,7 @@ int main(int argc, char **argv) {
                         total = optarg;
                         break;
                 case 'r':
-                        report_interval = atoi(optarg);
+                        report_interval = atof(optarg);
                         break;
                 case 'n':
                         shift_leaf = atoi(optarg);
