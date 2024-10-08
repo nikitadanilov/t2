@@ -7417,6 +7417,7 @@ static bool odir_check(struct node *n) {
 }
 
 static void odir_make(struct node *n, struct cap *cap) {
+        ASSERT(nsize(n) <= INT16_MAX);
         oheader(n)->nr   = 0;
         oheader(n)->used = OHSIZE;
         oheader(n)->end  = OHSIZE;
