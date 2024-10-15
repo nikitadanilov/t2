@@ -752,6 +752,7 @@ struct path {
         int             rc;
         struct page     newroot;
         struct page     sb;
+        int             reset;
 };
 
 struct policy {
@@ -2686,6 +2687,9 @@ static bool rung_precheck(const struct rung *r, int idx) {
 
 static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx, enum optype opt) {
         SASSERT(NONE == 0);
+        ASSERT(buf_len(r->key) == buf_len(r->scr));
+        ASSERT(buf_len(r->key) > 0 ? r->key->addr != NULL && r->scr->addr != NULL && r->key->addr != r->scr->addr : true);
+        memcpy(r->scr->addr, r->key->addr, buf_len(r->key));
         p->used = -1;
         p->tree = t;
         p->rec  = r;
@@ -2852,6 +2856,8 @@ static void path_reset(struct path *p) {
         SET0(&p->sb);
         p->next = p->tree->root;
         CINC(traverse_restart);
+        ++p->reset;
+        memcpy(p->rec->key->addr, p->rec->scr->addr, buf_len(p->rec->scr));
 }
 
 static void path_pin(struct path *p) {
@@ -3344,9 +3350,8 @@ static int next_complete(struct path *p, struct node *n) {
                 int32_t keylen = buf_len(s.rec.key); /* Check that keys are monotone. */
                 EXPENSIVE_ASSERT(mcmp(c->curkey.addr, c->curkey.len, s.rec.key->addr, keylen) * c->dir < 0);
                 if (LIKELY(keylen <= c->maxlen)) {
-                        c->curkey.len = c->maxlen;
-                        buf_copy(&c->curkey, s.rec.key);
                         c->curkey.len = keylen;
+                        buf_copy(&c->curkey, s.rec.key);
                 } else {
                         result = ERROR(-ENAMETOOLONG);
                 }
@@ -3657,8 +3662,10 @@ static int next(struct t2_cursor *c) {
         struct t2_rec r = {
                 .key = &c->curkey,
                 .val = &val,
+                .scr = &c->scr,
                 .vcb = (void *)c /* Erm... */
         };
+        r.scr->len = buf_len(r.key);
         return traverse_result(c->tree, &r, NULL, NEXT);
 }
 
@@ -3685,6 +3692,7 @@ int t2_insert(struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx) {
 int t2_cursor_init(struct t2_cursor *c, struct t2_buf *key) {
         ASSERT(thread_registered);
         ASSERT(buf_len(key) <= buf_len(&c->curkey));
+        ASSERT(buf_len(&c->scr) == buf_len(&c->curkey));
         ASSERT(c->dir == T2_LESS || c->dir == T2_MORE);
         eclear();
         buf_copy(&c->curkey, key);
@@ -3697,6 +3705,7 @@ void t2_cursor_fini(struct t2_cursor *c) {
         ASSERT(thread_registered);
         eclear();
         c->curkey.len = c->maxlen;
+        c->scr.len = c->maxlen;
 }
 
 int t2_cursor_next(struct t2_cursor *c) {
@@ -3705,34 +3714,40 @@ int t2_cursor_next(struct t2_cursor *c) {
         return next(c);
 }
 
-int t2_lookup_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize) {
+int t2_lookup_ptr(struct t2_tree *t, void *key, void *scr, int32_t ksize, void *val, int32_t vsize) {
         struct t2_buf kbuf = { .addr = key, .len = ksize };
         struct t2_buf vbuf = { .addr = val, .len = vsize };
+        struct t2_buf cbuf = { .addr = scr, .len = ksize };
         struct t2_rec r = {
                 .key = &kbuf,
-                .val = &vbuf
+                .val = &vbuf,
+                .scr = &cbuf
         };
         ASSERT(thread_registered);
         eclear();
         return lookup(t, &r);
 }
 
-int t2_insert_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize, struct t2_tx *tx) {
+int t2_insert_ptr(struct t2_tree *t, void *key, void *scr, int32_t ksize, void *val, int32_t vsize, struct t2_tx *tx) {
         struct t2_buf kbuf = { .addr = key, .len = ksize };
         struct t2_buf vbuf = { .addr = val, .len = vsize };
+        struct t2_buf cbuf = { .addr = scr, .len = ksize };
         struct t2_rec r = {
                 .key = &kbuf,
-                .val = &vbuf
+                .val = &vbuf,
+                .scr = &cbuf
         };
         ASSERT(thread_registered);
         eclear();
         return insert(t, &r, tx);
 }
 
-int t2_delete_ptr(struct t2_tree *t, void *key, int32_t ksize, struct t2_tx *tx) {
+int t2_delete_ptr(struct t2_tree *t, void *key, void *scr, int32_t ksize, struct t2_tx *tx) {
         struct t2_buf kbuf = { .addr = key, .len = ksize };
+        struct t2_buf cbuf = { .addr = scr, .len = ksize };
         struct t2_rec r = {
                 .key = &kbuf,
+                .scr = &cbuf
         };
         ASSERT(thread_registered);
         eclear();
@@ -10332,14 +10347,17 @@ static void traverse_ut() {
         };
         char key0[] = "0";
         char val0[] = "+";
+        char copy[] = " ";
         struct t2_buf val;
         struct t2_buf key;
+        struct t2_buf cpy;
         struct slot s = {
                 .node = &n,
                 .idx = 0,
                 .rec = {
                         .key = &key,
-                        .val = &val
+                        .val = &val,
+                        .scr = &cpy
                 }
         };
         struct t2_tree t = {
@@ -10355,6 +10373,7 @@ static void traverse_ut() {
         ttype.mod = mod;
         buf_init_str(&key, key0);
         buf_init_str(&val, val0);
+        buf_init_str(&cpy, copy);
         n.mod = mod;
         utest("prepare");
         NCALL(&n, make(&n, &m));
@@ -10366,6 +10385,7 @@ static void traverse_ut() {
                 s.idx++;
                 buf_init_str(&key, key0);
                 buf_init_str(&val, val0);
+                buf_init_str(&cpy, copy);
                 SET0(&m);
                 cap_init(&m, nsize(&n));
                 UT_NOFAIL(NCALL(&n, insert(&s, &m)));
@@ -10409,20 +10429,24 @@ static void insert_ut() {
         utest("init");
         char key0[] = "0";
         char val0[] = "+";
+        char key1[] = " ";
         struct t2_buf val;
         struct t2_buf key;
+        struct t2_buf copy;
         struct t2_tree t = {
                 .ttype = &ttype
         };
         struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         struct t2_rec r = {
                 .key = &key,
-                .val = &val
+                .val = &val,
+                .scr = &copy
         };
         int result;
         struct cap m = {};
-        buf_init_str(&key, key0);
-        buf_init_str(&val, val0);
+        buf_init_str(&key,  key0);
+        buf_init_str(&val,  val0);
+        buf_init_str(&copy, key1);
         struct node *n = SAFE_ALLOC(alloc(&t, 0, &m));
         ASSERT(n != NULL && EISOK(n));
         t.root = n->addr;
@@ -10444,36 +10468,43 @@ static void tree_ut() {
         utest("init");
         char key0[] = "0";
         char val0[] = "+";
+        char key1[] = " ";
         struct t2_buf val;
         struct t2_buf key;
+        struct t2_buf copy;
         struct t2_tree *t;
         struct t2 *mod;
         struct t2_rec r = {
                 .key = &key,
-                .val = &val
+                .val = &val,
+                .scr = &copy
         };
         uint64_t k64;
         uint64_t v64;
+        uint64_t c64;
         int result;
         mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         t = t2_tree_create(&ttype, NULL);
         ASSERT(EISOK(t));
-        buf_init_str(&key, key0);
-        buf_init_str(&val, val0);
+        buf_init_str(&key,  key0);
+        buf_init_str(&val,  val0);
+        buf_init_str(&copy, key1);
         utest("insert-1");
         UT_NOFAIL(t2_insert(t, &r, NULL));
         utest("eexist");
         result = t2_insert(t, &r, NULL);
         ASSERT(result == -EEXIST || EOOM(result));
         utest("5K");
-        key = BUF_VAL(k64);
-        val = BUF_VAL(v64);
+        key  = BUF_VAL(k64);
+        val  = BUF_VAL(v64);
+        copy = BUF_VAL(c64);
         for (k64 = 0; k64 < 5000; ++k64) {
                 UT_NOFAIL(t2_insert(t, &r, NULL));
         }
         utest("20K");
-        key = BUF_VAL(k64);
-        val = BUF_VAL(v64);
+        key  = BUF_VAL(k64);
+        val  = BUF_VAL(v64);
+        copy = BUF_VAL(c64);
         for (int i = 0; i < 20000; ++i) {
                 k64 = ht_hash64(i);
                 v64 = ht_hash64(i + 1);
@@ -10520,11 +10551,14 @@ static void tx_end(struct t2 *mod, struct t2_tx *tx) {
 static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
         char key[1ul << ntype.shift];
         char val[1ul << ntype.shift];
+        char scr[1ul << ntype.shift];
         struct t2_buf keyb = BUF_VAL(key);
         struct t2_buf valb = BUF_VAL(val);
+        struct t2_buf copy = BUF_VAL(scr);
         struct t2_rec r = {
                 .key = &keyb,
-                .val = &valb
+                .val = &valb,
+                .scr = &copy
         };
         int32_t maxsize = ((int32_t)1 << (ntype.shift - 3)) - 10;
         int exist = 0;
@@ -10545,11 +10579,13 @@ static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 fill(val, vsize);
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
+                copy = (struct t2_buf){ .len = ksize, .addr = &scr };
                 UT_NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
                 for (int j = 0; j < 10; ++j) {
                         long probe = rand();
                         *(long *)key = probe;
                         keyb = (struct t2_buf){ .len = ksize, .addr = &key };
+                        copy = (struct t2_buf){ .len = ksize, .addr = &scr };
                         valb = BUF_VAL(val);
                         result = t2_lookup(t, &r);
                         ASSERT((result ==       0) == (probe <= i) &&
@@ -10567,6 +10603,7 @@ static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 *(long *)key = j;
                 keyb = (struct t2_buf){ .len = ksize,    .addr = &key };
                 valb = (struct t2_buf){ .len = SOF(val), .addr = &val };
+                copy = (struct t2_buf){ .len = ksize,    .addr = &scr };
                 result = t2_lookup(t, &r);
                 ASSERT(result == 0 || EOOM(result) || (result == -ENOENT && ut_mem_alloc_fail_N != 0));
         }
@@ -10582,6 +10619,7 @@ static void stress_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 fill(val, vsize);
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
+                copy = (struct t2_buf){ .len = ksize, .addr = &scr };
                 result = WITH_TX(mod, tx, t2_insert(t, &r, tx));
                 ASSERT(result == 0 || result == -EEXIST || EOOM(result));
                 if (result == -EEXIST) {
@@ -10612,11 +10650,14 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
         struct t2_tree *t;
         char key[1ul << ntype.shift];
         char val[1ul << ntype.shift];
+        char scr[1ul << ntype.shift];
         struct t2_buf keyb = BUF_VAL(key);
+        struct t2_buf copy = BUF_VAL(scr);
         struct t2_buf valb = BUF_VAL(val);
         struct t2_rec r = {
                 .key = &keyb,
-                .val = &valb
+                .val = &valb,
+                .scr = &copy
         };
         int32_t maxsize = ((int32_t)1 << (ntype.shift - 3)) - 10;
         int exist = 0;
@@ -10638,6 +10679,7 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 fill(val, vsize);
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
+                copy = (struct t2_buf){ .len = ksize, .addr = &scr };
                 UT_NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
         }
         for (long i = U - 1; i >= 0; --i) {
@@ -10646,6 +10688,7 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                         *(long *)key = j;
                         keyb = (struct t2_buf){ .len = ksize,    .addr = &key };
                         valb = (struct t2_buf){ .len = SOF(val), .addr = &val };
+                        copy = (struct t2_buf){ .len = ksize,    .addr = &scr };
                         result = t2_lookup(t, &r);
                         ASSERT((result == 0) == (j <= i) && (result == -ENOENT) == (j > i));
                 }
@@ -10657,6 +10700,7 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 *(long *)key = i;
                 keyb = (struct t2_buf){ .len = ksize, .addr = &key };
                 valb = (struct t2_buf){ .len = vsize, .addr = &val };
+                copy = (struct t2_buf){ .len = ksize, .addr = &scr };
                 UT_NOFAIL(WITH_TX(mod, tx, t2_delete(t, &r, tx)));
         }
         for (long i = 0; i < U; ++i) {
@@ -10665,6 +10709,7 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 *(long *)key = i;
                 keyb = (struct t2_buf){ .len = ksize,    .addr = &key };
                 valb = (struct t2_buf){ .len = SOF(val), .addr = &val };
+                copy = (struct t2_buf){ .len = ksize,    .addr = &scr };
                 result = t2_lookup(t, &r);
                 ASSERT(result == -ENOENT || EOOM(result));
         }
@@ -10680,6 +10725,7 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
                 ASSERT(4 * (ksize + vsize) < ((int32_t)1 << ntype.shift));
                 fill(key, ksize);
                 keyb = (struct t2_buf){ .len = ksize,    .addr = &key };
+                copy = (struct t2_buf){ .len = ksize,    .addr = &scr };
                 if (rand() & 1) {
                         fill(val, vsize);
                         valb = (struct t2_buf){ .len = vsize, .addr = &val };
@@ -10713,14 +10759,16 @@ static void delete_ut_with(struct t2 *mod, struct t2_tx *tx) {
         t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         ASSERT(EISOK(t));
         for (int i = 0; i < U; ++i) {
-                result = WITH_TX(mod, tx, t2_insert_ptr(t, &i, sizeof i, &i, sizeof i, tx));
+                int copy;
+                result = WITH_TX(mod, tx, t2_insert_ptr(t, &i, &copy, sizeof i, &i, sizeof i, tx));
                 ASSERT(result == 0);
         }
         for (int i = 0; i < U; ++i) {
-                result = WITH_TX(mod, tx, t2_delete_ptr(t, &i, sizeof i, tx));
+                int copy;
+                result = WITH_TX(mod, tx, t2_delete_ptr(t, &i, &copy, sizeof i, tx));
                 ASSERT(result == 0);
         }
-        t2_lookup_ptr(t, key, SOF(key), val, SOF(val));
+        t2_lookup_ptr(t, key, scr, SOF(key), val, SOF(val));
         t2_tree_close(t);
 }
 
@@ -10744,11 +10792,14 @@ static void next_ut_with(struct t2 *mod, struct t2_tx *tx) {
         struct t2_tree *t;
         char key[1ul << ntype.shift];
         char val[1ul << ntype.shift];
+        char scr[1ul << ntype.shift];
         struct t2_buf keyb = BUF_VAL(key);
         struct t2_buf valb = BUF_VAL(val);
+        struct t2_buf copy = BUF_VAL(scr);
         struct t2_rec r = {
                 .key = &keyb,
-                .val = &valb
+                .val = &valb,
+                .scr = &copy
         };
         t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
         ASSERT(EISOK(t));
@@ -10757,6 +10808,7 @@ static void next_ut_with(struct t2 *mod, struct t2_tx *tx) {
         };
         struct t2_cursor c = {
                 .curkey = keyb,
+                .scr    = copy,
                 .tree   = t,
                 .op     = &cop,
                 .maxlen = SOF(key)
@@ -10764,31 +10816,38 @@ static void next_ut_with(struct t2 *mod, struct t2_tx *tx) {
         utest("populate");
         long U = 10000;
         for (long i = 0; i < U; ++i) {
+                long copyi;
                 keyb = BUF_VAL(i);
                 valb = BUF_VAL(i);
+                copy = BUF_VAL(copyi);
                 UT_NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
         }
         utest("smoke");
         for (long i = 0, del = 0; i < U; ++i, del += 7, del %= U) {
                 unsigned long ulongmax = ~0ul;
+                long copydel;
                 struct t2_buf maxkey = BUF_VAL(ulongmax);
+                int result;
                 keyb = BUF_VAL(del);
                 valb = BUF_VAL(del);
+                copy = BUF_VAL(copydel);
                 UT_NOFAIL(WITH_TX(mod, tx, t2_delete(t, &r, tx)));
                 c.dir = T2_MORE;
                 t2_cursor_init(&c, &zero);
                 cit = 0;
-                while (t2_cursor_next(&c) > 0) {
+                while ((result = t2_cursor_next(&c)) > 0) {
                         ;
                 }
+                ASSERT(result == 0);
                 t2_cursor_fini(&c);
                 ASSERT(cit == U - i);
                 c.dir = T2_LESS;
                 t2_cursor_init(&c, &maxkey);
                 cit = 0;
-                while (t2_cursor_next(&c) > 0) {
+                while ((result = t2_cursor_next(&c)) > 0) {
                         ;
                 }
+                ASSERT(result == 0);
                 t2_cursor_fini(&c);
                 ASSERT(cit == U - i);
         }
@@ -10881,8 +10940,10 @@ static void inc(char *key, int len) {
 static void seq_ut_with(struct t2 *mod, struct t2_tx *tx) {
         char key[] = "999999999";
         char val[] = "*VALUE*";
+        char scr[sizeof key] = {};
         struct t2_buf keyb;
         struct t2_buf valb;
+        struct t2_buf copy;
         struct t2_rec r = {};
         struct t2_tree *t;
         t = WITH_TX(mod, tx, t2_tree_create(&ttype, tx));
@@ -10892,8 +10953,10 @@ static void seq_ut_with(struct t2 *mod, struct t2_tx *tx) {
         for (long i = 0; i < U; ++i) {
                 keyb = BUF_VAL(key);
                 valb = BUF_VAL(val);
+                copy = BUF_VAL(scr);
                 r.key = &keyb;
                 r.val = &valb;
+                r.scr = &copy;
                 UT_NOFAIL(WITH_TX(mod, tx, t2_insert(t, &r, tx)));
                 inc(key, (sizeof key) - 1);
         }
@@ -10953,12 +11016,13 @@ static void random_buf(char *buf, int32_t max, int32_t *out) {
 static void *lookup_worker(void *arg) {
         struct t2_tree *t = arg;
         char kbuf[8];
+        char copy[8];
         char vbuf[MAXSIZE];
         int32_t ksize;
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
-                int result = t2_lookup_ptr(t, kbuf, ksize, vbuf, sizeof vbuf);
+                int result = t2_lookup_ptr(t, kbuf, copy, ksize, vbuf, sizeof vbuf);
                 ASSERT(result == 0 || result == -ENOENT || EOOM(result));
         }
         t2_thread_degister();
@@ -10969,6 +11033,7 @@ static void *insert_worker(void *arg) {
         struct t2_tree *t = arg;
         struct t2_tx *tx = t->ttype->mod->te != NULL ? t2_tx_make(t->ttype->mod) : NULL;
         char kbuf[8];
+        char copy[8];
         char vbuf[MAXSIZE];
         int32_t ksize;
         int32_t vsize;
@@ -10976,7 +11041,7 @@ static void *insert_worker(void *arg) {
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 random_buf(vbuf, sizeof vbuf, &vsize);
-                int result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, tx));
+                int result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, kbuf, copy, ksize, vbuf, vsize, tx));
                 ASSERT(result == 0 || result == -EEXIST || EOOM(result));
         }
         if (tx != NULL) {
@@ -10990,11 +11055,12 @@ static void *delete_worker(void *arg) {
         struct t2_tree *t = arg;
         struct t2_tx *tx = t->ttype->mod->te != NULL ? t2_tx_make(t->ttype->mod) : NULL;
         char kbuf[8];
+        char copy[8];
         int32_t ksize;
         t2_thread_register();
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
-                int result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, kbuf, ksize, tx));
+                int result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, kbuf, copy, ksize, tx));
                 ASSERT(result == 0 || result == -ENOENT || EOOM(result));
         }
         if (tx != NULL) {
@@ -11007,11 +11073,13 @@ static void *delete_worker(void *arg) {
 static void *next_worker(void *arg) {
         struct t2_tree *t = arg;
         char key[8];
+        char copy[8];
         struct t2_cursor_op cop = {
                 .next = &cnext
         };
         struct t2_cursor c = {
                 .curkey = BUF_VAL(key),
+                .scr    = BUF_VAL(copy),
                 .tree   = t,
                 .op     = &cop
         };
@@ -11035,6 +11103,7 @@ void mt_ut_with(struct t2 *mod, struct t2_tx *tx) {
         struct t2_tree *t;
         pthread_t tid[4*THREADS];
         char kbuf[8];
+        char copy[8];
         char vbuf[MAXSIZE];
         int32_t ksize;
         int32_t vsize;
@@ -11045,7 +11114,7 @@ void mt_ut_with(struct t2 *mod, struct t2_tx *tx) {
         for (long i = 0; i < OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 random_buf(vbuf, sizeof vbuf, &vsize);
-                result = WITH_TX(mod, tx, t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, tx));
+                result = WITH_TX(mod, tx, t2_insert_ptr(t, kbuf, copy, ksize, vbuf, vsize, tx));
                 ASSERT(result == 0 || result == -EEXIST || EOOM(result));
         }
         utest("lookup");
@@ -11105,6 +11174,7 @@ static void open_ut() {
         struct t2_tree *t;
         pthread_t tid[4*THREADS];
         char kbuf[8];
+        char copy[8];
         char vbuf[MAXSIZE];
         int32_t ksize;
         int32_t vsize;
@@ -11119,7 +11189,7 @@ static void open_ut() {
         for (long i = 0; i < 4*OPS; ++i) {
                 random_buf(kbuf, sizeof kbuf, &ksize);
                 random_buf(vbuf, sizeof vbuf, &vsize);
-                result = t2_insert_ptr(t, kbuf, ksize, vbuf, vsize, NULL);
+                result = t2_insert_ptr(t, kbuf, copy, ksize, vbuf, vsize, NULL);
                 ASSERT(result == 0 || result == -EEXIST || EOOM(result));
         }
         id = t->id;
@@ -11184,6 +11254,7 @@ static int wal_cnext(struct t2_cursor *c, const struct t2_rec *rec) {
 
 static void wal_ut_verify(struct t2_tree *t) {
         uint64_t key;
+        uint64_t scr;
         uint64_t start = 0;
         struct t2_buf startkey = BUF_VAL(start);
         struct t2_cursor_op cop = {
@@ -11191,6 +11262,7 @@ static void wal_ut_verify(struct t2_tree *t) {
         };
         struct t2_cursor c = {
                 .curkey = BUF_VAL(key),
+                .scr    = BUF_VAL(scr),
                 .tree   = t,
                 .dir    = T2_MORE,
                 .op     = &cop
@@ -11289,6 +11361,7 @@ struct seg_state {
         int                  sleep_max;
         uint64_t             nr_ops;
         _Atomic(int32_t)     initialised;
+        bool                 shutdown;
 };
 
 static struct seg_state cseg = {};
@@ -11312,7 +11385,7 @@ static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, int *ks
         memset(val, 0, sizeof *val);
         key->tno = htobe16(threadno);
         key->idx = htobe64(idx);
-        key->h   = ht_hash64(threadno + (idx << 17));
+        key->h   = ht_hash64(6 + threadno + (idx << 17));
         key->nr  = idx % SOF(key->load);
         val->h   = key->h;
         val->nr  = val->h % SOF(val->load);
@@ -11322,7 +11395,7 @@ static void makerec(uint64_t threadno, uint64_t idx, struct ct_key *key, int *ks
 
 static bool checkrec(struct ct_key *key, struct ct_val *val) {
         uint64_t idx = be64toh(key->idx);
-        return  key->h == ht_hash64(be16toh(key->tno) + (idx << 17)) &&
+        return  key->h == ht_hash64(6 + be16toh(key->tno) + (idx << 17)) &&
                 val->h == key->h &&
                 key->nr == (int8_t)(idx    % SOF(key->load)) &&
                 val->nr == (int8_t)(val->h % SOF(val->load));
@@ -11335,6 +11408,8 @@ static bool checkrec(struct ct_key *key, struct ct_val *val) {
         }                                       \
 })
 
+static _Atomic(int32_t) failed;
+
 static void *ct_scan(void *arg) {
         int               tno = (long)arg;
         struct t2_tree   *t   = cseg.tree;
@@ -11345,6 +11420,7 @@ static void *ct_scan(void *arg) {
         uint64_t          half;
         int               result;
         struct ct_key     key;
+        struct ct_key     scr;
         struct ct_val     val;
         int               klen;
         int               vlen;
@@ -11352,7 +11428,7 @@ static void *ct_scan(void *arg) {
         ASSERT(cseg.iter != 0);
         while (true) {
                 makerec(tno, idx, &key, &klen, &val, &vlen);
-                result = t2_lookup_ptr(t, &key, klen, &val, sizeof val);
+                result = t2_lookup_ptr(t, &key, &scr, klen, &val, sizeof val);
                 if (result == -ENOENT) {
                         if (got) {
                                 break;
@@ -11377,10 +11453,10 @@ static void *ct_scan(void *arg) {
         printf("    .... Thread %i found: %"PRIu64" .. %"PRIu64": %s\n", tno, lo, idx, ok ? "correct" : "wrong");
         cseg.idx[tno] = idx;
         cseg.lo[tno] = lo;
-        t2_thread_degister();
         if (!ok) {
-                exit(1);
+                ++failed;
         }
+        t2_thread_degister();
         return NULL;
 }
 
@@ -11400,7 +11476,9 @@ static void *busy(void *arg) {
         int             result;
         uint64_t        idx = cseg.idx[tno];
         struct ct_key   key;
+        struct ct_key   kcopy;
         struct ct_val   val;
+        struct ct_val   vcopy;
         int             klen;
         int             vlen;
         t2_thread_register();
@@ -11408,22 +11486,26 @@ static void *busy(void *arg) {
         ASSERT(EISOK(tx));
         if (idx > 0 && todelete(idx - 1)) {
                 makerec(tno, victim(idx - 1), &key, &klen, &val, &vlen);
-                WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, klen, tx));
+                WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, &kcopy, klen, tx));
         }
-        while (true) {
+        while (!cseg.shutdown) {
                 if (cseg.mode == CHECK && idx == cseg.nr_ops) {
                         break;
                 }
                 makerec(tno, idx, &key, &klen, &val, &vlen);
-                result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, klen, &val, vlen, tx));
-                CT_ASSERT(result == 0);
+                result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, &kcopy, klen, &val, vlen, tx));
+                if (cseg.mode == CHECK) {
+                        makerec(tno, idx, &key, &klen, &val, &vlen);
+                        result = t2_lookup_ptr(t, &key, &kcopy, klen, &vcopy, sizeof vcopy);
+                        CT_ASSERT(result == 0 || result == -ENAMETOOLONG);
+                }
                 if (todelete(idx)) {
                         makerec(tno, victim(idx), &key, &klen, &val, &vlen);
-                        result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, klen, tx));
+                        result = WITH_TX(t->ttype->mod, tx, t2_delete_ptr(t, &key, &kcopy, klen, tx));
                         CT_ASSERT(result == 0 || (result == -ENOENT && idx == cseg.idx[tno]));
                 }
                 if (cseg.mode == FIXED && cseg.iter == 0 && idx == cseg.nr_ops - 1) {
-                        t2_tx_wait(cseg.mod, tx, true);
+                        t2_tx_wait(cseg.mod, tx, false);
                 }
                 cseg.initialised += cseg.mode != FIXED || idx >= cseg.nr_ops;
                 ++idx;
@@ -11502,6 +11584,7 @@ static void ct(int argc, char **argv) {
         cseg.sleep_max = atoi(argv[5]);
         cseg.nr_ops = cseg.mode == FIXED ? atol(&argv[1][2]) : 0;
         ASSERT(cseg.sleep_min < cseg.sleep_max);
+        bool crash = argv[1][0] == 'c'; /* Crash or repeat? */
         uint64_t idx[cseg.nr_threads];
         uint64_t lo [cseg.nr_threads];
         memset(idx, 0, sizeof idx);
@@ -11509,9 +11592,9 @@ static void ct(int argc, char **argv) {
         cseg.idx = idx;
         cseg.lo  = lo;
         while (true) {
-                pid_t child = fork();
+                pid_t child = crash ? fork() : 0;
                 int   status;
-                if (child == 0) {
+                while (child == 0) {
                         pthread_t       tid[cseg.nr_threads + 1];
                         struct t2      *mod;
                         struct t2_tree *t;
@@ -11522,6 +11605,7 @@ static void ct(int argc, char **argv) {
                         if (cseg.iter == 0) {
                                 flags |= MAKE;
                         }
+                        cseg.shutdown = false;
                         mod = T2_INIT_MAKE(&file_storage.gen, wprep(flags), CT_SHIFT, CT_SHIFT, ttypes, ntypes, cseg.iter == 0);
                         if (cseg.iter == 0) {
                                 struct t2_tx *tx = t2_tx_make(mod);
@@ -11545,11 +11629,17 @@ static void ct(int argc, char **argv) {
                         cseg.initialised = 0;
                         if (cseg.iter != 0) {
                                 printf("    .... Checking from %lu.\n", cseg.lo[0]);
+                                failed = 0;
                                 for (int i = 0; i < cseg.nr_threads; ++i) {
                                         NOFAIL(pthread_create(&tid[i], NULL, &ct_scan, (void *)(long)i));
                                 }
                                 for (int i = 0; i < cseg.nr_threads; ++i) {
                                         NOFAIL(pthread_join(tid[i], NULL));
+                                }
+                                if (failed > 0) {
+                                        puts("Scan failed.");
+                                        debugger_attach();
+                                        exit(1);
                                 }
                                 seg_save();
                         }
@@ -11562,19 +11652,27 @@ static void ct(int argc, char **argv) {
                                 printf("    .... Sleeping for %i.\n", sec);
                                 sleep(sec);
                         } while (cseg.initialised < cseg.nr_threads);
-                        puts("    .... Crashing.");
-                        kill(getpid(), SIGKILL);
-                } else {
-                        ASSERT(child > 0);
-                        pid_t deceased = wait(&status);
-                        ASSERT(deceased == child);
-                        puts("    .... Child terminated.");
-                        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
-                                printf("    .... Child wasn't aborted properly: %o.\n", status);
-                                break;
+                        if (crash) {
+                                puts("    .... Crashing.");
+                                kill(getpid(), SIGKILL);
+                        } else {
+                                cseg.shutdown = true;
+                                for (int i = 0; i < cseg.nr_threads; ++i) {
+                                        NOFAIL(pthread_join(tid[i], NULL));
+                                }
                         }
+                        t2_fini(mod);
                         ++ cseg.iter;
                 }
+                ASSERT(child > 0); /* Parent. */
+                pid_t deceased = wait(&status);
+                ASSERT(deceased == child);
+                puts("    .... Child terminated.");
+                if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+                        printf("    .... Child wasn't aborted properly: %o.\n", status);
+                        break;
+                }
+                ++ cseg.iter;
         }
 }
 
@@ -11643,7 +11741,7 @@ int main(int argc, char **argv) {
         argv0 = argv[0];
         setbuf(stdout, NULL);
         setbuf(stderr, NULL);
-        if (argc > 1 && argv[1][0] == 'c') {
+        if (argc > 1 && tolower(argv[1][0]) == 'c') {
                 ct(argc, argv);
         } else {
                 ut();

@@ -195,6 +195,7 @@ struct t2_rec {
         struct t2_buf   *key;
         void           (*kcb)(struct t2_buf *buf, void *arg);
         void            *arg;
+        struct t2_buf   *scr;
         struct t2_cookie cookie;
 };
 
@@ -210,6 +211,7 @@ struct t2_cursor_op {
 struct t2_cursor {
         enum t2_dir          dir;
         struct t2_buf        curkey;
+        struct t2_buf        scr;
         struct t2_tree      *tree;
         struct t2_cursor_op *op;
         int32_t              maxlen;
@@ -289,9 +291,9 @@ enum t2_stats_flags {
 void t2_stats_print(struct t2 *mod, uint64_t flags);
 uint64_t t2_stats_flags_parse(const char *s);
 
-int t2_lookup_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize);
-int t2_insert_ptr(struct t2_tree *t, void *key, int32_t ksize, void *val, int32_t vsize, struct t2_tx *tx);
-int t2_delete_ptr(struct t2_tree *t, void *key, int32_t ksize, struct t2_tx *tx);
+int t2_lookup_ptr(struct t2_tree *t, void *key, void *scr, int32_t ksize, void *val, int32_t vsize);
+int t2_insert_ptr(struct t2_tree *t, void *key, void *scr, int32_t ksize, void *val, int32_t vsize, struct t2_tx *tx);
+int t2_delete_ptr(struct t2_tree *t, void *key, void *scr, int32_t ksize, struct t2_tx *tx);
 
 /*
  *  Local variables:

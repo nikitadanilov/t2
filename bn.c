@@ -447,6 +447,7 @@ static void *bworker(void *arg) {
         int32_t maxval = 0;
         int rndmax = 0;
         void *key;
+        void *cpy;
         void *val;
         void *cur;
         struct bvar *var;
@@ -469,9 +470,10 @@ static void *bworker(void *arg) {
         }
         assert(finger == 100);
         key = mem_alloc(maxkey);
+        cpy = mem_alloc(maxkey);
         val = mem_alloc(maxval);
         cur = mem_alloc(maxkey);
-        assert(key != NULL && val != NULL);
+        assert(key != NULL && val != NULL && cpy != NULL);
         rc = mem_alloc(bt->nr * sizeof rc[0]);
         assert(rc != NULL);
         data.b = &b->kv;
@@ -504,14 +506,14 @@ static void *bworker(void *arg) {
                         int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
                         if (opt->opt == BLOOKUP) {
                                 start = now();
-                                result = kv[kvt].lookup(rt, &data, key, ksize, val, maxval);
+                                result = kv[kvt].lookup(rt, &data, key, cpy, ksize, val, maxval);
                         } else if (opt->opt == BINSERT) {
                                 int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val);
                                 start = now();
-                                result = kv[kvt].insert(rt, &data, key, ksize, val, vsize);
+                                result = kv[kvt].insert(rt, &data, key, cpy, ksize, val, vsize);
                         } else if (opt->opt == BDELETE) {
                                 start = now();
-                                result = kv[kvt].del(rt, &data, key, ksize);
+                                result = kv[kvt].del(rt, &data, key, cpy, ksize);
                         } else if (opt->opt == BNEXT) {
                                 start = now();
                                 result = kv[kvt].next(rt, &data, key, ksize, (brnd(seed + 4) % 2 == 0) ? T2_MORE : T2_LESS, brnd(seed + 3) % opt->iter);
@@ -752,7 +754,9 @@ static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int 
         d->u.t2.c.tree = d->u.t2.tree;
         d->u.t2.c.op = &d->u.t2.cop;
         d->u.t2.cur = mem_alloc(maxkey);
+        d->u.t2.cpy = mem_alloc(maxkey);
         d->u.t2.c.curkey = (struct t2_buf){ .addr = d->u.t2.cur, .len = maxkey };
+        d->u.t2.c.scr    = (struct t2_buf){ .addr = d->u.t2.cpy, .len = maxkey };
         t2_thread_register();
         if (transactions) {
                 d->u.t2.tx = t2_tx_make(d->b->u.t2.mod);
@@ -766,19 +770,19 @@ static void t_worker_fini(struct rthread *rt, struct kvdata *d) {
         t2_thread_degister();
 }
 
-static int t_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
-        int result = t2_lookup_ptr(d->u.t2.tree, key, ksize, val, vsize);
+static int t_lookup(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize) {
+        int result = t2_lookup_ptr(d->u.t2.tree, key, cpy, ksize, val, vsize);
         assert(result == 0 || result == -ENOENT || result == -ENAMETOOLONG);
         return result;
 }
 
-static int t_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int t_insert(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize) {
         int result;
         if (transactions) {
                 result = t2_tx_open(d->b->u.t2.mod, d->u.t2.tx);
                 assert(result == 0);
         }
-        result = t2_insert_ptr(d->u.t2.tree, key, ksize, val, vsize, d->u.t2.tx);
+        result = t2_insert_ptr(d->u.t2.tree, key, cpy, ksize, val, vsize, d->u.t2.tx);
         if (transactions) {
                 t2_tx_close(d->b->u.t2.mod, d->u.t2.tx);
         }
@@ -786,13 +790,13 @@ static int t_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, 
         return result;
 }
 
-static int t_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+static int t_delete(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize) {
         int result;
         if (transactions) {
                 result = t2_tx_open(d->b->u.t2.mod, d->u.t2.tx);
                 assert(result == 0);
         }
-        result = t2_delete_ptr(d->u.t2.tree, key, ksize, d->u.t2.tx);
+        result = t2_delete_ptr(d->u.t2.tree, key, cpy, ksize, d->u.t2.tx);
         if (transactions) {
                 t2_tx_close(d->b->u.t2.mod, d->u.t2.tx);
         }

@@ -179,6 +179,7 @@ struct kvdata {
                         struct t2_cursor_op  cop;
                         struct t2_cursor     c;
                         void                *cur;
+                        void                *cpy;
                         struct t2_tx        *tx;
                         struct t2_cookie     kookie;
                 } t2;
@@ -195,9 +196,9 @@ struct kv {
         void (*umount)(struct benchmark *b);
         void (*worker_init)(struct rthread *rt, struct kvdata *d, int maxkey, int maxval);
         void (*worker_fini)(struct rthread *rt, struct kvdata *d);
-        int  (*lookup)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
-        int  (*insert)(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize);
-        int  (*del)(struct rthread *rt, struct kvdata *d, void *key, int ksize);
+        int  (*lookup)(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize);
+        int  (*insert)(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize);
+        int  (*del)(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize);
         int  (*next)  (struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr);
 };
 
