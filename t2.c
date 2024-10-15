@@ -6565,8 +6565,8 @@ static void range_print(void *orig, int32_t nsize, void *start, int32_t nob) {
 
 static void header_print(struct node *n) {
         struct header *h = nheader(n);
-        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRId64" ... %"PRId64"\n",
-               n->addr, h->treeid, h->level, h->ntype, nr(n), nsize(n), n, n->ref, n->flags, n->lsn_lo, n->lsn_hi);
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRId64" ... %"PRId64" seq: %"PRId64"\n",
+               n->addr, h->treeid, h->level, h->ntype, nr(n), nsize(n), n, n->ref, n->flags, n->lsn_lo, n->lsn_hi, n->seq);
 }
 
 static void simple_print(struct node *n) {
