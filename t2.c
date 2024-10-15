@@ -1098,6 +1098,7 @@ static struct t2_tx *wal_make(struct t2_te *te);
 static int  wal_init    (struct t2_te *engine, struct t2 *mod);
 static void wal_quiesce (struct t2_te *engine);
 static void wal_fini    (struct t2_te *engine);
+static void wal_destroy (struct t2_te *engine);
 static int  wal_diff    (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr, int32_t rtype);
 static int  wal_ante    (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr);
 static int  wal_post    (struct t2_te *engine, struct t2_tx *trax, int32_t nob, int nr, struct t2_txrec *txr);
@@ -1435,6 +1436,7 @@ void t2_fini(struct t2 *mod) {
                 __attribute__((fallthrough));
         case CACHE_INIT:
                 cache_fini(mod);
+                TXCALL(mod->te, destroy(mod->te));
                 __attribute__((fallthrough));
         case IOCACHE_INIT:
                 iocache_fini(&mod->ioc);
@@ -8464,14 +8466,6 @@ static void wal_fini(struct t2_te *engine) {
         for (int i = 0; i < en->nr_workers; ++i) {
                 pthread_join(en->worker[i], NULL);
         }
-        mem_free(en->worker);
-        ASSERT(cds_list_empty(&en->inflight));
-        if (en->cur != NULL) {
-                wal_buf_fini(en->cur);
-        }
-        while (!cds_list_empty(&en->ready)) {
-                wal_buf_fini(COF(en->ready.next, struct wal_buf, link));
-        }
         for (int i = 0; i < (1 << en->log_shift); ++i) {
                 if (en->fd[i] >= 0) {
                         close(en->fd[i]);
@@ -8480,9 +8474,21 @@ static void wal_fini(struct t2_te *engine) {
                         WITH_LOGNAME(en, i, unlink);
                 }
         }
+}
+
+static void wal_destroy(struct t2_te *engine) {
+        struct wal_te *en = COF(engine, struct wal_te, base);
+        ASSERT(cds_list_empty(&en->inflight));
+        ASSERT(cds_list_empty(&en->ready));
+        if (en->cur != NULL) {
+                wal_buf_fini(en->cur);
+        }
+        while (!cds_list_empty(&en->ready)) {
+                wal_buf_fini(COF(en->ready.next, struct wal_buf, link));
+        }
+        mem_free(en->worker);
         mem_free(en->snapbuf);
         mem_free(en->fd);
-        ASSERT(cds_list_empty(&en->ready));
         NOFAIL(pthread_cond_destroy(&en->bufwrite));
         NOFAIL(pthread_cond_destroy(&en->bufwait));
         NOFAIL(pthread_cond_destroy(&en->logwait));
@@ -8540,6 +8546,7 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         en->base.post     = &wal_post;
         en->base.quiesce  = &wal_quiesce;
         en->base.fini     = &wal_fini;
+        en->base.destroy  = &wal_destroy;
         en->base.lsn      = &wal_lsn;
         en->base.make     = &wal_make;
         en->base.open     = &wal_open;

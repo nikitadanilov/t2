@@ -97,6 +97,7 @@ struct t2_te { /* Transaction engine. */
         int           (*ante)    (struct t2_te *te, struct t2_tx *tx, int32_t nob, int nr, struct t2_txrec *txr);
         int           (*init)    (struct t2_te *te, struct t2 *mod);
         void          (*fini)    (struct t2_te *te);
+        void          (*destroy) (struct t2_te *te);
         void          (*quiesce) (struct t2_te *te);
         struct t2_tx *(*make)    (struct t2_te *te);
         lsn_t         (*lsn)     (struct t2_te *te);
