@@ -8049,6 +8049,53 @@ struct wal_writer_ctx {
 
 static __thread struct wal_writer_ctx wal_writer_ctx = {};
 
+static bool wal_is_header(const struct wal_rec *rec) {
+        return rec->rtype == HEADER || rec->rtype == COMPRS;
+}
+
+static struct wal_rec *wal_next(struct wal_rec *rec) {
+        return (void *)&rec->data[rec->len];
+}
+
+static void wal_rec_print(const struct wal_rec *rec) {
+        printf("%c %5i ", rec->rtype, rec->len);
+        switch (rec->rtype) {
+        case HEADER:
+        case COMPRS:
+        case FOOTER:
+                printf("lsn: %08"PRIx64"\n", rec->u.header.lsn);
+                break;
+        case UNDO:
+        case REDO:
+                printf("node: %08"PRIx64" off: %5i ntype: %4i\n", rec->u.update.node, rec->u.update.off, rec->u.update.ntype);
+                break;
+        default:
+                printf("illegible.\n");
+        }
+}
+
+static void wal_buf_print(struct wal_te *en, void *data) ATTRIBUTE_RETAIN;
+static void wal_buf_print(struct wal_te *en, void *data) {
+        for (struct wal_rec *rec = data; (void *)rec < data + en->buf_size; rec = wal_next(rec)) {
+                wal_rec_print(rec);
+        }
+}
+
+static bool wal_rec_invariant(const struct wal_rec *rec);
+
+static bool wal_buf_invariant(struct wal_te *en, void *data) {
+        struct wal_rec *rec;
+        for (rec = data + SOF(struct wal_header); (void *)rec < data + en->buf_size; rec = wal_next(rec)) {
+                if (wal_is_header(rec)) {
+                        return false;
+                }
+                if (!wal_rec_invariant(rec)) {
+                        return false;
+                }
+        }
+        return rec == data + en->buf_size;
+}
+
 static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         int                result;
         int                fd;
@@ -8086,6 +8133,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 }
         };
         ASSERT(buf->lsn != 0);
+        EXPENSIVE_ASSERT(wal_buf_invariant(en, data));
         nob = en->buf_size - buf->free;
         crc = en->crc ? crc32(crc32(0L, Z_NULL, 0), data + SOF(*header), nob - SOF(*header)) : 0;
         if (wal_writer_ctx.cctx != NULL) {
@@ -8212,10 +8260,6 @@ static void wal_get(struct wal_te *en, int32_t size) {
                 }
                 wal_buf_end_locked(en);
         }
-}
-
-static struct wal_rec *wal_next(struct wal_rec *rec) {
-        return (void *)&rec->data[rec->len];
 }
 
 enum {
@@ -8387,8 +8431,6 @@ static int wal_page(struct wal_te *en) {
         sh_broadcast(en->mod);
         return 0;
 }
-
-static bool wal_rec_invariant(const struct wal_rec *rec);
 
 static void wal_snapshot(struct wal_te *en) {
         int   rc1;
@@ -8694,10 +8736,6 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         return result == 0 ? &en->base : EPTR(result);
 }
 
-static bool wal_is_header(const struct wal_rec *rec) {
-        return rec->rtype == HEADER || rec->rtype == COMPRS;
-}
-
 static bool wal_rec_invariant(const struct wal_rec *rec) {
         struct wal_header *h = (void *)rec;
         lsn_t lsn = rec->u.header.lsn;
@@ -8729,17 +8767,27 @@ static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len
                 LOG("CRC32 mismatch: %"PRIx64, lsn);
                 return ERROR(-EIO);
         }
+        EXPENSIVE_ASSERT(wal_buf_invariant(en, space));
         for (rec = space; result == 0 && (void *)rec < space + len; rec = wal_next(rec)) {
                 if (!wal_rec_invariant(rec)) {
                         result = ERROR(-EIO);
                 } else if (wal_is_header(rec)) {
                         lsn = rec->u.header.lsn;
                 } else if (rec->rtype == FOOTER) {
+                        if (lsn == -1) {
+                                LOG("Footer without header: %"PRIx64, lsn);
+                                return ERROR(-EIO);
+                        }
                         if (rec->u.header.lsn != lsn) {
                                 LOG("Mismatch: header: %"PRIx64" footer: %"PRIx64, lsn, rec->u.header.lsn);
                                 return ERROR(-EIO);
                         }
+                        break;
                 } else if (rec->rtype == REDO) {
+                        if (lsn == -1) {
+                                LOG("Redo without header: %"PRIx64, lsn);
+                                return ERROR(-EIO);
+                        }
                         if (rec->u.update.off == T2_TXR_ALLOC || rec->u.update.off == T2_TXR_DEALLOC) {
                                 result = SCALL(en->mod, replay, rec->u.update.node, rec->u.update.off);
                         } else {
@@ -8767,6 +8815,10 @@ static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len
                                 }
                         }
                 }
+        }
+        if (result == 0 && wal_next(rec) != space + en->buf_size) {
+                LOG("Malformed buffer: %"PRIx64" size: %"PRIx64, lsn, (void *)wal_next(rec) - space);
+                return ERROR(-EIO);
         }
         return result;
 }
@@ -8896,10 +8948,11 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
                 return ERROR(-EIO);
         }
         for (struct rbuf *scan = start; scan < end; ++scan) {
-                if ((scan + 1)->lsn != scan->lsn + 1) {
+                struct rbuf *next = scan + 1;
+                if (next->lsn != scan->lsn + 1 || next->start < scan->start || next->end < scan->end) {
                         LOG("Non-sequential records.");
                         rbuf_print(scan);
-                        rbuf_print(scan + 1);
+                        rbuf_print(next);
                         return ERROR(-EIO);
                 }
         }
