@@ -9445,7 +9445,6 @@ struct file_storage {
         int               fd[FRAG_NR];
         int               hand;
         uint64_t          frag_free[FRAG_NR];
-        uint64_t          free;
         bool              allsame;
         dev_t             device;
         bool              kill_switch;
@@ -9477,9 +9476,6 @@ static int file_init(struct t2_storage *storage, bool make) {
         int namesize = strlen(fs->filename) + 10;
         char name[namesize]; /* VLA */
         NOFAIL(pthread_mutex_init(&fs->lock, NULL));
-        if (fs->free == 0) {
-                fs->free = FREE0;
-        }
         fs->allsame = true;
         for (int i = 0; i < ARRAY_SIZE(fs->frag_free); ++i) {
                 snprintf(name, namesize, file_fmt, fs->filename, i);
@@ -9500,7 +9496,6 @@ static int file_init(struct t2_storage *storage, bool make) {
                 } else {
                         fs->frag_free[i] = max_64(st.st_size, FREE0);
                 }
-                fs->free = max_64(fs->free, fs->frag_free[i]);
                 if (i == 0) {
                         fs->device = st.st_dev;
                 }
@@ -9547,7 +9542,6 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
         } else {
                 result = taddr_make(fs->frag_free[hand] | ((uint64_t)hand << BASE_SHIFT), shift_min);
                 fs->frag_free[hand] = lim;
-                fs->free = max_64(fs->free, fs->frag_free[hand]);
         }
         mutex_unlock(&fs->lock);
         return result;
@@ -9558,7 +9552,7 @@ static void file_free(struct t2_storage *storage, taddr_t addr) {
         file_kill_check(fs);
         if (!TRANSACTIONS) { /* TODO: Must be WALed. */
                 mutex_lock(&fs->lock);
-                fd_prune(fs->fd[frag_select(fs)], frag_off(taddr_saddr(addr)), taddr_ssize(addr));
+                fd_prune(fs->fd[frag(fs, addr)], frag_off(taddr_saddr(addr)), taddr_ssize(addr));
                 mutex_unlock(&fs->lock);
         }
 }
@@ -9808,22 +9802,21 @@ static bool file_same(struct t2_storage *storage, int fd) {
 
 static int file_replay(struct t2_storage *storage, taddr_t addr, enum t2_txr_op op) {
         struct file_storage *fs = COF(storage, struct file_storage, gen);
+        int      fr  = frag(fs, addr);
+        uint64_t off = frag_off(addr);
         ASSERT(op ==  T2_TXR_ALLOC || op ==  T2_TXR_DEALLOC);
+        mutex_lock(&fs->lock);
         if (op == T2_TXR_ALLOC) {
-                uint64_t end = taddr_saddr(addr) + taddr_ssize(addr);
-                mutex_lock(&fs->lock);
-                fs->free = max_64(end, fs->free);
-                for (int i = 0; i < FRAG_NR; ++i) {
-                        if (end > fs->frag_free[i]) {
-                                int result = ftruncate(fs->fd[i], end);
-                                (void)result; /* Suppress 'warn_unused_result'. */
-                        }
-                        fs->frag_free[i] = fs->free;
+                uint64_t end = off + taddr_ssize(addr);
+                if (end > fs->frag_free[fr]) {
+                        int result = ftruncate(fs->fd[fr], end);
+                        (void)result; /* Suppress 'warn_unused_result'. */
+                        fs->frag_free[fr] = end;
                 }
-                mutex_unlock(&fs->lock);
         } else {
-                file_free(storage, addr);
+                /* fd_prune(fs->fd[fr], off, taddr_ssize(addr)); */
         }
+        mutex_unlock(&fs->lock);
         return 0;
 }
 
