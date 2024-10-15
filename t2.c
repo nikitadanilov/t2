@@ -9499,11 +9499,12 @@ static taddr_t file_alloc(struct t2_storage *storage, int shift_min, int shift_m
         hand = frag_select(fs);
         lim = fs->frag_free[hand] + (1ull << shift_min);
         if (UNLIKELY(lim >= 1ull << BASE_SHIFT)) {
-                return ERROR(-ENOSPC);
+                result = ERROR(-ENOSPC);
+        } else {
+                result = taddr_make(fs->frag_free[hand] | ((uint64_t)hand << BASE_SHIFT), shift_min);
+                fs->frag_free[hand] = lim;
+                fs->free = max_64(fs->free, fs->frag_free[hand]);
         }
-        result = taddr_make(fs->frag_free[hand] | ((uint64_t)hand << BASE_SHIFT), shift_min);
-        fs->frag_free[hand] = lim;
-        fs->free = max_64(fs->free, fs->frag_free[hand]);
         mutex_unlock(&fs->lock);
         return result;
 }
