@@ -4689,6 +4689,7 @@ static int cache_load(struct t2 *mod) {
                                 }
                                 NCALLD(n, load(n, n->ntype)); /* TODO: Check for errors. */
                         }
+                        ASSERT(ncheck(n));
                 }
         }
         return 0;
@@ -8897,7 +8898,6 @@ static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len
                                                  */
                                                 sh_add(n->mod, &n, 1);
                                         }
-                                        ASSERT(ncheck(n));
                                         ASSERT(n->radix == NULL);
                                         n->radix = (void *)1; /* Suppress radixmap update of a possibly inconsistent node. */
                                         unlock(n, WRITE);
