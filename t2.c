@@ -9452,8 +9452,10 @@ static int file_init(struct t2_storage *storage, bool make) {
                         if (result != 0) {
                                 return ERROR(result);
                         }
+                        fs->frag_free[i] = FREE0;
+                } else {
+                        fs->frag_free[i] = max_64(st.st_size, FREE0);
                 }
-                fs->frag_free[i] = max_64(st.st_size, FREE0);
                 fs->free = max_64(fs->free, fs->frag_free[i]);
                 if (i == 0) {
                         fs->device = st.st_dev;
