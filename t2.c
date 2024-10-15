@@ -8776,6 +8776,8 @@ static void wal_recovery_done(struct wal_te *en, lsn_t start, lsn_t end) {
         wal_lock(en);
         en->lsn = en->max_persistent = en->max_synced = en->max_written = en->max_inflight = end;
         en->start_persistent = en->start = en->start_synced = en->start_written = en->max_paged = start;
+        wal_snapshot(en);
+        wal_snapshot(en);
         en->recovered = true;
         wal_broadcast(en);
         wal_unlock(en);
