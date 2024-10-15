@@ -308,6 +308,36 @@ enum {
 #define WRITE_ONCE(x, val) do { ACCESS_ONCE(x) = (val); } while (0)
 #define BARRIER()          __asm__ __volatile__("": : :"memory")
 
+#if defined(__x86_64__) || defined(__i386__)
+
+static inline void fence(void) {
+        __asm__ __volatile__("mfence" ::: "memory");
+}
+
+static inline void read_fence(void) {
+        __asm__ __volatile__("lfence" ::: "memory");
+}
+
+static inline void write_fence(void) {
+        __asm__ __volatile__("sfence" ::: "memory");
+}
+
+#else
+
+static inline void fence(void) {
+        __sync_synchronize();
+}
+
+static inline void read_fence(void) {
+        fence();
+}
+
+static inline void write_fence(void) {
+        fence();
+}
+
+#endif
+
 #define WITH_LOCK(exp, lock)                    \
 ({                                              \
         pthread_mutex_t *__lock = (lock);       \
@@ -1802,29 +1832,36 @@ static void rec_get(struct slot *s, int32_t idx) {
         NCALL(s->node, get(s));
 }
 
+static bool is_stable(const struct node *n) {
+        return (n->seq & 1) == 0;
+}
+
 static uint64_t node_seq(const struct node *n) {
         uint64_t seq = READ_ONCE(n->seq);
-        __sync_synchronize();
+        read_fence();
         return seq & ~(uint64_t)1;
 }
 
-static void node_seq_increase(struct node *n) {
-        __sync_synchronize();
+static void node_seq_increase_begin(struct node *n) {
+        ASSERT(is_stable(n));
+        n->seq++;
+        write_fence();
+}
+
+static void node_seq_increase_end(struct node *n) {
+        ASSERT(!is_stable(n));
+        write_fence();
         n->seq++;
 }
 
 static bool node_seq_is_valid(const struct node *n, uint64_t expected) {
         uint64_t seq;
-        __sync_synchronize();
+        read_fence();
         seq = READ_ONCE(n->seq);
         return seq == expected;
 }
 
 /* @node */
-
-static bool is_stable(const struct node *n) {
-        return (n->seq & 1) == 0;
-}
 
 enum { NODE_LOGGING = false };
 
