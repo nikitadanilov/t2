@@ -648,6 +648,13 @@ enum ext_id {
         M_NR
 };
 
+enum {
+        NREC_SHIFT   = 5,
+        NREC_MASK    = MASK(NREC_SHIFT),
+};
+
+#define NREC_ENABLED (0)
+
 struct node {
         struct cds_hlist_node      hash;
         taddr_t                    addr;
@@ -665,7 +672,38 @@ struct node {
         uint64_t                   cookie;
         pthread_rwlock_t           lock;
         struct rcu_head            rcu;
+#if NREC_ENABLED
+        _Atomic(uint32_t)          hand;
+        struct nrec {
+                uint64_t  time;
+                pthread_t thread;
+                char      op;
+                uint64_t  seq;
+        }                          nrec[1 << NREC_SHIFT];
+#endif
 };
+
+#if NREC_ENABLED
+
+static uint64_t rdtscp() {
+        uint32_t lo = 0;
+        uint32_t hi = 0;
+        asm volatile ("rdtscp" : "=a" (lo), "=d" (hi) :: "%rcx");
+        return ((uint64_t)hi << 32) | lo;
+}
+
+static void nrec(struct node *n, char op) {
+        n->nrec[n->hand++ & NREC_MASK] = (struct nrec) {
+                .time   = rdtscp(),
+                .thread = pthread_self(),
+                .op     = op,
+                .seq    = n->seq
+        };
+}
+#else
+static void nrec(struct node *n, char op) {
+}
+#endif
 
 enum lock_mode {
         NONE,
@@ -1858,6 +1896,7 @@ static uint64_t node_seq(const struct node *n) {
 static void node_seq_increase_begin(struct node *n) {
         ASSERT(is_stable(n));
         n->seq++;
+        nrec(n, '(');
         write_fence();
 }
 
@@ -1865,12 +1904,14 @@ static void node_seq_increase_end(struct node *n) {
         ASSERT(!is_stable(n));
         write_fence();
         n->seq++;
+        nrec(n, ')');
 }
 
 static bool node_seq_is_valid(const struct node *n, uint64_t expected) {
         uint64_t seq;
         read_fence();
         seq = READ_ONCE(n->seq);
+        nrec((void *)n, seq == expected ? '=' : '?');
         return seq == expected;
 }
 
@@ -3050,6 +3091,7 @@ static void path_add(struct path *p, struct node *n, uint64_t flags) {
         r->page.node = n;
         r->page.seq  = node_seq(n);
         r->flags     = flags;
+        nrec(n, 'A');
 }
 
 static bool path_is_valid(const struct path *p) {
@@ -5301,7 +5343,6 @@ static void counters_check() {
         }
         if (CVAL(wlock) != 0) {
                 LOG("Leaked wlock: %i.", CVAL(wlock));
-                debugger_attach();
         }
         if (CVAL(rcu) != 0) {
                 LOG("Leaked rcu: %i.", CVAL(rcu));
@@ -7414,6 +7455,7 @@ static int odir_insert(struct slot *s, struct cap *cap) {
         ASSERT(idx <= oh->nr);
         ASSERT(odir_invariant(n));
         NINC(n, insert);
+        nrec(n, '+');
         if (odir_free(n) < incr) {
                 NINC(n, nospc);
                 return -ENOSPC;
@@ -7455,6 +7497,7 @@ static void odir_delete(struct slot *s, struct cap *cap) {
         ASSERT(s->idx < oh->nr);
         ASSERT(odir_invariant(n));
         NINC(n, delete);
+        nrec(n, '-');
         oh->used -= len + ORSIZE;
         if (oh->end == rec->off + len) {
                 oh->end -= len;
@@ -7622,6 +7665,7 @@ static bool odir_search(struct node *n, struct path *p, struct slot *out) {
                 val->addr = orig + rec->off + rec->klen;
                 val->len  = rec->vlen;
                 buf_clip(val, mask, orig);
+                nrec(n, found ? '!' : '/');
         }
         return found;
 }
