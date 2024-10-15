@@ -69,6 +69,21 @@ enum {
 #define IOCACHE (1)
 #endif
 
+#define USE_PREFIX_SEPARATORS (0) /* TODO: Fix deletion with this enabled. */
+#define REF_DEBUG (0)
+
+/*
+ * When nodes are merged during deletion, a separating key higher in the tree
+ * needs to be updated (SEPCHG, delete_update()). As the new separating key can
+ * be longer than the old one, deletion might result in a split and a new root.
+ *
+ * For now, only merge nodes that share the immediate parent.
+ *
+ * This is a temporary work-around. For one thing, it might result in empty leaf
+ * nodes.
+ */
+enum { DELETE_WORKAROUND = true };
+
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
@@ -1293,12 +1308,16 @@ static bool next_stage(struct t2 *mod, bool success, enum t2_initialisation_stag
         return !success;
 }
 
-#define NEXT_STAGE(mod, result, stage)                          \
-({                                                              \
-        typeof(result) __result = (result);                     \
-        if (next_stage((mod), __result == 0, (stage))) {        \
-                return EPTR(__result);                          \
-        }                                                       \
+#define NEXT_STAGE(mod, result, stage)                                                    \
+({                                                                                        \
+        typeof(result) __result = (result);                                               \
+        if (__result != 0) {                                                              \
+                LOG("Initialisation failed at stage %i with %lli.", stage, (long long)__result); \
+                eprint();                                                                 \
+        }                                                                                 \
+        if (next_stage((mod), __result == 0, (stage))) {                                  \
+                return EPTR(__result);                                                    \
+        }                                                                                 \
 })
 
 enum {
@@ -1414,6 +1433,36 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
         SETIF0DEFAULT(flags, param, conf.cache_briard_shift,    DEFAULT_BRIARD_SHIFT,    "d");
         SETIF0DEFAULT(flags, param, conf.cache_buhund_shift,    DEFAULT_BUHUND_SHIFT,    "d");
         SETIF0DEFAULT(flags, param, conf.cache_direct,          DEFAULT_DIRECT,          "d");
+        if (DEBUG) {
+                DECIDE(flags, "Enabled:  DEBUG\n");
+        }
+        if (COUNTERS) {
+                DECIDE(flags, "Enabled:  COUNTERS\n");
+        }
+        if (EXPENSIVE_ASSERTS_ON) {
+                DECIDE(flags, "Enabled:  EXPENSIVE_ASSERTS_ON\n");
+        }
+        if (REF_DEBUG) {
+                DECIDE(flags, "Enabled:  REF_DEBUG\n");
+        }
+        if (DELETE_WORKAROUND) {
+                DECIDE(flags, "Enabled:  DELETE_WORKAROUND\n");
+        }
+        if (!TRANSACTIONS) {
+                DECIDE(flags, "Disabled: TRANSACTIONS\n");
+        }
+        if (!IOCACHE) {
+                DECIDE(flags, "Disabled: IOCACHE\n");
+        }
+        if (NREC_ENABLED) {
+                DECIDE(flags, "Enabled:  NREC_ENABLED\n");
+        }
+        if (SHADOW_CHECK_ON) {
+                DECIDE(flags, "Enabled:  SHADOW_CHECK_ON\n");
+        }
+        DECIDE(flags, "%s HAS_DEFAULT_FORMAT\n",    HAS_DEFAULT_FORMAT    ? "Enabled: " : "Disabled:");
+        DECIDE(flags, "%s DEFAULT_TE\n",            DEFAULT_TE            ? "Enabled: " : "Disabled:");
+        DECIDE(flags, "%s USE_PREFIX_SEPARATORS\n", USE_PREFIX_SEPARATORS ? "Enabled: " : "Disabled:");
         mod = t2_init(&param->conf);
         if (EISERR(mod) && (flags & T2_INIT_VERBOSE)) {
                 t2_error_print();
@@ -2337,8 +2386,6 @@ static void radixmap_update(struct node *n) {
 
 /* @policy */
 
-#define USE_PREFIX_SEPARATORS (0) /* TODO: Fix deletion with this enabled. */
-
 static int32_t prefix_separator(const struct t2_buf *l, struct t2_buf *r, int level) {
         ASSERT(buf_cmp(l, r) < 0);
         if (USE_PREFIX_SEPARATORS) {
@@ -2543,18 +2590,6 @@ static void delete_update(struct path *p, int idx, struct slot *s, struct page *
 static bool utmost_path(struct path *p, int idx, enum dir d) {
         return FORALL(i, idx, p->rung[i].page.lm == WRITE ? p->rung[i].pos == utmost(p->rung[i].page.node, d) : true);
 }
-
-/*
- * When nodes are merged during deletion, a separating key higher in the tree
- * needs to be updated (SEPCHG, delete_update()). As the new separating key can
- * be longer than the old one, deletion might result in a split and a new root.
- *
- * For now, only merge nodes that share the immediate parent.
- *
- * This is a temporary work-around. For one thing, it might result in empty leaf
- * nodes.
- */
-enum { DELETE_WORKAROUND = true };
 
 static int split_right_exec_delete(struct path *p, int idx) {
         int result = 0;
@@ -5730,8 +5765,6 @@ static void mutex_lock(pthread_mutex_t *lock) {
 static void mutex_unlock(pthread_mutex_t *lock) {
         NOFAIL(pthread_mutex_unlock(lock));
 }
-
-#define REF_DEBUG (0)
 
 #if REF_DEBUG
 
