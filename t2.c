@@ -2240,7 +2240,7 @@ static void radixmap_update(struct node *n) {
         int32_t          pidx = -1;
         int32_t          plen;
         SLOT_DEFINE(s, n);
-        if (level(n) < n->mod->min_radix_level || is_stable(n)) {
+        if (level(n) < n->mod->min_radix_level || UNLIKELY(n->radix == (void *)1)) { /* Skip updates during recovery. */
                 return; /* TODO: Use n->seq and prefix stats to decide. */
         }
         if (UNLIKELY(n->radix == NULL)) {
@@ -8847,10 +8847,17 @@ static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len
                                         if (!(n->flags & DIRTY)) {
                                                 n->flags |= DIRTY;
                                                 t2_lsnset((void *)n, lsn);
+                                                /*
+                                                 * At this point, the node might contain an inconsistent combination of updates from
+                                                 * lsn and later updates. It is safe to write, because WAL.
+                                                 */
                                                 sh_add(n->mod, &n, 1);
                                         }
                                         ASSERT(ncheck(n));
+                                        ASSERT(n->radix == NULL);
+                                        n->radix = (void *)1; /* Suppress radixmap update of a possibly inconsistent node. */
                                         unlock(n, WRITE);
+                                        n->radix = NULL;
                                         put(n);
                                 } else {
                                         result = ERROR(ERRCODE(n));
