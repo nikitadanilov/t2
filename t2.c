@@ -1757,41 +1757,52 @@ struct t2_tree *t2_tree_create(struct t2_tree_type *ttype, struct t2_tx *tx) {
         eclear();
         struct t2_tree *t = mem_alloc(sizeof *t);
         if (LIKELY(t != NULL)) {
-                struct page groot = { .lm = WRITE };
-                struct page gsb   = { .lm = WRITE, .node = mod->seg.sb };
+                int         result = 0;
+                struct page groot  = { .lm = WRITE };
+                struct page gsb    = { .lm = WRITE, .node = mod->seg.sb };
                 t->ttype = ttype;
                 struct node *root = groot.node = alloc(t, 0, &groot.cap);
                 if (EISOK(root)) {
-                        int result;
+                        uint64_t      zerodata0 = 0;
+                        struct t2_buf zero0     = { .len = 0, .addr = &zerodata0 };
                         lock(mod->seg.sb, WRITE);
                         lock(root, WRITE);
                         t->id = seg_root_add(&mod->seg, root->addr, &gsb.cap);
-                        if (TRANSACTIONS && tx != NULL) {
-                                struct t2_txrec txr[2 * M_NR + 1];
-                                int32_t         nob = 0;
-                                struct t2_te   *te  = mod->te;
-                                int             nr  = txadd_code(root, txr, T2_TXR_ALLOC);
-                                nr += txadd(&groot, &txr[nr], &nob);
-                                nr += txadd(&gsb,   &txr[nr], &nob);
-                                TXCALL(te, post(te, tx, nob, nr, txr));
+                        if (EISOK(t->id)) {
+                                if (TRANSACTIONS && tx != NULL) {
+                                        struct t2_txrec txr[2 * M_NR + 1];
+                                        int32_t         nob = 0;
+                                        struct t2_te   *te  = mod->te;
+                                        int             nr  = txadd_code(root, txr, T2_TXR_ALLOC);
+                                        nr += txadd(&groot, &txr[nr], &nob);
+                                        nr += txadd(&gsb,   &txr[nr], &nob);
+                                        TXCALL(te, post(te, tx, nob, nr, txr));
+                                }
+                                t->root = root->addr;
+                                dirty(&groot, true);
+                                dirty(&gsb, true);
+                        } else {
+                                result = t->id;
                         }
-                        t->root = root->addr;
-                        dirty(&groot, true);
-                        dirty(&gsb, true);
                         unlock(mod->seg.sb, WRITE);
                         unlock(root, WRITE);
                         put(root);
-                        result = insert(t, &(struct t2_rec) { .key = &zero, .val = &zero }, tx);
-                        if (result != 0) {
-                                t = EPTR(result);
+                        if (result == 0) {
+                                t2_tx_close(mod, tx); /* TODO: Should be the same transaction. */
+                                result = t2_tx_open(mod, tx) ?:
+                                         insert(t, &(struct t2_rec) { .key = &zero, .val = &zero, .scr = &zero0 }, tx);
                         }
-                        return t;
                 } else {
-                        return EPTR(root);
+                        result = ERROR((uintptr_t)root);
+                }
+                if (result != 0) {
+                        mem_free(t);
+                        t = EPTR(result);
                 }
         } else {
-                return EPTR(-ENOMEM);
+                t = EPTR(-ENOMEM);
         }
+        return t;
 }
 
 struct t2_tree *t2_tree_open(struct t2_tree_type *ttype, uint32_t id) {
