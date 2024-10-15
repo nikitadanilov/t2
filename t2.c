@@ -8049,6 +8049,16 @@ struct wal_writer_ctx {
 
 static __thread struct wal_writer_ctx wal_writer_ctx = {};
 
+static int32_t wal_compress(ZSTD_CCtx *cctx, void *dst, int32_t dst_len, const void *src, int32_t src_len, int level) {
+        ASSERT(dst_len >= src_len);
+        return ZSTD_compressCCtx(cctx, dst, dst_len, src, src_len, level);
+}
+
+static int32_t wal_decompress(void *dst, int32_t dst_len, const void *src, int32_t src_len) {
+        ASSERT(dst_len >= src_len);
+        return ZSTD_decompress(dst, dst_len, src, src_len); /* TODO: Use ZSTD_decompressDCtx(). */
+}
+
 static bool wal_is_header(const struct wal_rec *rec) {
         return rec->rtype == HEADER || rec->rtype == COMPRS;
 }
@@ -8137,9 +8147,15 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         nob = en->buf_size - buf->free;
         crc = en->crc ? crc32(crc32(0L, Z_NULL, 0), data + SOF(*header), nob - SOF(*header)) : 0;
         if (wal_writer_ctx.cctx != NULL) {
-                nob = ZSTD_compressCCtx(wal_writer_ctx.cctx,
-                                        wal_writer_ctx.buf + sizeof *header, wal_writer_ctx.buf_len - sizeof *header,
-                                        data + sizeof *header, nob - sizeof *header, wal_writer_ctx.level) + sizeof *header;
+                nob = wal_compress(wal_writer_ctx.cctx,
+                                   wal_writer_ctx.buf + SOF(*header), wal_writer_ctx.buf_len - SOF(*header),
+                                   data + SOF(*header), nob - SOF(*header), wal_writer_ctx.level);
+                if (UNLIKELY(ZSTD_isError(nob))) {
+                        LOG("Compression error: %"PRIx64" '%s' (%i)", buf->lsn, ZSTD_getErrorName(nob), nob);
+                        wal_lock(en); /* TODO: put the buffer on some list. */
+                        return ERROR(-EIO);
+                }
+                nob += SOF(*header);
                 if (UNLIKELY(nob > en->buf_size)) { /* Overflow. */
                         nob = en->buf_size - buf->free;
                 } else {
@@ -8752,19 +8768,30 @@ static bool wal_buf_is_valid(struct wal_te *en, struct wal_rec *rec) {
 }
 
 static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len) {
-        struct wal_rec *rec;
-        int             result = 0;
-        lsn_t           lsn    = -1;
+        struct wal_rec    *rec;
+        struct wal_header *h      = space;
+        int                result = 0;
+        lsn_t              lsn    = -1;
         ASSERT((en->flags & (FORCE|STEAL)) == 0); /* Redo-Noundo */
-        rec = space;
-        if (rec->rtype == COMPRS) {
-                struct wal_header *h = space; /* TODO: Use ZSTD_decompressDCtx(). */
-                ZSTD_decompress(scratch + sizeof *h, en->buf_size - sizeof *h,
-                                space   + sizeof *h, h->data.nob  - sizeof *h);
+        if (h->h.rtype == COMPRS) {
+                if (len != en->buf_size) {
+                        LOG("Compressed buffer too short: %i", len);
+                        return ERROR(-EIO);
+                }
+                len = wal_decompress(scratch + SOF(*h), en->buf_size - SOF(*h),
+                                     space   + SOF(*h), h->data.nob  - SOF(*h));
+                if (UNLIKELY(ZSTD_isError(len))) {
+                        LOG("Decompression error: %"PRIx64" '%s' (%i)", h->h.u.header.lsn, ZSTD_getErrorName(len), len);
+                        return ERROR(-EIO);
+                }
                 *(struct wal_header *)scratch = *h;
                 space = scratch;
-        if (UNLIKELY(en->crc && crc32(crc32(0L, Z_NULL, 0), space + SOF(struct wal_header), len - SOF(struct wal_header)))) {
-                LOG("CRC32 mismatch: %"PRIx64, lsn);
+                len += SOF(*h);
+        } else {
+                len = h->data.nob;
+        }
+        if (UNLIKELY(en->crc && h->data.crc != crc32(crc32(0L, Z_NULL, 0), space + SOF(struct wal_header), len - SOF(struct wal_header)))) {
+                LOG("CRC32 mismatch.");
                 return ERROR(-EIO);
         }
         EXPENSIVE_ASSERT(wal_buf_invariant(en, space));
@@ -9181,8 +9208,8 @@ static void wal_work(struct wal_te *en, uint32_t mask, int ops, pthread_cond_t *
 static void wal_writer_ctx_init(struct wal_te *en) {
         wal_writer_ctx.cctx    = ZSTD_createCCtx();
         wal_writer_ctx.level   = ZSTD_CLEVEL_DEFAULT - 1; /* TODO: ZSTD_defaultCLevel() in zstd v1.5.0. */
-        wal_writer_ctx.buf_len = ZSTD_compressBound(en->buf_size);
-        wal_writer_ctx.buf     = en->directio ? mem_alloc_align(en->buf_size, DIRECTIO_ALIGNMENT) : mem_alloc(en->buf_size);
+        wal_writer_ctx.buf_len = ZSTD_compressBound(en->buf_size - sizeof (struct wal_header)) + sizeof (struct wal_header);
+        wal_writer_ctx.buf     = en->directio ? mem_alloc_align(wal_writer_ctx.buf_len, DIRECTIO_ALIGNMENT) : mem_alloc(wal_writer_ctx.buf_len);
         ASSERT(en->directio ? (en->buf_size & (DIRECTIO_ALIGNMENT - 1)) == 0 : true);
 }
 
