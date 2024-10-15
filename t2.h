@@ -72,6 +72,8 @@ struct t2_param {
         int            wal_threshold_log_sync;
         int            wal_ready_lo;
         bool           wal_directio;
+        bool           wal_crc;
+        int            wal_compression;
         const char    *policy_leaf;
         const char    *policy_twig;
         const char    *policy_internal;

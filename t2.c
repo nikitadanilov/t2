@@ -33,6 +33,7 @@
 #include <urcu/rcuhlist.h>
 #include <urcu/list.h>
 #include <aio.h>
+#include <zlib.h>
 
 #include "t2.h"
 #include "config.h"
@@ -1117,7 +1118,7 @@ static void wal_pulse   (struct t2 *mod);
 static lsn_t wal_lsn(struct t2_te *engine);
 static struct t2_te *wal_prep  (const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                                 uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                                int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio);
+                                int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio, bool crc);
 static void cap_print(const struct cap *cap);
 static void cap_init(struct cap *cap, uint32_t size);
 static void cap_normalise(struct cap *cap, uint32_t size);
@@ -1250,7 +1251,8 @@ enum {
         DEFAULT_WAL_THRESHOLD_LOG_SYNCD =         64,
         DEFAULT_WAL_THRESHOLD_LOG_SYNC  =         32,
         DEFAULT_WAL_READY_LO            =         -1,
-        DEFAULT_WAL_DIRECTIO            = HAS_O_DIRECT
+        DEFAULT_WAL_DIRECTIO            = HAS_O_DIRECT,
+        DEFAULT_WAL_CRC                 =      false
 };
 
 const double DEFAULT_WAL_LOG_SLEEP = 1.0;
@@ -1307,6 +1309,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         SETIF0DEFAULT(flags, param, wal_threshold_log_sync,   DEFAULT_WAL_THRESHOLD_LOG_SYNC,    "d");
                         SETIF0DEFAULT(flags, param, wal_ready_lo,             DEFAULT_WAL_READY_LO,              "d");
                         SETIF0DEFAULT(flags, param, wal_directio,             DEFAULT_WAL_DIRECTIO,              "d");
+                        SETIF0DEFAULT(flags, param, wal_crc,                  DEFAULT_WAL_CRC,                   "d");
                         if (param->wal_log_nr & (param->wal_log_nr - 1)) {
                                 CONFLICT(flags, "wal_log_nr is not a power of 2.");
                         }
@@ -1318,7 +1321,7 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
                         }
                         te = wal_prep(param->wal_logname, param->wal_nr_bufs, param->wal_buf_size, param->wal_flags, param->wal_workers,
                                       ilog2(param->wal_log_nr), param->wal_log_sleep, BILLION * param->wal_age_limit, BILLION * param->wal_sync_age, param->wal_sync_nob, param->wal_log_size, param->wal_reserve_quantum,
-                                      param->wal_threshold_paged, param->wal_threshold_page, param->wal_threshold_log_syncd, param->wal_threshold_log_sync, param->wal_ready_lo, param->wal_directio);
+                                      param->wal_threshold_paged, param->wal_threshold_page, param->wal_threshold_log_syncd, param->wal_threshold_log_sync, param->wal_ready_lo, param->wal_directio, param->wal_crc);
                         if (EISERR(te)) {
                                 return EPTR(te);
                         }
@@ -7773,6 +7776,7 @@ struct wal_te {
         bool                                   page_syncing;
         bool                                   use_barrier;
         bool                                   directio;
+        bool                                   crc;
         struct t2                             *mod;
         int                                    snapshot_hand;
         struct wal_header                     *snapbuf;
@@ -7907,6 +7911,18 @@ static void wal_space_put(struct wal_buf *buf) {
         mutex_unlock(&buf->lock);
 }
 
+struct wal_header {
+        struct wal_rec h;
+        struct hdata {
+                lsn_t    start;
+                lsn_t    end;
+                int32_t  nob;
+                uint32_t crc;
+        } data;
+} __attribute__((packed));
+
+SASSERT(offsetof(struct wal_header, data) == offsetof(struct wal_header, h.data));
+
 enum { DIRECTIO_ALIGNMENT = 512 };
 
 static int wal_buf_alloc(struct wal_te *en) {
@@ -7976,17 +7992,6 @@ static ssize_t wal_pwrite(int fd, const void *buf, size_t count, off_t offset) {
         return (UT && ut_pwrite != NULL ? ut_pwrite : pwrite)(fd, buf, count, offset);
 }
 
-struct wal_header {
-        struct wal_rec h;
-        struct hdata {
-                lsn_t    start;
-                lsn_t    end;
-                int32_t  nob;
-        } data;
-} __attribute__((packed));
-
-SASSERT(offsetof(struct wal_header, data) == offsetof(struct wal_header, h.data));
-
 struct wal_writer_ctx {
         ZSTD_CCtx *cctx;
         size_t     buf_len;
@@ -8006,6 +8011,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         struct wal_header *header;
         int                nob;
         enum rec_type      rt;
+        uint32_t           crc;
         uint64_t __attribute__((unused)) start;
         ASSERT(wal_log_free(en) > 0);
         ASSERT(buf->off + SOF(struct wal_rec) <= en->buf_size);
@@ -8033,6 +8039,7 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         };
         ASSERT(buf->lsn != 0);
         nob = en->buf_size - buf->free;
+        crc = en->crc ? crc32(crc32(0L, Z_NULL, 0), data + SOF(*header), nob - SOF(*header)) : 0;
         if (wal_writer_ctx.cctx != NULL) {
                 nob = ZSTD_compressCCtx(wal_writer_ctx.cctx,
                                         wal_writer_ctx.buf + sizeof *header, wal_writer_ctx.buf_len - sizeof *header,
@@ -8058,7 +8065,8 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 .data = {
                         .start = bstart,
                         .end   = bend,
-                        .nob   = nob
+                        .nob   = nob,
+                        .crc   = crc
                 }
         };
         if (en->directio) {
@@ -8521,7 +8529,7 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
                               int log_shift, double log_sleep, uint64_t age_limit, uint64_t sync_age,
                               uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
                               int threshold_paged, int threshold_page, int threshold_log_syncd,
-                              int threshold_log_sync, int ready_lo, bool directio) {
+                              int threshold_log_sync, int ready_lo, bool directio, bool crc) {
         struct wal_te *en     = mem_alloc(sizeof *en);
         pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
         int           *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
@@ -8591,6 +8599,7 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         en->threshold_log_syncd = threshold_log_syncd;
         en->threshold_log_sync  = threshold_log_sync;
         en->directio            = directio;
+        en->crc                 = crc;
         en->snapbuf             = snap;
         en->snapbuf_size        = nob;
         en->snapbuf[0]          = (struct wal_header) {
@@ -8668,6 +8677,9 @@ static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len
                                 space   + sizeof *h, h->data.nob  - sizeof *h);
                 *(struct wal_header *)scratch = *h;
                 space = scratch;
+        if (UNLIKELY(en->crc && crc32(crc32(0L, Z_NULL, 0), space + SOF(struct wal_header), len - SOF(struct wal_header)))) {
+                LOG("CRC32 mismatch: %"PRIx64, lsn);
+                return ERROR(-EIO);
         }
         for (rec = space; result == 0 && (void *)rec < space + len; rec = wal_next(rec)) {
                 if (!wal_rec_invariant(rec)) {
@@ -11076,14 +11088,15 @@ enum {
         WAL_THRESHOLD_LOG_SYNCD =         64,
         WAL_THRESHOLD_LOG_SYNC  =         32,
         WAL_READY_LO            =          2,
-        WAL_DIRECTIO            = HAS_O_DIRECT
+        WAL_DIRECTIO            = HAS_O_DIRECT,
+        WAL_CRC                 =      false
 };
 
 const double WAL_LOG_SLEEP = 1.0;
 
 static struct t2_te *wprep(int32_t flags) {
         struct t2_te *engine = wal_prep(logname, NR_BUFS, BUF_SIZE, flags, WAL_WORKERS, WAL_LOG_SHIFT, WAL_LOG_SLEEP, WAL_AGE_LIMIT, WAL_SYNC_AGE, WAL_SYNC_NOB, WAL_LOG_SIZE, WAL_RESERVE_QUANTUM,
-                                        WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO, WAL_DIRECTIO);
+                                        WAL_THRESHOLD_PAGE, WAL_THRESHOLD_PAGED, WAL_THRESHOLD_LOG_SYNCD, WAL_THRESHOLD_LOG_SYNC, WAL_READY_LO, WAL_DIRECTIO, WAL_CRC);
         ASSERT(EISOK(engine));
         return engine;
 }
