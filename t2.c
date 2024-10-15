@@ -11482,14 +11482,14 @@ static void *ct_scan(void *arg) {
                         }
                 } else if (result == 0) {
                         if (!checkrec(&key, &val)) {
-                                printf("    .... Thread %i corrupt record: %i.\n", tno, result);
+                                printf("    .... Thread %3i corrupt record: %i.\n", tno, result);
                                 exit(1);
                         } else if (!got) {
                                 lo = idx;
                         }
                         got = true;
                 } else  {
-                        printf("    .... Thread %i scan error: %i.\n", tno, result);
+                        printf("    .... Thread %3i scan error: %i.\n", tno, result);
                         exit(1);
                 }
                 ++idx;
@@ -11497,7 +11497,7 @@ static void *ct_scan(void *arg) {
         half = idx >> 1;
         ok = cseg.mode == FIXED ? (idx - lo == cseg.nr_ops || idx - lo == cseg.nr_ops + 1) :
                                   (lo == half || lo == half + (idx & 1));
-        printf("    .... Thread %i found: %"PRIu64" .. %"PRIu64": %s\n", tno, lo, idx, ok ? "correct" : "wrong");
+        printf("    .... Thread %3i found: %10"PRIu64" .. %10"PRIu64": %s\n", tno, lo, idx, ok ? "correct" : "wrong");
         cseg.idx[tno] = idx;
         cseg.lo[tno] = lo;
         if (!ok) {
@@ -11541,6 +11541,7 @@ static void *busy(void *arg) {
                 }
                 makerec(tno, idx, &key, &klen, &val, &vlen);
                 result = WITH_TX(t->ttype->mod, tx, t2_insert_ptr(t, &key, &kcopy, klen, &val, vlen, tx));
+                CT_ASSERT(result == 0);
                 if (cseg.mode == CHECK) {
                         makerec(tno, idx, &key, &klen, &val, &vlen);
                         result = t2_lookup_ptr(t, &key, &kcopy, klen, &vcopy, sizeof vcopy);
@@ -11553,8 +11554,9 @@ static void *busy(void *arg) {
                 }
                 if (cseg.mode == FIXED && cseg.iter == 0 && idx == cseg.nr_ops - 1) {
                         t2_tx_wait(cseg.mod, tx, false);
+                        printf("    .... Thread %3i synched at %"PRId64".\n", tno, ((struct wal_tx *)tx)->id);
+                        cseg.initialised++;
                 }
-                cseg.initialised += cseg.mode != FIXED || idx >= cseg.nr_ops;
                 ++idx;
         }
         t2_tx_done(t->ttype->mod, tx);
@@ -11675,7 +11677,7 @@ static void ct(int argc, char **argv) {
                         cseg.file = &file_storage;
                         cseg.initialised = 0;
                         if (cseg.iter != 0) {
-                                printf("    .... Checking from %lu.\n", cseg.lo[0]);
+                                printf("    .... Checking from %10lu.\n", cseg.lo[0]);
                                 failed = 0;
                                 for (int i = 0; i < cseg.nr_threads; ++i) {
                                         NOFAIL(pthread_create(&tid[i], NULL, &ct_scan, (void *)(long)i));
@@ -11696,10 +11698,14 @@ static void ct(int argc, char **argv) {
                         }
                         do {
                                 sec = cseg.sleep_min + rand() % (cseg.sleep_max - cseg.sleep_min);
-                                printf("    .... Sleeping for %i.\n", sec);
+                                printf("    .... Sleeping for %2i.\n", sec);
                                 sleep(sec);
-                        } while (cseg.initialised < cseg.nr_threads);
-                        if (crash) {
+                        } while (cseg.iter == 0 && cseg.initialised < cseg.nr_threads);
+                        if (debugger_attached > 0) {
+                                while (true) {
+                                        sleep(1);
+                                }
+                        } else if (crash) {
                                 puts("    .... Crashing.");
                                 kill(getpid(), SIGKILL);
                         } else {
