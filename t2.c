@@ -83,8 +83,9 @@ enum {
         &__ctx;                                 \
 })
 #define IMMANENTISE(fmt, ...) immanentise(MSG_PREP(fmt) , ## __VA_ARGS__)
+#define VERITASNUMQUAMPERIT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
 #if DEBUG
-#define ASSERT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
+#define ASSERT(expr) VERITASNUMQUAMPERIT(expr)
 #else
 #define ASSERT(expr) ASSUME(expr)
 #endif
