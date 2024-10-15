@@ -17,6 +17,8 @@
 #define NOSANITISE_ADDRESS
 #endif
 
+#define ATTRIBUTE_RETAIN __attribute__((used))
+
 /*
  *  Local variables:
  *  c-indentation-style: "K&R"
