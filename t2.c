@@ -11862,6 +11862,8 @@ static bool ut_mem_alloc_fail() {
  *
  * - simplify rung flags
  *
+ * - execute inserts and deletes under RCU when possible: no IO, no allocator calls, trylocks succeed
+ *
  * Done:
  *
  * + path locking and re-checking (allocate new nodes outside of the lock)
