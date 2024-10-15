@@ -11338,7 +11338,7 @@ enum {
         WAL_THRESHOLD_LOG_SYNC  =         32,
         WAL_READY_LO            =          2,
         WAL_DIRECTIO            = HAS_O_DIRECT,
-        WAL_CRC                 =      false
+        WAL_CRC                 =       true
 };
 
 const double WAL_LOG_SLEEP = 1.0;
