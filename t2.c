@@ -1891,7 +1891,7 @@ static int lock(struct node *n, enum lock_mode mode) {
                 ;
         } else if (mode == WRITE) {
                 NOFAIL(pthread_rwlock_wrlock(&n->lock));
-                ASSERT(is_stable(n));
+                node_seq_increase_begin(n);
                 CINC(wlock);
                 node_state_print(n, 'L');
                 if (n->flags&PAGING) { /* COW. */
@@ -1922,10 +1922,8 @@ static void unlock(struct node *n, enum lock_mode mode) {
                 ;
         } else if (mode == WRITE) {
                 node_state_print(n, 'U');
-                if (!is_stable(n)) {
-                        radixmap_update(n);
-                        node_seq_increase(n);
-                }
+                radixmap_update(n);
+                node_seq_increase_end(n);
                 NOFAIL(pthread_rwlock_unlock(&n->lock));
                 CDEC(wlock);
         } else if (mode == READ) {
@@ -2084,7 +2082,6 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                 if (LIKELY(result == 0)) {
                                         if (LIKELY(ncheck(n) && addr != 0)) {
                                                 struct header *h = nheader(n);
-                                                node_seq_increase(n);
                                                 if (mod->ntypes[h->ntype]->ops->load != NULL) {
                                                         mod->ntypes[h->ntype]->ops->load(n, mod->ntypes[h->ntype]); /* TODO: Handle errors. */
                                                 }
@@ -2678,9 +2675,13 @@ static enum policy_id policy_select(const struct path *p, int idx) {
 
 /* @tree */
 
+static bool page_seq_is_valid(const struct page *g) {
+        return node_seq_is_valid(g->node, g->seq + !!(g->lm == WRITE));
+}
+
 static bool rung_precheck(const struct rung *r, int idx) {
         struct node *n = r->page.node; /* Check that the path is descending before locking it. */
-        return node_seq_is_valid(n, r->page.seq) && (idx > 0 ? level(n) + 1 == level((r - 1)->page.node) : true);
+        return page_seq_is_valid(&r->page) && (idx > 0 ? level(n) + 1 == level((r - 1)->page.node) : true);
 }
 
 static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struct t2_tx *tx, enum optype opt) {
@@ -2695,8 +2696,6 @@ static void path_init(struct path *p, struct t2_tree *t, struct t2_rec *r, struc
 static void dirty(struct page *g, bool hastx) {
         struct node *n = g->node;
         if (n != NULL && g->lm == WRITE) {
-                ASSERT(is_stable(n));
-                node_seq_increase(n);
                 node_state_print(n, 'D');
                 if ((!TRANSACTIONS || !hastx) && !(n->flags & DIRTY)) {
                         n->flags |= DIRTY; /* Transactional nodes are dirtied in ->post(). */
@@ -2987,7 +2986,7 @@ static bool rung_validity_invariant(const struct path *p, int i) {
         const struct rung *r    = &p->rung[i];
         const struct node *n    = r->page.node;
         const struct rung *prev = &p->rung[i - 1];
-        return is_stable(n) &&
+        return is_stable(n) == (r->page.lm != WRITE) &&
                 (!is_leaf(n) ? r->pos < nr(n) : true) &&
                 (i == 0 ? p->tree->root == n->addr :
                  (prev->page.lm != WRITE) || (n->addr == internal_get(prev->page.node, prev->pos) &&
@@ -2999,9 +2998,9 @@ static bool rung_is_valid(const struct path *p, int i) {
         const struct rung *r        = &p->rung[i];
         struct page       *left     = brother((struct rung *)r, LEFT);
         struct page       *right    = brother((struct rung *)r, RIGHT);
-        bool               is_valid = node_seq_is_valid(r->page.node, r->page.seq) &&
-                (left->node  != NULL ? node_seq_is_valid(left->node,  left->seq)  : true) &&
-                (right->node != NULL ? node_seq_is_valid(right->node, right->seq) : true);
+        bool               is_valid = page_seq_is_valid(&r->page) &&
+                (left->node  != NULL ? page_seq_is_valid(left)  : true) &&
+                (right->node != NULL ? page_seq_is_valid(right) : true);
         ASSERT(is_valid && r->page.lm == WRITE ? rung_validity_invariant(p, i) : true);
         return is_valid;
 }
@@ -3564,7 +3563,7 @@ static int cookie_node_complete(struct path *p, struct node *n) {
         switch (p->opt) {
         case LOOKUP:
                 result = found ? val_copy(r, n, &s) : -ENOENT;
-                if (!node_seq_is_valid(n, rung->page.seq)) { /* No need to run full path_is_valid(). */
+                if (!page_seq_is_valid(&rung->page)) { /* No need to run full path_is_valid(). */
                         result = -ESTALE;
                 }
                 break;
