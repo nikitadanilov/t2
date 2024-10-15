@@ -7982,8 +7982,8 @@ static int wal_buf_alloc(struct wal_te *en) {
                 NOFAIL(pthread_mutex_init(&buf->lock, NULL));
                 NOFAIL(pthread_cond_init(&buf->signal, NULL));
                 cds_list_add(&buf->link, &en->ready);
-                buf->off  = sizeof(struct wal_rec);
-                buf->free = en->buf_size - 2 * sizeof(struct wal_rec);
+                buf->off  = sizeof(struct wal_header);
+                buf->free = en->buf_size - sizeof(struct wal_rec) - sizeof(struct wal_header);
                 ++en->ready_nr;
                 return 0;
         } else {
@@ -8451,7 +8451,7 @@ static bool wal_progress(struct wal_te *en, uint32_t allowed, int max, uint32_t 
                 ++done;
         }
         if (done < max && allowed&BUF_CLOSE && UNLIKELY(en->cur != NULL && READ_ONCE(en->mod->tick) - en->cur_age > en->age_limit &&
-                                                        en->cur->off > SOF(struct wal_rec))) {
+                                                        en->cur->off > SOF(struct wal_header))) {
                 if (LIKELY(wal_log_free(en) > wal_log_need(en))) {
                         wal_buf_end(en);
                         CINC(wal_cur_aged);
@@ -8818,7 +8818,7 @@ static int wal_index_replay(struct wal_te *en, int nr, struct rbuf *index, lsn_t
                 struct rbuf *r = &index[i];
                 if (start <= r->lsn && r->lsn < end) {
                         result = pread(en->fd[r->idx], buf0, en->buf_size, r->off);
-                        if (result < SOF(struct wal_rec)) {
+                        if (result < SOF(struct wal_header)) {
                                 LOG("Cannot read log buffer %04x+%"PRId64": %i/%i.", r->idx, r->off, result, errno);
                                 return ERROR(result < 0 ? -errno : -EIO);
                         }
