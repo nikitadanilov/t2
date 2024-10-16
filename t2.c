@@ -5826,43 +5826,50 @@ static uint64_t threadid(void)
 static volatile bool debugger_plug = true;
 static _Atomic(int) debugger_attached = 0;
 
+static void wait_forever() {
+        while (debugger_plug) {
+                sleep(1);
+        }
+}
+
 static void debugger_attach(void) {
         if (debugger_attached++ == 0) {
                 int         result;
-                const char *debugger = getenv("DEBUGGER");
+                const char *argv[6]    = {};
+                char        pidbuf[16] = {};
+                char        tidbuf[64] = {};
+                const char *debugger   = getenv("T2_DEBUGGER");
+                argv[0] = debugger;
+                argv[1] = argv0;
+                argv[2] = pidbuf;
+                snprintf(pidbuf, sizeof pidbuf, "%i", getpid());
+                snprintf(tidbuf, sizeof tidbuf, "thread find %i", gettid());
                 if (debugger == NULL) {
                         return;
+                } else if (strcmp(debugger, "gdb") == 0) {
+                        argv[3] = "-ex"; /* gdb <ARGV0> <PID> -ex "thread find <TID>" */
+                        argv[4] = tidbuf;
+                        argv[5] = NULL;
+
                 } else if (strcmp(debugger, "wait") == 0) {
                         printf("Waiting for debugger, pid: %i tid: %"PRId64".\n", getpid(), threadid());
-                        result = +1;
+                        wait_forever();
+                        return;
                 } else {
-                        if (argv0 == NULL) {
-                                puts("Quod est nomen meum?");
-                                return;
-                        }
-                        result = fork();
-                }
-                if (result > 0) {
-                        while (debugger_plug) {
-                                sleep(1);
-                        }
-                } else if (result == 0) {
-                        const char *argv[4];
-                        char        pidbuf[16];
-                        argv[0] = debugger;
-                        argv[1] = argv0;
-                        argv[2] = pidbuf;
                         argv[3] = NULL;
-                        snprintf(pidbuf, sizeof pidbuf, "%i", getppid());
-                        printf("Attaching debugger: %s %s %s\n", argv[0], argv[1], argv[2]);
+                }
+                if (argv0 == NULL) {
+                        puts("Quod est nomen meum?");
+                        return;
+                }
+                result = fork();
+                if (result == 0) {
+                        printf("Attaching debugger: %s %s %s %s %s\n", argv[0], argv[1], argv[2], argv[3], argv[4]);
                         execvp(debugger, (void *)argv);
                         exit(1);
                 }
-        } else {
-                while (debugger_plug) {
-                        sleep(1);
-                }
         }
+        wait_forever();
 }
 
 /* @ht */
@@ -9490,9 +9497,7 @@ static const char file_fmt[] = "%s.%03x";
 static void file_kill_check(struct file_storage *fs) {
         mutex_lock(&fs->lock);
         if (UNLIKELY(fs->kill_switch)) {
-                while (1) {
-                        sleep(1);
-                }
+                wait_forever();
         }
         mutex_unlock(&fs->lock);
 }
@@ -11735,9 +11740,7 @@ static void ct(int argc, char **argv) {
                                 sleep(sec);
                         } while (cseg.iter == 0 && cseg.initialised < cseg.nr_threads);
                         if (debugger_attached > 0) {
-                                while (true) {
-                                        sleep(1);
-                                }
+                                wait_forever();
                         } else if (crash) {
                                 puts("    .... Crashing.");
                                 kill(getpid(), SIGKILL);
