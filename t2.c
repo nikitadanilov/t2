@@ -69,8 +69,12 @@ enum {
 #define IOCACHE (1)
 #endif
 
+#define EXPENSIVE_ASSERTS_ON (0)
+#define SHADOW_CHECK_ON (0)
 #define USE_PREFIX_SEPARATORS (0) /* TODO: Fix deletion with this enabled. */
 #define REF_DEBUG (0)
+#define NREC_ENABLED (0)
+enum { NODE_LOGGING = false };
 
 /*
  * When nodes are merged during deletion, a separating key higher in the tree
@@ -104,7 +108,6 @@ enum { DELETE_WORKAROUND = true };
 #else
 #define ASSERT(expr) ASSUME(expr)
 #endif
-#define EXPENSIVE_ASSERTS_ON (0)
 #if EXPENSIVE_ASSERTS_ON
 #define EXPENSIVE_ASSERT(expr) ASSERT(expr)
 #else
@@ -668,8 +671,6 @@ enum {
         NREC_MASK    = MASK(NREC_SHIFT),
 };
 
-#define NREC_ENABLED (0)
-
 struct node {
         struct cds_hlist_node      hash;
         taddr_t                    addr;
@@ -734,8 +735,6 @@ struct ext {
 struct cap {
         struct ext ext[M_NR];
 };
-
-#define SHADOW_CHECK_ON (0)
 
 struct page {
         struct node    *node;
@@ -1965,8 +1964,6 @@ static bool node_seq_is_valid(const struct node *n, uint64_t expected) {
 }
 
 /* @node */
-
-enum { NODE_LOGGING = false };
 
 static void node_state_print(struct node *n, char state) {
         if (NODE_LOGGING) { /* Keep node-trace.py in sync. */
