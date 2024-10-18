@@ -7862,6 +7862,11 @@ enum {
         FILL  = 1 << 4  /* Pre-fill the journal. */
 };
 
+struct wal_prec {
+        lsn_t start;
+        lsn_t end;
+};
+
 struct wal_te {
         struct t2_te                           base;
         alignas(MAX_CACHELINE) pthread_mutex_t curlock;
@@ -7889,6 +7894,8 @@ struct wal_te {
         lsn_t                                  start_written;
         lsn_t                                  start_synced;
         lsn_t                                  start_persistent;
+        int                                    persisted_shift;
+        struct wal_prec                       *persisted;
         uint64_t                               last_log_sync;
         uint64_t                               last_page_sync;
         uint64_t                               cur_age;
@@ -8195,12 +8202,21 @@ static bool wal_buf_invariant(struct wal_te *en, void *data) {
         return rec == data + en->buf_size;
 }
 
+static void wal_log_sync_at(struct wal_te *en, lsn_t start, lsn_t end, lsn_t max_written, lsn_t start_synced) {
+        en->max_persistent   = max_64(en->max_persistent, end);
+        en->max_synced       = max_64(en->max_synced, max_written);
+        en->start_persistent = max_64(en->start_persistent, start_synced);
+        en->start_synced     = max_64(en->start_synced, start);
+}
+
 static int wal_write(struct wal_te *en, struct wal_buf *buf) {
         int                result;
         int                fd;
         off_t              off;
-        lsn_t              bstart = en->start;
-        lsn_t              bend   = en->max_synced;
+        lsn_t              bstart       = en->start;
+        lsn_t              bend         = en->max_synced;
+        lsn_t              max_written  = en->max_written;
+        lsn_t              start_synced = en->start_synced;
         void              *data;
         struct wal_header *header;
         int                nob;
@@ -8295,6 +8311,10 @@ static int wal_write(struct wal_te *en, struct wal_buf *buf) {
                 if (lsn > en->max_written) {
                         en->max_written = lsn;
                         en->start_written = max_64(en->start_written, bstart);
+                        en->persisted[buf->lsn & MASK(en->persisted_shift)] = (struct wal_prec) { .start = bstart, .end = bend };
+                        if (en->directio) {
+                                wal_log_sync_at(en, bstart, bend, max_written, start_synced);
+                        }
                         wal_broadcast(en);
                 }
                 NOFAIL(pthread_cond_broadcast(&en->bufwait));
@@ -8486,7 +8506,10 @@ static int wal_post(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
 }
 
 static void wal_log_sync(struct wal_te *en) {
-        int result = 0;
+        int   result          = 0;
+        lsn_t max_written     = en->max_written;
+        lsn_t start_synced    = en->start_synced;
+        struct wal_prec *prec = &en->persisted[(en->max_written - 1) & MASK(en->persisted_shift)];
         en->last_log_sync = READ_ONCE(en->mod->tick);
         en->log_syncing = true;
         if (!en->directio) {
@@ -8500,10 +8523,7 @@ static void wal_log_sync(struct wal_te *en) {
                 wal_lock(en);
         }
         if (LIKELY(result == 0)) {
-                en->max_persistent = en->max_synced;
-                en->max_synced = en->max_written;
-                en->start_persistent = en->start_synced;
-                en->start_synced = en->start_written;
+                wal_log_sync_at(en, prec->start, prec->end, max_written, start_synced);
                 wal_broadcast(en);
         } else {
                 LOG("Cannot sync log: %i.", errno);
@@ -8689,6 +8709,7 @@ static void wal_destroy(struct t2_te *engine) {
         while (!cds_list_empty(&en->ready)) {
                 wal_buf_fini(COF(en->ready.next, struct wal_buf, link));
         }
+        mem_free(en->persisted);
         mem_free(en->worker);
         mem_free(en->snapbuf);
         mem_free(en->fd);
@@ -8725,19 +8746,21 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
                               uint64_t sync_nob, lsn_t log_size, int reserve_quantum,
                               int threshold_paged, int threshold_page, int threshold_log_syncd,
                               int threshold_log_sync, int ready_lo, bool directio, bool crc) {
-        struct wal_te *en     = mem_alloc(sizeof *en);
-        pthread_t     *ws     = mem_alloc(workers * sizeof ws[0]);
-        int           *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
-        int            nob    = (sizeof *en->snapbuf + sizeof (struct wal_rec) + DIRECTIO_ALIGNMENT - 1) / DIRECTIO_ALIGNMENT * DIRECTIO_ALIGNMENT;
-        void          *snap   = mem_alloc_align(nob, DIRECTIO_ALIGNMENT);
-        int            result = 0;
+        struct wal_te   *en     = mem_alloc(sizeof *en);
+        pthread_t       *ws     = mem_alloc(workers * sizeof ws[0]);
+        int             *fd     = mem_alloc((1 << log_shift) * sizeof fd[0]);
+        int              pshift = ilog2(nr_bufs) + 1;
+        struct wal_prec *pers   = mem_alloc((1 << pshift) * sizeof pers[0]);
+        int              nob    = (sizeof *en->snapbuf + sizeof (struct wal_rec) + DIRECTIO_ALIGNMENT - 1) / DIRECTIO_ALIGNMENT * DIRECTIO_ALIGNMENT;
+        void            *snap   = mem_alloc_align(nob, DIRECTIO_ALIGNMENT);
+        int              result = 0;
         ASSERT(nr_bufs > 0);
         ASSERT((buf_size & (buf_size - 1)) == 0);
         ASSERT(workers > 0);
         ASSERT(log_sleep > 0);
         ASSERT(directio ? HAS_O_DIRECT : true);
         ASSERT((buf_size & (DIRECTIO_ALIGNMENT - 1)) == 0);
-        if (en == NULL || ws == NULL || fd == NULL || snap == NULL) {
+        if (en == NULL || ws == NULL || fd == NULL || snap == NULL || pers == NULL) {
                 mem_free(en);
                 mem_free(ws);
                 mem_free(fd);
@@ -8795,6 +8818,8 @@ static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, in
         en->threshold_log_sync  = threshold_log_sync;
         en->directio            = directio;
         en->crc                 = crc;
+        en->persisted_shift     = pshift;
+        en->persisted           = pers;
         en->snapbuf             = snap;
         en->snapbuf_size        = nob;
         en->snapbuf[0]          = (struct wal_header) {
