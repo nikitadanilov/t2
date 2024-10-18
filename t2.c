@@ -8943,9 +8943,9 @@ static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len
                                 };
                                 struct node *n = (void *)t2_apply(en->mod, &txr);
                                 if (EISOK(n)) {
+                                        t2_lsnset((void *)n, lsn);
                                         if (!(n->flags & DIRTY)) {
                                                 n->flags |= DIRTY;
-                                                t2_lsnset((void *)n, lsn);
                                                 /*
                                                  * At this point, the node might contain an inconsistent combination of updates from
                                                  * lsn and later updates. It is safe to write, because WAL.
