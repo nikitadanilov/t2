@@ -11833,14 +11833,16 @@ int main(int argc, char **argv) {
                 ct(argc, argv);
         } else {
                 ut();
-                printf("Re-running with disordered storage.\n");
-                ut_storage = &disorder_storage.gen;
-                ut();
-                ut_storage = &file_storage.gen;
-                for (int i = 100000; i != 0; i /= 2) {
-                        printf("Re-running with every %i memory allocation failing.\n", i);
-                        ut_mem_alloc_fail_N = i;
+                if (argc > 1 && argv[1][0] == 'd') {
+                        printf("Re-running with disordered storage.\n");
+                        ut_storage = &disorder_storage.gen;
                         ut();
+                        ut_storage = &file_storage.gen;
+                        for (int i = 100000; i != 0; i /= 2) {
+                                printf("Re-running with every %i memory allocation failing.\n", i);
+                                ut_mem_alloc_fail_N = i;
+                                ut();
+                        }
                 }
         }
         return 0;
