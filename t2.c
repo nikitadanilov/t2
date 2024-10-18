@@ -10452,7 +10452,7 @@ static void traverse_ut() {
         struct cap m = {};
         int result;
         usuite("traverse");
-        utest("t2_init");
+        utest("init");
         struct t2 *mod = T2_INIT(ut_storage, NULL, HT_SHIFT, CA_SHIFT, ttypes, ntypes);
         ttype.mod = mod;
         buf_init_str(&key, key0);
@@ -10503,7 +10503,7 @@ static void traverse_ut() {
         result = traverse(&p);
         ASSERT(result == -ENOENT || EOOM(result));
         ht_delete(&n);
-        utest("t2_fini");
+        utest("fini");
         t2_fini(mod);
         utestdone();
 }
