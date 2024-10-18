@@ -1357,6 +1357,8 @@ const double DEFAULT_WAL_SYNC_AGE  = 0.1;
 #define SET(flags, obj, field, val, fmt, reason) ({ (obj)->field = (val); DECIDE(flags, "Set %-40s to: %20" fmt " (" reason ").\n", #field, (obj)->field); })
 #define SETIF0(flags, obj, field, val, fmt, reason) ({ ((obj)->field == 0) ? SET(flags, obj, field, val, fmt, reason) : (void)0; })
 #define SETIF0DEFAULT(flags, obj, field, val, fmt) SETIF0(flags, obj, field, val, fmt, "default")
+#define ENABLED(swtch) do { if (swtch) { DECIDE(flags, "Enabled:  " #swtch "\n"); } } while (0)
+#define SWITCH(swtch) DECIDE(flags, "%s " #swtch "\n", (swtch) ? "Enabled: " : "Disabled:")
 
 struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
         struct t2 *mod;
@@ -1432,36 +1434,19 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
         SETIF0DEFAULT(flags, param, conf.cache_briard_shift,    DEFAULT_BRIARD_SHIFT,    "d");
         SETIF0DEFAULT(flags, param, conf.cache_buhund_shift,    DEFAULT_BUHUND_SHIFT,    "d");
         SETIF0DEFAULT(flags, param, conf.cache_direct,          DEFAULT_DIRECT,          "d");
-        if (DEBUG) {
-                DECIDE(flags, "Enabled:  DEBUG\n");
-        }
-        if (COUNTERS) {
-                DECIDE(flags, "Enabled:  COUNTERS\n");
-        }
-        if (EXPENSIVE_ASSERTS_ON) {
-                DECIDE(flags, "Enabled:  EXPENSIVE_ASSERTS_ON\n");
-        }
-        if (REF_DEBUG) {
-                DECIDE(flags, "Enabled:  REF_DEBUG\n");
-        }
-        if (DELETE_WORKAROUND) {
-                DECIDE(flags, "Enabled:  DELETE_WORKAROUND\n");
-        }
-        if (!TRANSACTIONS) {
-                DECIDE(flags, "Disabled: TRANSACTIONS\n");
-        }
-        if (!IOCACHE) {
-                DECIDE(flags, "Disabled: IOCACHE\n");
-        }
-        if (NREC_ENABLED) {
-                DECIDE(flags, "Enabled:  NREC_ENABLED\n");
-        }
-        if (SHADOW_CHECK_ON) {
-                DECIDE(flags, "Enabled:  SHADOW_CHECK_ON\n");
-        }
-        DECIDE(flags, "%s HAS_DEFAULT_FORMAT\n",    HAS_DEFAULT_FORMAT    ? "Enabled: " : "Disabled:");
-        DECIDE(flags, "%s DEFAULT_TE\n",            DEFAULT_TE            ? "Enabled: " : "Disabled:");
-        DECIDE(flags, "%s USE_PREFIX_SEPARATORS\n", USE_PREFIX_SEPARATORS ? "Enabled: " : "Disabled:");
+        ENABLED(DEBUG);
+        ENABLED(COUNTERS);
+        ENABLED(EXPENSIVE_ASSERTS_ON);
+        ENABLED(REF_DEBUG);
+        ENABLED(NODE_LOGGING);
+        ENABLED(DELETE_WORKAROUND);
+        ENABLED(NREC_ENABLED);
+        ENABLED(SHADOW_CHECK_ON);
+        ENABLED(!TRANSACTIONS);
+        ENABLED(!IOCACHE);
+        SWITCH(HAS_DEFAULT_FORMAT);
+        SWITCH(DEFAULT_TE);
+        SWITCH(USE_PREFIX_SEPARATORS);
         mod = t2_init(&param->conf);
         if (EISERR(mod) && (flags & T2_INIT_VERBOSE)) {
                 t2_error_print();
@@ -1474,6 +1459,8 @@ struct t2 *t2_init_with(uint64_t flags, struct t2_param *param) {
 #undef CONFLICT
 #undef SET
 #undef SETIF0
+#undef ENABLED
+#undef SWITCH
 
 enum {
         IO_QUEUE = /* TODO: Make this a parameter. */
