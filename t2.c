@@ -462,15 +462,13 @@ enum {
 };
 
 struct pageout_req {
-        union {
-                struct {
-                        struct node        *node;
-                        struct pageout_req *next;
-                        void               *data;
-                        lsn_t               lsn;
-                };
-                struct rcu_head             rcu;
+        struct {
+                struct node        *node;
+                struct pageout_req *next;
+                void               *data;
+                lsn_t               lsn;
         };
+        struct rcu_head             rcu;
 };
 
 struct queue { /* Multiple producers, single consumer. */
