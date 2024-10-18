@@ -539,6 +539,7 @@ static void *bworker(void *arg) {
         blog(BINFO, "        Thread %3i in group %2i completed %i operations.\n", rt->idx, bt->parent->idx, i);
         var_fold(ph, bt, var, rc);
         mem_free(cur);
+        mem_free(cpy);
         mem_free(key);
         mem_free(val);
         mem_free(var);
@@ -766,6 +767,7 @@ static void t_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int 
 
 static void t_worker_fini(struct rthread *rt, struct kvdata *d) {
         t2_tx_done(d->b->u.t2.mod, d->u.t2.tx);
+        mem_free(d->u.t2.cpy);
         mem_free(d->u.t2.cur);
         t2_thread_degister();
 }

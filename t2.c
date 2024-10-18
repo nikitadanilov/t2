@@ -9335,11 +9335,19 @@ static void wal_writer_ctx_init(struct wal_te *en) {
         ASSERT(en->directio ? (en->buf_size & (DIRECTIO_ALIGNMENT - 1)) == 0 : true);
 }
 
+static void wal_writer_ctx_fini() {
+        if (wal_writer_ctx.cctx != NULL) {
+                ZSTD_freeCCtx(wal_writer_ctx.cctx);
+        }
+        mem_free(wal_writer_ctx.buf);
+}
+
 static void *wal_aux_worker(void *arg) {
         struct wal_te *en = arg;
         thread_set_name("t2.walaux");
         wal_writer_ctx_init(en);
         wal_work(en, LOG_SYNC|PAGE_WRITE|PAGE_SYNC|BUF_CLOSE, INT_MAX, &en->logwait);
+        wal_writer_ctx_fini();
         return NULL;
 }
 
@@ -9348,6 +9356,7 @@ static void *wal_worker(void *arg) {
         thread_set_name("t2.walworker");
         wal_writer_ctx_init(en);
         wal_work(en, LOG_WRITE, INT_MAX, &en->bufwrite);
+        wal_writer_ctx_fini();
         return NULL;
 }
 
