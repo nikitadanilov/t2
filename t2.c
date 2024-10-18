@@ -11693,6 +11693,7 @@ static void ct(int argc, char **argv) {
                                 t2_tx_close(mod, tx);
                                 t2_tx_done(mod, tx);
                         } else {
+                                t2_stats_print(mod, T2_SF_TX);
                                 t = t2_tree_open(&ttype, 1);
                                 if (cseg.iter > 1) {
                                         seg_load();
@@ -11732,6 +11733,7 @@ static void ct(int argc, char **argv) {
                                 wait_forever();
                         } else if (crash) {
                                 puts("    .... Crashing.");
+                                t2_stats_print(mod, T2_SF_TX);
                                 kill(getpid(), SIGKILL);
                         } else {
                                 cseg.shutdown = true;
