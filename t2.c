@@ -2918,6 +2918,7 @@ static void path_reset(struct path *p) {
         CINC(traverse_restart);
         ++p->reset;
         memcpy(p->rec->key->addr, p->rec->scr->addr, buf_len(p->rec->scr));
+        p->rec->key->len = buf_len(p->rec->scr);
 }
 
 static void path_pin(struct path *p) {
