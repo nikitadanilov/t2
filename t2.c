@@ -98,7 +98,7 @@ enum { DELETE_WORKAROUND = true };
         &__ctx;                                 \
 })
 #define IMMANENTISE(fmt, ...) immanentise(MSG_PREP(fmt) , ## __VA_ARGS__)
-#define VERITASNUMQUAMPERIT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: %s", #expr))
+#define VERITASNUMQUAMPERIT(expr) (LIKELY(expr) ? (void)0 : IMMANENTISE("Assertion failed: " #expr))
 #if DEBUG
 #define ASSERT(expr) VERITASNUMQUAMPERIT(expr)
 #else
