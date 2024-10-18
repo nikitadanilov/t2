@@ -5820,7 +5820,7 @@ static void wait_forever() {
 static void debugger_attach(void) {
         if (debugger_attached++ == 0) {
                 int         result;
-                const char *argv[6]    = {};
+                const char *argv  [10] = {};
                 char        pidbuf[16] = {};
                 char        tidbuf[64] = {};
                 const char *debugger   = getenv("T2_DEBUGGER");
@@ -5832,7 +5832,7 @@ static void debugger_attach(void) {
                 if (debugger == NULL) {
                         return;
                 } else if (strcmp(debugger, "gdb") == 0) {
-                        argv[3] = "-ex"; /* gdb <ARGV0> <PID> -ex "thread find <TID>" */
+                        argv[3] = "-ex"; /* gdb <ARGV0> <PID> -ex "thread find <TID>" -ex "set $t = _$thread" -ex "thread $t" */
                         argv[4] = tidbuf;
                         argv[5] = NULL;
 
@@ -5849,7 +5849,11 @@ static void debugger_attach(void) {
                 }
                 result = fork();
                 if (result == 0) {
-                        printf("Attaching debugger: %s %s %s %s %s\n", argv[0], argv[1], argv[2], argv[3], argv[4]);
+                        printf("Attaching debugger:");
+                        for (int i = 0; i < ARRAY_SIZE(argv) && argv[i] != NULL; ++i) {
+                                printf(" %s", argv[i]);
+                        }
+                        puts("");
                         execvp(debugger, (void *)argv);
                         exit(1);
                 }
