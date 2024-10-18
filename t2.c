@@ -1937,7 +1937,7 @@ static bool is_stable(const struct node *n) {
 
 static uint64_t node_seq(const struct node *n) {
         uint64_t seq = READ_ONCE(n->seq);
-        read_fence();
+        read_fence(); /* TODO: issue barriers per path validity check, not per level. */
         return seq & ~(uint64_t)1;
 }
 
@@ -11906,6 +11906,8 @@ static bool ut_mem_alloc_fail() {
  * - simplify rung flags
  *
  * - execute inserts and deletes under RCU when possible: no IO, no allocator calls, trylocks succeed
+ *
+ * - clustered pageout
  *
  * Done:
  *
