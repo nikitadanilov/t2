@@ -2319,6 +2319,8 @@ static void rcu_quiescent() {
         urcu_memb_quiescent_state();
 }
 
+#define RADIX_SKIP ((void *)1)
+
 static void radixmap_update(struct node *n) {
         struct radixmap *m;
         int32_t          i;
@@ -2327,7 +2329,7 @@ static void radixmap_update(struct node *n) {
         int32_t          pidx = -1;
         int32_t          plen;
         SLOT_DEFINE(s, n);
-        if (level(n) < n->mod->min_radix_level || UNLIKELY(n->radix == (void *)1)) { /* Skip updates during recovery. */
+        if (level(n) < n->mod->min_radix_level || UNLIKELY(n->radix == RADIX_SKIP)) { /* Skip updates during recovery. */
                 return; /* TODO: Use n->seq and prefix stats to decide. */
         }
         if (UNLIKELY(n->radix == NULL)) {
@@ -8936,7 +8938,7 @@ static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len
                                                 sh_add(n->mod, &n, 1);
                                         }
                                         ASSERT(n->radix == NULL);
-                                        n->radix = (void *)1; /* Suppress radixmap update of a possibly inconsistent node. */
+                                        n->radix = RADIX_SKIP; /* Suppress radixmap update of a possibly inconsistent node. */
                                         unlock(n, WRITE);
                                         n->radix = NULL;
                                         put(n);
