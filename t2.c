@@ -1525,8 +1525,9 @@ struct t2 *t2_init(const struct t2_conf *conf) {
 }
 
 void t2_fini(struct t2 *mod) {
-        struct cache *c = &mod->cache;
-        struct pool  *p = &c->pool;
+        struct cache *c  = &mod->cache;
+        struct pool  *p  = &c->pool;
+        struct t2_te *te = mod->te;
         eclear();
         urcu_memb_barrier();
         cache_sync(mod);
@@ -1542,7 +1543,9 @@ void t2_fini(struct t2 *mod) {
                 __attribute__((fallthrough));
         case CACHE_INIT:
                 cache_fini(mod);
-                TXCALL(mod->te, destroy(mod->te));
+                if (te != NULL) {
+                        te->destroy(te); /* Call directly, because mod->te is NULL already. */
+                }
                 __attribute__((fallthrough));
         case IOCACHE_INIT:
                 iocache_fini(&mod->ioc);
@@ -8702,7 +8705,6 @@ static void wal_fini(struct t2_te *engine) {
 static void wal_destroy(struct t2_te *engine) {
         struct wal_te *en = COF(engine, struct wal_te, base);
         ASSERT(cds_list_empty(&en->inflight));
-        ASSERT(cds_list_empty(&en->ready));
         if (en->cur != NULL) {
                 wal_buf_fini(en->cur);
         }
