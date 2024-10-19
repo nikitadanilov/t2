@@ -4274,7 +4274,7 @@ static int pageout(struct node *n, struct pageout_ctx *ctx) {
                 cds_list_del_init(&n->free);
         }
         ASSERT(pageout_ctx_invariant(ctx));
-        iocache_put(&mod->ioc, n);
+        iocache_put(&mod->ioc, n); /* TODO: Race with COW or concurrent update. */
         return result;
 }
 
