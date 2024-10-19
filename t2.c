@@ -4079,11 +4079,9 @@ static void node_unlock(struct node *n) {
 static int node_trylock(struct node *n) {
         int result = -pthread_rwlock_trywrlock(&n->lock);
         ASSERT(result == 0 || result == -EBUSY);
-#if COUNTERS
-        if (result == 0) {
+        if (COUNTERS && result == 0) {
                 CINC(wlock);
         }
-#endif
         return result;
 }
 
