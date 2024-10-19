@@ -5164,14 +5164,15 @@ static taddr_t seg_root_get(struct seg *s, uint32_t id) {
 __attribute__((noreturn)) static void immanentise(const struct msg_ctx *ctx, ...)
 {
         va_list args;
-        fprintf(stderr, "%s (%s/%i): Immanentising the eschaton: ", ctx->func, ctx->file, ctx->lineno);
+        dprintf(2, "%s (%s:%i): Immanentising the eschaton: ", ctx->func, ctx->file, ctx->lineno);
         va_start(args, ctx);
-        vfprintf(stderr, ctx->fmt, args);
+        dprintf(2, ctx->fmt, args);
         va_end(args);
-        puts("");
+        dprintf(2, "\n");
         stacktrace();
-        printf("pid: %lu tid: %lu pthread: %"PRIx64" errno: %i\n",
-               (unsigned long)getpid(), (unsigned long)threadid(), (uint64_t)pthread_self(), errno);
+        dprintf(2, "pid: %lu tid: %lu pthread: %"PRIx64" errno: %i\n",
+                (unsigned long)getpid(), (unsigned long)threadid(), (uint64_t)pthread_self(), errno);
+        t2_conf_print(2);
         eprint();
         debugger_attach();
         abort();
@@ -5849,7 +5850,7 @@ static void debugger_attach(void) {
                 argv[1] = argv0;
                 argv[2] = pidbuf;
                 snprintf(pidbuf, sizeof pidbuf, "%i", getpid());
-                snprintf(tidbuf, sizeof tidbuf, "thread find %i", gettid());
+                snprintf(tidbuf, sizeof tidbuf, "thread find %"PRId64, threadid());
                 if (debugger == NULL) {
                         return;
                 } else if (strcmp(debugger, "gdb") == 0) {
@@ -5858,24 +5859,25 @@ static void debugger_attach(void) {
                         argv[5] = NULL;
 
                 } else if (strcmp(debugger, "wait") == 0) {
-                        printf("Waiting for debugger, pid: %i tid: %"PRId64".\n", getpid(), threadid());
+                        dprintf(2, "Waiting for debugger, pid: %i tid: %"PRId64".\n", getpid(), threadid());
                         wait_forever();
                         return;
                 } else {
                         argv[3] = NULL;
                 }
                 if (argv0 == NULL) {
-                        puts("Quod est nomen meum?");
+                        dprintf(2, "Quod est nomen meum?\n");
                         return;
                 }
                 result = fork();
                 if (result == 0) {
-                        printf("Attaching debugger:");
+                        dprintf(2, "Attaching debugger:");
                         for (int i = 0; i < ARRAY_SIZE(argv) && argv[i] != NULL; ++i) {
-                                printf(" %s", argv[i]);
+                                dprintf(2, " %s", argv[i]);
                         }
-                        puts("");
+                        dprintf(2, "\n");
                         execvp(debugger, (void *)argv);
+                        dprintf(2, "execvp() failed: %i\n", errno);
                         exit(1);
                 }
         }
