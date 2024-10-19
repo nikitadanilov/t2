@@ -256,6 +256,18 @@ for o in $options ;do
     esac       
 done
 
+git_head=$(git rev-parse HEAD 2> /dev/null || echo "Not a repository.")
+md5_sum=$(md5sum t2.c | cut -f1 -d' ')
+cc_ver=$($CC -v 2>&1)
+uname=$(uname -a)
+
+cadd "#define GIT_HEAD \"$git_head\""
+cadd "#define MD5_SUM \"$md5_sum\""
+cadd "#define CC_VER \"$cc_ver\""
+cadd "#define UNAME \"$uname\""
+cadd "#define CFLAGS \"$CFLAGS\""
+cadd "#define LDFLAGS \"$LDFLAGS\""
+
 run $CC $CFLAGS -DUT=1 -BN=0 t2.c $LDFLAGS -o ut
 run $CC $CFLAGS -DUT=0 -DBN=1 -c t2.c
 if [ $rocksdb == 1 ] ;then

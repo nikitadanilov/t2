@@ -53,6 +53,8 @@ enum {
 
 /* @macro */
 
+#define VERSION "1.0"
+
 #if !defined(DEBUG)
 #define DEBUG (1)
 #endif
@@ -1274,6 +1276,14 @@ static void ref_print(void);
 static int cds_list_length(const struct cds_list_head *head);
 static bool cds_list_contains(const struct cds_list_head *head, const struct cds_list_head *item);
 
+static const char version[]  = VERSION;
+static const char git_head[] = GIT_HEAD;
+static const char md5_sum[]  = MD5_SUM;
+static const char cc_ver[]   = CC_VER;
+static const char uname[]    = UNAME;
+static const char cflags[]   = CFLAGS;
+static const char ldflags[]  = LDFLAGS;
+
 #if COUNTERS
 static __thread struct counters __t_counters = {};
 static __thread struct double_counters __d_counters = {};
@@ -1781,6 +1791,11 @@ int t2_errcode(void *ptr) {
 
 void *t2_errptr(int errcode) {
         return EPTR(errcode);
+}
+
+void t2_conf_print(int fd) {
+        dprintf(fd, "VERSION:  %s\nGIT_HEAD: %s\nMD5_SUM:  %s\nCC_VER:   %s\nUNAME:    %s\nCFLAGS:   %s\nLDFLAGS:  %s\n",
+                version, git_head, md5_sum, cc_ver, uname, cflags, ldflags);
 }
 
 void t2_thread_register() {

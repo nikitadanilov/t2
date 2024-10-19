@@ -271,6 +271,7 @@ void  t2_error_print(void);
 bool  t2_is_err (void *ptr);
 int   t2_errcode(void *ptr);
 void *t2_errptr (int errcode);
+void  t2_conf_print(int fd);
 
 enum t2_stats_flags {
         T2_SF_TREE       = 1ull <<  0, /* t */
