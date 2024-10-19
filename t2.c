@@ -649,10 +649,10 @@ struct radixmap {
 };
 
 enum node_flags {
-        HEARD_BANSHEE = 1ull << 0,
-        NOCACHE       = 1ull << 1,
-        DIRTY         = 1ull << 2,
-        PAGING        = 1ull << 3
+        HEARD_BANSHEE = 1u << 0,
+        NOCACHE       = 1u << 1,
+        DIRTY         = 1u << 2,
+        PAGING        = 1u << 3
 };
 
 enum ext_id {
@@ -672,7 +672,9 @@ enum {
 struct node {
         struct cds_hlist_node      hash;
         taddr_t                    addr;
-        uint64_t                   flags;
+        uint32_t                   flags;
+        uint16_t                   shidx;
+        uint16_t                   dirty_nr;
         uint64_t                   seq;
         atomic_int                 ref;
         const struct t2_node_type *ntype;
@@ -4141,9 +4143,10 @@ static int node_clean(struct node *n) {
         int           kpa;
         TXCALL(n->mod->te, clean(n->mod->te, (struct t2_node **)&n, 1));
         node_state_print(n, 'C');
-        NMOD(n, page_dirty_nr, n->flags >> 40);
+        NMOD(n, page_dirty_nr, n->dirty_nr);
         NMOD(n, page_lsn_diff, n->lsn_hi - n->lsn_lo);
-        n->flags &= ~(DIRTY|PAGING|(~0ull << 40)); /* The only place where DIRTY is cleared. */
+        n->flags &= ~(DIRTY|PAGING); /* The only place where DIRTY is cleared. */
+        n->dirty_nr = 0;
         if (stress(&c->pool.free[bits], &kpa) &&
             (kpa >= PRESSURE_DROP_ALL ||
              !is_hotter(krate(&nheader(n)->kelvin, bolt(n)), c->md.crittemp, c->md.critfrac, ++shepherd_hand))) {
@@ -4433,8 +4436,9 @@ static void sh_print(const struct shepherd *sh) {
 }
 
 static void sh_add(struct t2 *mod, struct node **ns, int nr) {
-        struct cache    *c  = &mod->cache;
-        struct shepherd *sh = &c->sh[shepherd_hand++ & MASK(c->sh_shift)];
+        struct cache    *c   = &mod->cache;
+        int              idx = shepherd_hand++ & MASK(c->sh_shift);
+        struct shepherd *sh  = &c->sh[idx];
         if (nr > 0) {
                 mutex_lock(&sh->queue.lock);
                 for (int i = 0; i < nr; ++i) {
@@ -4443,6 +4447,7 @@ static void sh_add(struct t2 *mod, struct node **ns, int nr) {
                         ASSERT(!(n->flags & (PAGING|HEARD_BANSHEE|NOCACHE)));
                         ref(n);
                         NINC(n, shepherd_queued);
+                        n->shidx = idx;
                         queue_put_locked(&sh->queue, &n->free);
                 }
                 NOFAIL(pthread_cond_signal(&sh->wantclean));
@@ -6653,8 +6658,10 @@ static void range_print(void *orig, int32_t nsize, void *start, int32_t nob) {
 
 static void header_print(struct node *n) {
         struct header *h = nheader(n);
-        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx64" lsn: %"PRId64" ... %"PRId64" seq: %"PRId64"\n",
-               n->addr, h->treeid, h->level, h->ntype, nr(n), nsize(n), n, n->ref, n->flags, n->lsn_lo, n->lsn_hi, n->seq);
+        printf("addr: %"PRIx64" tree: %"PRIx32" level: %u ntype: %u nr: %u size: %u (%p) ref: %i flags: %"PRIx16
+               " dirty_nr: %"PRId16" shidx: %"PRId16" lsn: %"PRId64" ... %"PRId64" seq: %"PRId64"\n",
+               n->addr, h->treeid, h->level, h->ntype, nr(n), nsize(n), n, n->ref, n->flags,
+               n->dirty_nr, n->shidx, n->lsn_lo, n->lsn_hi, n->seq);
 }
 
 static void simple_print(struct node *n) {
@@ -8486,7 +8493,7 @@ static int wal_diff(struct t2_te *engine, struct t2_tx *trax, int32_t nob, int n
                         if (COUNTERS && prev != n) {
                                 CINC(wal_redirty);
                                 CMOD(wal_redirty_lsn, en->lsn - n->lsn_hi);
-                                n->flags += 1ull << 40;
+                                ++n->dirty_nr;
                         }
                 }
         }
