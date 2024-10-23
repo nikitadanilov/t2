@@ -38,7 +38,40 @@ The last 2 commands produce:
 Benchmarks
 ----------
 
-_TBD_.
+`./benchmarks` script runs a "typical" set of workloads against t2 and rocksdb
+(additionally C++ `std::map` is used in some cases).
+
+Configuration:
+
+    16-core i7-12650H, 32GB memory, Kingston 501b ssd
+
+Insert 50M records:
+
+![insert 50M records](https://github.com/nikitadanilov/t2/blob/master/doc/images/insert-50M.png?raw=true)
+
+Each record has a random key of between 8 and 16 bytes, a random value between
+10 and 20 bytes. 100 threads inserting records, 500K records per thread. The graph
+plots the progress.
+
+Now that the key-value store is populated, benchmark lookups at various concurrency levels:
+
+![lookup 50M records](https://github.com/nikitadanilov/t2/blob/master/doc/images/lookup-50M.png?raw=true)
+
+Next, iterate over the keys: create 50K cursors, each doing 1000 iterations
+(50M iterations total with varyin concurrency levels):
+
+![iterate over 50M records](https://github.com/nikitadanilov/t2/blob/master/doc/images/iterations-50M.png?raw=true)
+
+Delete the records:
+
+![delete 50M records](https://github.com/nikitadanilov/t2/blob/master/doc/images/deletes-50M.png?raw=true)
+
+Finally, benchmark concurrent insertion of random and sequential keys in a freshly re-initialised key-value store:
+
+![insert random keys](https://github.com/nikitadanilov/t2/blob/master/doc/images/insert-rnd.png?raw=true)
+
+
+![insert sequential keys](https://github.com/nikitadanilov/t2/blob/master/doc/images/insert-seq.png?raw=true)
 
 Transportability
 ----------------
