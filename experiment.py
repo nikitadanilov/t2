@@ -206,6 +206,29 @@ def run_benchmarks_seq(constant_param, versions, num_runs, benchmark_cmd_templat
     progress_bar.close()
     return results
 
+def assign_colors_to_versions(versions):
+    # Define a fixed list of colors
+    color_list = [
+        '#1f77b4',  # Blue
+        '#ff7f0e',  # Orange
+        '#2ca02c',  # Green
+        '#d62728',  # Red
+        '#9467bd',  # Purple
+        '#8c564b',  # Brown
+        '#e377c2',  # Pink
+        '#7f7f7f',  # Gray
+        '#bcbd22',  # Olive
+        '#17becf'   # Cyan
+    ]
+
+    # Map versions to colors deterministically
+    version_colors = {}
+    for idx, version in enumerate(sorted(versions)):
+        # Use modulo to ensure we stay within the color list length
+        color = color_list[ord(version[0]) % len(color_list)]
+        version_colors[version] = color
+    return version_colors
+
 def plot_results_2d(scales, results, output_file, x_label, y_label, title, fig_size=None, x_label_rotation=0):
     # Convert scales to strings in case they are not numeric
     scales = [str(scale) for scale in scales]
@@ -217,10 +240,13 @@ def plot_results_2d(scales, results, output_file, x_label, y_label, title, fig_s
     else:
         plt.figure()
 
+    version_colors = assign_colors_to_versions(results.keys())
+
     for version, data in results.items():
         means = data['means']
         std_devs = data['std_devs']
-        plt.errorbar(x_indices, means, yerr=std_devs, marker='o', markersize=2, capsize=csize, label=version)
+        color = version_colors[version]
+        plt.errorbar(x_indices, means, yerr=std_devs, marker='o', markersize=2, capsize=csize, label=version, color=color)
     plt.xlabel(x_label)
     plt.ylabel(y_label)
     plt.title(title)
@@ -238,11 +264,14 @@ def plot_results_seq(results, output_file, x_label, y_label, title, fig_size=Non
     else:
         plt.figure()
 
+    version_colors = assign_colors_to_versions(results.keys())
+
     for version, data in results.items():
         scales = data['scales']  # Scales are numeric
         means = data['means']
         std_devs = data['std_devs']
-        plt.errorbar(scales, means, yerr=std_devs, marker='o', markersize=2, capsize=csize, label=version)
+        color = version_colors[version]
+        plt.errorbar(scales, means, yerr=std_devs, marker='o', markersize=2, capsize=csize, label=version, color=color)
     plt.xlabel(x_label)
     plt.ylabel(y_label)
     plt.title(title)
@@ -270,12 +299,12 @@ def plot_results_3d(scales_x, scales_y, results, output_file, x_label, y_label, 
         fig = plt.figure()
 
     ax = fig.add_subplot(111, projection='3d')
+    version_colors = assign_colors_to_versions(results.keys())
 
-    # Define colormap
-    colors = plt.cm.viridis(np.linspace(0, 1, len(results)))
     for idx, (version, data) in enumerate(results.items()):
+        color = version_colors[version]
         # data is a 2D array of means with shape (len(scales_x), len(scales_y))
-        surf = ax.plot_surface(x_mesh, y_mesh, data, color=colors[idx], alpha=0.7)
+        surf = ax.plot_surface(x_mesh, y_mesh, data, alpha=0.7, color=color)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_zlabel(z_label)
