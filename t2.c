@@ -10177,9 +10177,9 @@ static struct t2_storage_op disorder_storage_op = {
 static struct disorder_storage disorder_storage = {
         .gen         = { .op = &disorder_storage_op },
         .substrate   = &file_storage.gen,
-        .randomness  = 5,
+        .randomness  = 10,
         .sleep_min   = 0,
-        .sleep_range = 1000
+        .sleep_range = 100000
 };
 
 #endif /* UT */
