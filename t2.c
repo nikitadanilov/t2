@@ -1112,6 +1112,7 @@ static int32_t nsize(const struct node *n);
 static int32_t utmost(const struct node *n, enum dir d);
 static int lock(struct node *n, enum lock_mode mode);
 static void unlock(struct node *n, enum lock_mode mode);
+static void unlock_unsafe(struct node *n, bool unsafe);
 static void dirty(struct page *g, bool hastx);
 static void radixmap_update(struct node *n);
 static struct header *nheader(const struct node *n);
@@ -2026,6 +2027,16 @@ static void unlock(struct node *n, enum lock_mode mode) {
         }
 }
 
+#define RADIX_SKIP ((void *)1)
+
+static void unlock_unsafe(struct node *n, bool unsafe) {
+        if (unsafe) {
+                ASSERT(n->radix == NULL);
+                n->radix = RADIX_SKIP; /* Suppress radixmap update of a possibly inconsistent node. */
+        }
+        unlock(n, WRITE);
+}
+
 static struct node *peek(struct t2 *mod, taddr_t addr) {
         CINC(peek);
         return ht_lookup(&mod->ht, addr, ht_bucket(&mod->ht, addr));
@@ -2187,7 +2198,7 @@ static struct node *get(struct t2 *mod, taddr_t addr) {
                                         CADD(read_bytes, taddr_ssize(n->addr));
                                 }
                         }
-                        unlock(n, WRITE);
+                        unlock_unsafe(n, result != 0);
                 }
                 if (UNLIKELY(result != 0)) {
                         ndelete(n);
@@ -2324,8 +2335,6 @@ static void rcu_quiescent() {
         urcu_memb_quiescent_state();
 }
 
-#define RADIX_SKIP ((void *)1)
-
 static void radixmap_update(struct node *n) {
         struct radixmap *m;
         int32_t          i;
@@ -2334,7 +2343,11 @@ static void radixmap_update(struct node *n) {
         int32_t          pidx = -1;
         int32_t          plen;
         SLOT_DEFINE(s, n);
-        if (level(n) < n->mod->min_radix_level || UNLIKELY(n->radix == RADIX_SKIP)) { /* Skip updates during recovery. */
+        if (UNLIKELY(n->radix == RADIX_SKIP)) { /* Skip updates during recovery or read. */
+                n->radix = NULL;
+                return;
+        }
+        if (level(n) < n->mod->min_radix_level) {
                 return; /* TODO: Use n->seq and prefix stats to decide. */
         }
         if (UNLIKELY(n->radix == NULL)) {
@@ -8976,10 +8989,7 @@ static int wal_buf_replay(struct wal_te *en, void *space, void *scratch, int len
                                                  */
                                                 sh_add(n->mod, &n, 1);
                                         }
-                                        ASSERT(n->radix == NULL);
-                                        n->radix = RADIX_SKIP; /* Suppress radixmap update of a possibly inconsistent node. */
-                                        unlock(n, WRITE);
-                                        n->radix = NULL;
+                                        unlock_unsafe(n, true);
                                         put(n);
                                 } else {
                                         result = ERROR(ERRCODE(n));
