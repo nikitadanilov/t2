@@ -892,23 +892,23 @@ static void r_tail(const char *label, char *err) {
         free(err);
 }
 
-static int r_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int r_lookup(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize) {
         char *err = NULL;
         size_t len;
         char *value = rocksdb_get(d->b->u.r.db, d->b->u.r.ro, key, ksize, &len, &err);
         r_tail("get", err);
         free(value);
-        return 0;
+        return len == 0 ? -ENOENT : 0;
 }
 
-static int r_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int r_insert(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize) {
         char *err = NULL;
         rocksdb_put(d->b->u.r.db, d->b->u.r.wo, key, ksize, val, vsize, &err);
         r_tail("put", err);
         return 0;
 }
 
-static int r_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+static int r_delete(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize) {
         char *err = NULL;
         rocksdb_delete(d->b->u.r.db, d->b->u.r.wo, key, ksize, &err);
         r_tail("delete", err);
@@ -953,7 +953,7 @@ static void l_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int 
 static void l_worker_fini(struct rthread *rt, struct kvdata *d) {
 }
 
-static int l_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int l_lookup(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize) {
         MDB_val mkey = { .mv_size = ksize, .mv_data = key };
         MDB_val mval = {};
         MDB_txn *txn;
@@ -974,7 +974,7 @@ static int l_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, 
         return rc == 0 ? 0 : rc == MDB_NOTFOUND ? -ENOENT : rc;
 }
 
-static int l_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int l_insert(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize) {
         MDB_val mkey = { .mv_size = ksize, .mv_data = key };
         MDB_val mval = { .mv_size = vsize, .mv_data = val };
         MDB_txn *txn;
@@ -988,7 +988,7 @@ static int l_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, 
         return rc == 0 ? 0 : rc == MDB_KEYEXIST ? -EEXIST : rc;
 }
 
-static int l_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+static int l_delete(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize) {
         MDB_val mkey = { .mv_size = ksize, .mv_data = key };
         MDB_txn *txn;
 	MDB_dbi dbi;

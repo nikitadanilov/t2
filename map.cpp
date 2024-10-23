@@ -36,7 +36,7 @@ static void m_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int 
 static void m_worker_fini(struct rthread *rt, struct kvdata *d) {
 }
 
-static int m_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int m_lookup(struct rthread *rt, struct kvdata *d, void *key, void *kcopy, int ksize, void *val, int vsize) {
 	std::lock_guard<std::mutex> guard(*lock(d->b));
 	auto m = map(d->b);
 	auto it = m->find(std::string((const char *)key, ksize));
@@ -53,12 +53,12 @@ static int m_lookup(struct rthread *rt, struct kvdata *d, void *key, int ksize, 
 	}
 }
 
-static int  m_insert(struct rthread *rt, struct kvdata *d, void *key, int ksize, void *val, int vsize) {
+static int  m_insert(struct rthread *rt, struct kvdata *d, void *key, void *kcopy, int ksize, void *val, int vsize) {
 	std::lock_guard<std::mutex> guard(*lock(d->b));
 	return map(d->b)->insert({std::string((const char *)key, ksize), std::string((const char *)val, vsize)}).second ? 0 : -EEXIST;
 }
 
-static int  m_delete(struct rthread *rt, struct kvdata *d, void *key, int ksize) {
+static int  m_delete(struct rthread *rt, struct kvdata *d, void *key, void *kcopy, int ksize) {
 	std::lock_guard<std::mutex> guard(*lock(d->b));
 	return map(d->b)->erase(std::string((const char *)key, ksize)) > 0 ? 0 : -ENOENT;
 }
