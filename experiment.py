@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 from string import Template
 import sys
 
+csize=0
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Benchmarking and Graphing Tool with Sequential Mode Support')
     parser.add_argument('--constant_param', required=True, help='Constant parameter for all runs')
@@ -55,6 +57,7 @@ def run_benchmarks_2d(constant_param, versions, scales, num_runs, benchmark_cmd_
                 try:
                     # Execute the benchmark command
                     output = subprocess.check_output(benchmark_cmd, shell=True)
+                    # print(f'{benchmark_cmd} -> "{output}"');
                     # Decode and convert the output to a float
                     result = float(output.decode().strip())
                     run_results.append(result)
@@ -150,7 +153,7 @@ def run_benchmarks_seq(constant_param, versions, num_runs, benchmark_cmd_templat
                 output = subprocess.check_output(benchmark_cmd, shell=True)
                 # Decode and split the output into lines
                 lines = output.decode().strip().split('\n')
-                print(benchmark_cmd + " -> " + str(lines))
+                # print(benchmark_cmd + " -> " + str(lines))
                 scales = []
                 results_list = []
                 for line in lines:
@@ -217,7 +220,7 @@ def plot_results_2d(scales, results, output_file, x_label, y_label, title, fig_s
     for version, data in results.items():
         means = data['means']
         std_devs = data['std_devs']
-        plt.errorbar(x_indices, means, yerr=std_devs, marker='o', capsize=5, label=version)
+        plt.errorbar(x_indices, means, yerr=std_devs, marker='o', markersize=2, capsize=csize, label=version)
     plt.xlabel(x_label)
     plt.ylabel(y_label)
     plt.title(title)
@@ -239,7 +242,7 @@ def plot_results_seq(results, output_file, x_label, y_label, title, fig_size=Non
         scales = data['scales']  # Scales are numeric
         means = data['means']
         std_devs = data['std_devs']
-        plt.errorbar(scales, means, yerr=std_devs, marker='o', capsize=5, label=version)
+        plt.errorbar(scales, means, yerr=std_devs, marker='o', markersize=2, capsize=csize, label=version)
     plt.xlabel(x_label)
     plt.ylabel(y_label)
     plt.title(title)
@@ -294,12 +297,14 @@ def plot_results_3d(scales_x, scales_y, results, output_file, x_label, y_label, 
     plt.close()
 
 def main():
+    global csize
     args = parse_arguments()
     constant_param = args.constant_param
     versions = args.version
     num_runs = args.num_runs
     benchmark_cmd_template = args.benchmark_cmd
-
+    csize = 5 if num_runs > 1 else 0
+    
     if args.seq:
         # Sequential mode
         # Set default labels if not provided
