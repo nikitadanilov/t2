@@ -42,7 +42,8 @@ enum bop_type {
 enum border {
         RND,
         EXI,
-        SEQ
+        SEQ,
+        REC
 };
 
 struct bspec {
@@ -95,6 +96,11 @@ struct bphase {
         bool shutdown;
         uint64_t begin;
         uint64_t last;
+#if defined(__cplusplus)
+        uint64_t __undef;
+#else
+        _Atomic(uint64_t) seq;
+#endif
 };
 
 #if USE_ROCKSDB

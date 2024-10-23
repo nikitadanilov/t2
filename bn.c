@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <sys/cdefs.h>
 #include <unistd.h>
 #include <sys/time.h>
 
@@ -207,6 +208,8 @@ static void bspec_parse(struct bspec *sp, struct span *s) {
                 sp->ord = EXI;
         } else if (bstarts(s, "seq")) {
                 sp->ord = SEQ;
+        } else if (bstarts(s, "rec")) {
+                sp->ord = REC;
         } else {
                 puts("Cannot parse spec.");
                 assert(false);
@@ -356,7 +359,29 @@ static int rnd_between(int lo, int hi, uint64_t seed) {
         return lo + brnd(seed) % (hi - lo + 1);
 }
 
-static int32_t bufgen(void *key, uint64_t seed0, int max, int *rndmax, int delta, struct bspec *sp) {
+struct rec {
+        uint64_t h;
+};
+
+static uint64_t hash(uint64_t x) {
+        x = (~x) + (x << 21);
+        x = x ^ (x >> 24);
+        x = (x + (x << 3)) + (x << 8);
+        x = x ^ (x >> 14);
+        x = (x + (x << 2)) + (x << 4);
+        x = x ^ (x >> 28);
+        x = x + (x << 31);
+        return x;
+}
+
+static int32_t makerec(struct rec *rec, uint64_t idx, int min, int max) {
+        assert(min >= SOF(*rec));
+        memset(rec, 0, max);
+        rec->h   = hash(6 + (idx << 17));
+        return min + rec->h % (max - min + 1);
+}
+
+static int32_t bufgen(void *key, uint64_t seed0, int max, int *rndmax, int delta, struct bspec *sp, struct bphase *ph) {
         uint64_t seed = seed0 + max + delta;
         int len = 0;
         switch (sp->ord) {
@@ -374,6 +399,8 @@ static int32_t bufgen(void *key, uint64_t seed0, int max, int *rndmax, int delta
                 len = rnd_between(sp->min, sp->max, seed);
                 binc(key, len);
                 break;
+        case REC:
+                len = makerec(key, ph->seq++, sp->min, sp->max);
         }
         return len;
 }
@@ -503,12 +530,12 @@ static void *bworker(void *arg) {
                         kv[kvt].umount(b);
                         kv[kvt].mount(b);
                 } else {
-                        int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key);
+                        int32_t ksize = bufgen(key, seed0, i, &rndmax, 1, &opt->key, ph);
                         if (opt->opt == BLOOKUP) {
                                 start = now();
                                 result = kv[kvt].lookup(rt, &data, key, cpy, ksize, val, maxval);
                         } else if (opt->opt == BINSERT) {
-                                int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val);
+                                int32_t vsize = bufgen(val, seed0, i, &rndmax, 2, &opt->val, ph);
                                 start = now();
                                 result = kv[kvt].insert(rt, &data, key, cpy, ksize, val, vsize);
                         } else if (opt->opt == BDELETE) {
@@ -587,6 +614,7 @@ static void bphase(struct bphase *ph, int i) {
         NOFAIL(pthread_cond_init(&ph->cond, NULL));
         NOFAIL(pthread_cond_init(&ph->start, NULL));
         ph->idx = i;
+        ph->seq = 0;
         ph->shutdown = false;
         blog(BINFO, "    Starting phase %2i.\n", i);
         for (int i = 0; i < ph->nr; ++i) {
