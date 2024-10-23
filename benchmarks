@@ -5,7 +5,7 @@
 
 # TODO: extract config (hash, build flags, switches, etc) from ./bn
 hash=$(git rev-parse HEAD)
-now=$(date -Iminutes)
+now=$(date +%Y-%m-%d-%H-%M)
 
 dir=$now-$hash
 mkdir $dir
