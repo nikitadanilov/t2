@@ -721,6 +721,7 @@ const double LOG_SLEEP = 1.0;
 
 static const char logname[] = "./log/l";
 static bool transactions = false;
+static uint32_t tree_id = 0;
 
 static void t_mount(struct benchmark *b) {
         bn_ntype_internal = t2_node_type_init(2, "simple-bn-internal", shift_internal, 0);
@@ -752,6 +753,9 @@ static void t_mount(struct benchmark *b) {
                         .wal_flags   = transactions ? wal_flags : 0
                 });
         assert(!t2_is_err(mod));
+        if (tree_id != 0) {
+                b->kv.u.t2.id = tree_id;
+        }
         if (b->kv.u.t2.id != 0) {
                 b->kv.u.t2.tree = t2_tree_open(&bn_ttype, b->kv.u.t2.id);
         } else {
@@ -765,6 +769,7 @@ static void t_mount(struct benchmark *b) {
                         b->kv.u.t2.tree = t2_tree_create(&bn_ttype, NULL);
                 }
         }
+        assert(!t2_is_err(b->kv.u.t2.tree));
 }
 
 static void t_umount(struct benchmark *b) {
@@ -1051,7 +1056,7 @@ int main(int argc, char **argv) {
 #if USE_MAP
         kv[MAP] = mapkv;
 #endif
-        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:ck:I:C:KMF:p")) != -1) {
+        while ((ch = getopt(argc, argv, "vr:f:t:Tn:N:h:i:ck:I:C:KMF:p")) != -1) {
                 switch (ch) {
                 case 'v':
                         blog_level++;
@@ -1070,6 +1075,9 @@ int main(int argc, char **argv) {
                         break;
                 case 'T':
                         transactions = true;
+                        break;
+                case 'i':
+                        tree_id = atoi(optarg);
                         break;
                 case 'N':
                         shift_internal = atoi(optarg);
