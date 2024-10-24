@@ -3293,8 +3293,7 @@ static int next_prep(struct path *p) {
         if (EISERR(sibling)) {
                 result = ERROR(ERRCODE(sibling));
         }
-        path_lock(p);
-        return result;
+        return path_lock(p) ?: result;
 }
 
 static int lookup_complete(struct path *p, struct node *n) {
@@ -3408,6 +3407,20 @@ static int delete_complete(struct path *p, struct node *n) {
         return result;
 }
 
+static void next_cache(struct t2_cursor *c, struct path *p, int idx) {
+        ASSERT(idx < ARRAY_SIZE(c->cached));
+        if (LIKELY(idx <= p->used)) {
+                ASSERT(p->rung[idx].flags & PINNED);
+                if (p->rung[idx].page.node != c->cached[idx]) {
+                        if (c->cached[idx] != NULL) {
+                                put(c->cached[idx]);
+                        }
+                        c->cached[idx] = p->rung[idx].page.node;
+                }
+                p->rung[idx].flags &= ~PINNED;
+        }
+}
+
 static int next_complete(struct path *p, struct node *n) {
         struct rung      *r      = &p->rung[p->used];
         struct t2_cursor *c      = (void *)p->rec->vcb;
@@ -3420,6 +3433,10 @@ static int next_complete(struct path *p, struct node *n) {
                         break;
                 }
         }
+        for (int i = 0; i < ARRAY_SIZE(c->cached); ++i) {
+                next_cache(c, p, i);
+        }
+        p->rung[0].flags &= ~PINNED;
         if (result > 0) {
                 struct node *sibling = brother(r, (enum dir)c->dir)->node;
                 if (LIKELY(sibling != NULL && nr(sibling) > 0)) { /* Rightmost leaf can be empty. */
@@ -3799,6 +3816,11 @@ int t2_cursor_init(struct t2_cursor *c, struct t2_buf *key) {
 void t2_cursor_fini(struct t2_cursor *c) {
         ASSERT(thread_registered);
         eclear();
+        for (int i = 0; i < ARRAY_SIZE(c->cached); ++i) {
+                if (c->cached[i] != NULL) {
+                        put(c->cached[i]);
+                }
+        }
         c->curkey.len = c->maxlen;
         c->scr.len = c->maxlen;
 }

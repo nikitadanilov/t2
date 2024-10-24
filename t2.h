@@ -208,6 +208,8 @@ struct t2_cursor_op {
         int (*next)(struct t2_cursor *c, const struct t2_rec *rec);
 };
 
+enum { T2_CURSOR_CACHED = 3 };
+
 struct t2_cursor {
         enum t2_dir          dir;
         struct t2_buf        curkey;
@@ -215,6 +217,7 @@ struct t2_cursor {
         struct t2_tree      *tree;
         struct t2_cursor_op *op;
         int32_t              maxlen;
+        void                *cached[T2_CURSOR_CACHED];
 };
 
 enum t2_node_type_flags {
