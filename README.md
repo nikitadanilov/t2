@@ -38,8 +38,10 @@ The last 2 commands produce:
 Benchmarks
 ----------
 
-`./benchmarks` script runs a "typical" set of workloads against t2 and rocksdb
-(additionally C++ `std::map` is used in some cases).
+The plots below are made by `./benchmarks` script, which runs a "typical" set of
+workloads against t2 and rocksdb (additionally C++ `std::map` is used in some
+cases). Warning: the script takes a lot of time (a few hours) to complete, in
+part because it, by default, repeats each experiment 5 times (see `nr` variable).
 
 Configuration:
 
@@ -58,7 +60,9 @@ Now that the key-value store is populated, benchmark lookups at various concurre
 ![lookup 50M records](https://github.com/nikitadanilov/t2/blob/master/doc/images/lookup-50M.png?raw=true)
 
 Next, iterate over the keys: create 50K cursors, each doing 1000 iterations
-(50M iterations total with varyin concurrency levels):
+(50M iterations total with varying concurrency levels).
+
+Currently, cursors in t2 use fairly standard B-tree locking. This is sugnificantly slower than lockless lookup:
 
 ![iterate over 50M records](https://github.com/nikitadanilov/t2/blob/master/doc/images/iterations-50M.png?raw=true)
 
@@ -76,8 +80,8 @@ Finally, benchmark concurrent insertion of random and sequential keys in a fresh
 Transportability
 ----------------
 
-All tests are done on Ubuntu, any Linux version should be all right. There is a
-macos (Darwin) port, but it lacks some features, like asynchronous IO.
+All tests are done on Ubuntu, any Linux version should be all right. t2 compiles
+on macos (Darwin), but it lacks some features, like asynchronous IO there.
 
 Limitations
 -----------
