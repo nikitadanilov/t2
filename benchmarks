@@ -97,4 +97,18 @@ cmd='o=$$((10000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
     --benchmark_cmd "$prepare; $cmd"
 echo "    done."
 
+echo "    Key-value size."
+cmd='./bn ${constant_param} -kt2 -f "100*100000*100:insert\$$rnd${version}-${version}/seq${version}-${version}" | grep "^ - " | awk "{ printf(\"%f %f\n\", \$$9, \$$15) }"'
+./experiment.py \
+    --title '10M parallel inserts, variable key and value size' \
+    --constant_param "$c -v -r1.0" \
+    --version 4 --version 8 --version 16 --version 32 --version 64 \
+    --x_label '% complete' \
+    --y_label 'Cumulative inserts per second' \
+    --seq \
+    --num_runs $nr \
+    --output_file $dir/insert-varsize.png \
+    --benchmark_cmd "$prepare; $cmd"
+echo "    done."
+
 echo "Done in $dir"
