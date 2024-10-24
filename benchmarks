@@ -23,7 +23,7 @@ cmd='./bn ${constant_param} -k${version} -f "100*500000*100:insert\$$rec8-16/seq
 ./experiment.py \
     --title '50M inserts, 100 threads' \
     --constant_param "$c -v -r1.0" \
-    --version rocksdb --version t2 \
+    --version rocksdb --version t2 --version lmdb --version map \
     --x_label '% complete' \
     --y_label 'Cumulative inserts per second' \
     --seq \
@@ -35,7 +35,7 @@ cmd='o=$$((50000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
 ./experiment.py \
     --title '50M lookups' \
     --constant_param "$c -r1 -M -i1" \
-    --version rocksdb --version t2 \
+    --version rocksdb --version t2 --version lmdb \
     --x_label 'Threads' \
     --y_label 'Cumulative lookups per second' \
     $scale128 \
@@ -74,7 +74,7 @@ cmd='o=$$((10000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
 ./experiment.py \
     --title '10M parallel inserts, random 4-byte keys, 10-byte values' \
     --constant_param "$c" \
-    --version rocksdb --version map --version t2 \
+    --version rocksdb --version map --version t2 --version lmdb \
     --x_label 'Threads' \
     --y_label 'Cumulative inserts per second' \
     $scale128 \
@@ -88,7 +88,7 @@ cmd='o=$$((10000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
 ./experiment.py \
     --title '10M parallel inserts, sequential 4-byte keys, 10-byte values' \
     --constant_param "$c" \
-    --version rocksdb --version map --version t2 \
+    --version rocksdb --version map --version t2 --version lmdb \
     --x_label 'Threads' \
     --y_label 'Cumulative inserts per second' \
     $scale128 \
@@ -100,7 +100,7 @@ echo "    done."
 echo "    Key-value size."
 cmd='./bn ${constant_param} -kt2 -f "100*100000*100:insert\$$rnd${version}-${version}/seq${version}-${version}" | grep "^ - " | awk "{ printf(\"%f %f\n\", \$$9, \$$15) }"'
 ./experiment.py \
-    --title '10M parallel inserts, variable key and value size' \
+    --title '10M parallel inserts, variable key and value size, 100 threads' \
     --constant_param "$c -v -r1.0" \
     --version 4 --version 8 --version 16 --version 32 --version 64 \
     --x_label '% complete' \

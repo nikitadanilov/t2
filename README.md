@@ -39,9 +39,9 @@ Benchmarks
 ----------
 
 The plots below are made by `./benchmarks` script, which runs a "typical" set of
-workloads against t2 and rocksdb (additionally C++ `std::map` is used in some
+workloads against t2, lmdb and rocksdb (additionally C++ `std::map` is used in some
 cases). Warning: the script takes a lot of time (a few hours) to complete, in
-part because it, by default, repeats each experiment 5 times (see `nr` variable).
+part because it, by default, it repeats each experiment 5 times (see `nr` variable).
 
 Configuration:
 
@@ -70,12 +70,16 @@ Delete the records:
 
 ![delete 50M records](https://github.com/nikitadanilov/t2/blob/master/doc/images/deletes-50M.png?raw=true)
 
-Finally, benchmark concurrent insertion of random and sequential keys in a freshly re-initialised key-value store:
+Insertion of random and sequential keys in a freshly re-initialised key-value store:
 
 ![insert random keys](https://github.com/nikitadanilov/t2/blob/master/doc/images/insert-rnd.png?raw=true)
 
 
 ![insert sequential keys](https://github.com/nikitadanilov/t2/blob/master/doc/images/insert-seq.png?raw=true)
+
+Dependence of insertion rate on record size:
+
+![insert sequential keys](https://github.com/nikitadanilov/t2/blob/master/doc/images/insert-varsize.png?raw=true)
 
 Transportability
 ----------------
