@@ -184,6 +184,7 @@ struct kvdata {
                         struct t2_tree      *tree;
                         struct t2_cursor_op  cop;
                         struct t2_cursor     c;
+                        int                  iter;
                         void                *cur;
                         void                *cpy;
                         struct t2_tx        *tx;

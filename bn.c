@@ -75,6 +75,7 @@
         SASSERT(IS_ARRAY(array));                       \
         ((unsigned long)(idx)) < ARRAY_SIZE(array);     \
 })
+#define COF(ptr, type, member) ((type *)((char *)(ptr) - __builtin_offsetof(type, member)))
 
 /*
  * Reduces ("aggregates") given expression over an interval.
@@ -333,7 +334,8 @@ static uint64_t brnd(uint64_t prev) {
 }
 
 static int bn_next(struct t2_cursor *c, const struct t2_rec *rec) {
-        return +1;
+        struct kvdata *d = COF(c, struct kvdata, u.t2.c);
+        return --d->u.t2.iter > 0 ? +1 : 0;
 }
 
 static void binc(unsigned char *key, int len) {
@@ -842,8 +844,9 @@ static int t_delete(struct rthread *rt, struct kvdata *d, void *key, void *cpy, 
 static int t_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
         struct t2_buf nextkey = { .addr = key, .len = ksize };
         d->u.t2.c.dir = dir;
+        d->u.t2.iter = nr;
         t2_cursor_init(&d->u.t2.c, &nextkey);
-        for (int i = 0; i < nr && t2_cursor_next(&d->u.t2.c) > 0; ++i) {
+        while (t2_cursor_next(&d->u.t2.c) > 0) {
                 ;
         }
         t2_cursor_fini(&d->u.t2.c);

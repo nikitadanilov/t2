@@ -62,8 +62,6 @@ Now that the key-value store is populated, benchmark lookups at various concurre
 Next, iterate over the keys: create 50K cursors, each doing 1000 iterations
 (50M iterations total with varying concurrency levels).
 
-Currently, cursors in t2 use fairly standard B-tree locking. This is significantly slower than lockless lookup:
-
 ![iterate over 50M records](https://github.com/nikitadanilov/t2/blob/master/doc/images/iterations-50M.png?raw=true)
 
 Delete the records:
