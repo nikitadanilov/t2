@@ -917,8 +917,10 @@ static int r_delete(struct rthread *rt, struct kvdata *d, void *key, void *cpy, 
 
 static int r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
         char *err = NULL;
+        int   i;
         rocksdb_iter_seek(d->u.r.it, key, ksize);
-        for (int i = 0; i < nr && rocksdb_iter_valid(d->u.r.it); ++i) {
+        assert(rocksdb_iter_valid(d->u.r.it));
+        for (i = 0; i < nr && rocksdb_iter_valid(d->u.r.it); ++i) {
                 size_t len;
                 rocksdb_iter_key(d->u.r.it, &len);
                 rocksdb_iter_value(d->u.r.it, &len);
@@ -926,7 +928,7 @@ static int r_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, en
         }
         rocksdb_iter_get_error(d->u.r.it, &err);
         r_tail("next", err);
-        return 0;
+        return i == nr ? 0 : -ENOENT;
 }
 
 #endif
