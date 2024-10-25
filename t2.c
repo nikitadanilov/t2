@@ -3641,6 +3641,16 @@ static int traverse(struct path *p) {
                                         break;
                                 }
                         } else {
+                                /*
+                                 * Iterator always leaves RCU and pins the path. Unpinning in path_fini() is costly,
+                                 * because it has to take the lock on the root node hash bucket. To amortise this
+                                 * overhead few upper tree layers are cached in the cursor, see next_cache().
+                                 *
+                                 * TODO: Alternatively, lockless iterator flag can be added. With this flag, iterator
+                                 * works like lookup: cursor call-back is called without node lock and without
+                                 * leaving RCU. If, after the leaf is processed, path_is_valid()---then we are done.
+                                 * Otherwise, call cursor->op->reset() and repeat.
+                                 */
                                 rcu_leave(p, NULL);
                                 result = PREPARE(p, next_prep(p));
                                 if (LIKELY(result == DONE)) {
