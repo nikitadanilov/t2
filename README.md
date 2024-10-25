@@ -39,7 +39,7 @@ Benchmarks
 ----------
 
 The plots below are made by `./benchmarks` script, which runs a "typical" set of
-workloads against t2, lmdb and rocksdb (additionally C++ `std::map` is used in some
+workloads against t2 and rocksdb (additionally C++ `std::map` is used in some
 cases). Warning: the script takes a lot of time (a few hours) to complete, in
 part because it, by default, it repeats each experiment 5 times (see `nr` variable).
 
