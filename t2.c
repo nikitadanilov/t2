@@ -3409,7 +3409,7 @@ static int delete_complete(struct path *p, struct node *n) {
 
 static void next_cache(struct t2_cursor *c, struct path *p, int idx) {
         ASSERT(idx < ARRAY_SIZE(c->cached));
-        if (LIKELY(idx <= p->used)) {
+        if (LIKELY(idx < p->used)) { /* Do not cache leaves. */
                 ASSERT(p->rung[idx].flags & PINNED);
                 if (p->rung[idx].page.node != c->cached[idx]) {
                         if (c->cached[idx] != NULL) {
