@@ -3408,16 +3408,21 @@ static int delete_complete(struct path *p, struct node *n) {
 }
 
 static void next_cache(struct t2_cursor *c, struct path *p, int idx) {
+        struct rung *r = &p->rung[idx];
+        struct node *n = r->page.node;
         ASSERT(idx < ARRAY_SIZE(c->cached));
         if (LIKELY(idx < p->used)) { /* Do not cache leaves. */
-                ASSERT(p->rung[idx].flags & PINNED);
-                if (p->rung[idx].page.node != c->cached[idx]) {
+                ASSERT(r->flags & PINNED);
+                if (n != c->cached[idx]) {
                         if (c->cached[idx] != NULL) {
                                 put(c->cached[idx]);
                         }
-                        c->cached[idx] = p->rung[idx].page.node;
+                        c->cached[idx] = n;
+                } else {
+                        ASSERT(n->ref > 1);
+                        --n->ref;
                 }
-                p->rung[idx].flags &= ~PINNED;
+                r->flags &= ~PINNED;
         }
 }
 
@@ -3828,6 +3833,7 @@ void t2_cursor_fini(struct t2_cursor *c) {
         for (int i = 0; i < ARRAY_SIZE(c->cached); ++i) {
                 if (c->cached[i] != NULL) {
                         put(c->cached[i]);
+                        c->cached[i] = NULL;
                 }
         }
         c->curkey.len = c->maxlen;
