@@ -3436,7 +3436,6 @@ static int next_complete(struct path *p, struct node *n) {
         for (int i = 0; i < ARRAY_SIZE(c->cached); ++i) {
                 next_cache(c, p, i);
         }
-        p->rung[0].flags &= ~PINNED;
         if (result > 0) {
                 struct node *sibling = brother(r, (enum dir)c->dir)->node;
                 if (LIKELY(sibling != NULL && nr(sibling) > 0)) { /* Rightmost leaf can be empty. */
