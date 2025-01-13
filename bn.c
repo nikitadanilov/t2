@@ -335,6 +335,7 @@ static uint64_t brnd(uint64_t prev) {
 
 static int bn_next(struct t2_cursor *c, const struct t2_rec *rec) {
         struct kvdata *d = COF(c, struct kvdata, u.t2.c);
+        d->ph->seq++;
         return --d->u.t2.iter > 0 ? +1 : 0;
 }
 
@@ -506,6 +507,7 @@ static void *bworker(void *arg) {
         rc = mem_alloc(bt->nr * sizeof rc[0]);
         assert(rc != NULL);
         data.b = &b->kv;
+        data.ph = ph;
         kv[kvt].worker_init(rt, &data, maxkey, maxval);
         mutex_lock(&ph->lock);
         rt->ready = true;

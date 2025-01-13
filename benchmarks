@@ -14,11 +14,13 @@ echo "Benchmarking $hash at $now."
 
 c='-C24 -h24 -I26 -n9 -t14 -N14 -T -p -r 0.1'
 scale128=$(for s in 1 2 4 8 16 32 64 128 ;do echo "--scale $s" ;done)
-prepare='rm -fr pages/* log/* lmdb testdb; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"'
+prepare='rm -fr pages/* log/* lmdb testdb'
+clean='sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"'
 nr=5
 
 echo "    Inserting 50M records."
 eval $prepare
+eval $clean
 cmd='./bn ${constant_param} -k${version} -f "100*500000*100:insert\$$rec8-16/seq10-20" | grep "^ - " | awk "{ printf(\"%f %f\n\", \$$9, \$$15) }"'
 ./experiment.py \
     --title '50M inserts, 100 threads' \
@@ -28,33 +30,33 @@ cmd='./bn ${constant_param} -k${version} -f "100*500000*100:insert\$$rec8-16/seq
     --y_label 'Cumulative inserts per second' \
     --seq \
     --output_file $dir/insert-50M.png \
-    --benchmark_cmd "$cmd"
+    --benchmark_cmd "$clean; $cmd"
 
 echo "    Lookups."
 cmd='o=$$((50000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}*$$o*100:lookup\$$rec8-16/20" | awk "{ print \$$14 }"'
 ./experiment.py \
     --title '50M lookups' \
-    --constant_param "$c -r1 -M -i1" \
+    --constant_param "$c -M -i1" \
     --version rocksdb --version t2 \
     --x_label 'Threads' \
     --y_label 'Cumulative lookups per second' \
     $scale128 \
     --num_runs $nr \
     --output_file $dir/lookup-50M.png \
-    --benchmark_cmd "$cmd"
+    --benchmark_cmd "$clean; $cmd"
 
 echo "    Cursors."
 cmd='o=$$((50000000/${scale}/1000)); ./bn ${constant_param} -k${version} -f "${scale}*$$o*100:next\$$rec8-16/1000" | awk "{ print \$$14 }"'
 ./experiment.py \
     --title '50M cursor iterations' \
-    --constant_param "$c -r1 -M -i1" \
+    --constant_param "$c -M -i1" \
     --version rocksdb --version t2 \
     --x_label 'Threads' \
     --y_label 'Cumulative iterations per second' \
     $scale128 \
     --num_runs $nr \
     --output_file $dir/iterations-50M.png \
-    --benchmark_cmd "$cmd"
+    --benchmark_cmd "$clean; $cmd"
 
 echo "    Deletes."
 cmd='o=$$((50000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}*$$o*100:delete\$$rec8-16" | awk "{ print \$$14 }"'
@@ -67,7 +69,7 @@ cmd='o=$$((50000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
     $scale128 \
     --num_runs $nr \
     --output_file $dir/deletes-50M.png \
-    --benchmark_cmd "$cmd"
+    --benchmark_cmd "$clean; $cmd"
 
 echo "    Parallel random inserts."
 cmd='o=$$((10000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}*$$o*100:insert\$$rnd4-4/seq0-20" | awk "{ print \$$14 }"'
@@ -80,7 +82,7 @@ cmd='o=$$((10000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
     $scale128 \
     --num_runs $nr \
     --output_file $dir/insert-rnd.png \
-    --benchmark_cmd "$prepare; $cmd"
+    --benchmark_cmd "$prepare; $clean; $cmd"
 echo "    done."
 
 echo "    Parallel sequential inserts."
@@ -94,21 +96,21 @@ cmd='o=$$((10000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
     $scale128 \
     --num_runs $nr \
     --output_file $dir/insert-seq.png \
-    --benchmark_cmd "$prepare; $cmd"
+    --benchmark_cmd "$prepare; $clean; $cmd"
 echo "    done."
 
 echo "    Key-value size."
 cmd='./bn ${constant_param} -kt2 -f "100*100000*100:insert\$$rnd${version}-${version}/seq${version}-${version}" | grep "^ - " | awk "{ printf(\"%f %f\n\", \$$9, \$$15) }"'
 ./experiment.py \
-    --title '10M parallel inserts, variable key and value size, 100 threads' \
-    --constant_param "$c -v -r1.0" \
+    --title '10M parallel inserts, t2, variable key and value size, 100 threads' \
+    --constant_param "$c -v" \
     --version 4 --version 8 --version 16 --version 32 --version 64 \
     --x_label '% complete' \
     --y_label 'Cumulative inserts per second' \
     --seq \
     --num_runs $nr \
     --output_file $dir/insert-varsize.png \
-    --benchmark_cmd "$prepare; $cmd"
+    --benchmark_cmd "$prepare; $clean; $cmd"
 echo "    done."
 
 echo "Done in $dir"

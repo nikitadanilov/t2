@@ -179,6 +179,7 @@ enum kvtype {
 
 struct kvdata {
         struct kvbenchmark *b;
+        struct bphase      *ph;
         union {
                 struct {
                         struct t2_tree      *tree;
