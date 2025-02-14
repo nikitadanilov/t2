@@ -14,3 +14,6 @@ t2.prof
 t2.svg
 ut
 ut.dSYM
+.cache/
+.gdb_history
+
