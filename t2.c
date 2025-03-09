@@ -10100,8 +10100,8 @@ static void *disorder_end(struct t2_storage *storage, struct t2_io_ctx *ioctx, i
         struct disorder_storage *dis = COF(storage, struct disorder_storage, gen);
         struct disorder_ctx     *ctx = (void *)ioctx;
         struct disorder_req     *req;
-        mutex_lock(&dis->lock);
         req = dis->substrate->op->end(dis->substrate, ctx->subring, nob, wait);
+        mutex_lock(&dis->lock);
         if (req != NULL && EISOK(req)) {
                 void *arg = req->arg;
                 ASSERT(req->inflight);
