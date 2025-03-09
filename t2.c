@@ -10119,7 +10119,7 @@ static struct disorder_req *disorder_scan(struct disorder_storage *dis, uint64_t
         struct disorder_req *scan;
         struct disorder_req *select = NULL;
         uint64_t             order  = MAX_LSN;
-        uint64_t             salt   = 0;
+        static uint64_t      salt   = 0;
         *min = MAX_LSN;
         *max = 0;
         cds_list_for_each_entry(scan, &dis->reqs, linkage) {
