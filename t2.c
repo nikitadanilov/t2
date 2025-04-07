@@ -11810,7 +11810,7 @@ static void ct(int argc, char **argv) {
                         cseg.file = &file_storage;
                         cseg.initialised = 0;
                         if (cseg.iter != 0) {
-                                printf("    .... Checking from %10lu.\n", cseg.lo[0]);
+                                printf("    .... Checking from %10"PRId64".\n", cseg.lo[0]);
                                 failed = 0;
                                 for (int i = 0; i < cseg.nr_threads; ++i) {
                                         NOFAIL(pthread_create(&tid[i], NULL, &ct_scan, (void *)(long)i));
