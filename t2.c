@@ -9450,7 +9450,7 @@ static int wal_init(struct t2_te *engine, struct t2 *mod) {
 #else /* TRANSACTIONS */
 static struct t2_te *wal_prep(const char *logname, int nr_bufs, int buf_size, int32_t flags, int workers, int log_shift, double log_sleep,
                               uint64_t age_limit, uint64_t sync_age, uint64_t sync_nob, lsn_t max_log, int reserve_quantum,
-                              int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio) {
+                              int threshold_paged, int threshold_page, int threshold_log_syncd, int threshold_log_sync, int ready_lo, bool directio, bool crc) {
         return NULL; /* TODO: For bn.c. */
 }
 
