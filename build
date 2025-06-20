@@ -167,7 +167,7 @@ function setup() {
         echo Installing rockdb.
         unset CC CXX CFLAGS LDFLAGS
         run rm -fr rocksdb
-        git clone https://github.com/facebook/rocksdb.git
+        run git clone https://github.com/facebook/rocksdb.git
         cd rocksdb
         export DEBUG_LEVEL=0
         run make shared_lib
@@ -196,11 +196,14 @@ runbn=0
 rocksdb=0
 lmdb=0
 map=0
+builddocs=0
 while [ $# != 0 ] ;do
       case "$1" in
           ('-o')
               options="$options $2"
               shift
+      ;;  ('-c')
+	      builddocs=1
       ;;  ('-u')
 	      runut=1
       ;;  ('-r')
@@ -229,6 +232,17 @@ while [ $# != 0 ] ;do
       esac
       shift
 done
+
+if [ $builddocs == 1 ] ;then
+    [ -d "./card" ] || (
+        echo Installing card.
+        run pip3 install requests
+        run rm -fr card
+        run git clone https://github.com/nikitadanilov/card.git
+    )
+    run ./card/card t2.deck
+    exit
+fi
 
 for o in $options ;do
     case $o in 
