@@ -9910,7 +9910,11 @@ static int file_write(struct t2_storage *storage, taddr_t addr, int nr, struct i
                         return ERROR(-EIO);
                 }
         } else {
-                return file_async_start(fs, addr, nr, src, ioctx, arg);
+                result = file_async_start(fs, addr, nr, src, ioctx, arg);
+                if (UNLIKELY(result == -EAGAIN)) { /* Recurse synchronously. */
+                        result = file_write(storage, addr, nr, src, NULL, NULL);
+                }
+                return result;
         }
 }
 
