@@ -94,7 +94,7 @@ esac
 
 case "$cc" in (*clang*)
     cadd '#include "cc-clang.h"'
-    OPTFLAGS="-O3 -Ofast"
+    OPTFLAGS="-O3 -ffast-math"
     CFLAGS="$CFLAGS -Wno-assume"
     MAP_CFLAGS="$MAP_CFLAGS -std=gnu++11"
 esac

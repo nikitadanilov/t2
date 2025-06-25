@@ -83,7 +83,7 @@ Transportability
 ----------------
 
 All tests are done on Ubuntu, any Linux version should be all right. t2 compiles
-on macos (Darwin), but it lacks some features, like asynchronous IO there.
+on macos (Darwin) too.
 
 Limitations
 -----------

@@ -1,6 +1,6 @@
 /* -*- C -*- */
 
-/* Copyright 2023--2024 Nikita Danilov <danilov@gmail.com> */
+/* Copyright 2023--2025 Nikita Danilov <danilov@gmail.com> */
 /* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for the licencing information. */
 
 #define _GNU_SOURCE
@@ -11757,6 +11757,12 @@ static void seg_load() {
 }
 
 static void ct(int argc, char **argv) {
+        /*
+         * ui cf$NR c $NR_THREADS $SLEEP_MIN $SLEEP_MAX
+         * ui cf$NR i $NR_THREADS $SLEEP_MIN $SLEEP_MAX
+         * ui cg    c $NR_THREADS $SLEEP_MIN $SLEEP_MAX
+         * ui cg    i $NR_THREADS $SLEEP_MIN $SLEEP_MAX
+         */
         enum { CT_SHIFT = 24 };
         ASSERT(argc > 5);
         ut_storage = &disorder_storage.gen;
@@ -11802,7 +11808,6 @@ static void ct(int argc, char **argv) {
                                 t2_tx_close(mod, tx);
                                 t2_tx_done(mod, tx);
                         } else {
-                                t2_stats_print(mod, T2_SF_TX);
                                 t = t2_tree_open(&ttype, 1);
                                 if (cseg.iter > 1) {
                                         seg_load();
@@ -11842,7 +11847,6 @@ static void ct(int argc, char **argv) {
                                 wait_forever();
                         } else if (crash) {
                                 puts("    .... Crashing.");
-                                t2_stats_print(mod, T2_SF_TX);
                                 kill(getpid(), SIGKILL);
                         } else {
                                 cseg.shutdown = true;
