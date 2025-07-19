@@ -9147,6 +9147,9 @@ static int wal_index_build(struct wal_te *en, int *nr, struct rbuf *index, int64
                 ;
         }
         *nr  = pos;
+        if (pos == 0) {
+                return 0;
+        }
         *out = index[pos - 1];
         if (snapend > 0 && index[snapend - 1].end > out->end) {
                 *out = index[snapend - 1];
@@ -9224,7 +9227,9 @@ static int wal_recover(struct wal_te *en) {
                 struct rbuf last = {};
                 buf_nr0 = buf_nr;
                 result = wal_index_build(en, &buf_nr, index, size, &last);
-                if (result == 0) {
+                if (result == 0 && buf_nr == 0) {
+                        ;
+                } else if (result == 0) {
                         void *buf0 = mem_alloc(en->buf_size);
                         void *buf1 = mem_alloc(en->buf_size);
                         if (buf0 != NULL && buf1 != NULL) {
