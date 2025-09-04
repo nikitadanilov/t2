@@ -90,7 +90,7 @@ Limitations
 
 - Only C bindings exist.
 
-- The implementation of trasnactions supports integration with an external
+- The implementation of transactions supports integration with an external
   trasnaction engine, so that t2 can be used as a part of large system (_e.g._,
   as a meta-data store in a file-system server), but this has never been tried
   and will most likely require some additional coding.
