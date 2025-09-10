@@ -37,7 +37,6 @@ struct t2_conf {
         int                   cache_briard_shift;
         int                   cache_buhund_shift;
         bool                  cache_direct;
-        int                   max_cluster;
         int                   scan_run;
         int                   free_hi;
         int                   free_lo;
