@@ -1,6 +1,6 @@
 /* -*- C -*- */
 
-/* Copyright 2023--2025 Nikita Danilov <danilov@gmail.com> */
+/* Copyright 2023--2026 Nikita Danilov <danilov@gmail.com> */
 /* See https://github.com/nikitadanilov/t2/blob/master/LICENCE for the licencing information. */
 
 #define _GNU_SOURCE
@@ -7435,8 +7435,8 @@ struct oheader {
 
 struct orec {
         int16_t off;
-        int8_t klen;
-        int8_t vlen;
+        int16_t klen;
+        int16_t vlen;
 };
 
 enum {
