@@ -110,7 +110,7 @@ function run() {
     if [ $rc != 0 ]
     then
         echo "failed: $rc"
-        exit $?
+        exit $rc
     fi
 }
 
