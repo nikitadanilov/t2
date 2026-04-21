@@ -191,6 +191,35 @@ function runprep() {
     esac
 }
 
+function build_bftree_adapter() {
+    repo_dir=bf-tree-src
+    manifest="$repo_dir/bn-adapter/Cargo.toml"
+    if ! command -v cargo >/dev/null 2>/dev/null ;then
+        echo "cargo is required to build bf-tree backend adapter."
+        exit 1
+    fi
+    if [ ! -d "$repo_dir" ] ;then
+        run git clone https://github.com/microsoft/bf-tree.git "$repo_dir"
+    else
+        run git -C "$repo_dir" pull --ff-only
+    fi
+    if [ ! -f "$manifest" ] ;then
+        echo "Expected bf-tree benchmark adapter manifest at '$manifest'."
+        echo "Please ensure microsoft/bf-tree exports a bn-adapter crate with bftree_bn_* C ABI symbols."
+        exit 1
+    fi
+    run cargo build --manifest-path "$manifest" --release
+    case "$platform" in
+        (*Darwin*)
+            libname=libbftree_bn.dylib
+            ;;
+        (*)
+            libname=libbftree_bn.so
+            ;;
+    esac
+    run cp "$repo_dir/target/release/$libname" "./$libname"
+}
+
 runut=0
 runbn=0
 rocksdb=0
@@ -307,6 +336,7 @@ else
    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=0"
 fi
 if [ $bftree == 1 ] ;then
+   build_bftree_adapter
    BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=1"
 else
    BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=0"
