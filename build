@@ -114,6 +114,17 @@ function run() {
     fi
 }
 
+function as_root() {
+    if [ "$(id -u)" -eq 0 ] ;then
+        "$@"
+    elif command -v sudo >/dev/null 2>/dev/null ;then
+        sudo "$@"
+    else
+        echo "Need root privileges to run: $*"
+        return 1
+    fi
+}
+
 function headerp() {
     h="$1"
     f=/tmp/check.h
@@ -131,7 +142,7 @@ function libp() {
 function setup_prereq() {
     case "$distro" in
 	(ubuntu)
-	    run sudo apt install -y gcc make automake autoconf libtool g++ cargo rustc libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev zlib1g-dev libsnappy-dev bpfcc-tools bpftrace linux-headers-$(uname -r)
+	    run as_root apt install -y gcc make automake autoconf libtool g++ cargo rustc libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev zlib1g-dev libsnappy-dev bpfcc-tools bpftrace linux-headers-$(uname -r)
             run pip install tqdm matplotlib numpy
     ;;  (darwin)
             which -s brew
@@ -159,7 +170,7 @@ function setup() {
         run ./bootstrap
         run ./configure
         run make
-        run sudo make install
+        run as_root make install
         run cd ..
         run rm -fr userspace-rcu
     )
@@ -171,7 +182,7 @@ function setup() {
         cd rocksdb
         export DEBUG_LEVEL=0
         run make shared_lib
-        run sudo make install-shared install
+        run as_root make install-shared install
         run cd ..
         run rm -fr rocksdb
     )
@@ -185,8 +196,8 @@ function runprep() {
     run mkdir pages log
     case "$platform" in
         (*Darwin*)
-            run sudo sysctl kern.aioprocmax=8192
-            run sudo sysctl kern.aiomax=8192
+            run as_root sysctl kern.aioprocmax=8192
+            run as_root sysctl kern.aiomax=8192
             ;;
     esac
 }
