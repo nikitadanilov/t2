@@ -196,6 +196,7 @@ runbn=0
 rocksdb=0
 lmdb=0
 map=0
+bftree=0
 builddocs=0
 while [ $# != 0 ] ;do
       case "$1" in
@@ -212,6 +213,8 @@ while [ $# != 0 ] ;do
 	      lmdb=1
       ;;  ('-m')
 	      map=1
+      ;;  ('-B')
+	      bftree=1
       ;;  ('-f')
 	      options="$options nodebug nocounters opt"
       ;;  ('-d')
@@ -302,6 +305,11 @@ if [ $map == 1 ] ;then
    BN_LDFLAGS="$BN_LDFLAGS map.o $MAP_LDFLAGS"
 else
    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=0"
+fi
+if [ $bftree == 1 ] ;then
+   BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=1"
+else
+   BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=0"
 fi
 run $CC $CFLAGS $BN_CFLAGS bn.c t2.o $BN_LDFLAGS $LDFLAGS -o bn
 if [ $runut == 1 ] ;then

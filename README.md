@@ -35,6 +35,13 @@ The last 2 commands produce:
 - `ut`: a unit-test binary;
 - `bn`: a benchmarking executable.
 
+To enable the experimental `bf-tree` benchmark backend in `bn`, build with:
+
+    $ ./build -d -B
+
+At runtime `bn -k bftree` dynamically loads a bf-tree adapter shared library
+(`libbftree_bn.so` by default, or the path from `BFTREE_BN_LIB`).
+
 Benchmarks
 ----------
 
