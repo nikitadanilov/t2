@@ -181,11 +181,11 @@ function setup_prereq_backend() {
         (ubuntu)
             case "$backend" in
                 (rocksdb)
-                    run sudo apt install -y libbz2-dev liblz4-dev libsnappy-dev
+                    run as_root apt install -y libbz2-dev liblz4-dev libsnappy-dev
             ;;  (lmdb)
-                    run sudo apt install -y liblmdb0 liblmdb-dev
+                    run as_root apt install -y liblmdb0 liblmdb-dev
             ;;  (map)
-                    run sudo apt install -y g++
+                    run as_root apt install -y g++
             esac
     ;;  (darwin)
             case "$backend" in
@@ -207,7 +207,7 @@ function setup_t2() {
         run rm -fr userspace-rcu
         run git clone https://git.lttng.org/userspace-rcu.git
         run bash -c 'cd userspace-rcu && ./bootstrap && ./configure && make'
-        run sudo make -C userspace-rcu install
+        run as_root make -C userspace-rcu install
         run rm -fr userspace-rcu
     )
 }
@@ -223,7 +223,7 @@ function setup_backend() {
                 run rm -fr rocksdb
                 run git clone https://github.com/facebook/rocksdb.git
                 run bash -c 'cd rocksdb && DEBUG_LEVEL=0 make shared_lib'
-                run sudo make -C rocksdb install-shared install
+                run as_root make -C rocksdb install-shared install
                 run rm -fr rocksdb
             )
     ;;  (lmdb)
