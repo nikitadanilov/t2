@@ -40,10 +40,10 @@ To enable the experimental `bf-tree` benchmark backend in `bn`, build with:
     $ ./build -d -B
 
 The build script will clone `https://github.com/microsoft/bf-tree.git`, build
-its `bn-adapter` crate via `cargo`, and copy the resulting shared library
-(`libbftree_bn.so` or `libbftree_bn.dylib`) into the repository root.
-If this adapter crate is unavailable, `bn` is still built and you can point to
-an externally-built adapter by setting `BFTREE_BN_LIB`.
+the local `bftree-bn-adapter` crate against that source via `cargo`, and copy
+the resulting shared library (`libbftree_bn.so` or `libbftree_bn.dylib`) into
+the repository root. If adapter build fails, `bn` is still built and you can
+point to an externally-built adapter by setting `BFTREE_BN_LIB`.
 
 At runtime `bn -k bftree` dynamically loads this shared library (or the path
 from `BFTREE_BN_LIB`).

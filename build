@@ -204,7 +204,7 @@ function runprep() {
 
 function bft() {
     repo_dir=bf-tree-src
-    manifest="$repo_dir/bn-adapter/Cargo.toml"
+    manifest="bftree-bn-adapter/Cargo.toml"
     warn_prefix="bf-tree adapter build skipped:"
     if [ ! -d "$repo_dir" ] ;then
         git clone https://github.com/microsoft/bf-tree.git "$repo_dir"
@@ -216,8 +216,7 @@ function bft() {
         git -C "$repo_dir" pull --ff-only >/dev/null 2>/dev/null
     fi
     if [ ! -f "$manifest" ] ;then
-        echo "$warn_prefix expected manifest '$manifest' was not found."
-        echo "$warn_prefix bn will still be built; bftree backend requires setting BFTREE_BN_LIB to a compatible adapter."
+        echo "$warn_prefix expected local adapter manifest '$manifest' was not found."
         return 0
     fi
     cargo build --manifest-path "$manifest" --release
@@ -233,10 +232,10 @@ function bft() {
             libname=libbftree_bn.so
             ;;
     esac
-    if [ -f "$repo_dir/target/release/$libname" ] ;then
-        run cp "$repo_dir/target/release/$libname" "./$libname"
+    if [ -f "bftree-bn-adapter/target/release/$libname" ] ;then
+        run cp "bftree-bn-adapter/target/release/$libname" "./$libname"
     else
-        echo "$warn_prefix expected artifact '$repo_dir/target/release/$libname' was not produced."
+        echo "$warn_prefix expected artifact 'bftree-bn-adapter/target/release/$libname' was not produced."
     fi
 }
 
