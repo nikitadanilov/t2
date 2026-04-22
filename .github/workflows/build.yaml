@@ -9,4 +9,4 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: ./build -x -d -u
+      - run: ./build -d -u
