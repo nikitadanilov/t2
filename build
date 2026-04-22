@@ -205,7 +205,7 @@ function setup_t2() {
         echo "Installing userspace-rcu."
         unset CC CXX CFLAGS LDFLAGS
         run rm -fr userspace-rcu
-        run git clone git://git.liburcu.org/userspace-rcu.git
+        run git clone https://git.lttng.org/userspace-rcu.git
         run bash -c 'cd userspace-rcu && ./bootstrap && ./configure && make'
         run sudo make -C userspace-rcu install
         run rm -fr userspace-rcu
