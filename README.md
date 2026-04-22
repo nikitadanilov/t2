@@ -17,9 +17,9 @@ Build
 
 [build](https://github.com/nikitadanilov/t2/blob/master/build) script manages build process.
 
-To install the packages necessary for build (this needs to be done once):
-
-    $ ./build -S
+The script installs dependencies lazily by default: core t2 dependencies are
+always installed, backend dependencies are installed only when a backend is
+requested with `-B`, and `card` is installed only with `-c`.
 
 To build a debug version (this is the default, when no options are given):
 
@@ -29,7 +29,15 @@ To build an optimised version:
 
     $ ./build -f
 
-The last 2 commands produce:
+To enable a backend (repeat `-B` for multiple backends):
+
+    $ ./build -d -B bftree -B rocksdb
+
+To skip dependency installation (fast build):
+
+    $ ./build -x -d
+
+All these commands produce:
 
 - `t2.o`: an object file that can be linked in your application;
 - `ut`: a unit-test binary;
