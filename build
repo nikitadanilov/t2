@@ -3,6 +3,8 @@
 # Copyright 2023--2026 Nikita Danilov <danilov@gmail.com>
 # See https://github.com/nikitadanilov/t2/blob/master/LICENCE for licencing information.
 
+set -e
+
 echo > config.h
 platform="$(uname -srm)"
 LDFLAGS="$LDFLAGS -L/usr/local/lib/ -lurcu -lpthread -ldl -lzstd -ltcmalloc -rdynamic -lz"
@@ -12,9 +14,12 @@ CFLAGS="-I/usr/local/include -march=native -mtune=native -ggdb3 -fno-omit-frame-
 cc="$($CC -v 2>&1)"
 OPTFLAGS="-O6 -Ofast"
 distro=unknown
+VENV_DIR=".venv"
+VENV_PIP="$VENV_DIR/bin/pip"
+VENV_PYTHON="$VENV_DIR/bin/python"
 
 function cadd() {
-    echo $* >> config.h
+    echo "$*" >> config.h
 }
 
 function cundef() {
@@ -25,7 +30,7 @@ function cundef() {
 }
 
 function cpuflag() {
-        :
+    :
 }
 
 case "$platform" in ####################### Linux #############################
@@ -45,7 +50,7 @@ case "$platform" in ####################### Linux #############################
                         cat /proc/cpuinfo | grep " $flag " >/dev/null 2>/dev/null && echo "-m$flag"
                 fi
         }
-	grep -q Ubuntu /etc/os-release 2>/dev/null && distro=ubuntu
+        grep -q Ubuntu /etc/os-release 2>/dev/null && distro=ubuntu
         ;;
 esac
 
@@ -56,8 +61,8 @@ esac
 
 case "$platform" in
     (*x86_64*)
-	# popcnt for ilog2()
-	# No longer needed: cx16 for mag_{get,put}() (128-bit CAS)
+        # popcnt for ilog2()
+        # No longer needed: cx16 for mag_{get,put}() (128-bit CAS)
         MFLAGS="popcnt"
         ;;
 esac
@@ -73,9 +78,10 @@ case "$platform" in ####################### Darwin #############################
         cadd '#define ON_DARWIN (1)'
         cadd '#include "os-darwin.h"'
         function cpuflag() {
-                sysctl -a | grep machdep.cpu.features | grep -i " $1 " >/dev/null 2>/dev/null && echo "-m$flag"
+                flag="$1"
+                sysctl -a | grep machdep.cpu.features | grep -i " $flag " >/dev/null 2>/dev/null && echo "-m$flag"
         }
-	distro=darwin
+        distro=darwin
         ;;
 esac
 
@@ -104,13 +110,12 @@ for flag in $MFLAGS ;do
 done
 
 function run() {
-    echo "$* "
-    $*
+    echo "$*"
+    "$@"
     rc="$?"
-    if [ $rc != 0 ]
-    then
+    if [ "$rc" != 0 ]; then
         echo "failed: $rc"
-        exit $rc
+        exit "$rc"
     fi
 }
 
@@ -128,63 +133,112 @@ function as_root() {
 function headerp() {
     h="$1"
     f=/tmp/check.h
-    echo \#include $h > $f
-    cc -E $f 2>/dev/null >/dev/null
+    echo "#include $h" > "$f"
+    cc -E "$f" 2>/dev/null >/dev/null
 }
 
 function libp() {
     l="$1"
     f=/tmp/check.c
-    echo 'int main(int argc, char **argv) { return 0; }' > $f
-    cc $f -o/tmp/a.out $l 2>/dev/null >/dev/null
+    echo 'int main(int argc, char **argv) { return 0; }' > "$f"
+    cc "$f" -o/tmp/a.out "$l" 2>/dev/null >/dev/null
 }
 
-function setup_prereq() {
+function ensure_venv() {
+    if [ ! -x "$VENV_PYTHON" ]; then
+        run python3 -m venv "$VENV_DIR"
+    fi
+    run "$VENV_PYTHON" -m pip install --upgrade pip
+}
+
+function setup_prereq_t2() {
     case "$distro" in
-	(ubuntu)
-	    run as_root apt install -y gcc make automake autoconf libtool g++ cargo rustc libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev zlib1g-dev libsnappy-dev bpfcc-tools bpftrace linux-headers-$(uname -r)
-            run pip install tqdm matplotlib numpy
+        (ubuntu)
+            run as_root apt update
+            run  apt install -y git python3-venv gcc make automake autoconf libtool g++ libunwind-dev google-perftools libgoogle-perftools-dev zstd libzstd-dev liburing-dev libz-dev zlib1g-dev bpfcc-tools bpftrace "linux-headers-$(uname -r)"
+            ensure_venv
+            run "$VENV_PIP" install tqdm matplotlib numpy
     ;;  (darwin)
             which -s brew
-            if [[ $? != 0 ]] ; then
-                bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            if [[ $? != 0 ]]; then
+                run bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
                 eval "$(/opt/homebrew/bin/brew shellenv)"
             else
                 run brew update
             fi
-            run brew install automake autoconf libtool gcc gperftools zstd zlib rust
+            run brew install git python automake autoconf libtool gcc gperftools zstd zlib
+            ensure_venv
+            run "$VENV_PIP" install tqdm matplotlib numpy
     ;;  (*)
-	    echo "Unknown distro '$distro'"
-	    exit 1
+            echo "Unknown distro '$distro'"
+            exit 1
     esac
 }
 
-function setup() {
-    setup_prereq
+function setup_prereq_backend() {
+    backend="$1"
+    case "$distro" in
+        (ubuntu)
+            case "$backend" in
+                (rocksdb)
+                    run sudo apt install -y libbz2-dev liblz4-dev libsnappy-dev
+            ;;  (lmdb)
+                    run sudo apt install -y liblmdb0 liblmdb-dev
+            ;;  (map)
+                    run sudo apt install -y g++
+            esac
+    ;;  (darwin)
+            case "$backend" in
+                (rocksdb)
+                    run brew install snappy lz4 bzip2
+            ;;  (lmdb)
+                    run brew install lmdb
+            ;;  (map)
+                    run brew install gcc
+            esac
+    esac
+}
+
+function setup_t2() {
+    setup_prereq_t2
     headerp '<urcu/urcu-memb.h>' && libp -lurcu || (
-        echo Installing userspace-rcu.
+        echo "Installing userspace-rcu."
         unset CC CXX CFLAGS LDFLAGS
         run rm -fr userspace-rcu
         run git clone git://git.liburcu.org/userspace-rcu.git
-        run cd userspace-rcu
-        run ./bootstrap
-        run ./configure
-        run make
-        run as_root make install
-        run cd ..
+        run bash -c 'cd userspace-rcu && ./bootstrap && ./configure && make'
+        run sudo make -C userspace-rcu install
         run rm -fr userspace-rcu
     )
-    headerp '<rocksdb/c.h>' && libp -lrocksdb || (
-        echo Installing rockdb.
-        unset CC CXX CFLAGS LDFLAGS
-        run rm -fr rocksdb
-        run git clone https://github.com/facebook/rocksdb.git
-        cd rocksdb
-        export DEBUG_LEVEL=0
-        run make shared_lib
-        run as_root make install-shared install
-        run cd ..
-        run rm -fr rocksdb
+}
+
+function setup_backend() {
+    backend="$1"
+    setup_prereq_backend "$backend"
+    case "$backend" in
+        (rocksdb)
+            headerp '<rocksdb/c.h>' && libp -lrocksdb || (
+                echo "Installing rocksdb."
+                unset CC CXX CFLAGS LDFLAGS
+                run rm -fr rocksdb
+                run git clone https://github.com/facebook/rocksdb.git
+                run bash -c 'cd rocksdb && DEBUG_LEVEL=0 make shared_lib'
+                run sudo make -C rocksdb install-shared install
+                run rm -fr rocksdb
+            )
+    ;;  (lmdb)
+            true
+    ;;  (map)
+            true
+    esac
+}
+
+function setup_card() {
+    setup_prereq_t2
+    run "$VENV_PIP" install requests
+    [ -d "./card" ] || (
+        echo "Installing card."
+        run git clone https://github.com/nikitadanilov/card.git
     )
 }
 
@@ -239,6 +293,12 @@ function bft() {
     fi
 }
 
+function usage() {
+    echo "Usage: ./build [-d|-f] [-u] [-b] [-c] [-A] [-D SYM] [-o OPTION] [-B BACKEND] [-x]"
+    echo "  -B BACKEND  Enable backend: bftree|rocksdb|lmdb|map (can be repeated)"
+    echo "  -x          Fast build: skip dependency installation"
+}
+
 runut=0
 runbn=0
 rocksdb=0
@@ -246,79 +306,97 @@ lmdb=0
 map=0
 bftree=0
 builddocs=0
+skipdeps=0
+use_rocksdb=0
+use_lmdb=0
+use_map=0
+use_bftree=0
+
 while [ $# != 0 ] ;do
-      case "$1" in
-          ('-o')
-              options="$options $2"
-              shift
-      ;;  ('-c')
-	      builddocs=1
-      ;;  ('-u')
-	      runut=1
-      ;;  ('-r')
-	      rocksdb=1
-      ;;  ('-l')
-	      lmdb=1
-      ;;  ('-m')
-	      map=1
-      ;;  ('-B')
-	      bftree=1
-      ;;  ('-f')
-	      options="$options nodebug nocounters opt"
-      ;;  ('-d')
-	      options="$options debug counters noopt profile"
-      ;;  ('-D')
-	      CFLAGS="$CFLAGS -D$2"
-	      shift
-      ;;  ('-b')
-	      runbn=1
-      ;;  ('-S')
-	      setup
-	      exit 0
-      ;;  ('-A')
-              CFLAGS="$CFLAGS -fsanitize=address"
-      ;;  (*)
-	      echo "Unknown argument $1"
-	      exit 1
-      esac
-      shift
+    case "$1" in
+        ('-o')
+            options="$options $2"
+            shift
+        ;;  ('-c')
+            builddocs=1
+        ;;  ('-u')
+            runut=1
+        ;;  ('-B')
+            backend="$2"
+            case "$backend" in
+                (bftree) use_bftree=1
+            ;;  (rocksdb) use_rocksdb=1
+            ;;  (lmdb) use_lmdb=1
+            ;;  (map) use_map=1
+            ;;  (*)
+                echo "Unknown backend '$backend'"
+                usage
+                exit 1
+            esac
+            shift
+        ;;  ('-f')
+            options="$options nodebug nocounters opt"
+        ;;  ('-d')
+            options="$options debug counters noopt profile"
+        ;;  ('-D')
+            CFLAGS="$CFLAGS -D$2"
+            shift
+        ;;  ('-b')
+            runbn=1
+        ;;  ('-A')
+            CFLAGS="$CFLAGS -fsanitize=address"
+        ;;  ('-x')
+            skipdeps=1
+        ;;  ('-h'|'--help')
+            usage
+            exit 0
+        ;;  (*)
+            echo "Unknown argument $1"
+            usage
+            exit 1
+        ;;
+    esac
+    shift
 done
 
-if [ $builddocs == 1 ] ;then
-    [ -d "./card" ] || (
-        echo Installing card.
-        run pip3 install requests
-        run rm -fr card
-        run git clone https://github.com/nikitadanilov/card.git
-    )
-    run ./card/card t2.deck
+if [ "$skipdeps" != 1 ]; then
+    setup_t2
+    [ "$use_bftree" = 1 ] && true
+    [ "$use_rocksdb" = 1 ] && setup_backend rocksdb
+    [ "$use_lmdb" = 1 ] && setup_backend lmdb
+    [ "$use_map" = 1 ] && setup_backend map
+    [ "$builddocs" = 1 ] && setup_card
+fi
+
+if [ "$builddocs" = 1 ] ; then
+    run "$VENV_PYTHON" ./card/card t2.deck
     exit
 fi
 
 for o in $options ;do
-    case $o in 
+    case $o in
        (*profile*)
-        LDFLAGS="$LDFLAGS -lprofiler"
+            LDFLAGS="$LDFLAGS -lprofiler"
     ;; (*nodebug*)
-       cundef DEBUG
-       cadd '#define DEBUG  (0)'
+            cundef DEBUG
+            cadd '#define DEBUG  (0)'
     ;; (*debug*)
-       cundef DEBUG
-       cadd '#define DEBUG  (1)'
+            cundef DEBUG
+            cadd '#define DEBUG  (1)'
     ;; (*nocounters*)
-       cundef COUNTERS
-       cadd '#define COUNTERS  (0)'
+            cundef COUNTERS
+            cadd '#define COUNTERS  (0)'
     ;; (*counters*)
-       cundef COUNTERS
-       cadd '#define COUNTERS  (1)'
+            cundef COUNTERS
+            cadd '#define COUNTERS  (1)'
     ;; (*noopt*)
-       CFLAGS="$CFLAGS -O0"
+            CFLAGS="$CFLAGS -O0"
     ;; (*opt*)
-       CFLAGS="$CFLAGS $OPTFLAGS"
+            CFLAGS="$CFLAGS $OPTFLAGS"
     ;; (*)
-       echo "Unknown option '$o'"
-       exit 1
-    esac       
+            echo "Unknown option '$o'"
+            exit 1
+    esac
 done
 
 git_head=$(git rev-parse HEAD 2> /dev/null || echo "Not a repository.")
@@ -333,26 +411,26 @@ cadd "#define UNAME \"$uname\""
 cadd "#define CFLAGS \"$CFLAGS\""
 cadd "#define LDFLAGS \"$LDFLAGS\""
 
-run $CC $CFLAGS -DUT=1 -BN=0 t2.c $LDFLAGS -o ut
+run $CC $CFLAGS -DUT=1 -DBN=0 t2.c $LDFLAGS -o ut
 run $CC $CFLAGS -DUT=0 -DBN=1 -c t2.c
-if [ $rocksdb == 1 ] ;then
-   BN_CFLAGS="-DUSE_ROCKSDB=1"
-   BN_LDFLAGS="$ROCKSDB_LDFLAGS"
+if [ "$use_rocksdb" = 1 ] ;then
+    BN_CFLAGS="-DUSE_ROCKSDB=1"
+    BN_LDFLAGS="$ROCKSDB_LDFLAGS"
 else
-   BN_CFLAGS="-DUSE_ROCKSDB=0"
+    BN_CFLAGS="-DUSE_ROCKSDB=0"
 fi
-if [ $lmdb == 1 ] ;then
-   BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=1"
-   BN_LDFLAGS="$BN_LDFLAGS $LMDB_LDFLAGS"
+if [ "$use_lmdb" = 1 ] ;then
+    BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=1"
+    BN_LDFLAGS="$BN_LDFLAGS $LMDB_LDFLAGS"
 else
-   BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=0"
+    BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=0"
 fi
-if [ $map == 1 ] ;then
-   run $CXX $MAP_CFLAGS -c map.cpp -o map.o
-   BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=1"
-   BN_LDFLAGS="$BN_LDFLAGS map.o $MAP_LDFLAGS"
+if [ "$use_map" = 1 ] ;then
+    run $CXX $MAP_CFLAGS -c map.cpp -o map.o
+    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=1"
+    BN_LDFLAGS="$BN_LDFLAGS map.o $MAP_LDFLAGS"
 else
-   BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=0"
+    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=0"
 fi
 if [ $bftree == 1 ] ;then
    bft
@@ -361,11 +439,11 @@ else
    BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=0"
 fi
 run $CC $CFLAGS $BN_CFLAGS bn.c t2.o $BN_LDFLAGS $LDFLAGS -o bn
-if [ $runut == 1 ] ;then
+if [ "$runut" = 1 ] ; then
     runprep
     run ./ut
 fi
-if [ $runbn == 1 ] ;then
+if [ "$runbn" = 1 ] ; then
     runprep
     run ./bn -T -h22 -n12 -t14 -N16 -kt2 -f '1*10000000*100:insert$rnd1-6/seq0-20;1*10000000*100:lookup$rnd1-6/20;1*10000000*100:delete$rnd1-6'
 fi
