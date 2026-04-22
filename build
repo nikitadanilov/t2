@@ -261,19 +261,19 @@ function bft() {
     manifest="bftree-bn-adapter/Cargo.toml"
     warn_prefix="bf-tree adapter build skipped:"
     if [ ! -d "$repo_dir" ] ;then
-        git clone https://github.com/microsoft/bf-tree.git "$repo_dir"
+        run git clone https://github.com/microsoft/bf-tree.git "$repo_dir"
         if [ $? != 0 ] ;then
             echo "$warn_prefix cannot clone '$repo_dir'."
             return 0
         fi
     else
-        git -C "$repo_dir" pull --ff-only >/dev/null 2>/dev/null
+        run git -C "$repo_dir" pull --ff-only >/dev/null 2>/dev/null
     fi
     if [ ! -f "$manifest" ] ;then
         echo "$warn_prefix expected local adapter manifest '$manifest' was not found."
         return 0
     fi
-    cargo build --manifest-path "$manifest" --release
+    run cargo build --manifest-path "$manifest" --release
     if [ $? != 0 ] ;then
         echo "$warn_prefix cargo build failed."
         return 0
@@ -301,10 +301,6 @@ function usage() {
 
 runut=0
 runbn=0
-rocksdb=0
-lmdb=0
-map=0
-bftree=0
 builddocs=0
 skipdeps=0
 use_rocksdb=0
@@ -401,7 +397,7 @@ done
 
 git_head=$(git rev-parse HEAD 2> /dev/null || echo "Not a repository.")
 md5_sum=$(md5sum t2.c | cut -f1 -d' ')
-cc_ver=$($CC -v 2>&1)
+cc_ver=$($CC -v 2>&1 | tr '\n' ' ')
 uname=$(uname -a)
 
 cadd "#define GIT_HEAD \"$git_head\""
@@ -414,30 +410,17 @@ cadd "#define LDFLAGS \"$LDFLAGS\""
 run $CC $CFLAGS -DUT=1 -DBN=0 t2.c $LDFLAGS -o ut
 run $CC $CFLAGS -DUT=0 -DBN=1 -c t2.c
 if [ "$use_rocksdb" = 1 ] ;then
-    BN_CFLAGS="-DUSE_ROCKSDB=1"
     BN_LDFLAGS="$ROCKSDB_LDFLAGS"
-else
-    BN_CFLAGS="-DUSE_ROCKSDB=0"
 fi
 if [ "$use_lmdb" = 1 ] ;then
-    BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=1"
     BN_LDFLAGS="$BN_LDFLAGS $LMDB_LDFLAGS"
-else
-    BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=0"
 fi
 if [ "$use_map" = 1 ] ;then
     run $CXX $MAP_CFLAGS -c map.cpp -o map.o
-    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=1"
     BN_LDFLAGS="$BN_LDFLAGS map.o $MAP_LDFLAGS"
-else
-    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=0"
 fi
-if [ $bftree == 1 ] ;then
-   bft
-   BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=1"
-else
-   BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=0"
-fi
+BN_CFLAGS="$BN_CFLAGS -DUSE_LMDB=$use_lmdb -DUSE_MAP=$use_map -DUSE_BFTREE=$use_bftree -DUSE_ROCKSDB=$use_rocksdb"
+[ $use_bftree == 1 ] && bft
 run $CC $CFLAGS $BN_CFLAGS bn.c t2.o $BN_LDFLAGS $LDFLAGS -o bn
 if [ "$runut" = 1 ] ; then
     runprep
