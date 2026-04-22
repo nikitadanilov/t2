@@ -25,7 +25,7 @@ cmd='./bn ${constant_param} -k${version} -f "100*500000*100:insert\$$rec8-16/seq
 ./experiment.py \
     --title '50M inserts, 100 threads' \
     --constant_param "$c -v -r1.0" \
-    --version rocksdb --version t2 --version map \
+    --version bftree --version rocksdb --version t2 --version map \
     --x_label '% complete' \
     --y_label 'Cumulative inserts per second' \
     --seq \
@@ -37,7 +37,7 @@ cmd='o=$$((50000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
 ./experiment.py \
     --title '50M lookups' \
     --constant_param "$c -M -i1" \
-    --version rocksdb --version t2 \
+    --version bftree --version rocksdb --version t2 \
     --x_label 'Threads' \
     --y_label 'Cumulative lookups per second' \
     $scale128 \
@@ -50,7 +50,7 @@ cmd='o=$$((50000000/${scale}/1000)); ./bn ${constant_param} -k${version} -f "${s
 ./experiment.py \
     --title '50M cursor iterations' \
     --constant_param "$c -M -i1" \
-    --version rocksdb --version t2 \
+    --version bftree --version rocksdb --version t2 \
     --x_label 'Threads' \
     --y_label 'Cumulative iterations per second' \
     $scale128 \
@@ -63,7 +63,7 @@ cmd='o=$$((50000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
 ./experiment.py \
     --title '50M deletes' \
     --constant_param "$c -r1 -M -i1" \
-    --version rocksdb --version t2 \
+    --version bftree --version rocksdb --version t2 \
     --x_label 'Threads' \
     --y_label 'Cumulative deletes per second' \
     $scale128 \
@@ -76,7 +76,7 @@ cmd='o=$$((10000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
 ./experiment.py \
     --title '10M parallel inserts, random 4-byte keys, 10-byte values' \
     --constant_param "$c" \
-    --version rocksdb --version map --version t2 \
+    --version bftree --version rocksdb --version t2 \
     --x_label 'Threads' \
     --y_label 'Cumulative inserts per second' \
     $scale128 \
@@ -90,7 +90,7 @@ cmd='o=$$((10000000/${scale})); ./bn ${constant_param} -k${version} -f "${scale}
 ./experiment.py \
     --title '10M parallel inserts, sequential 4-byte keys, 10-byte values' \
     --constant_param "$c" \
-    --version rocksdb --version map --version t2 \
+    --version bftree --version rocksdb --version t2 \
     --x_label 'Threads' \
     --y_label 'Cumulative inserts per second' \
     $scale128 \
