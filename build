@@ -114,6 +114,17 @@ function run() {
     fi
 }
 
+function as_root() {
+    if [ "$(id -u)" -eq 0 ] ;then
+        "$@"
+    elif command -v sudo >/dev/null 2>/dev/null ;then
+        sudo "$@"
+    else
+        echo "Need root privileges to run: $*"
+        return 1
+    fi
+}
+
 function headerp() {
     h="$1"
     f=/tmp/check.h
@@ -131,7 +142,7 @@ function libp() {
 function setup_prereq() {
     case "$distro" in
 	(ubuntu)
-	    run sudo apt install -y gcc make automake autoconf libtool g++ libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev zlib1g-dev libsnappy-dev bpfcc-tools bpftrace linux-headers-$(uname -r)
+	    run as_root apt install -y gcc make automake autoconf libtool g++ cargo rustc libunwind-dev google-perftools libgoogle-perftools-dev liblmdb0 liblmdb-dev zstd libzstd-dev liburing-dev libz-dev libbz2-dev liblz4-dev zlib1g-dev libsnappy-dev bpfcc-tools bpftrace linux-headers-$(uname -r)
             run pip install tqdm matplotlib numpy
     ;;  (darwin)
             which -s brew
@@ -141,7 +152,7 @@ function setup_prereq() {
             else
                 run brew update
             fi
-            run brew install automake autoconf libtool gcc gperftools zstd zlib
+            run brew install automake autoconf libtool gcc gperftools zstd zlib rust
     ;;  (*)
 	    echo "Unknown distro '$distro'"
 	    exit 1
@@ -159,7 +170,7 @@ function setup() {
         run ./bootstrap
         run ./configure
         run make
-        run sudo make install
+        run as_root make install
         run cd ..
         run rm -fr userspace-rcu
     )
@@ -171,7 +182,7 @@ function setup() {
         cd rocksdb
         export DEBUG_LEVEL=0
         run make shared_lib
-        run sudo make install-shared install
+        run as_root make install-shared install
         run cd ..
         run rm -fr rocksdb
     )
@@ -185,10 +196,47 @@ function runprep() {
     run mkdir pages log
     case "$platform" in
         (*Darwin*)
-            run sudo sysctl kern.aioprocmax=8192
-            run sudo sysctl kern.aiomax=8192
+            run as_root sysctl kern.aioprocmax=8192
+            run as_root sysctl kern.aiomax=8192
             ;;
     esac
+}
+
+function bft() {
+    repo_dir=bf-tree-src
+    manifest="bftree-bn-adapter/Cargo.toml"
+    warn_prefix="bf-tree adapter build skipped:"
+    if [ ! -d "$repo_dir" ] ;then
+        git clone https://github.com/microsoft/bf-tree.git "$repo_dir"
+        if [ $? != 0 ] ;then
+            echo "$warn_prefix cannot clone '$repo_dir'."
+            return 0
+        fi
+    else
+        git -C "$repo_dir" pull --ff-only >/dev/null 2>/dev/null
+    fi
+    if [ ! -f "$manifest" ] ;then
+        echo "$warn_prefix expected local adapter manifest '$manifest' was not found."
+        return 0
+    fi
+    cargo build --manifest-path "$manifest" --release
+    if [ $? != 0 ] ;then
+        echo "$warn_prefix cargo build failed."
+        return 0
+    fi
+    case "$platform" in
+        (*Darwin*)
+            libname=libbftree_bn.dylib
+            ;;
+        (*)
+            libname=libbftree_bn.so
+            ;;
+    esac
+    if [ -f "bftree-bn-adapter/target/release/$libname" ] ;then
+        run cp "bftree-bn-adapter/target/release/$libname" "./$libname"
+    else
+        echo "$warn_prefix expected artifact 'bftree-bn-adapter/target/release/$libname' was not produced."
+    fi
 }
 
 runut=0
@@ -196,6 +244,7 @@ runbn=0
 rocksdb=0
 lmdb=0
 map=0
+bftree=0
 builddocs=0
 while [ $# != 0 ] ;do
       case "$1" in
@@ -212,6 +261,8 @@ while [ $# != 0 ] ;do
 	      lmdb=1
       ;;  ('-m')
 	      map=1
+      ;;  ('-B')
+	      bftree=1
       ;;  ('-f')
 	      options="$options nodebug nocounters opt"
       ;;  ('-d')
@@ -302,6 +353,12 @@ if [ $map == 1 ] ;then
    BN_LDFLAGS="$BN_LDFLAGS map.o $MAP_LDFLAGS"
 else
    BN_CFLAGS="$BN_CFLAGS -DUSE_MAP=0"
+fi
+if [ $bftree == 1 ] ;then
+   bft
+   BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=1"
+else
+   BN_CFLAGS="$BN_CFLAGS -DUSE_BFTREE=0"
 fi
 run $CC $CFLAGS $BN_CFLAGS bn.c t2.o $BN_LDFLAGS $LDFLAGS -o bn
 if [ $runut == 1 ] ;then

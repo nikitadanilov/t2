@@ -1015,6 +1015,145 @@ static int l_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, en
 
 #endif
 
+#if USE_BFTREE
+
+#include <dlfcn.h>
+
+struct bftree_api {
+        int  (*db_open) (const char *path, bool create_if_missing, void **out_db);
+        void (*db_close)(void *db);
+        int  (*get)     (void *db, const void *key, int32_t ksize, void *val, int32_t *vsize);
+        int  (*put)     (void *db, const void *key, int32_t ksize, const void *val, int32_t vsize);
+        int  (*del)     (void *db, const void *key, int32_t ksize);
+        int  (*iter_new)(void *db, void **out_it);
+        void (*iter_del)(void *it);
+        int  (*iter_seek)(void *it, const void *key, int32_t ksize);
+        int  (*iter_next)(void *it);
+        int  (*iter_prev)(void *it);
+        int  (*iter_key)(void *it, const void **key, int32_t *ksize);
+        int  (*iter_val)(void *it, const void **val, int32_t *vsize);
+};
+
+static struct {
+        void             *handle;
+        struct bftree_api api;
+} bft = {};
+
+static void *api_sym(const char *name) {
+        void *ptr = dlsym(bft.handle, name);
+        if (ptr == NULL) {
+                fprintf(stderr, "bf-tree backend symbol '%s' is missing: %s\n", name, dlerror());
+                abort();
+        }
+        return ptr;
+}
+
+static void bft_load(void) {
+        if (bft.handle != NULL) {
+                return;
+        }
+        const char *path = getenv("BFTREE_BN_LIB");
+        if (path == NULL) {
+                path = "libbftree_bn.so";
+        }
+        bft.handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (bft.handle == NULL) {
+                fprintf(stderr, "Cannot load bf-tree benchmark adapter '%s': %s\n", path, dlerror());
+                abort();
+        }
+        bft.api.db_open   = api_sym("bftree_bn_db_open");
+        bft.api.db_close  = api_sym("bftree_bn_db_close");
+        bft.api.get       = api_sym("bftree_bn_get");
+        bft.api.put       = api_sym("bftree_bn_put");
+        bft.api.del       = api_sym("bftree_bn_del");
+        bft.api.iter_new  = api_sym("bftree_bn_iter_new");
+        bft.api.iter_del  = api_sym("bftree_bn_iter_del");
+        bft.api.iter_seek = api_sym("bftree_bn_iter_seek");
+        bft.api.iter_next = api_sym("bftree_bn_iter_next");
+        bft.api.iter_prev = api_sym("bftree_bn_iter_prev");
+        bft.api.iter_key  = api_sym("bftree_bn_iter_key");
+        bft.api.iter_val  = api_sym("bftree_bn_iter_val");
+}
+
+static void b_mount(struct benchmark *b) {
+        int rc;
+        bft_load();
+        rc = bft.api.db_open("testdb-bftree", true, &b->kv.u.b.db);
+        if (rc != 0) {
+                fprintf(stderr, "bf-tree backend open failed: %d\n", rc);
+                abort();
+        }
+}
+
+static void b_umount(struct benchmark *b) {
+        if (b->kv.u.b.db != NULL) {
+                bft.api.db_close(b->kv.u.b.db);
+                b->kv.u.b.db = NULL;
+        }
+}
+
+static void b_worker_init(struct rthread *rt, struct kvdata *d, int maxkey, int maxval) {
+        int rc = bft.api.iter_new(d->b->u.b.db, &d->u.b.it);
+        if (rc != 0) {
+                fprintf(stderr, "bf-tree iter_new failed: %d\n", rc);
+                abort();
+        }
+}
+
+static void b_worker_fini(struct rthread *rt, struct kvdata *d) {
+        if (d->u.b.it != NULL) {
+                bft.api.iter_del(d->u.b.it);
+                d->u.b.it = NULL;
+        }
+}
+
+static int b_lookup(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize) {
+        int32_t out = vsize;
+        return bft.api.get(d->b->u.b.db, key, ksize, val, &out);
+}
+
+static int b_insert(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize, void *val, int vsize) {
+        return bft.api.put(d->b->u.b.db, key, ksize, val, vsize);
+}
+
+static int b_delete(struct rthread *rt, struct kvdata *d, void *key, void *cpy, int ksize) {
+        return bft.api.del(d->b->u.b.db, key, ksize);
+}
+
+/*
+ * Benchmark-oriented iteration:
+ * - best effort;
+ * - status is always success (0);
+ * - fetch key/value to account for lookup/decode work.
+ */
+static int b_next(struct rthread *rt, struct kvdata *d, void *key, int ksize, enum t2_dir dir, int nr) {
+        if (nr <= 0) {
+                return 0;
+        }
+        if (bft.api.iter_seek(d->u.b.it, key, ksize) != 0) {
+                return 0;
+        }
+        for (int i = 0; i < nr; ++i) {
+                const void *k = NULL;
+                const void *v = NULL;
+                int32_t kl = 0;
+                int32_t vl = 0;
+                if (bft.api.iter_key(d->u.b.it, &k, &kl) != 0) {
+                        break;
+                }
+                if (bft.api.iter_val(d->u.b.it, &v, &vl) != 0) {
+                        break;
+                }
+                int rc = (dir == T2_LESS) ? bft.api.iter_prev(d->u.b.it) : bft.api.iter_next(d->u.b.it);
+                if (rc != 0) {
+                        break;
+                }
+        }
+        return 0;
+}
+
+#endif
+
 static struct kv kv[] = {
         [T2] = {
                 .mount       = &t_mount,
@@ -1048,6 +1187,18 @@ static struct kv kv[] = {
                 .insert      = &l_insert,
                 .del         = &l_delete,
                 .next        = &l_next
+        }
+#endif
+#if USE_BFTREE
+        [BFTREE] = {
+                .mount       = &b_mount,
+                .umount      = &b_umount,
+                .worker_init = &b_worker_init,
+                .worker_fini = &b_worker_fini,
+                .lookup      = &b_lookup,
+                .insert      = &b_insert,
+                .del         = &b_delete,
+                .next        = &b_next
         }
 #endif
 };
@@ -1110,6 +1261,8 @@ int main(int argc, char **argv) {
                                 kvt = MAP;
                         } else if (USE_LMDB && strcmp(optarg, "lmdb") == 0) {
                                 kvt = LMDB;
+                        } else if (USE_BFTREE && strcmp(optarg, "bftree") == 0) {
+                                kvt = BFTREE;
                         } else {
                                 printf("Unknown kv: %s\n", optarg);
                                 return 1;

@@ -138,6 +138,10 @@ struct kvbenchmark {
                 struct rocksdb_benchmark r;
                 struct lmdb_benchmark l;
                 struct {
+                        void *db;
+                        void *it;
+                } b;
+                struct {
                         void *m;
                         void *l;
                 } m;
@@ -173,6 +177,7 @@ enum kvtype {
         ROCKSDB,
         MAP,
         LMDB,
+        BFTREE,
 
         KVNR
 };
@@ -195,6 +200,11 @@ struct kvdata {
                 struct {
                         rocksdb_iterator_t *it;
                 } r;
+#endif
+#if USE_BFTREE
+                struct {
+                        void *it;
+                } b;
 #endif
         } u;
 };

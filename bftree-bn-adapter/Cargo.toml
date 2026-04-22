@@ -1,0 +1,12 @@
+[package]
+name = "bftree-bn-adapter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bftree_bn"
+crate-type = ["cdylib"]
+
+[dependencies]
+bf-tree = { path = "../bf-tree-src" }
+libc = "0.2"
