@@ -1187,7 +1187,7 @@ static struct kv kv[] = {
                 .insert      = &l_insert,
                 .del         = &l_delete,
                 .next        = &l_next
-        }
+        },
 #endif
 #if USE_BFTREE
         [BFTREE] = {
