@@ -155,7 +155,7 @@ function setup_prereq_t2() {
     case "$distro" in
         (ubuntu)
             run as_root apt update
-            run  apt install -y git python3-venv gcc make automake autoconf libtool g++ libunwind-dev google-perftools libgoogle-perftools-dev zstd libzstd-dev liburing-dev libz-dev zlib1g-dev bpfcc-tools bpftrace "linux-headers-$(uname -r)"
+            run as_root apt install -y git python3-venv gcc make automake autoconf libtool g++ libunwind-dev google-perftools libgoogle-perftools-dev zstd libzstd-dev liburing-dev libz-dev zlib1g-dev bpfcc-tools bpftrace "linux-headers-$(uname -r)"
             ensure_venv
             run "$VENV_PIP" install tqdm matplotlib numpy
     ;;  (darwin)
