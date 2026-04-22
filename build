@@ -205,17 +205,26 @@ function runprep() {
 function bft() {
     repo_dir=bf-tree-src
     manifest="$repo_dir/bn-adapter/Cargo.toml"
+    warn_prefix="bf-tree adapter build skipped:"
     if [ ! -d "$repo_dir" ] ;then
-        run git clone https://github.com/microsoft/bf-tree.git "$repo_dir"
+        git clone https://github.com/microsoft/bf-tree.git "$repo_dir"
+        if [ $? != 0 ] ;then
+            echo "$warn_prefix cannot clone '$repo_dir'."
+            return 0
+        fi
     else
-        run git -C "$repo_dir" pull --ff-only
+        git -C "$repo_dir" pull --ff-only >/dev/null 2>/dev/null
     fi
     if [ ! -f "$manifest" ] ;then
-        echo "Expected bf-tree benchmark adapter manifest at '$manifest'."
-        echo "Please ensure microsoft/bf-tree exports a bn-adapter crate with bftree_bn_* C ABI symbols."
-        exit 1
+        echo "$warn_prefix expected manifest '$manifest' was not found."
+        echo "$warn_prefix bn will still be built; bftree backend requires setting BFTREE_BN_LIB to a compatible adapter."
+        return 0
     fi
-    run cargo build --manifest-path "$manifest" --release
+    cargo build --manifest-path "$manifest" --release
+    if [ $? != 0 ] ;then
+        echo "$warn_prefix cargo build failed."
+        return 0
+    fi
     case "$platform" in
         (*Darwin*)
             libname=libbftree_bn.dylib
@@ -224,7 +233,11 @@ function bft() {
             libname=libbftree_bn.so
             ;;
     esac
-    run cp "$repo_dir/target/release/$libname" "./$libname"
+    if [ -f "$repo_dir/target/release/$libname" ] ;then
+        run cp "$repo_dir/target/release/$libname" "./$libname"
+    else
+        echo "$warn_prefix expected artifact '$repo_dir/target/release/$libname' was not produced."
+    fi
 }
 
 runut=0
