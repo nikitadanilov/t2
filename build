@@ -250,8 +250,8 @@ function runprep() {
     run mkdir pages log
     case "$platform" in
         (*Darwin*)
-            run as_root sysctl kern.aioprocmax=8192
-            run as_root sysctl kern.aiomax=8192
+            # run as_root sysctl kern.aioprocmax=8192 # Fails on github.
+            # run as_root sysctl kern.aiomax=8192
             ;;
     esac
 }
