@@ -281,10 +281,9 @@ function bft() {
     case "$platform" in
         (*Darwin*)
             libname=libbftree_bn.dylib
-            ;;
-        (*)
+     ;; (*)
             libname=libbftree_bn.so
-            ;;
+     ;;
     esac
     if [ -f "bftree-bn-adapter/target/release/$libname" ] ;then
         run cp "bftree-bn-adapter/target/release/$libname" "./$libname"
@@ -313,11 +312,11 @@ while [ $# != 0 ] ;do
         ('-o')
             options="$options $2"
             shift
-        ;;  ('-c')
+    ;;  ('-c')
             builddocs=1
-        ;;  ('-u')
+    ;;  ('-u')
             runut=1
-        ;;  ('-B')
+    ;;  ('-B')
             backend="$2"
             case "$backend" in
                 (bftree) use_bftree=1
@@ -330,27 +329,27 @@ while [ $# != 0 ] ;do
                 exit 1
             esac
             shift
-        ;;  ('-f')
+    ;;  ('-f')
             options="$options nodebug nocounters opt"
-        ;;  ('-d')
+    ;;  ('-d')
             options="$options debug counters noopt profile"
-        ;;  ('-D')
+    ;;  ('-D')
             CFLAGS="$CFLAGS -D$2"
             shift
-        ;;  ('-b')
+    ;;  ('-b')
             runbn=1
-        ;;  ('-A')
+    ;;  ('-A')
             CFLAGS="$CFLAGS -fsanitize=address"
-        ;;  ('-x')
+    ;;  ('-x')
             skipdeps=1
-        ;;  ('-h'|'--help')
+    ;;  ('-h'|'--help')
             usage
             exit 0
-        ;;  (*)
+    ;;  (*)
             echo "Unknown argument $1"
             usage
             exit 1
-        ;;
+    ;;
     esac
     shift
 done
