@@ -71,6 +71,10 @@ enum {
 #define IOCACHE (1)
 #endif
 
+#if !defined(COVERAGE)
+#define COVERAGE (0)
+#endif
+
 #define EXPENSIVE_ASSERTS_ON (0)
 #define SHADOW_CHECK_ON (0)
 #define USE_PREFIX_SEPARATORS (0) /* TODO: Fix deletion with this enabled. */
@@ -11761,6 +11765,30 @@ static void seg_load() {
         fclose(seg);
 }
 
+#if COVERAGE
+void __gcov_dump(void);
+
+static void coverage_dump() {
+        __gcov_dump(); /* Counters are lost on SIGKILL, write them out. */
+}
+
+static void coverage_exit(int signo) {
+        coverage_dump();
+        _exit(128 + signo);
+}
+
+static void coverage_init() {
+        signal(SIGINT,  &coverage_exit);
+        signal(SIGTERM, &coverage_exit);
+}
+#else
+static void coverage_dump() {
+}
+
+static void coverage_init() {
+}
+#endif
+
 static void ct(int argc, char **argv) {
         /*
          * ui cf$NR c $NR_THREADS $SLEEP_MIN $SLEEP_MAX
@@ -11787,6 +11815,7 @@ static void ct(int argc, char **argv) {
         memset(lo , 0, sizeof lo);
         cseg.idx = idx;
         cseg.lo  = lo;
+        coverage_init();
         while (true) {
                 pid_t child = crash ? fork() : 0;
                 int   status;
@@ -11852,6 +11881,7 @@ static void ct(int argc, char **argv) {
                                 wait_forever();
                         } else if (crash) {
                                 puts("    .... Crashing.");
+                                coverage_dump();
                                 kill(getpid(), SIGKILL);
                         } else {
                                 cseg.shutdown = true;

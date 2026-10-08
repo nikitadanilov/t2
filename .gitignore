@@ -16,4 +16,5 @@ ut
 ut.dSYM
 .cache/
 .gdb_history
+*gcno
 
