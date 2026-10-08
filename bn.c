@@ -863,7 +863,8 @@ static void r_mount(struct benchmark *b) {
         rocksdb_options_set_manual_wal_flush(opts, 1);
         rocksdb_options_set_compression(opts, rocksdb_snappy_compression);
         char *err = NULL;
-        b->kv.u.r.db = rocksdb_open(opts, "testdb", &err);
+        const char *dbname = getenv("BN_ROCKSDB_DB") ?: "testdb";
+        b->kv.u.r.db = rocksdb_open(opts, dbname, &err);
         if (err != NULL) {
                 fprintf(stderr, "database open %s\n", err);
                 abort();
